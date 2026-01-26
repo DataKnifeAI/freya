@@ -25,10 +25,10 @@ WORKDIR /app
 # Clone SwarmUI repository
 RUN git clone https://github.com/mcmonkeyprojects/SwarmUI.git /app/SwarmUI
 
-WORKDIR /app/SwarmUI
+WORKDIR /app/SwarmUI/src
 
 # Restore dependencies and build SwarmUI
-RUN dotnet restore && dotnet build -c Release --no-restore
+RUN dotnet restore SwarmUI.csproj && dotnet build SwarmUI.csproj -c Release --no-restore
 
 # Create directories for models and data
 RUN mkdir -p /app/SwarmUI/Data/Models \
