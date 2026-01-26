@@ -21,6 +21,10 @@ jobs:
 
       - name: Validate Docker Compose
         run: |
+          # Create a minimal .env file if it doesn't exist (for CI validation)
+          if [ ! -f .env ]; then
+            touch .env
+          fi
           docker compose config > /dev/null
           echo "✅ Docker Compose configuration is valid"
 
