@@ -10,6 +10,8 @@ services:
       - ./comfyui/models:/app/ComfyUI/models
       - ./comfyui/output:/app/ComfyUI/output
       - ./comfyui/input:/app/ComfyUI/input
+    env_file:
+      - .env
     deploy:
       resources:
         reservations:
@@ -36,6 +38,8 @@ services:
       - ./swarmui/output:/app/SwarmUI/Data/Outputs
       - ./swarmui/input:/app/SwarmUI/Data/Inputs
       - ./swarmui/data:/app/SwarmUI/Data
+    env_file:
+      - .env
     deploy:
       resources:
         reservations:

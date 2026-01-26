@@ -264,13 +264,30 @@ make download-model TYPE=checkpoint URL=https://... FILE=model.safetensors
 - Verify Git access to SwarmUI repository
 
 ### GPU Not Detected
-```bash
-# Verify NVIDIA Container Toolkit is installed
-docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
 
-# Check GPU in containers
-make check-gpu-comfyui
-make check-gpu-swarmui
+**Symptoms:**
+- `nvidia-smi` works on host but not in containers
+- Error: `could not select device driver "" with capabilities: [[gpu]]`
+- `docker info` shows no NVIDIA runtime
+
+**Solution - Install NVIDIA Container Toolkit:**
+
+```bash
+# Ubuntu/Debian
+distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
+curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list
+sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+sudo systemctl restart docker
+
+# Verify installation
+docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+```
+
+**Run diagnostic script:**
+```bash
+chmod +x scripts/check-gpu.sh
+./scripts/check-gpu.sh
 ```
 
 ### Port Conflicts

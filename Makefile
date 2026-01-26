@@ -1,9 +1,15 @@
 .PHONY: help build build-comfyui build-swarmui up down restart logs clean
 
+help: ## Show this help message
+	@echo 'Usage: make [target]'
+	@echo ''
+	@echo 'Available targets:'
+	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+
 setup: ## Run initial directory setup
 	chmod +x scripts/setup.sh && ./scripts/setup.sh
 
-quick-setup: ## Interactive setup with model downloads
+quick-setup: ## Non-interactive setup with model downloads
 	chmod +x scripts/quick-setup.sh && ./scripts/quick-setup.sh
 
 download-model: ## Download a model (usage: make download-model TYPE=checkpoint URL=... FILE=...)
@@ -14,10 +20,6 @@ download-model: ## Download a model (usage: make download-model TYPE=checkpoint 
 	fi
 	chmod +x scripts/download-model.sh
 	./scripts/download-model.sh $(TYPE) $(URL) $(FILE)
-	@echo 'Usage: make [target]'
-	@echo ''
-	@echo 'Available targets:'
-	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
 build: ## Build all Docker images
 	docker compose build
@@ -60,6 +62,9 @@ shell-comfyui: ## Open shell in ComfyUI container
 
 shell-swarmui: ## Open shell in SwarmUI container
 	docker compose exec swarmui /bin/bash
+
+check-gpu: ## Run GPU diagnostic check
+	chmod +x scripts/check-gpu.sh && ./scripts/check-gpu.sh
 
 check-gpu-comfyui: ## Check GPU availability in ComfyUI container
 	docker compose exec comfyui python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU count: {torch.cuda.device_count()}'); [torch.cuda.is_available()] and print(f'GPU name: {torch.cuda.get_device_name(0)}')"
