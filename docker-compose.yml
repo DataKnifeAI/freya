@@ -34,6 +34,8 @@ services:
       - ./swarmui/output:/app/SwarmUI/Data/Outputs
       - ./swarmui/input:/app/SwarmUI/Data/Inputs
       - ./swarmui/data:/app/SwarmUI/Data
+      - ./swarmui/dlbackend:/app/SwarmUI/dlbackend
+      - ./swarmui/swarmui-models:/app/SwarmUI/Models
     env_file:
       - .env
     deploy:

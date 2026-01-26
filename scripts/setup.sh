@@ -26,6 +26,8 @@ mkdir -p swarmui/models
 mkdir -p swarmui/output
 mkdir -p swarmui/input
 mkdir -p swarmui/data
+mkdir -p swarmui/dlbackend
+mkdir -p swarmui/swarmui-models
 
 echo "✓ Directory structure created!"
 echo ""

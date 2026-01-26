@@ -41,6 +41,8 @@ spec:
           mountPath: /app/SwarmUI/Data/Inputs
         - name: data
           mountPath: /app/SwarmUI/Data
+        - name: dlbackend
+          mountPath: /app/SwarmUI/dlbackend
       volumes:
       - name: models
         persistentVolumeClaim:
@@ -54,6 +56,9 @@ spec:
       - name: data
         persistentVolumeClaim:
           claimName: swarmui-data
+      - name: dlbackend
+        persistentVolumeClaim:
+          claimName: swarmui-dlbackend
 ---
 apiVersion: v1
 kind: Service
@@ -119,3 +124,15 @@ spec:
   resources:
     requests:
       storage: 20Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: swarmui-dlbackend
+  namespace: aphrodite
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
