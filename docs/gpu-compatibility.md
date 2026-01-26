@@ -15,20 +15,24 @@ These GPUs provide excellent performance for running both ComfyUI and SwarmUI si
 - **NVIDIA A5000** (24GB) - Professional workstation GPU
 
 ### Consumer GPUs
-- **NVIDIA RTX 4090** (24GB) - Best consumer performance, can handle large models and high resolutions
+- **NVIDIA RTX 5090** (32GB GDDR7) - Latest generation flagship, excellent for large models and high-resolution generation
+- **NVIDIA RTX 4090** (24GB) - Previous generation flagship, can handle large models and high resolutions
 - **NVIDIA RTX 3090** (24GB) - Excellent for production workloads
-- **NVIDIA RTX 4080** (16GB) - Great balance of performance and cost
+- **NVIDIA RTX 5080** (16GB GDDR7) - Latest generation, great for running both services simultaneously
+- **NVIDIA RTX 5070 Ti** (16GB GDDR7) - Latest generation, good balance of performance and cost
+- **NVIDIA RTX 4080** (16GB) - Previous generation, great balance of performance and cost
 
 ## Minimum (8GB+ VRAM)
 
 These GPUs can run the platform but may require running services individually or using smaller models:
 
-- **NVIDIA RTX 4070** (12GB) - Good for single service or smaller models
-- **NVIDIA RTX 4060 Ti** (16GB) - Entry-level option with decent VRAM
+- **NVIDIA RTX 5070** (12GB GDDR7) - Latest generation, good for single service or smaller models
+- **NVIDIA RTX 4070** (12GB) - Previous generation, good for single service or smaller models
+- **NVIDIA RTX 4060 Ti** (16GB) - Entry-level option with decent VRAM (note: 16GB variant qualifies for Recommended)
 - **NVIDIA RTX 3080** (10GB) - Previous generation, still capable
 - **NVIDIA RTX 3070** (8GB) - Minimum viable, may need optimization
 - **NVIDIA RTX 3060** (12GB) - Budget-friendly option with good VRAM
-- **NVIDIA A4000** (16GB) - Professional GPU option
+- **NVIDIA A4000** (16GB) - Professional GPU option (note: 16GB qualifies for Recommended)
 
 ## Not Recommended
 
@@ -45,8 +49,10 @@ These GPUs can run the platform but may require running services individually or
 ## Performance Notes
 
 - **CUDA Compatibility**: All listed GPUs support CUDA 12.1+
-- **Performance**: RTX Pro 5000/6000 Blackwell, RTX 40-series, and A6000 series offer best performance
+- **Performance**: RTX Pro 5000/6000 Blackwell, RTX 50-series, RTX 40-series, and A6000 series offer best performance
+- **Latest Generation**: RTX 50-series (Blackwell architecture) provides improved performance and efficiency over RTX 40-series
 - **Professional GPUs**: RTX Pro 5000/6000 Blackwell and A6000 series are ideal for production AI workloads
+- **Consumer Flagship**: RTX 5090 (32GB) offers excellent performance for consumer AI workloads
 - **Cost-Effectiveness**: RTX 3060 12GB offers best VRAM-to-cost ratio for consumer cards
 
 ## Checking Your GPU
