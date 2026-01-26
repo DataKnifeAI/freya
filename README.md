@@ -1,4 +1,4 @@
-# Aphrodite - ComfyUI & SwarmUI Stable Diffusion Platform
+# Freya - ComfyUI & SwarmUI Stable Diffusion Platform
 
 A Kubernetes-ready platform for running ComfyUI and SwarmUI Stable Diffusion interfaces with discrete GPU support. Both UIs are built from source using custom Docker images.
 
@@ -11,7 +11,27 @@ A Kubernetes-ready platform for running ComfyUI and SwarmUI Stable Diffusion int
 - 🚀 **GPU Accelerated**: Full CUDA support for discrete GPUs
 - 🔧 **Custom Builds**: All images built from source, not using public images
 
-## Prerequisites
+## Requirements
+
+### System Requirements
+
+- **OS**: Linux (Ubuntu 22.04+ recommended, Arch Linux/CachyOS tested)
+- **Docker**: Docker Engine 20.10+ and Docker Compose v2.0+
+- **GPU**: NVIDIA GPU with CUDA support (CUDA 12.1+)
+- **GPU Memory**: Minimum 8GB VRAM (16GB+ recommended for both services)
+- **RAM**: Minimum 16GB system RAM (32GB+ recommended)
+- **Storage**: Minimum 50GB free space for models and images
+- **Network**: Internet connection for downloading models and dependencies
+
+### Software Requirements
+
+- **NVIDIA Container Toolkit**: Required for GPU access in containers
+- **Git**: For cloning repositories during Docker builds
+- **Python 3.12**: Installed in SwarmUI container (handled automatically)
+- **.NET 8 SDK**: Installed in SwarmUI container (handled automatically)
+- **CUDA 12.1**: Provided by base Docker images
+
+### Prerequisites
 
 - Docker and Docker Compose (v3.8+)
 - NVIDIA GPU with CUDA support
@@ -86,7 +106,7 @@ make download-model    # Download a model (see MODELS.md)
 ## Project Structure
 
 ```
-aphrodite/
+freya/
 ├── dockerfiles/
 │   ├── Dockerfile.comfyui  # ComfyUI build from source
 │   └── Dockerfile.swarmui  # SwarmUI build from source
@@ -103,7 +123,9 @@ aphrodite/
 │   ├── models/           # Model files (mounted as volume)
 │   ├── output/           # Generated images
 │   ├── input/            # Input images
-│   └── data/             # SwarmUI data directory
+│   ├── data/             # SwarmUI data directory
+│   ├── dlbackend/        # ComfyUI backend installation (persistent)
+│   └── swarmui-models/   # SwarmUI internal model storage (persistent)
 └── Makefile               # Build automation
 ```
 
@@ -122,11 +144,14 @@ aphrodite/
 - **Build**: Custom Dockerfile building from source
 - **Source**: https://github.com/mcmonkeyprojects/SwarmUI
 - **Port**: 7801
+- **Python**: 3.12 with pip support
 - **Volumes**:
-  - `./swarmui/models` → Model storage
-  - `./swarmui/output` → Generated images
-  - `./swarmui/input` → Input images
-  - `./swarmui/data` → SwarmUI data directory
+  - `./swarmui/models` → Model storage (Data/Models)
+  - `./swarmui/output` → Generated images (Data/Outputs)
+  - `./swarmui/input` → Input images (Data/Inputs)
+  - `./swarmui/data` → SwarmUI data directory (settings, databases)
+  - `./swarmui/dlbackend` → ComfyUI backend installation (persistent)
+  - `./swarmui/swarmui-models` → SwarmUI internal model storage (persistent)
 
 ## Building Images
 
@@ -165,12 +190,12 @@ The project includes Kubernetes manifests for deploying ComfyUI and SwarmUI to a
 make build
 
 # Tag for your registry
-docker tag aphrodite-comfyui:latest your-registry/aphrodite-comfyui:latest
-docker tag aphrodite-swarmui:latest your-registry/aphrodite-swarmui:latest
+docker tag freya-comfyui:latest your-registry/freya-comfyui:latest
+docker tag freya-swarmui:latest your-registry/freya-swarmui:latest
 
 # Push to registry
-docker push your-registry/aphrodite-comfyui:latest
-docker push your-registry/aphrodite-swarmui:latest
+docker push your-registry/freya-comfyui:latest
+docker push your-registry/freya-swarmui:latest
 ```
 
 ### Update Kubernetes Manifests
@@ -178,7 +203,7 @@ docker push your-registry/aphrodite-swarmui:latest
 Edit `k8s/comfyui/deployment.yaml` and `k8s/swarmui/deployment.yaml` to use your registry:
 
 ```yaml
-image: your-registry/aphrodite-comfyui:latest
+image: your-registry/freya-comfyui:latest
 imagePullPolicy: Always
 ```
 
@@ -186,7 +211,7 @@ imagePullPolicy: Always
 
 ```bash
 # Create namespace
-kubectl create namespace aphrodite
+kubectl create namespace freya
 
 # Deploy ComfyUI
 kubectl apply -f k8s/comfyui/
@@ -198,8 +223,8 @@ kubectl apply -f k8s/swarmui/
 kubectl apply -f k8s/ingress.yaml
 
 # Check status
-kubectl get pods -n aphrodite
-kubectl get svc -n aphrodite
+kubectl get pods -n freya
+kubectl get svc -n freya
 ```
 
 ### Access Services
@@ -208,8 +233,8 @@ After deployment, access services via:
 - Ingress (if configured): Update `k8s/ingress.yaml` with your domain
 - Port forwarding: 
   ```bash
-  kubectl port-forward -n aphrodite svc/comfyui 8188:8188
-  kubectl port-forward -n aphrodite svc/swarmui 7801:7801
+  kubectl port-forward -n freya svc/comfyui 8188:8188
+  kubectl port-forward -n freya svc/swarmui 7801:7801
   ```
 - NodePort/LoadBalancer (modify service type in manifests)
 
@@ -262,6 +287,7 @@ make download-model TYPE=checkpoint URL=https://... FILE=model.safetensors
 - Ensure .NET 8 SDK installs correctly
 - Check for sufficient memory during build
 - Verify Git access to SwarmUI repository
+- Verify Python 3.12 and pip installation in Dockerfile
 
 ### GPU Not Detected
 

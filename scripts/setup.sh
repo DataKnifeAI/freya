@@ -1,9 +1,9 @@
 #!/bin/bash
-# Setup script for Aphrodite - Creates directory structure for models
+# Setup script for Freya - Creates directory structure for models
 
 set -e
 
-echo "Setting up Aphrodite model directories..."
+echo "Setting up Freya model directories..."
 
 # ComfyUI directories
 echo "Creating ComfyUI directories..."

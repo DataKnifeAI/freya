@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: swarmui
-  namespace: aphrodite
+  namespace: freya
   labels:
     app: swarmui
 spec:
@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: swarmui
-        image: aphrodite-swarmui:latest
+        image: freya-swarmui:latest
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 7801
@@ -64,7 +64,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: swarmui
-  namespace: aphrodite
+  namespace: freya
   labels:
     app: swarmui
 spec:
@@ -81,7 +81,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: swarmui-models
-  namespace: aphrodite
+  namespace: freya
 spec:
   accessModes:
     - ReadWriteOnce
@@ -93,7 +93,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: swarmui-output
-  namespace: aphrodite
+  namespace: freya
 spec:
   accessModes:
     - ReadWriteOnce
@@ -105,7 +105,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: swarmui-input
-  namespace: aphrodite
+  namespace: freya
 spec:
   accessModes:
     - ReadWriteOnce
@@ -117,7 +117,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: swarmui-data
-  namespace: aphrodite
+  namespace: freya
 spec:
   accessModes:
     - ReadWriteOnce
@@ -129,7 +129,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: swarmui-dlbackend
-  namespace: aphrodite
+  namespace: freya
 spec:
   accessModes:
     - ReadWriteOnce

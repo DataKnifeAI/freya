@@ -1,7 +1,7 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: aphrodite
+  name: freya
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
       - name: comfyui
-        image: aphrodite-comfyui:latest
+        image: freya-comfyui:latest
         imagePullPolicy: IfNotPresent
         ports:
         - containerPort: 8188

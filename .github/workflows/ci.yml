@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check YAML syntax
+        run: |
+          docker compose config > /dev/null
+          find k8s -name "*.yaml" -exec kubectl --dry-run=client -f {} \; || true

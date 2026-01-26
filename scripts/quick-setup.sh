@@ -4,7 +4,7 @@
 
 set -e
 
-echo "Aphrodite Model Setup"
+echo "Freya Model Setup"
 echo "===================="
 echo ""
 echo "This script will download essential Stable Diffusion models."

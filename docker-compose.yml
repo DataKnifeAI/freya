@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: dockerfiles/Dockerfile.comfyui
-    container_name: comfyui
+    container_name: freya-comfyui
     network_mode: host
     volumes:
       - ./comfyui/models:/app/ComfyUI/models
@@ -27,7 +27,7 @@ services:
     build:
       context: .
       dockerfile: dockerfiles/Dockerfile.swarmui
-    container_name: swarmui
+    container_name: freya-swarmui
     network_mode: host
     volumes:
       - ./swarmui/models:/app/SwarmUI/Data/Models
