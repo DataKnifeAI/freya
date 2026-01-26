@@ -85,6 +85,10 @@ See [Installation Guide](docs/installation.md) for detailed requirements.
 - First build may take 15-30 minutes
 - Both services can run simultaneously with 16GB+ GPU memory
 
+## Acknowledgments
+
+This project was built with [Cursor](https://cursor.sh) using the Composer model.
+
 ## License
 
 MIT
