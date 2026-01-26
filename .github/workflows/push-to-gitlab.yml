@@ -45,9 +45,12 @@ jobs:
           # Remove gitlab remote if it exists
           git remote remove gitlab 2>/dev/null || true
           
-          # Add GitLab remote with token
-          GITLAB_URL="https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com/dk-raas/dkai/tools/freya.git"
-          git remote add gitlab "$GITLAB_URL"
+          # Add GitLab remote (without token in URL - will use credential helper)
+          git remote add gitlab https://gitlab.com/dk-raas/dkai/tools/freya.git
+          
+          # Configure credential helper to use token
+          git config --global credential.helper store
+          echo "https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com" > ~/.git-credentials
           
           # Verify remote was added
           git remote -v
