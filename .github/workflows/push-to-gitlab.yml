@@ -31,18 +31,25 @@ jobs:
 
       - name: Configure GitLab remote
         run: |
-          # Ensure we're on main branch
-          git fetch origin main || true
-          git checkout -b main origin/main 2>/dev/null || git checkout main || git branch -f main HEAD && git checkout main
+          # Fetch all branches
+          git fetch origin
           
-          # Configure GitLab remote - use set-url if exists, otherwise add
-          if git remote get-url gitlab >/dev/null 2>&1; then
-            git remote set-url gitlab https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com/dk-raas/dkai/tools/freya.git
+          # Ensure we're on main branch (create from origin/main if needed)
+          if git show-ref --verify --quiet refs/heads/main; then
+            git checkout main
+            git reset --hard origin/main
           else
-            git remote add gitlab https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com/dk-raas/dkai/tools/freya.git
+            git checkout -b main origin/main
           fi
           
-          # Verify remote was configured
+          # Remove gitlab remote if it exists
+          git remote remove gitlab 2>/dev/null || true
+          
+          # Add GitLab remote with token
+          GITLAB_URL="https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com/dk-raas/dkai/tools/freya.git"
+          git remote add gitlab "$GITLAB_URL"
+          
+          # Verify remote was added
           git remote -v
 
       - name: Push to GitLab
