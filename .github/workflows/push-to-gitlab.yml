@@ -32,10 +32,12 @@ jobs:
       - name: Configure GitLab remote
         run: |
           # Checkout main branch if in detached HEAD
-          git checkout -B main 2>/dev/null || git checkout main
+          git checkout -B main origin/main 2>/dev/null || git checkout main || git checkout -B main
           
-          # Configure GitLab remote (set-url works whether remote exists or not)
-          git remote set-url gitlab https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com/dk-raas/dkai/tools/freya.git 2>/dev/null || \
+          # Remove existing gitlab remote if it exists
+          git remote remove gitlab 2>/dev/null || true
+          
+          # Add GitLab remote
           git remote add gitlab https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com/dk-raas/dkai/tools/freya.git
           
           # Verify remote was added
