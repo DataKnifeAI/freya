@@ -22,8 +22,15 @@ To enable automatic pushing to GitLab from GitHub Actions:
 1. Go to https://gitlab.com/-/user_settings/personal_access_tokens
 2. Create a token with:
    - Name: `github-actions-freya`
-   - Scopes: `api`, `write_repository`
-3. Copy the token and add it to GitHub secrets as `GITLAB_TOKEN`
+   - Scopes: **`api`**, **`write_repository`** (both required)
+   - Expiration: Set appropriate expiration date
+3. Copy the token immediately (it won't be shown again)
+4. Add it to GitHub secrets as `GITLAB_TOKEN`
+
+**Important**: The token must have:
+- `api` scope - for API access
+- `write_repository` scope - for pushing code
+- Access to the `dk-raas/dkai/tools` group or the `freya` project
 
 ## Manual Push to GitLab
 
