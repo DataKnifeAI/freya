@@ -30,6 +30,8 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Configure GitLab remote
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
         run: |
           # Fetch all branches
           git fetch origin
@@ -45,16 +47,15 @@ jobs:
           # Remove gitlab remote if it exists
           git remote remove gitlab 2>/dev/null || true
           
-          # Add GitLab remote (without token in URL - will use credential helper)
-          git remote add gitlab https://gitlab.com/dk-raas/dkai/tools/freya.git
+          # Add GitLab remote with token from environment variable
+          git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@gitlab.com/dk-raas/dkai/tools/freya.git"
           
-          # Configure credential helper to use token
-          git config --global credential.helper store
-          echo "https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com" > ~/.git-credentials
-          
-          # Verify remote was added
-          git remote -v
+          # Verify remote was added (without showing token)
+          git remote -v | sed 's/oauth2:[^@]*@/oauth2:***@/g'
 
       - name: Push to GitLab
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+          GIT_TERMINAL_PROMPT: 0
         run: |
           git push gitlab main --force
