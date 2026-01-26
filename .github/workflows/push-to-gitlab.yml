@@ -28,6 +28,17 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global init.defaultBranch main
+
+      - name: Verify GitLab token
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          if [ -z "$GITLAB_TOKEN" ]; then
+            echo "❌ Error: GITLAB_TOKEN secret is not set"
+            exit 1
+          fi
+          echo "✅ GitLab token is set (length: ${#GITLAB_TOKEN} characters)"
 
       - name: Configure GitLab remote
         env:
