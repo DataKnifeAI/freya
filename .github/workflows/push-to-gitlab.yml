@@ -34,8 +34,17 @@ jobs:
         run: |
           # Remove remote if it exists, ignore error if it doesn't
           git remote remove gitlab 2>/dev/null || true
+          # Add GitLab remote
           git remote add gitlab https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com/dk-raas/dkai/tools/freya.git
+
+      - name: Ensure we're on main branch
+        run: |
+          # If in detached HEAD, checkout main branch
+          git checkout -B main || git checkout main
+          # Ensure we have the latest from origin
+          git fetch origin main
+          git reset --hard origin/main
 
       - name: Push to GitLab
         run: |
-          git push gitlab main --force || git push gitlab main
+          git push gitlab main --force
