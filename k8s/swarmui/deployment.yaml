@@ -17,8 +17,8 @@ spec:
     spec:
       containers:
       - name: swarmui
-        image: freya-swarmui:latest
-        imagePullPolicy: IfNotPresent
+        image: harbor.dataknife.net/tools/freya-swarmui:latest
+        imagePullPolicy: Always
         ports:
         - containerPort: 7801
           name: http
@@ -27,11 +27,12 @@ spec:
           value: "all"
         - name: NVIDIA_DRIVER_CAPABILITIES
           value: "compute,utility"
-        resources:
-          limits:
-            nvidia.com/gpu: 1
-          requests:
-            nvidia.com/gpu: 1
+        # GPU resources - comment out for testing without NVIDIA
+        # resources:
+        #   limits:
+        #     nvidia.com/gpu: 1
+        #   requests:
+        #     nvidia.com/gpu: 1
         volumeMounts:
         - name: models
           mountPath: /app/SwarmUI/Data/Models
