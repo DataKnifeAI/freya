@@ -33,17 +33,26 @@ swarmui/models/      # All model types
 
 ### Base Checkpoints
 
-**Stable Diffusion 1.5:**
-- [runwayml/stable-diffusion-v1-5](https://huggingface.co/runwayml/stable-diffusion-v1-5)
-- File: `v1-5-pruned-emaonly.safetensors` (4.27 GB)
-
-**Stable Diffusion XL:**
+**Stable Diffusion XL (SDXL) - Most Popular Overall:**
 - [stabilityai/stable-diffusion-xl-base-1.0](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)
 - File: `sd_xl_base_1.0.safetensors` (6.94 GB)
+- **Best for**: High-quality realistic images, commercial content, influencer images
+- **Why popular**: Dual text encoders, 1024×1024 native resolution, superior detail, fewer artifacts
+- **Recommended for**: Most users starting out
 
-**Flux:**
+**Stable Diffusion 1.5 - Still Widely Used:**
+- [runwayml/stable-diffusion-v1-5](https://huggingface.co/runwayml/stable-diffusion-v1-5)
+- File: `v1-5-pruned-emaonly.safetensors` (4.27 GB)
+- **Best for**: Artistic styles, anime, conceptual visuals, lower VRAM requirements
+- **Why popular**: Extensive LoRA/ControlNet support, well-established ecosystem, smaller file size
+- **Recommended for**: Artistic work, users with limited GPU memory, anime/artistic styles
+
+**FLUX.1 - Next Generation:**
 - [black-forest-labs/FLUX.1-dev](https://huggingface.co/black-forest-labs/FLUX.1-dev)
 - File: `flux1-dev.safetensors` (23.4 GB)
+- **Best for**: Sophisticated details, readable text, accurate anatomy, natural language prompts
+- **Why popular**: State-of-the-art quality, excellent prompt understanding
+- **Note**: Requires significant GPU memory (24GB+ recommended)
 
 ### VAE Models
 

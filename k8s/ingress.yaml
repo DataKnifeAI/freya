@@ -13,7 +13,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-  - host: comfyui.example.com
+  - host: comfyui.dataknife.net
     http:
       paths:
       - path: /
@@ -23,7 +23,7 @@ spec:
             name: comfyui
             port:
               number: 8188
-  - host: swarmui.example.com
+  - host: swarmui.dataknife.net
     http:
       paths:
       - path: /
