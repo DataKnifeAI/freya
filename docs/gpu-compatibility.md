@@ -6,12 +6,18 @@ This project requires NVIDIA GPUs with CUDA support. Below are examples of GPU c
 
 These GPUs provide excellent performance for running both ComfyUI and SwarmUI simultaneously:
 
-- **NVIDIA RTX 4090** (24GB) - Best performance, can handle large models and high resolutions
-- **NVIDIA RTX 3090** (24GB) - Excellent for production workloads
-- **NVIDIA RTX 4080** (16GB) - Great balance of performance and cost
+### Professional/Workstation GPUs (Best for Production)
+- **NVIDIA RTX Pro 6000 Blackwell** (96GB) - Flagship workstation GPU, ideal for large models and high-resolution generation
+- **NVIDIA RTX Pro 5000 Blackwell** (72GB) - Excellent for AI workloads, large model support
+- **NVIDIA RTX Pro 5000 Blackwell** (48GB) - Professional workstation GPU with ample VRAM
 - **NVIDIA RTX 6000 Ada Generation** (48GB) - Professional workstation GPU
 - **NVIDIA A6000** (48GB) - Professional data center GPU
 - **NVIDIA A5000** (24GB) - Professional workstation GPU
+
+### Consumer GPUs
+- **NVIDIA RTX 4090** (24GB) - Best consumer performance, can handle large models and high resolutions
+- **NVIDIA RTX 3090** (24GB) - Excellent for production workloads
+- **NVIDIA RTX 4080** (16GB) - Great balance of performance and cost
 
 ## Minimum (8GB+ VRAM)
 
@@ -39,8 +45,9 @@ These GPUs can run the platform but may require running services individually or
 ## Performance Notes
 
 - **CUDA Compatibility**: All listed GPUs support CUDA 12.1+
-- **Performance**: RTX 40-series and A6000 series offer best performance
-- **Cost-Effectiveness**: RTX 3060 12GB offers best VRAM-to-cost ratio
+- **Performance**: RTX Pro 5000/6000 Blackwell, RTX 40-series, and A6000 series offer best performance
+- **Professional GPUs**: RTX Pro 5000/6000 Blackwell and A6000 series are ideal for production AI workloads
+- **Cost-Effectiveness**: RTX 3060 12GB offers best VRAM-to-cost ratio for consumer cards
 
 ## Checking Your GPU
 
