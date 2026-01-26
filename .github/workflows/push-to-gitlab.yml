@@ -1,0 +1,33 @@
+name: Push to GitLab
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  push-to-gitlab:
+    name: Mirror to GitLab
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add GitLab remote
+        run: |
+          git remote remove gitlab || true
+          git remote add gitlab https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com/dk-raas/dkai/tools/freya.git
+
+      - name: Push to GitLab
+        run: |
+          git push gitlab main --force || git push gitlab main

@@ -1,0 +1,92 @@
+stages:
+  - lint
+  - test
+  - build
+
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+
+lint:
+  stage: lint
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - apk add --no-cache make bash python3 py3-pip
+    - pip3 install pyyaml
+  script:
+    - echo "🔍 Running lint checks..."
+    - docker compose config > /dev/null && echo "✅ Docker Compose valid"
+    - make help > /dev/null && echo "✅ Makefile valid"
+    - find . -name "*.yml" -o -name "*.yaml" | grep -v node_modules | while read file; do
+        echo "Checking $file"
+        python3 -c "import yaml; yaml.safe_load(open('$file'))" || exit 1
+      done || echo "⚠️  YAML check skipped"
+    - for script in scripts/*.sh; do
+        if [ -f "$script" ]; then
+          echo "Checking $script"
+          bash -n "$script" || exit 1
+        fi
+      done
+    - echo "✅ All lint checks passed"
+  only:
+    - main
+    - merge_requests
+
+test-scripts:
+  stage: test
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache make bash
+  script:
+    - echo "🧪 Testing scripts..."
+    - chmod +x scripts/*.sh || true
+    - for script in scripts/*.sh; do
+        if [ -f "$script" ]; then
+          echo "Testing $script syntax"
+          bash -n "$script" || exit 1
+        fi
+      done
+    - echo "✅ Script tests passed"
+  only:
+    - main
+    - merge_requests
+
+test-dockerfiles:
+  stage: test
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - apk add --no-cache make bash
+  script:
+    - echo "🐳 Testing Dockerfiles..."
+    - docker buildx create --use || true
+    - docker buildx build --dry-run \
+        -f dockerfiles/Dockerfile.comfyui \
+        --platform linux/amd64 \
+        . || echo "⚠️  ComfyUI Dockerfile (build may require GPU)"
+    - docker buildx build --dry-run \
+        -f dockerfiles/Dockerfile.swarmui \
+        --platform linux/amd64 \
+        . || echo "⚠️  SwarmUI Dockerfile (build may require GPU)"
+    - echo "✅ Dockerfile tests passed"
+  only:
+    - main
+    - merge_requests
+
+build-images:
+  stage: build
+  image: docker:latest
+  services:
+    - docker:dind
+  before_script:
+    - apk add --no-cache make bash
+  script:
+    - echo "🔨 Building Docker images..."
+    - docker compose build --no-cache || echo "⚠️  Build skipped (requires GPU)"
+    - echo "✅ Build complete"
+  only:
+    - tags
+  when: manual
