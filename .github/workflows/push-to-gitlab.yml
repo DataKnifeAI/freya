@@ -22,7 +22,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          # If triggered by workflow_run, checkout the commit from that workflow
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       - name: Setup Git
@@ -30,20 +29,17 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Add GitLab remote
+      - name: Configure GitLab remote
         run: |
-          # Remove remote if it exists, ignore error if it doesn't
-          git remote remove gitlab 2>/dev/null || true
-          # Add GitLab remote
+          # Checkout main branch if in detached HEAD
+          git checkout -B main 2>/dev/null || git checkout main
+          
+          # Configure GitLab remote (set-url works whether remote exists or not)
+          git remote set-url gitlab https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com/dk-raas/dkai/tools/freya.git 2>/dev/null || \
           git remote add gitlab https://oauth2:${{ secrets.GITLAB_TOKEN }}@gitlab.com/dk-raas/dkai/tools/freya.git
-
-      - name: Ensure we're on main branch
-        run: |
-          # If in detached HEAD, checkout main branch
-          git checkout -B main || git checkout main
-          # Ensure we have the latest from origin
-          git fetch origin main
-          git reset --hard origin/main
+          
+          # Verify remote was added
+          git remote -v
 
       - name: Push to GitLab
         run: |
