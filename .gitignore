@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Models and outputs
+comfyui/models/
+comfyui/output/
+comfyui/input/
+swarmui/models/
+swarmui/output/
+swarmui/input/
+swarmui/data/
+*.ckpt
+*.safetensors
+*.pt
+*.pth
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+.dockerignore
+
+# Logs
+*.log
+logs/
+
+# Environment
+.env
+.env.local
+
+# .NET
+bin/
+obj/
+*.dll
+*.exe
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb

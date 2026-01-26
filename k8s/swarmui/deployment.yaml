@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swarmui
+  namespace: aphrodite
+  labels:
+    app: swarmui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: swarmui
+  template:
+    metadata:
+      labels:
+        app: swarmui
+    spec:
+      containers:
+      - name: swarmui
+        image: aphrodite-swarmui:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 7801
+          name: http
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility"
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+          requests:
+            nvidia.com/gpu: 1
+        volumeMounts:
+        - name: models
+          mountPath: /app/SwarmUI/Data/Models
+        - name: output
+          mountPath: /app/SwarmUI/Data/Outputs
+        - name: input
+          mountPath: /app/SwarmUI/Data/Inputs
+        - name: data
+          mountPath: /app/SwarmUI/Data
+      volumes:
+      - name: models
+        persistentVolumeClaim:
+          claimName: swarmui-models
+      - name: output
+        persistentVolumeClaim:
+          claimName: swarmui-output
+      - name: input
+        persistentVolumeClaim:
+          claimName: swarmui-input
+      - name: data
+        persistentVolumeClaim:
+          claimName: swarmui-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: swarmui
+  namespace: aphrodite
+  labels:
+    app: swarmui
+spec:
+  type: ClusterIP
+  ports:
+  - port: 7801
+    targetPort: 7801
+    protocol: TCP
+    name: http
+  selector:
+    app: swarmui
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: swarmui-models
+  namespace: aphrodite
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: swarmui-output
+  namespace: aphrodite
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: swarmui-input
+  namespace: aphrodite
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: swarmui-data
+  namespace: aphrodite
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi

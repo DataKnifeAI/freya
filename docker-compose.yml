@@ -1,0 +1,55 @@
+services:
+  comfyui:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.comfyui
+    container_name: comfyui
+    ports:
+      - "8188:8188"
+    volumes:
+      - ./comfyui/models:/app/ComfyUI/models
+      - ./comfyui/output:/app/ComfyUI/output
+      - ./comfyui/input:/app/ComfyUI/input
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    restart: unless-stopped
+    networks:
+      - aphrodite-network
+
+  swarmui:
+    build:
+      context: .
+      dockerfile: dockerfiles/Dockerfile.swarmui
+    container_name: swarmui
+    ports:
+      - "7801:7801"
+    volumes:
+      - ./swarmui/models:/app/SwarmUI/Data/Models
+      - ./swarmui/output:/app/SwarmUI/Data/Outputs
+      - ./swarmui/input:/app/SwarmUI/Data/Inputs
+      - ./swarmui/data:/app/SwarmUI/Data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    restart: unless-stopped
+    networks:
+      - aphrodite-network
+
+networks:
+  aphrodite-network:
+    driver: bridge
