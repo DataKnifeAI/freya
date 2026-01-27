@@ -38,8 +38,12 @@ jobs:
 
       - name: Validate Kubernetes Manifests
         run: |
-          # Ignore checks that aren't applicable or too strict for this use case
-          IGNORE_CHECKS="container-image-tag,container-resources,container-security-context-readonlyrootfilesystem,container-security-context-user-group-id,container-ephemeral-storage-request-and-limit,pod-networkpolicy,deployment-has-poddisruptionbudget"
+          # Ignore checks that aren't applicable for this use case
+          # - container-image-tag: Using latest is acceptable for this project
+          # - pod-networkpolicy: Requires CNI support, optional
+          # - deployment-has-poddisruptionbudget: Optional for single replica deployments
+          # - ingress-targets-service: Cross-file validation issue
+          IGNORE_CHECKS="container-image-tag,pod-networkpolicy,deployment-has-poddisruptionbudget"
           
           ERROR_COUNT=0
           for file in $(find k8s -name "*.yaml" -type f); do

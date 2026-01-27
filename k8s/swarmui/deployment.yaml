@@ -27,12 +27,33 @@ spec:
           value: "all"
         - name: NVIDIA_DRIVER_CAPABILITIES
           value: "compute,utility"
-        # GPU resources - comment out for testing without NVIDIA
-        # resources:
-        #   limits:
-        #     nvidia.com/gpu: 1
-        #   requests:
-        #     nvidia.com/gpu: 1
+        resources:
+          requests:
+            cpu: "2"
+            memory: "8Gi"
+            ephemeral-storage: "10Gi"
+            nvidia.com/gpu: 1
+          limits:
+            cpu: "4"
+            memory: "16Gi"
+            ephemeral-storage: "20Gi"
+            nvidia.com/gpu: 1
+        securityContext:
+          runAsNonRoot: false
+          runAsUser: 0
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 7801
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          successThreshold: 1
+          failureThreshold: 3
         volumeMounts:
         - name: models
           mountPath: /app/SwarmUI/Data/Models
