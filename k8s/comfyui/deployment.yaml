@@ -34,15 +34,17 @@ spec:
           value: "compute,utility"
         resources:
           requests:
-            cpu: "2"
-            memory: "8Gi"
+            cpu: "500m"
+            memory: "2Gi"
             ephemeral-storage: "10Gi"
-            nvidia.com/gpu: 1
+            # GPU request commented out - enable when GPUs are available
+            # nvidia.com/gpu: 1
           limits:
-            cpu: "4"
-            memory: "16Gi"
+            cpu: "2"
+            memory: "4Gi"
             ephemeral-storage: "20Gi"
-            nvidia.com/gpu: 1
+            # GPU limit commented out - enable when GPUs are available
+            # nvidia.com/gpu: 1
         securityContext:
           runAsNonRoot: false
           runAsUser: 0
