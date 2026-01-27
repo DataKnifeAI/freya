@@ -39,10 +39,13 @@ jobs:
         run: |
           find k8s -name "*.yaml" -type f | while read file; do
             echo "Validating $file"
+            # kubectl outputs to stderr even on success, so we check exit code
             if kubectl apply --dry-run=client -f "$file" > /dev/null 2>&1; then
               echo "✅ $file is valid"
             else
               echo "❌ $file validation failed"
+              echo "Error details:"
+              kubectl apply --dry-run=client -f "$file" 2>&1 || true
               exit 1
             fi
           done
