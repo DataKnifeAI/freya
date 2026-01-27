@@ -1,5 +1,7 @@
 # Freya - ComfyUI & SwarmUI Stable Diffusion Platform
 
+![Freya](freya.png)
+
 A Kubernetes-ready platform for running ComfyUI and SwarmUI Stable Diffusion interfaces with discrete GPU support. Both UIs are built from source using custom Docker images.
 
 ## Features
