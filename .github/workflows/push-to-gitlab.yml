@@ -58,11 +58,13 @@ jobs:
           # Remove gitlab remote if it exists
           git remote remove gitlab 2>/dev/null || true
           
-          # Add GitLab remote without credentials
+          # Add GitLab remote without credentials in URL
           git remote add gitlab https://gitlab.com/dk-raas/dkai/tools/freya.git
           
-          # Configure credential helper to use token
-          git config --global credential.helper '!f() { echo "username=oauth2"; echo "password=$GITLAB_TOKEN"; }; f'
+          # Set up credential helper using store method
+          git config --global credential.helper store
+          echo "https://oauth2:${GITLAB_TOKEN}@gitlab.com" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
           
           # Verify remote was added
           git remote -v
@@ -72,6 +74,4 @@ jobs:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
           GIT_TERMINAL_PROMPT: 0
         run: |
-          # Set up credential helper for this push
-          git config --global credential.helper '!f() { echo "username=oauth2"; echo "password=$GITLAB_TOKEN"; }; f'
           git push gitlab main --force
