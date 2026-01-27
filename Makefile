@@ -9,8 +9,11 @@ help: ## Show this help message
 setup: ## Run initial directory setup
 	chmod +x scripts/setup.sh && ./scripts/setup.sh
 
-quick-setup: ## Non-interactive setup with model downloads
+quick-setup: ## Non-interactive setup with model downloads (ComfyUI + SwarmUI video models)
 	chmod +x scripts/quick-setup.sh && ./scripts/quick-setup.sh
+
+download-video-models: ## Download Wan 2.1 14B fp8 + LTX Video 2B fp8 for SwarmUI (~20 GB)
+	chmod +x scripts/download-video-models.sh && ./scripts/download-video-models.sh
 
 download-model: ## Download a model (usage: make download-model TYPE=checkpoint URL=... FILE=...)
 	@if [ -z "$(TYPE)" ] || [ -z "$(URL)" ]; then \

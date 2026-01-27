@@ -29,6 +29,15 @@ SwarmUI models go under the data directory:
 swarmui/data/Models/   # All model types
 ```
 
+### Video and image-to-video (SwarmUI)
+
+SwarmUI supports **text-to-video (T2V)** and **image-to-video (I2V)**. No extra Freya config is required—use SwarmUI as usual once the right models are in place.
+
+- **Install recommended video models (Wan 2.1 14B fp8 + LTX Video 2B fp8, good for RTX 4090)**: run `make download-video-models` (~20 GB), or `make quick-setup` to get ComfyUI + video models. Wan → `swarmui/data/Models/diffusion_models/`, LTX → `swarmui/data/Models/Stable-Diffusion/`.
+- **Image-to-video**: In the Models sub-tab, pick a normal image model (e.g. SDXL or Flux) as the base, then in the **Image To Video** parameter group select the video model. For an external image, use **Init Image** and set **Init Image Creativity** to 0.
+- **Where video models go**: Depends on the model (e.g. `swarmui/data/Models/diffusion_models/` or `Stable-Diffusion` subfolder). Use SwarmUI’s **Server → Paths** or the official docs for exact paths.
+- **Official guide**: [SwarmUI Video Model Support](https://github.com/mcmonkeyprojects/SwarmUI/blob/master/docs/Video%20Model%20Support.md) — install and usage for Hunyuan Video, Wan 2.1/2.2, LTX Video, Kandinsky 5, and others.
+
 ## Popular Models
 
 ### Base Checkpoints

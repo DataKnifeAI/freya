@@ -5,8 +5,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Install system dependencies (single RUN: install + cleanup to keep layer small)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.10 \
     python3.10-dev \
     python3-pip \
@@ -19,43 +19,25 @@ RUN apt-get update && apt-get install -y \
     libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip
-RUN pip3 install --upgrade pip setuptools wheel
-
-# Set working directory
+# Clone ComfyUI and create directory layout in one layer (repo + dirs rarely change together)
 WORKDIR /app
-
-# Clone ComfyUI repository
-RUN git clone https://github.com/comfyanonymous/ComfyUI.git /app/ComfyUI
+RUN git clone https://github.com/comfyanonymous/ComfyUI.git /app/ComfyUI && \
+    mkdir -p /app/ComfyUI/models/checkpoints /app/ComfyUI/models/loras \
+        /app/ComfyUI/models/vae /app/ComfyUI/models/controlnet \
+        /app/ComfyUI/models/upscale_models /app/ComfyUI/models/embeddings \
+        /app/ComfyUI/models/clip /app/ComfyUI/models/clip_vision \
+        /app/ComfyUI/models/style_models /app/ComfyUI/models/unet \
+        /app/ComfyUI/output /app/ComfyUI/input
 
 WORKDIR /app/ComfyUI
 
-# Install PyTorch with CUDA 12.1 support and all dependencies in one step for better caching
-RUN pip3 install --no-cache-dir \
-    torch==2.1.0 \
-    torchvision==0.16.0 \
-    --index-url https://download.pytorch.org/whl/cu121 && \
-    pip3 install --no-cache-dir -r requirements.txt || true && \
+# Pip upgrade + PyTorch + deps in one layer to minimize layer count and cache invalidation
+RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel && \
     pip3 install --no-cache-dir \
-    transformers \
-    accelerate \
-    xformers \
-    safetensors \
-    pillow
-
-# Create directories with proper structure
-RUN mkdir -p /app/ComfyUI/models/checkpoints \
-    /app/ComfyUI/models/loras \
-    /app/ComfyUI/models/vae \
-    /app/ComfyUI/models/controlnet \
-    /app/ComfyUI/models/upscale_models \
-    /app/ComfyUI/models/embeddings \
-    /app/ComfyUI/models/clip \
-    /app/ComfyUI/models/clip_vision \
-    /app/ComfyUI/models/style_models \
-    /app/ComfyUI/models/unet \
-    /app/ComfyUI/output \
-    /app/ComfyUI/input
+        torch==2.1.0 torchvision==0.16.0 \
+        --index-url https://download.pytorch.org/whl/cu121 && \
+    pip3 install --no-cache-dir -r requirements.txt || true && \
+    pip3 install --no-cache-dir transformers accelerate xformers safetensors pillow
 
 # Expose port
 EXPOSE 8188

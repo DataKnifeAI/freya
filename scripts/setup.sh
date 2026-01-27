@@ -23,6 +23,8 @@ mkdir -p comfyui/input
 # SwarmUI directories (Models and Inputs live under data)
 echo "Creating SwarmUI directories..."
 mkdir -p swarmui/data/Models
+mkdir -p swarmui/data/Models/diffusion_models
+mkdir -p swarmui/data/Models/Stable-Diffusion
 mkdir -p swarmui/data/Inputs
 mkdir -p swarmui/output
 mkdir -p swarmui/dlbackend
@@ -31,6 +33,7 @@ mkdir -p swarmui/swarmui-models
 echo "✓ Directory structure created!"
 echo ""
 echo "Next steps:"
-echo "1. Download models to the appropriate directories"
-echo "2. See MODELS.md for model download instructions"
-echo "3. Run 'make up' to start the services"
+echo "1. Run 'make quick-setup' to download ComfyUI + SwarmUI video models (Wan + LTX)"
+echo "2. Or run 'make download-video-models' for video models only (~20 GB)"
+echo "3. See docs/MODELS.md for manual download instructions"
+echo "4. Run 'make up' to start the services"

@@ -18,8 +18,9 @@ if [ ! -d "comfyui/models/checkpoints" ]; then
     ./scripts/setup.sh
 fi
 
-# Make download script executable
+# Make download scripts executable
 chmod +x scripts/download-model.sh
+chmod +x scripts/download-video-models.sh
 
 echo "Downloading Stable Diffusion XL checkpoint (6.94 GB) - Most Popular..."
 ./scripts/download-model.sh checkpoint \
@@ -33,11 +34,17 @@ echo "Downloading SDXL VAE (335 MB)..."
     "sdxl_vae.safetensors"
 
 echo ""
+echo "Downloading SwarmUI video models (Wan 2.1 14B fp8 + LTX Video 2B fp8, ~20 GB total)..."
+./scripts/download-video-models.sh
+
+echo ""
 echo "✓ Setup complete!"
 echo ""
 echo "Models are located in:"
 echo "  - comfyui/models/checkpoints/"
 echo "  - comfyui/models/vae/"
+echo "  - swarmui/data/Models/diffusion_models/  (Wan video)"
+echo "  - swarmui/data/Models/Stable-Diffusion/   (LTX video)"
 echo ""
 echo "Start the services with: make up"
-echo "Then access ComfyUI at http://localhost:8188"
+echo "ComfyUI: http://localhost:8188  |  SwarmUI: http://localhost:7801"

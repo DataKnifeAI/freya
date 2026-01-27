@@ -6,8 +6,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=$PATH:/usr/share/dotnet \
     ASPNETCORE_URLS=http://+:7801
 
-# Install system dependencies including Python 3.12, pip, and git
-RUN apt-get update && apt-get install -y \
+# System deps + .NET 8 SDK in one layer (both change rarely; single cleanup)
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     wget \
@@ -17,47 +17,24 @@ RUN apt-get update && apt-get install -y \
     software-properties-common \
     python3-pip \
     && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt-get update && apt-get install -y \
-    python3.12 \
-    python3.12-venv \
-    python3.12-dev \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-venv python3.12-dev \
+    && ln -sf /usr/bin/python3.12 /usr/bin/python3 && ln -sf /usr/bin/python3.12 /usr/bin/python \
     && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
-    && python3.12 -m pip --version \
-    && ln -sf /usr/local/bin/pip3.12 /usr/local/bin/pip3 \
-    && ln -sf /usr/local/bin/pip3.12 /usr/local/bin/pip \
+    && ln -sf /usr/local/bin/pip3.12 /usr/local/bin/pip3 && ln -sf /usr/local/bin/pip3.12 /usr/local/bin/pip \
+    && curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 8.0 --install-dir /usr/share/dotnet \
+    && ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet \
     && rm -rf /var/lib/apt/lists/*
 
-# Install .NET 8 SDK
-RUN curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 8.0 --install-dir /usr/share/dotnet && \
-    ln -s /usr/share/dotnet/dotnet /usr/local/bin/dotnet && \
-    /usr/share/dotnet/dotnet --version
-
-# Set working directory
+# Clone, build, dirs, and wrapper in one layer (app changes invalidate together)
 WORKDIR /app
-
-# Clone SwarmUI repository
-RUN git clone https://github.com/mcmonkeyprojects/SwarmUI.git /app/SwarmUI
-
-WORKDIR /app/SwarmUI
-
-# Restore dependencies and build SwarmUI (use full path to dotnet)
-RUN /usr/share/dotnet/dotnet restore src/SwarmUI.csproj && \
-    /usr/share/dotnet/dotnet build src/SwarmUI.csproj -c Release --no-restore
-
-# Create empty directories for models and data (will be mounted as volumes)
-RUN mkdir -p /app/SwarmUI/Data/Models \
-    /app/SwarmUI/Data/Outputs \
-    /app/SwarmUI/Data/Inputs
-
-# Create wrapper script that ensures correct working directory
-RUN echo '#!/bin/bash' > /app/run-swarmui.sh && \
-    echo 'cd /app/SwarmUI' >> /app/run-swarmui.sh && \
-    echo 'exec dotnet src/bin/Release/net8.0/SwarmUI.dll --urls http://0.0.0.0:7801 "$@"' >> /app/run-swarmui.sh && \
+RUN git clone https://github.com/mcmonkeyprojects/SwarmUI.git /app/SwarmUI && \
+    /usr/share/dotnet/dotnet restore /app/SwarmUI/src/SwarmUI.csproj && \
+    /usr/share/dotnet/dotnet build /app/SwarmUI/src/SwarmUI.csproj -c Release --no-restore && \
+    mkdir -p /app/SwarmUI/Data/Models /app/SwarmUI/Data/Outputs /app/SwarmUI/Data/Inputs && \
+    printf '%s\n' '#!/bin/bash' 'cd /app/SwarmUI' 'exec dotnet src/bin/Release/net8.0/SwarmUI.dll --urls http://0.0.0.0:7801 "$@"' > /app/run-swarmui.sh && \
     chmod +x /app/run-swarmui.sh
 
-# Set working directory to SwarmUI root
 WORKDIR /app/SwarmUI
 
 # Expose port (default SwarmUI port)
