@@ -13,8 +13,22 @@ publish-comfyui:
     entrypoint: [""]
   script:
     - |
+      # Verify required variables
+      if [ -z "$HARBOR_REGISTRY" ] || [ -z "$HARBOR_PROJECT" ]; then
+        echo "❌ Error: HARBOR_REGISTRY or HARBOR_PROJECT not set"
+        echo "HARBOR_REGISTRY: ${HARBOR_REGISTRY:-NOT SET}"
+        echo "HARBOR_PROJECT: ${HARBOR_PROJECT:-NOT SET}"
+        exit 1
+      fi
+      
+      echo "Building ComfyUI image..."
+      echo "Registry: $HARBOR_REGISTRY"
+      echo "Project: $HARBOR_PROJECT"
+      echo "Image: $IMAGE_NAME_COMFYUI"
+      
       # Use commit SHA if available, otherwise fall back to pipeline ID
       IMAGE_TAG="${CI_COMMIT_SHORT_SHA:-$CI_PIPELINE_ID}"
+      echo "Image tag: $IMAGE_TAG"
       
       # Build and push images with BuildKit rootless (multiple outputs for multiple tags)
       OUTPUT_FLAGS="--output type=image,name=$HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME_COMFYUI:latest,push=true"
@@ -24,6 +38,8 @@ publish-comfyui:
       if [ -n "$CI_COMMIT_TAG" ]; then
         OUTPUT_FLAGS="$OUTPUT_FLAGS --output type=image,name=$HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME_COMFYUI:$CI_COMMIT_TAG,push=true"
       fi
+      
+      echo "Output flags: $OUTPUT_FLAGS"
       
       # Temporarily rename Dockerfile for buildctl (rootless requires specific naming)
       cp Dockerfile.comfyui Dockerfile
@@ -46,8 +62,22 @@ publish-swarmui:
     entrypoint: [""]
   script:
     - |
+      # Verify required variables
+      if [ -z "$HARBOR_REGISTRY" ] || [ -z "$HARBOR_PROJECT" ]; then
+        echo "❌ Error: HARBOR_REGISTRY or HARBOR_PROJECT not set"
+        echo "HARBOR_REGISTRY: ${HARBOR_REGISTRY:-NOT SET}"
+        echo "HARBOR_PROJECT: ${HARBOR_PROJECT:-NOT SET}"
+        exit 1
+      fi
+      
+      echo "Building SwarmUI image..."
+      echo "Registry: $HARBOR_REGISTRY"
+      echo "Project: $HARBOR_PROJECT"
+      echo "Image: $IMAGE_NAME_SWARMUI"
+      
       # Use commit SHA if available, otherwise fall back to pipeline ID
       IMAGE_TAG="${CI_COMMIT_SHORT_SHA:-$CI_PIPELINE_ID}"
+      echo "Image tag: $IMAGE_TAG"
       
       # Build and push images with BuildKit rootless (multiple outputs for multiple tags)
       OUTPUT_FLAGS="--output type=image,name=$HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME_SWARMUI:latest,push=true"
@@ -57,6 +87,8 @@ publish-swarmui:
       if [ -n "$CI_COMMIT_TAG" ]; then
         OUTPUT_FLAGS="$OUTPUT_FLAGS --output type=image,name=$HARBOR_REGISTRY/$HARBOR_PROJECT/$IMAGE_NAME_SWARMUI:$CI_COMMIT_TAG,push=true"
       fi
+      
+      echo "Output flags: $OUTPUT_FLAGS"
       
       # Temporarily rename Dockerfile for buildctl (rootless requires specific naming)
       cp Dockerfile.swarmui Dockerfile
