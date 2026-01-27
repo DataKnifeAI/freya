@@ -37,16 +37,14 @@ jobs:
 
       - name: Validate Kubernetes Manifests
         run: |
-          set -e
           ERROR_COUNT=0
           for file in $(find k8s -name "*.yaml" -type f); do
             echo "Validating $file"
             # kubectl outputs to stderr even on success, capture both
-            OUTPUT=$(kubectl apply --dry-run=client -f "$file" 2>&1)
-            EXIT_CODE=$?
-            if [ $EXIT_CODE -eq 0 ]; then
+            if OUTPUT=$(kubectl apply --dry-run=client -f "$file" 2>&1); then
               echo "✅ $file is valid"
             else
+              EXIT_CODE=$?
               echo "❌ $file validation failed (exit code: $EXIT_CODE)"
               echo "Error output:"
               echo "$OUTPUT"
