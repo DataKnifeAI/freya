@@ -106,14 +106,14 @@ jobs:
 
       - name: Validate ComfyUI Dockerfile
         run: |
-          echo "Validating dockerfiles/Dockerfile.comfyui..."
-          hadolint dockerfiles/Dockerfile.comfyui || echo "⚠️  ComfyUI Dockerfile had linting warnings (non-blocking)"
+          echo "Validating Dockerfile.comfyui..."
+          hadolint Dockerfile.comfyui || echo "⚠️  ComfyUI Dockerfile had linting warnings (non-blocking)"
           echo "✅ ComfyUI Dockerfile validation complete"
 
       - name: Validate SwarmUI Dockerfile
         run: |
-          echo "Validating dockerfiles/Dockerfile.swarmui..."
-          hadolint dockerfiles/Dockerfile.swarmui || echo "⚠️  SwarmUI Dockerfile had linting warnings (non-blocking)"
+          echo "Validating Dockerfile.swarmui..."
+          hadolint Dockerfile.swarmui || echo "⚠️  SwarmUI Dockerfile had linting warnings (non-blocking)"
           echo "✅ SwarmUI Dockerfile validation complete"
 
   test-scripts:
