@@ -21,6 +21,7 @@ swarmui/input/
 swarmui/data/
 swarmui/dlbackend/
 swarmui/swarmui-models/
+ollama/
 *.ckpt
 *.safetensors
 *.pt
