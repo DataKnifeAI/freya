@@ -62,34 +62,14 @@ jobs:
             echo "✅ Token has access to project"
           fi
 
-      - name: Configure GitLab remote
-        env:
-          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
-        run: |
-          # Fetch all branches
-          git fetch origin
-          
-          # Ensure we're on main branch (create from origin/main if needed)
-          if git show-ref --verify --quiet refs/heads/main; then
-            git checkout main
-            git reset --hard origin/main
-          else
-            git checkout -b main origin/main
-          fi
-          
-          # Remove gitlab remote if it exists
-          git remote remove gitlab 2>/dev/null || true
-          
-          # Add GitLab remote - use token directly (GitHub Actions handles secrets safely)
-          # The token should be properly handled by the shell
-          git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@gitlab.com/dk-raas/dkai/tools/freya.git"
-          
-          # Verify remote was added (mask token in output)
-          git remote -v | sed 's/oauth2:[^@]*@/oauth2:***@/g'
-
       - name: Push to GitLab
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
-          GIT_TERMINAL_PROMPT: 0
         run: |
-          git push gitlab main --force
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git remote remove gitlab 2>/dev/null || true
+          git remote add gitlab https://gitlab.com/dk-raas/dkai/tools/freya.git
+          git config credential.helper '!f() { echo "username=oauth2"; echo "password=${GITLAB_TOKEN}"; }; f'
+          git fetch gitlab main
+          git push gitlab HEAD:main --force
