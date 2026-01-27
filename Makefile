@@ -30,6 +30,9 @@ build-comfyui: ## Build ComfyUI image only
 build-swarmui: ## Build SwarmUI image only
 	docker compose build swarmui
 
+build-prompt-generator: ## Build prompt generator image only
+	docker compose build prompt-generator
+
 build-no-cache: ## Build all images without cache
 	docker compose build --no-cache
 
@@ -51,6 +54,12 @@ logs-comfyui: ## Show logs from ComfyUI service
 logs-swarmui: ## Show logs from SwarmUI service
 	docker compose logs -f swarmui
 
+logs-ollama: ## Show logs from Ollama service
+	docker compose logs -f ollama
+
+logs-prompt-generator: ## Show logs from prompt generator service
+	docker compose logs -f prompt-generator
+
 clean: ## Remove containers, volumes, and images
 	docker compose down -v
 
@@ -62,6 +71,20 @@ shell-comfyui: ## Open shell in ComfyUI container
 
 shell-swarmui: ## Open shell in SwarmUI container
 	docker compose exec swarmui /bin/bash
+
+shell-prompt-generator: ## Open shell in prompt generator container
+	docker compose exec prompt-generator /bin/bash
+
+setup-ollama: ## Download Ollama model (usage: make setup-ollama MODEL=llama3.2:1b)
+	@if [ -z "$(MODEL)" ]; then \
+		echo "Usage: make setup-ollama MODEL=<model_name>"; \
+		echo "Example: make setup-ollama MODEL=llama3.2:1b"; \
+		echo "Available models: llama3.2:1b, llama3.2:3b, mistral:7b, etc."; \
+		exit 1; \
+	fi
+	@echo "Pulling Ollama model: $(MODEL)"
+	@docker compose exec ollama ollama pull $(MODEL) || \
+		docker compose run --rm ollama ollama pull $(MODEL)
 
 check-gpu: ## Run GPU diagnostic check
 	chmod +x scripts/check-gpu.sh && ./scripts/check-gpu.sh
@@ -77,5 +100,7 @@ status: ## Show service status and URLs
 	@echo "=== Service Status ==="
 	@docker compose ps
 	@echo "\n=== Access URLs ==="
-	@echo "ComfyUI:  http://localhost:8188"
-	@echo "SwarmUI:  http://localhost:7801"
+	@echo "ComfyUI:         http://localhost:8188"
+	@echo "SwarmUI:         http://localhost:7801"
+	@echo "Prompt Generator: http://localhost:8080"
+	@echo "Ollama API:      http://localhost:11434"
