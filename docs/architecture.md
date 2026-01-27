@@ -4,7 +4,8 @@
 
 ```
 freya/
-├── dockerfiles/
+├── Dockerfile.comfyui
+├── Dockerfile.swarmui
 │   ├── Dockerfile.comfyui  # ComfyUI build from source
 │   └── Dockerfile.swarmui  # SwarmUI build from source
 ├── docker-compose.yml      # Docker Compose configuration
