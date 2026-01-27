@@ -1,4 +1,4 @@
-# Kubernetes Ingress for ComfyUI and SwarmUI
+# Kubernetes Ingress for ComfyUI, SwarmUI, and Open WebUI
 # Requires an ingress controller (nginx, traefik, etc.)
 
 apiVersion: networking.k8s.io/v1
@@ -33,3 +33,13 @@ spec:
             name: swarmui
             port:
               number: 7801
+  - host: openwebui.dataknife.net
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: open-webui
+            port:
+              number: 8080

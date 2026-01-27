@@ -4,7 +4,7 @@
 
 - **OS**: Linux (Ubuntu 22.04+ recommended, Arch Linux/CachyOS tested)
 - **Docker**: Docker Engine 20.10+ and Docker Compose v2.0+
-- **GPU**: NVIDIA GPU with CUDA support (CUDA 12.1+)
+- **GPU**: NVIDIA GPU with CUDA support (CUDA 12.4+ or 13.x; images use 13.1.1)
 - **GPU Memory**: Minimum 8GB VRAM (16GB+ recommended for both services)
 - **RAM**: Minimum 16GB system RAM (32GB+ recommended)
 - **Storage**: Minimum 50GB free space for models and images
@@ -16,7 +16,7 @@
 - **Git**: For cloning repositories during Docker builds
 - **Python 3.12**: Installed in SwarmUI container (handled automatically)
 - **.NET 8 SDK**: Installed in SwarmUI container (handled automatically)
-- **CUDA 12.1**: Provided by base Docker images
+- **CUDA 13.1**: Provided by base Docker images (Ubuntu 24.04)
 
 ## Installing NVIDIA Container Toolkit
 
@@ -33,7 +33,7 @@ sudo systemctl restart docker
 ### Verify Installation
 
 ```bash
-docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi
 ```
 
 ## Initial Setup

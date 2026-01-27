@@ -37,16 +37,16 @@ fi
 
 echo ""
 echo "3. Testing GPU access in Docker..."
-if docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi &> /dev/null; then
+if docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi &> /dev/null; then
     echo "✓ GPU accessible in Docker containers"
-    docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+    docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 else
     echo "✗ GPU NOT accessible in Docker containers"
     echo ""
     echo "Troubleshooting:"
     echo "  1. Ensure NVIDIA Container Toolkit is installed (see above)"
     echo "  2. Restart Docker: sudo systemctl restart docker"
-    echo "  3. Verify: docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi"
+    echo "  3. Verify: docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi"
     echo ""
     exit 1
 fi

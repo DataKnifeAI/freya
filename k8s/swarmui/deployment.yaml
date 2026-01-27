@@ -17,16 +17,20 @@ spec:
     spec:
       containers:
       - name: swarmui
-        image: harbor.dataknife.net/library/freya-swarmui:v0.44
+        image: harbor.dataknife.net/library/freya-swarmui:v0.47
         imagePullPolicy: Always
+        args: ["--launch_mode", "none"]
         ports:
         - containerPort: 7801
           name: http
         env:
+        # NVIDIA disabled for CPU-only UI verification – uncomment when GPUs available
+        # - name: NVIDIA_VISIBLE_DEVICES
+        #   value: "all"
+        # - name: NVIDIA_DRIVER_CAPABILITIES
+        #   value: "compute,utility"
         - name: NVIDIA_VISIBLE_DEVICES
-          value: "all"
-        - name: NVIDIA_DRIVER_CAPABILITIES
-          value: "compute,utility"
+          value: ""
         resources:
           requests:
             cpu: "500m"

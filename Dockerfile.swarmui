@@ -1,4 +1,5 @@
-FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+# Ubuntu 24.04 + latest supported CUDA per https://gitlab.com/nvidia/container-images/cuda/-/blob/master/doc/supported-tags.md
+FROM nvidia/cuda:13.1.1-cudnn-runtime-ubuntu24.04
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -6,22 +7,20 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=$PATH:/usr/share/dotnet \
     ASPNETCORE_URLS=http://+:7801
 
-# System deps + .NET 8 SDK in one layer (both change rarely; single cleanup)
+# Ubuntu 24.04 ships Python 3.12; system deps + .NET 8 SDK in one layer (no PPA needed)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     wget \
-    libgl1-mesa-glx \
+    libgl1 \
+    libglx-mesa0 \
     libglib2.0-0 \
     ca-certificates \
     software-properties-common \
+    python3 \
     python3-pip \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt-get update && apt-get install -y --no-install-recommends \
-    python3.12 python3.12-venv python3.12-dev \
-    && ln -sf /usr/bin/python3.12 /usr/bin/python3 && ln -sf /usr/bin/python3.12 /usr/bin/python \
-    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.12 \
-    && ln -sf /usr/local/bin/pip3.12 /usr/local/bin/pip3 && ln -sf /usr/local/bin/pip3.12 /usr/local/bin/pip \
+    python3-venv \
+    python3-dev \
     && curl -sSL https://dot.net/v1/dotnet-install.sh | bash /dev/stdin --channel 8.0 --install-dir /usr/share/dotnet \
     && ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet \
     && rm -rf /var/lib/apt/lists/*

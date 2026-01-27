@@ -34,12 +34,12 @@ echo ""
 echo "✓ Installation complete!"
 echo ""
 echo "Verifying installation..."
-if docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi &> /dev/null; then
+if docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi &> /dev/null; then
     echo "✓ GPU accessible in Docker!"
-    docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+    docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 else
     echo "✗ GPU still not accessible. Please check:"
     echo "  1. Docker service is running: systemctl status docker"
     echo "  2. NVIDIA drivers are installed: nvidia-smi"
-    echo "  3. Try: docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi"
+    echo "  3. Try: docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi"
 fi

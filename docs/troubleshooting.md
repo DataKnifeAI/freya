@@ -1,5 +1,15 @@
 # Troubleshooting Guide
 
+## CUDA Base Image Support
+
+Freya’s Dockerfiles use **supported** NVIDIA CUDA container tags. Deprecated tags (e.g. `12.1.0-cudnn8-runtime-ubuntu22.04`) are [unsupported](https://gitlab.com/nvidia/container-images/cuda/-/blob/master/doc/unsupported-tags.md) and scheduled for removal; they also show “THIS IMAGE IS DEPRECATED” at runtime.
+
+- **Policy**: [CUDA Container Support Policy](https://gitlab.com/nvidia/container-images/cuda/blob/master/doc/support-policy.md)
+- **Supported tags**: [supported-tags.md](https://gitlab.com/nvidia/container-images/cuda/-/blob/master/doc/supported-tags.md)
+- **Current base**: `nvidia/cuda:13.1.1-cudnn-runtime-ubuntu24.04` (Ubuntu 24.04, latest supported CUDA 13.1.1 + cuDNN)
+
+When updating the base image, pick a tag from the [supported list](https://gitlab.com/nvidia/container-images/cuda/-/blob/master/doc/supported-tags.md) for your distro (e.g. ubuntu24.04) and variant (e.g. cudnn-runtime).
+
 ## Build Issues
 
 ### ComfyUI build fails
@@ -34,7 +44,7 @@ sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
 sudo systemctl restart docker
 
 # Verify installation
-docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi
 ```
 
 ### Run diagnostic script
@@ -98,3 +108,33 @@ make setup
 - Re-download the model
 - Verify file size matches source
 - Check disk space availability
+
+## Kubernetes CrashLoopBackOff
+
+### ComfyUI: "Found no NVIDIA driver"
+
+**Symptom:** ComfyUI pod in CrashLoopBackOff; logs show:
+`RuntimeError: Found no NVIDIA driver on your system`
+
+**Cause:** ComfyUI assumes CUDA and calls `torch.cuda.current_device()` on startup. With `NVIDIA_VISIBLE_DEVICES=""` (CPU-only UI verification) or when the node has no GPU, it exits immediately.
+
+**Options:**
+
+1. **Use GPU nodes:** Re-enable NVIDIA env vars in `k8s/comfyui/deployment.yaml`, uncomment `nvidia.com/gpu` requests, and ensure the pod runs on a node with the NVIDIA device plugin and drivers.
+2. **CPU-only verification:** ComfyUI cannot run without a GPU. To verify other UIs (SwarmUI, Open WebUI, Ollama) without GPU, scale ComfyUI to 0:
+   ```bash
+   kubectl scale deployment/comfyui -n freya --replicas=0
+   ```
+
+### SwarmUI: "Failed to launch mode 'webinstall'"
+
+**Symptom:** SwarmUI pod starts then fails; logs show:
+`Failed to launch mode 'webinstall' (If this is a headless/server install, run with '--launch_mode none')`
+
+**Cause:** Default launch mode tries to open a browser; in a headless container that fails.
+
+**Fix:** The deployment must pass `--launch_mode none`. In `k8s/swarmui/deployment.yaml` the container should have:
+```yaml
+args: ["--launch_mode", "none"]
+```
+Then re-apply and restart: `kubectl apply -f k8s/swarmui/deployment.yaml && kubectl rollout restart deployment/swarmui -n freya`.

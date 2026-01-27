@@ -22,16 +22,19 @@ spec:
     spec:
       containers:
       - name: comfyui
-        image: harbor.dataknife.net/library/freya-comfyui:v0.44
+        image: harbor.dataknife.net/library/freya-comfyui:v0.47
         imagePullPolicy: Always
         ports:
         - containerPort: 8188
           name: http
         env:
+        # NVIDIA disabled for CPU-only UI verification – uncomment when GPUs available
+        # - name: NVIDIA_VISIBLE_DEVICES
+        #   value: "all"
+        # - name: NVIDIA_DRIVER_CAPABILITIES
+        #   value: "compute,utility"
         - name: NVIDIA_VISIBLE_DEVICES
-          value: "all"
-        - name: NVIDIA_DRIVER_CAPABILITIES
-          value: "compute,utility"
+          value: ""
         resources:
           requests:
             cpu: "500m"

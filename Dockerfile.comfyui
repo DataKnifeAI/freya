@@ -1,18 +1,21 @@
-FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
+# Ubuntu 24.04 + latest supported CUDA per https://gitlab.com/nvidia/container-images/cuda/-/blob/master/doc/supported-tags.md
+FROM nvidia/cuda:13.1.1-cudnn-runtime-ubuntu24.04
 
 # Set environment variables
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Install system dependencies (single RUN: install + cleanup to keep layer small)
+# Ubuntu 24.04 ships Python 3.12; install system deps (single RUN + cleanup)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.10 \
-    python3.10-dev \
+    python3 \
+    python3-dev \
+    python3-venv \
     python3-pip \
     git \
     wget \
-    libgl1-mesa-glx \
+    libgl1 \
+    libglx-mesa0 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
@@ -31,20 +34,19 @@ RUN git clone https://github.com/comfyanonymous/ComfyUI.git /app/ComfyUI && \
 
 WORKDIR /app/ComfyUI
 
-# Pip upgrade + PyTorch + deps in one layer to minimize layer count and cache invalidation
-RUN pip3 install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip3 install --no-cache-dir \
-        torch==2.1.0 torchvision==0.16.0 \
-        --index-url https://download.pytorch.org/whl/cu121 && \
-    pip3 install --no-cache-dir -r requirements.txt || true && \
-    pip3 install --no-cache-dir transformers accelerate xformers safetensors pillow
+# Use venv instead of system Python (PEP 668 / Ubuntu 24.04 externally-managed-environment)
+# PyTorch and index are taken from ComfyUI's requirements / install process.
+RUN python3 -m venv .venv && \
+    .venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    .venv/bin/pip install --no-cache-dir -r requirements.txt || true && \
+    .venv/bin/pip install --no-cache-dir transformers accelerate xformers safetensors pillow
 
 # Expose port
 EXPOSE 8188
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8188')" || exit 1
+    CMD /app/ComfyUI/.venv/bin/python -c "import urllib.request; urllib.request.urlopen('http://localhost:8188')" || exit 1
 
-# Run ComfyUI
-CMD ["python3", "main.py", "--listen", "0.0.0.0", "--port", "8188"]
+# Run ComfyUI via venv
+CMD ["/app/ComfyUI/.venv/bin/python", "main.py", "--listen", "0.0.0.0", "--port", "8188"]

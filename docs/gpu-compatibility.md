@@ -48,7 +48,7 @@ These GPUs can run the platform but may require running services individually or
 
 ## Performance Notes
 
-- **CUDA Compatibility**: All listed GPUs support CUDA 12.1+
+- **CUDA Compatibility**: All listed GPUs support CUDA 12.4+ / 13.x (Freya images use 13.1.1)
 - **Performance**: RTX Pro 5000/6000 Blackwell, RTX 50-series, RTX 40-series, and A6000 series offer best performance
 - **Latest Generation**: RTX 50-series (Blackwell architecture) provides improved performance and efficiency over RTX 40-series
 - **Professional GPUs**: RTX Pro 5000/6000 Blackwell and A6000 series are ideal for production AI workloads

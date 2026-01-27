@@ -78,7 +78,7 @@ See [Architecture Guide](docs/architecture.md) for complete command reference.
 ## Requirements
 
 - **OS**: Linux (Ubuntu 22.04+ recommended)
-- **GPU**: NVIDIA GPU with CUDA 12.1+ support
+- **GPU**: NVIDIA GPU with CUDA 12.4+ or 13.x (images use 13.1.1)
 - **VRAM**: Minimum 8GB (16GB+ recommended for both services)
 - **RAM**: Minimum 16GB system RAM
 - **Storage**: Minimum 50GB free space
