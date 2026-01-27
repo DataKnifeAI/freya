@@ -28,9 +28,11 @@ jobs:
           docker compose config > /dev/null
           echo "✅ Docker Compose configuration is valid"
 
-      - name: Install kubescore
+      - name: Install kube-score
         run: |
-          curl -L "https://github.com/zegl/kube-score/releases/latest/download/kube-score_$(curl -s https://api.github.com/repos/zegl/kube-score/releases/latest | grep tag_name | cut -d '"' -f 4 | tr -d 'v')_linux_amd64.tar.gz" | tar -xz
+          VERSION=$(curl -s https://api.github.com/repos/zegl/kube-score/releases/latest | grep tag_name | cut -d '"' -f 4 | tr -d 'v')
+          curl -L "https://github.com/zegl/kube-score/releases/download/v${VERSION}/kube-score_${VERSION}_linux_amd64.tar.gz" -o kube-score.tar.gz
+          tar -xzf kube-score.tar.gz
           sudo mv kube-score /usr/local/bin/
           kube-score version
 
