@@ -33,7 +33,7 @@ jobs:
           if command -v kubectl &> /dev/null; then
             find k8s -name "*.yaml" -type f | while read file; do
               echo "Validating $file"
-              kubectl --dry-run=client -f "$file" > /dev/null || echo "⚠️  Warning: $file validation skipped (kubectl not fully available)"
+              kubectl apply --dry-run=client -f "$file" > /dev/null 2>&1 || echo "⚠️  Warning: $file validation skipped (kubectl not fully available)"
             done
           else
             echo "⚠️  kubectl not available, skipping K8s validation"
@@ -43,7 +43,8 @@ jobs:
         run: |
           find . -name "*.yml" -o -name "*.yaml" | grep -v node_modules | while read file; do
             echo "Checking $file"
-            python3 -c "import yaml; yaml.safe_load(open('$file'))" || exit 1
+            # Use safe_load_all for multi-document YAML files
+            python3 -c "import yaml; list(yaml.safe_load_all(open('$file')))" || exit 1
           done || echo "⚠️  Python YAML check skipped"
 
       - name: Validate Makefile
