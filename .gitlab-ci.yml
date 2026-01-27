@@ -28,7 +28,8 @@ publish-comfyui:
       buildctl-daemonless.sh build \
         --frontend dockerfile.v0 \
         --local context=. \
-        --opt filename=dockerfiles/Dockerfile.comfyui \
+        --local dockerfile=dockerfiles \
+        --opt filename=Dockerfile.comfyui \
         $OUTPUT_FLAGS
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
@@ -58,7 +59,8 @@ publish-swarmui:
       buildctl-daemonless.sh build \
         --frontend dockerfile.v0 \
         --local context=. \
-        --opt filename=dockerfiles/Dockerfile.swarmui \
+        --local dockerfile=dockerfiles \
+        --opt filename=Dockerfile.swarmui \
         $OUTPUT_FLAGS
   rules:
     - if: '$CI_COMMIT_BRANCH == "main"'
