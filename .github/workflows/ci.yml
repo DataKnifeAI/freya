@@ -37,18 +37,26 @@ jobs:
 
       - name: Validate Kubernetes Manifests
         run: |
-          find k8s -name "*.yaml" -type f | while read file; do
+          set -e
+          ERROR_COUNT=0
+          for file in $(find k8s -name "*.yaml" -type f); do
             echo "Validating $file"
-            # kubectl outputs to stderr even on success, so we check exit code
-            if kubectl apply --dry-run=client -f "$file" > /dev/null 2>&1; then
+            # kubectl outputs to stderr even on success, capture both
+            OUTPUT=$(kubectl apply --dry-run=client -f "$file" 2>&1)
+            EXIT_CODE=$?
+            if [ $EXIT_CODE -eq 0 ]; then
               echo "✅ $file is valid"
             else
-              echo "❌ $file validation failed"
-              echo "Error details:"
-              kubectl apply --dry-run=client -f "$file" 2>&1 || true
-              exit 1
+              echo "❌ $file validation failed (exit code: $EXIT_CODE)"
+              echo "Error output:"
+              echo "$OUTPUT"
+              ERROR_COUNT=$((ERROR_COUNT + 1))
             fi
           done
+          if [ $ERROR_COUNT -gt 0 ]; then
+            echo "❌ Validation failed for $ERROR_COUNT file(s)"
+            exit 1
+          fi
           echo "✅ All Kubernetes manifests are valid"
 
       - name: Check YAML syntax
