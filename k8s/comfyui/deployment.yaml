@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
       - name: comfyui
-        image: harbor.dataknife.net/tools/freya-comfyui:latest
+        image: harbor.dataknife.net/library/freya-comfyui:v0.44
         imagePullPolicy: Always
         ports:
         - containerPort: 8188

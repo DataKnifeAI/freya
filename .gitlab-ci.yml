@@ -5,8 +5,8 @@ stages:
 variables:
   IMAGE_NAME_COMFYUI: freya-comfyui
   IMAGE_NAME_SWARMUI: freya-swarmui
-  # Override HARBOR_PROJECT to use 'tools' instead of group default 'library'
-  HARBOR_PROJECT: tools
+  # Use 'library' as Harbor project for image pushes
+  HARBOR_PROJECT: library
 
 publish-comfyui:
   stage: docker

@@ -66,9 +66,22 @@ ports:
 - SwarmUI: Initializes database and downloads dependencies
 - Both: First generation may be slower as models load into GPU memory
 
+## Migrating from Old SwarmUI Layout
+
+If you previously used separate `swarmui/models` and `swarmui/input` directories, move them under `swarmui/data`:
+
+```bash
+# Run setup to create new structure
+make setup
+
+# Move existing data
+[ -d swarmui/models ] && mv swarmui/models/* swarmui/data/Models/ 2>/dev/null; rmdir swarmui/models 2>/dev/null
+[ -d swarmui/input ]  && mv swarmui/input/* swarmui/data/Inputs/ 2>/dev/null; rmdir swarmui/input 2>/dev/null
+```
+
 ## Model Not Showing Up
 
-1. Check file is in correct directory
+1. Check file is in correct directory (ComfyUI: `comfyui/models/…`; SwarmUI: `swarmui/data/Models/`)
 2. Verify file format (.safetensors, .ckpt, etc.)
 3. Restart the service: `make restart`
 4. Check file permissions

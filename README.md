@@ -8,6 +8,7 @@ A Kubernetes-ready platform for running ComfyUI and SwarmUI Stable Diffusion int
 
 - 🎨 **ComfyUI**: Advanced node-based workflow interface for Stable Diffusion (built from source)
 - 🐝 **SwarmUI**: Modular AI image and video generation web interface (built from source)
+- 💬 **Open WebUI + Ollama**: Stable Diffusion prompt generator agent (chat UI backed by local LLMs)
 - 🐳 **Docker Support**: Custom-built containers with GPU support for local development
 - ☸️ **Kubernetes Ready**: Designed to run in Kubernetes clusters
 - 🚀 **GPU Accelerated**: Full CUDA support for discrete GPUs
@@ -44,6 +45,7 @@ make up
 
 - **ComfyUI**: http://localhost:8188
 - **SwarmUI**: http://localhost:7801
+- **Open WebUI** (SD prompt generator): http://localhost:8080
 
 ## Makefile Commands
 
@@ -57,6 +59,8 @@ make restart           # Restart services
 make status            # Show service status and URLs
 make check-gpu-comfyui # Verify GPU access in ComfyUI
 make check-gpu-swarmui # Verify GPU access in SwarmUI
+make setup-ollama MODEL=llama3.2:1b  # Pull an Ollama model for Open WebUI
+make logs-open-webui   # View Open WebUI logs
 ```
 
 See [Architecture Guide](docs/architecture.md) for complete command reference.
@@ -68,6 +72,7 @@ See [Architecture Guide](docs/architecture.md) for complete command reference.
 - [Kubernetes Deployment](docs/kubernetes.md) - Deploy to Kubernetes
 - [Model Management](docs/MODELS.md) - Download and manage models
 - [Architecture](docs/architecture.md) - Project structure and services
+- [Open WebUI prompt agent](docs/open-webui-prompt-agent.md) - Use Open WebUI + Ollama as SD prompt generator
 - [Troubleshooting](docs/troubleshooting.md) - Common issues and solutions
 
 ## Requirements

@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: swarmui
-        image: harbor.dataknife.net/tools/freya-swarmui:latest
+        image: harbor.dataknife.net/library/freya-swarmui:v0.44
         imagePullPolicy: Always
         ports:
         - containerPort: 7801
@@ -57,32 +57,27 @@ spec:
           successThreshold: 1
           failureThreshold: 3
         volumeMounts:
-        - name: models
-          mountPath: /app/SwarmUI/Data/Models
-        - name: output
-          mountPath: /app/SwarmUI/Data/Outputs
-        - name: input
-          mountPath: /app/SwarmUI/Data/Inputs
         - name: data
           mountPath: /app/SwarmUI/Data
+        - name: output
+          mountPath: /app/SwarmUI/Output
         - name: dlbackend
           mountPath: /app/SwarmUI/dlbackend
+        - name: swarmui-models
+          mountPath: /app/SwarmUI/Models
       volumes:
-      - name: models
-        persistentVolumeClaim:
-          claimName: swarmui-models
-      - name: output
-        persistentVolumeClaim:
-          claimName: swarmui-output
-      - name: input
-        persistentVolumeClaim:
-          claimName: swarmui-input
       - name: data
         persistentVolumeClaim:
           claimName: swarmui-data
+      - name: output
+        persistentVolumeClaim:
+          claimName: swarmui-output
       - name: dlbackend
         persistentVolumeClaim:
           claimName: swarmui-dlbackend
+      - name: swarmui-models
+        persistentVolumeClaim:
+          claimName: swarmui-swarmui-models
 ---
 apiVersion: v1
 kind: Service
@@ -104,18 +99,6 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: swarmui-models
-  namespace: freya
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 100Gi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
   name: swarmui-output
   namespace: freya
 spec:
@@ -128,18 +111,6 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: swarmui-input
-  namespace: freya
-spec:
-  accessModes:
-    - ReadWriteOnce
-  resources:
-    requests:
-      storage: 10Gi
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
   name: swarmui-data
   namespace: freya
 spec:
@@ -147,12 +118,24 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: 20Gi
+      storage: 130Gi
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: swarmui-dlbackend
+  namespace: freya
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: swarmui-swarmui-models
   namespace: freya
 spec:
   accessModes:

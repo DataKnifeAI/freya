@@ -30,9 +30,6 @@ build-comfyui: ## Build ComfyUI image only
 build-swarmui: ## Build SwarmUI image only
 	docker compose build swarmui
 
-build-prompt-generator: ## Build prompt generator image only
-	docker compose build prompt-generator
-
 build-no-cache: ## Build all images without cache
 	docker compose build --no-cache
 
@@ -57,8 +54,8 @@ logs-swarmui: ## Show logs from SwarmUI service
 logs-ollama: ## Show logs from Ollama service
 	docker compose logs -f ollama
 
-logs-prompt-generator: ## Show logs from prompt generator service
-	docker compose logs -f prompt-generator
+logs-open-webui: ## Show logs from Open WebUI service
+	docker compose logs -f open-webui
 
 clean: ## Remove containers, volumes, and images
 	docker compose down -v
@@ -72,8 +69,8 @@ shell-comfyui: ## Open shell in ComfyUI container
 shell-swarmui: ## Open shell in SwarmUI container
 	docker compose exec swarmui /bin/bash
 
-shell-prompt-generator: ## Open shell in prompt generator container
-	docker compose exec prompt-generator /bin/bash
+shell-open-webui: ## Open shell in Open WebUI container
+	docker compose exec open-webui /bin/bash
 
 setup-ollama: ## Download Ollama model (usage: make setup-ollama MODEL=llama3.2:1b)
 	@if [ -z "$(MODEL)" ]; then \
@@ -102,5 +99,5 @@ status: ## Show service status and URLs
 	@echo "\n=== Access URLs ==="
 	@echo "ComfyUI:         http://localhost:8188"
 	@echo "SwarmUI:         http://localhost:7801"
-	@echo "Prompt Generator: http://localhost:8080"
+	@echo "Open WebUI:      http://localhost:8080"
 	@echo "Ollama API:      http://localhost:11434"

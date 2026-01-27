@@ -20,12 +20,11 @@ mkdir -p comfyui/models/unet
 mkdir -p comfyui/output
 mkdir -p comfyui/input
 
-# SwarmUI directories
+# SwarmUI directories (Models and Inputs live under data)
 echo "Creating SwarmUI directories..."
-mkdir -p swarmui/models
+mkdir -p swarmui/data/Models
+mkdir -p swarmui/data/Inputs
 mkdir -p swarmui/output
-mkdir -p swarmui/input
-mkdir -p swarmui/data
 mkdir -p swarmui/dlbackend
 mkdir -p swarmui/swarmui-models
 

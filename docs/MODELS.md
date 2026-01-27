@@ -24,9 +24,9 @@ comfyui/models/
 
 ### SwarmUI Models
 
-SwarmUI models go in a single directory:
+SwarmUI models go under the data directory:
 ```
-swarmui/models/      # All model types
+swarmui/data/Models/   # All model types
 ```
 
 ## Popular Models
@@ -269,10 +269,10 @@ Both ComfyUI and SwarmUI can share models:
 
 ```bash
 # Create symlink to share checkpoints
-ln -s ../comfyui/models/checkpoints swarmui/models/checkpoints
+ln -s ../../../comfyui/models/checkpoints swarmui/data/Models/checkpoints
 
 # Or copy models (uses more space)
-cp -r comfyui/models/checkpoints/* swarmui/models/
+cp -r comfyui/models/checkpoints/* swarmui/data/Models/
 ```
 
 **Note**: SwarmUI may need models in different locations. Check SwarmUI documentation for exact paths.

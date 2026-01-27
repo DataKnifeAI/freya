@@ -7,7 +7,7 @@ This project uses GitLab CI/CD to build Docker images and push them to Harbor re
 The following variables must be set at the group level (`dk-raas/dkai/tools`) or project level:
 
 - `HARBOR_REGISTRY` - Harbor registry URL (e.g., `harbor.dataknife.net`)
-- `HARBOR_PROJECT` - Harbor project name (e.g., `tools`)
+- `HARBOR_PROJECT` - Harbor project name (e.g., `library`)
 
 These variables are typically set at the group level and inherited by all projects.
 

@@ -15,13 +15,12 @@ pip-delete-this-directory.txt
 comfyui/models/
 comfyui/output/
 comfyui/input/
-swarmui/models/
-swarmui/output/
-swarmui/input/
 swarmui/data/
+swarmui/output/
 swarmui/dlbackend/
 swarmui/swarmui-models/
 ollama/
+openwebui/
 *.ckpt
 *.safetensors
 *.pt

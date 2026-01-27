@@ -30,10 +30,8 @@ services:
     container_name: freya-swarmui
     network_mode: host
     volumes:
-      - ./swarmui/models:/app/SwarmUI/Data/Models
-      - ./swarmui/output:/app/SwarmUI/Data/Outputs
-      - ./swarmui/input:/app/SwarmUI/Data/Inputs
       - ./swarmui/data:/app/SwarmUI/Data
+      - ./swarmui/output:/app/SwarmUI/Output
       - ./swarmui/dlbackend:/app/SwarmUI/dlbackend
       - ./swarmui/swarmui-models:/app/SwarmUI/Models
     env_file:
@@ -68,19 +66,16 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     restart: unless-stopped
 
-  prompt-generator:
-    build:
-      context: ./prompt-generator
-      dockerfile: Dockerfile
-    container_name: freya-prompt-generator
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: freya-open-webui
     network_mode: host
-    ports:
-      - "8080:8080"
+    volumes:
+      - ./openwebui/data:/app/backend/data
     environment:
-      - PORT=8080
-      - OLLAMA_URL=http://localhost:11434
-      - OLLAMA_MODEL=llama3.2:1b
-      - USE_LLM=true
+      - OLLAMA_BASE_URL=http://localhost:11434
+      - WEBUI_AUTH=true
+      - ENABLE_SIGNUP=true
     depends_on:
       - ollama
     restart: unless-stopped
