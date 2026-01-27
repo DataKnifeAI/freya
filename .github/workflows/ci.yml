@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   actions: read
 
 jobs:
@@ -128,3 +128,26 @@ jobs:
           echo "| Dockerfiles | ${{ needs.test-dockerfiles.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Scripts | ${{ needs.test-scripts.result }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Security | ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+
+  push-to-gitlab:
+    name: Push to GitLab
+    runs-on: ubuntu-latest
+    needs: [lint, test-dockerfiles, test-scripts, security]
+    if: always() && needs.lint.result == 'success' && needs.test-dockerfiles.result == 'success' && needs.test-scripts.result == 'success' && needs.security.result == 'success' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Push to GitLab
+        env:
+          GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git remote remove gitlab 2>/dev/null || true
+          git remote add gitlab https://gitlab.com/dk-raas/dkai/tools/freya.git
+          git config credential.helper '!f() { echo "username=oauth2"; echo "password=${GITLAB_TOKEN}"; }; f'
+          git fetch gitlab main
+          git push gitlab HEAD:main --force
