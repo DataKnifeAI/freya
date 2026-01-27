@@ -28,16 +28,25 @@ jobs:
           docker compose config > /dev/null
           echo "✅ Docker Compose configuration is valid"
 
+      - name: Install kubectl
+        run: |
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/
+          kubectl version --client
+
       - name: Validate Kubernetes Manifests
         run: |
-          if command -v kubectl &> /dev/null; then
-            find k8s -name "*.yaml" -type f | while read file; do
-              echo "Validating $file"
-              kubectl apply --dry-run=client -f "$file" > /dev/null 2>&1 || echo "⚠️  Warning: $file validation skipped (kubectl not fully available)"
-            done
-          else
-            echo "⚠️  kubectl not available, skipping K8s validation"
-          fi
+          find k8s -name "*.yaml" -type f | while read file; do
+            echo "Validating $file"
+            if kubectl apply --dry-run=client -f "$file" > /dev/null 2>&1; then
+              echo "✅ $file is valid"
+            else
+              echo "❌ $file validation failed"
+              exit 1
+            fi
+          done
+          echo "✅ All Kubernetes manifests are valid"
 
       - name: Check YAML syntax
         run: |
