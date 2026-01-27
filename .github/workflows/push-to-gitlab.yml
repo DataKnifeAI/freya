@@ -58,15 +58,20 @@ jobs:
           # Remove gitlab remote if it exists
           git remote remove gitlab 2>/dev/null || true
           
-          # Add GitLab remote with token from environment variable
-          git remote add gitlab "https://oauth2:${GITLAB_TOKEN}@gitlab.com/dk-raas/dkai/tools/freya.git"
+          # Add GitLab remote without credentials
+          git remote add gitlab https://gitlab.com/dk-raas/dkai/tools/freya.git
           
-          # Verify remote was added (without showing token)
-          git remote -v | sed 's/oauth2:[^@]*@/oauth2:***@/g'
+          # Configure credential helper to use token
+          git config --global credential.helper '!f() { echo "username=oauth2"; echo "password=$GITLAB_TOKEN"; }; f'
+          
+          # Verify remote was added
+          git remote -v
 
       - name: Push to GitLab
         env:
           GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
           GIT_TERMINAL_PROMPT: 0
         run: |
+          # Set up credential helper for this push
+          git config --global credential.helper '!f() { echo "username=oauth2"; echo "password=$GITLAB_TOKEN"; }; f'
           git push gitlab main --force
