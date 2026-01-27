@@ -1,4 +1,4 @@
-# Freya - ComfyUI & SwarmUI Stable Diffusion Platform
+# Freya - Stable Diffusion with UI on Kubernetes
 
 ![Freya](freya.png)
 
