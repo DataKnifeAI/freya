@@ -1,8 +1,23 @@
 # Installation Guide
 
+## Supported Linux distributions
+
+Freya supports Docker Compose on these distributions (NVIDIA Container Toolkit available):
+
+| Distribution        | Versions tested / recommended     |
+|---------------------|-----------------------------------|
+| **Ubuntu**          | 22.04 LTS, 24.04 LTS              |
+| **Debian**          | 12 (Bookworm), 13 (Trixie)        |
+| **Fedora**          | 38, 39, 40+                       |
+| **RHEL / CentOS**   | RHEL 8/9, CentOS Stream 8/9       |
+| **openSUSE**        | Leap 15.x, Tumbleweed             |
+| **Arch Linux**      | Rolling (incl. CachyOS, EndeavourOS) |
+
+Install **Docker Engine** and **Docker Compose v2** using your distro’s packages (e.g. `apt`, `dnf`, `zypper`, `pacman`) before following the steps below. See [Docker: Install Docker Engine](https://docs.docker.com/engine/install/) for per-distro instructions.
+
 ## System Requirements
 
-- **OS**: Linux (Ubuntu 22.04+ recommended, Arch Linux/CachyOS tested)
+- **OS**: Linux (see supported distributions above)
 - **Docker**: Docker Engine 20.10+ and Docker Compose v2.0+
 - **GPU**: NVIDIA GPU with CUDA support (CUDA 12.4+ or 13.x; images use 13.1.1)
 - **GPU Memory**: Minimum 8GB VRAM (16GB+ recommended for both services)
@@ -12,7 +27,7 @@
 
 ## Software Requirements
 
-- **NVIDIA Container Toolkit**: Required for GPU access in containers
+- **NVIDIA Container Toolkit**: Required for GPU access in containers (install per distro below)
 - **Git**: For cloning repositories during Docker builds
 - **Python 3.12**: Installed in SwarmUI container (handled automatically)
 - **.NET 8 SDK**: Installed in SwarmUI container (handled automatically)
@@ -20,15 +35,50 @@
 
 ## Installing NVIDIA Container Toolkit
 
-### Ubuntu/Debian
+Install the toolkit for your distribution, then run the [Verify Installation](#verify-installation) command.
+
+### Ubuntu / Debian
 
 ```bash
 distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
-curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
-curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list
+curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-docker.gpg
+curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | \
+  sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-docker.gpg] https://#' | \
+  sudo tee /etc/apt/sources.list.d/nvidia-docker.list
 sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
 sudo systemctl restart docker
 ```
+
+### Fedora / RHEL / CentOS
+
+```bash
+curl -s -L https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo | \
+  sudo tee /etc/yum.repos.d/nvidia-container-toolkit.repo
+sudo dnf install -y nvidia-container-toolkit  # RHEL/CentOS: use yum if dnf not available
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+### openSUSE Leap / Tumbleweed
+
+```bash
+# Add repository (e.g. opensuse-leap15.6 or opensuse-tumbleweed)
+distribution=$(. /etc/os-release; echo $ID$VERSION_ID)
+sudo zypper ar https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.repo
+sudo zypper ref && sudo zypper in -y nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+### Arch Linux (and derivatives: CachyOS, EndeavourOS)
+
+```bash
+sudo pacman -S --noconfirm nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+```
+
+Alternatively use the helper script (Arch and Ubuntu/Debian): `sudo ./scripts/install-nvidia-toolkit.sh`
 
 ### Verify Installation
 

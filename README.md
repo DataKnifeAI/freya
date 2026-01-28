@@ -18,12 +18,12 @@ A Kubernetes-ready platform for running ComfyUI and SwarmUI Stable Diffusion int
 
 ### Prerequisites
 
-- Linux (Ubuntu 22.04+ recommended)
+- **Linux**: Supported distros include Ubuntu, Debian, Fedora, RHEL/CentOS, openSUSE, Arch (see [Installation Guide](docs/installation.md))
 - Docker & Docker Compose v2.0+
 - NVIDIA GPU with 8GB+ VRAM (16GB+ recommended)
 - NVIDIA Container Toolkit installed
 
-See [Installation Guide](docs/installation.md) for detailed setup instructions.
+See [Installation Guide](docs/installation.md) for detailed setup and per-distro NVIDIA toolkit install.
 
 ### Getting Started
 
@@ -104,7 +104,7 @@ See [Architecture Guide](docs/architecture.md) for complete command reference.
 
 ## Requirements
 
-- **OS**: Linux (Ubuntu 22.04+ recommended)
+- **OS**: Linux (Ubuntu, Debian, Fedora, RHEL, openSUSE, Arch — see [installation](docs/installation.md))
 - **GPU**: NVIDIA GPU with CUDA 12.4+ or 13.x (images use 13.1.1)
 - **VRAM**: Minimum 8GB (16GB+ recommended for both services)
 - **RAM**: Minimum 16GB system RAM

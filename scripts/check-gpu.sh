@@ -23,14 +23,9 @@ if docker info 2>&1 | grep -qi nvidia; then
 else
     echo "✗ NVIDIA runtime NOT found in Docker"
     echo ""
-    echo "NVIDIA Container Toolkit needs to be installed."
-    echo ""
-    echo "Installation (Ubuntu/Debian):"
-    echo "  distribution=\$(. /etc/os-release;echo \$ID\$VERSION_ID)"
-    echo "  curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -"
-    echo "  curl -s -L https://nvidia.github.io/nvidia-docker/\$distribution/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list"
-    echo "  sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit"
-    echo "  sudo systemctl restart docker"
+    echo "Install NVIDIA Container Toolkit for your distribution."
+    echo "  See docs/installation.md (Ubuntu, Debian, Fedora, RHEL, openSUSE, Arch)"
+    echo "  Or run: sudo ./scripts/install-nvidia-toolkit.sh (supported distros only)"
     echo ""
     exit 1
 fi
