@@ -63,8 +63,9 @@ make restart           # Restart services
 make status            # Show service status and URLs
 make check-gpu-comfyui # Verify GPU access in ComfyUI
 make check-gpu-swarmui # Verify GPU access in SwarmUI
-make llm-pull MODEL=llama3.2:1b  # Pull an Ollama model (for SwarmUI MagicPrompt)
+make llm-pull MODEL=dolphin3  # Pull default Ollama model (MagicPrompt); see https://ollama.com/library/dolphin3
 make llm-list          # List installed models + browse link
+make llm-rm MODEL=dolphin3  # Remove an Ollama model
 make llm-logs          # View Ollama logs
 ```
 

@@ -30,6 +30,10 @@ kubectl apply -f k8s/comfyui/deployment.yaml
 echo "🐝 Deploying SwarmUI..."
 kubectl apply -f k8s/swarmui/deployment.yaml
 
+# Deploy Ollama
+echo "💬 Deploying Ollama..."
+kubectl apply -f k8s/ollama/deployment.yaml
+
 # Deploy Ingress (optional)
 echo "🌐 Deploying Ingress..."
 kubectl apply -f k8s/ingress.yaml
@@ -38,6 +42,7 @@ kubectl apply -f k8s/ingress.yaml
 echo "⏳ Waiting for deployments to be ready..."
 kubectl wait --for=condition=available --timeout=300s deployment/comfyui -n "$NAMESPACE" || echo "⚠️  ComfyUI deployment not ready yet"
 kubectl wait --for=condition=available --timeout=300s deployment/swarmui -n "$NAMESPACE" || echo "⚠️  SwarmUI deployment not ready yet"
+kubectl wait --for=condition=available --timeout=300s deployment/ollama -n "$NAMESPACE" || echo "⚠️  Ollama deployment not ready yet"
 
 # Show status
 echo ""
@@ -55,7 +60,10 @@ echo ""
 echo "To access services:"
 echo "  ComfyUI:    kubectl port-forward -n $NAMESPACE svc/comfyui 8188:8188"
 echo "  SwarmUI:    kubectl port-forward -n $NAMESPACE svc/swarmui 7801:7801"
+echo "  Ollama:     kubectl port-forward -n $NAMESPACE svc/ollama 11434:11434 (internal only, for debugging)"
 echo ""
 echo "Or via Ingress:"
 echo "  ComfyUI:    http://comfyui.dataknife.net"
 echo "  SwarmUI:    http://swarmui.dataknife.net"
+echo ""
+echo "Note: Ollama is internal-only (SwarmUI connects via service DNS: ollama.freya.svc.cluster.local:11434)"

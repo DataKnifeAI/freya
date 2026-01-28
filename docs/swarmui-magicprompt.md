@@ -9,11 +9,11 @@ Extensions live in `swarmui/extensions/` (source); the recompiled app lives in `
 ## Automatic install (recommended)
 
 1. **Start SwarmUI and Ollama** (e.g. `make up` or `make sui`; or `make llm` for Ollama only).
-2. **Pull an Ollama model** (if needed):
+2. **Pull an Ollama model** (if needed). Default for most control and compatibility: **[dolphin3](https://ollama.com/library/dolphin3)** (Dolphin 3.0 Llama 3.1 8B, ~4.9GB, 128K context):
    ```bash
-   make llm-pull MODEL=llama3.2:1b
+   make llm-pull MODEL=dolphin3
    ```
-   Browse available models: **`make llm-list`** (shows installed + link to [ollama.com/library](https://ollama.com/library)) or visit [ollama.com/library](https://ollama.com/library) directly.
+   Browse available models: **`make llm-list`** or [ollama.com/library](https://ollama.com/library).
 3. In SwarmUI go to **Server → Extensions**, find **MagicPrompt**, and click **Install**. Let it download and follow the prompts to restart Swarm.
 4. Open the **MagicPrompt** tab (or **Enhance Prompt** / **Magic Vision** in the Generate tab), then **Settings** and set:
    - **Chat Backend**: Ollama (or another supported backend)
@@ -53,16 +53,17 @@ Ollama uses **GPU VRAM** when an NVIDIA GPU is available (same GPU as ComfyUI/Sw
 |------------|--------------|----------|
 | 1B         | ~1–2 GB      | `llama3.2:1b` |
 | 3B         | ~2–4 GB      | `llama3.2:3b`, `phi3:mini` |
-| 7–8B       | ~4–7 GB      | `llama3.2`, `mistral`, `gemma2:7b` |
+| 7–8B       | ~4–7 GB      | **[dolphin3](https://ollama.com/library/dolphin3)** (default), `llama3.2`, `mistral`, `gemma2:7b` |
 | 12B+       | ~8 GB+       | `gemma2:9b`, `llama3.1:8b` (larger variants) |
 
-**Models that work well for prompt generation (MagicPrompt):**  
-For enhancing or generating SD prompts you want something **fast and small** so the GPU still has room for SwarmUI/ComfyUI. Good options:
+**Default model: [dolphin3](https://ollama.com/library/dolphin3)**  
+Dolphin 3.0 Llama 3.1 8B is the recommended default for MagicPrompt: steerable, no imposed alignment, you control system prompt and data—good for compatibility and control. See [ollama.com/library/dolphin3](https://ollama.com/library/dolphin3).
 
-- **Light (1–3B):** `llama3.2:1b`, `llama3.2:3b`, `phi3:mini` — minimal VRAM, quick responses, fine for short prompt enhancement.
-- **Balanced (7–8B):** `llama3.2`, `mistral`, `gemma2:7b` — better quality and nuance for more detailed or creative prompts; still reasonable VRAM (~5–7 GB).
+**Other options for prompt generation:**  
+- **Light (1–3B):** `llama3.2:1b`, `llama3.2:3b`, `phi3:mini` — minimal VRAM, quick responses.
+- **Balanced (7–8B):** `dolphin3`, `mistral`, `gemma2:7b` — better quality and nuance; dolphin3 preferred for control.
 
-If you run **SwarmUI + Ollama on one GPU**, prefer 1B or 3B so enough VRAM stays free for image/video models. If you run Ollama alone (`make llm`) or on a separate machine, 7B is a good default for prompt quality.
+If you run **SwarmUI + Ollama on one GPU**, prefer 1B or 3B so enough VRAM stays free for image/video models. If you run Ollama alone (`make llm`) or on a separate machine, **dolphin3** is the default for prompt quality and control.
 
 ## Managing Ollama models
 
@@ -71,12 +72,13 @@ Visit [ollama.com/library](https://ollama.com/library) or run **`make llm-list`*
 
 **Pull additional models:**  
 ```bash
+make llm-pull MODEL=dolphin3   # default: https://ollama.com/library/dolphin3
 make llm-pull MODEL=<model-name>
 ```
 Examples:
-- `make llm-pull MODEL=llama3.2:3b` (larger than 1b)
-- `make llm-pull MODEL=mistral` (7B, good quality)
-- `make llm-pull MODEL=gemma2:7b` (alternative 7B)
+- `make llm-pull MODEL=dolphin3` (default: Dolphin 3.0 8B, most control and compatibility)
+- `make llm-pull MODEL=llama3.2:3b` (smaller)
+- `make llm-pull MODEL=mistral` (7B)
 - `make llm-pull MODEL=phi3:mini` (very small, fast)
 
 **List installed models:**  
@@ -85,5 +87,13 @@ make llm-list
 ```
 Shows all models you’ve pulled (stored in `ollama/models/`, persisted across restarts).
 
+**Remove models:**  
+```bash
+make llm-rm MODEL=<model-name>
+```
+Examples:
+- `make llm-rm MODEL=dolphin3`
+- `make llm-rm MODEL=mistral`
+
 **Use different models in MagicPrompt:**  
-After pulling multiple models, select which one to use in MagicPrompt **Settings** → **Chat Model** or **Vision Model** dropdown. You can switch models per batch or per feature without restarting SwarmUI.
+After pulling multiple models, select which one to use in MagicPrompt **Settings** → **Chat Model** or **Vision Model** dropdown. You can switch models per batch or per feature without restarting SwarmUI. Models are available immediately after pulling—no restart needed.

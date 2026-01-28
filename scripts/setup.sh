@@ -32,10 +32,15 @@ mkdir -p swarmui/swarmui-models
 mkdir -p swarmui/extensions
 mkdir -p swarmui/bin
 
+# Ollama (for SwarmUI MagicPrompt)
+echo "Creating Ollama directory..."
+mkdir -p ollama/models
+
 echo "✓ Directory structure created!"
 echo ""
 echo "Next steps:"
 echo "1. Run 'make download-starter-models' to fetch ComfyUI starter models (SDXL + VAE), or 'make quick-setup' for dirs + starters"
 echo "2. Add more ComfyUI models: make download-model TYPE=<type> URL=<url> — see docs/model-downloads.md (Hugging Face, Civitai — account + API key required)"
 echo "3. SwarmUI: use its built-in model download utility"
-echo "4. Run 'make up' to start the services — docs/MODELS.md for model types and layout"
+echo "4. Ollama (MagicPrompt): start with 'make llm', then 'make llm-pull MODEL=dolphin3' — see https://ollama.com/library/dolphin3"
+echo "5. Run 'make up' to start the services — docs/MODELS.md for model types and layout"

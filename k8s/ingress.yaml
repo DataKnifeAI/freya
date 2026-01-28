@@ -1,4 +1,5 @@
 # Kubernetes Ingress for ComfyUI and SwarmUI
+# Note: Ollama is internal-only (SwarmUI connects via service DNS)
 # Requires an ingress controller (nginx, traefik, etc.)
 
 apiVersion: networking.k8s.io/v1

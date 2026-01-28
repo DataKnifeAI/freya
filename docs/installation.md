@@ -67,3 +67,11 @@ docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi
 6. **Access the interfaces:**
    - ComfyUI: http://localhost:8188
    - SwarmUI: http://localhost:7801
+   - Ollama API: http://localhost:11434 (for SwarmUI MagicPrompt)
+
+7. **Optional — Ollama for MagicPrompt:** Start Ollama and pull the default model ([dolphin3](https://ollama.com/library/dolphin3), recommended for control and compatibility):
+   ```bash
+   make llm
+   make llm-pull MODEL=dolphin3
+   ```
+   See [SwarmUI MagicPrompt](swarmui-magicprompt.md) for configuration.
