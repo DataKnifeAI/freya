@@ -62,8 +62,7 @@ spec:
           successThreshold: 1
           failureThreshold: 3
         livenessProbe:
-          httpGet:
-            path: /api/tags
+          tcpSocket:
             port: 11434
           initialDelaySeconds: 30
           periodSeconds: 30
