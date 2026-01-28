@@ -49,7 +49,7 @@ docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi
    make setup
    ```
 
-3. **Optional: Download models interactively:**
+3. **Optional: Quick setup** (dirs + ComfyUI starter models via script; add more with `make download-model`; see [model-downloads.md](model-downloads.md)):
    ```bash
    make quick-setup
    ```

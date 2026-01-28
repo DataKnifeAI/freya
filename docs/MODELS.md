@@ -33,10 +33,11 @@ swarmui/data/Models/   # All model types
 
 SwarmUI supports **text-to-video (T2V)** and **image-to-video (I2V)**. No extra Freya config is required—use SwarmUI as usual once the right models are in place.
 
-- **Install recommended video models (Wan 2.1 14B fp8 + LTX Video 2B fp8, good for RTX 4090)**: run `make download-video-models` (~20 GB), or `make quick-setup` to get ComfyUI + video models. Wan → `swarmui/data/Models/diffusion_models/`, LTX → `swarmui/data/Models/Stable-Diffusion/`.
+- **Install recommended video models (Wan 2.1 14B fp8 + LTX Video 2B fp8, good for RTX 4090)**: use SwarmUI’s built-in model download utility, or see [docs/model-downloads.md](model-downloads.md) for Hugging Face / Civitai (account and API key required). Wan → `swarmui/data/Models/diffusion_models/`, LTX → `swarmui/data/Models/Stable-Diffusion/`.
 - **Image-to-video**: In the Models sub-tab, pick a normal image model (e.g. SDXL or Flux) as the base, then in the **Image To Video** parameter group select the video model. For an external image, use **Init Image** and set **Init Image Creativity** to 0.
 - **Where video models go**: Depends on the model (e.g. `swarmui/data/Models/diffusion_models/` or `Stable-Diffusion` subfolder). Use SwarmUI’s **Server → Paths** or the official docs for exact paths.
-- **Official guide**: [SwarmUI Video Model Support](https://github.com/mcmonkeyprojects/SwarmUI/blob/master/docs/Video%20Model%20Support.md) — install and usage for Hunyuan Video, Wan 2.1/2.2, LTX Video, Kandinsky 5, and others.
+- **Beginner’s guide**: [Generate Videos With SwarmUI](https://huggingface.co/blog/MonsterMMORPG/beginners-guide-generate-videos-with-swarmui) (Hugging Face) — step-by-step T2V, text-to-image-to-video, and direct I2V; model pick (e.g. Wan 2.1 14B fp8 for 4090), params, and Init Image Creativity=0. See also [SwarmUI Video Guide](swarmui-video-guide.md) in this repo.
+- **Official reference**: [SwarmUI Video Model Support](https://github.com/mcmonkeyprojects/SwarmUI/blob/master/docs/Video%20Model%20Support.md) — install and usage for Hunyuan Video, Wan 2.1/2.2, LTX Video, Kandinsky 5, and others.
 
 ## Popular Models
 
@@ -90,64 +91,19 @@ Popular LoRA sources:
 
 ## Downloading Models
 
-### Using the Download Script
+### ComfyUI (no built-in downloader)
 
-```bash
-# Make script executable
-chmod +x scripts/download-model.sh
+Use the provided script for starter models and to add more:
 
-# Download a checkpoint
-./scripts/download-model.sh checkpoint \
-  https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors
+- **Starter models (SDXL base + VAE, ~7.3 GB):** `make download-starter-models` or `make quick-setup`
+- **Add one model:** `make download-model TYPE=<type> URL=<url> [FILE=<filename>]`  
+  Types: `checkpoint`, `lora`, `vae`, `controlnet`, `upscale`, `embedding`
 
-# Download a LoRA with custom filename
-./scripts/download-model.sh lora \
-  https://civitai.com/api/download/models/12345 \
-  my-custom-lora.safetensors
+For where to get URLs (Hugging Face, Civitai) and API keys, see **[docs/model-downloads.md](model-downloads.md)**. Both sources require an account and API key/token for API or authenticated downloads. You can also download in the browser and place files under `comfyui/models/<type>/` per [Directory Structure](#directory-structure) above.
 
-# Download a VAE
-./scripts/download-model.sh vae \
-  https://huggingface.co/stabilityai/sd-vae-ft-mse-original/resolve/main/vae-ft-mse-840000-ema-pruned.safetensors
-```
+### SwarmUI
 
-### Manual Download
-
-1. **From Hugging Face:**
-   - Navigate to the model page
-   - Click on the file you want
-   - Click "Download" button
-   - Place in appropriate directory
-
-2. **From Civitai:**
-   - Browse models at https://civitai.com/
-   - Click "Download" on desired model
-   - Place in appropriate directory
-
-3. **Using wget/curl:**
-   ```bash
-   # For Hugging Face (use "resolve/main" in URL)
-   wget -O comfyui/models/checkpoints/model.safetensors \
-     https://huggingface.co/user/model/resolve/main/file.safetensors
-   
-   # For direct links
-   curl -L -o comfyui/models/checkpoints/model.safetensors \
-     https://example.com/model.safetensors
-   ```
-
-### Using Git LFS (for Hugging Face)
-
-Some models use Git LFS. Install git-lfs first:
-
-```bash
-# Install git-lfs
-sudo apt-get install git-lfs  # Ubuntu/Debian
-brew install git-lfs          # macOS
-
-# Clone repository
-git lfs install
-git clone https://huggingface.co/runwayml/stable-diffusion-v1-5
-cp stable-diffusion-v1-5/v1-5-pruned-emaonly.safetensors comfyui/models/checkpoints/
-```
+SwarmUI has a built-in model download utility — use it from the SwarmUI UI (http://localhost:7801) for SwarmUI models. For Hugging Face / Civitai URLs and API keys, see [model-downloads.md](model-downloads.md).
 
 ## Model Formats
 
@@ -186,38 +142,17 @@ For a full collection:
 - **ComfyUI**: 200-500 GB
 - **SwarmUI**: 200-500 GB
 
-## Quick Start: Download Essential Models
-
-```bash
-# Run setup script first
-chmod +x scripts/setup.sh
-./scripts/setup.sh
-
-# Download SD 1.5 (essential)
-./scripts/download-model.sh checkpoint \
-  https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors
-
-# Download VAE for SD 1.5
-./scripts/download-model.sh vae \
-  https://huggingface.co/stabilityai/sd-vae-ft-mse-original/resolve/main/vae-ft-mse-840000-ema-pruned.safetensors
-
-# Download a popular ControlNet
-./scripts/download-model.sh controlnet \
-  https://huggingface.co/lllyasviel/control_v11p_sd15_canny/resolve/main/diffusion_pytorch_model.safetensors \
-  control_v11p_sd15_canny.safetensors
-```
-
 ## Model Sources
 
 ### Hugging Face
 - **URL**: https://huggingface.co/models
 - **Search**: Filter by "text-to-image" or "stable-diffusion"
-- **Direct Download**: Use "resolve/main" in URL path
+- **Account + token required** for API and gated models. See [model-downloads.md](model-downloads.md).
 
 ### Civitai
 - **URL**: https://civitai.com/
 - **Features**: Ratings, previews, community feedback
-- **API**: Use `/api/download/models/{id}` for direct download
+- **Account + API key required** for API downloads. See [model-downloads.md](model-downloads.md).
 
 ### Stability AI
 - **URL**: https://stability.ai/

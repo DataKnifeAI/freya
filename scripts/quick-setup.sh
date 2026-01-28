@@ -1,50 +1,34 @@
 #!/bin/bash
-# Quick setup script - Downloads essential models for getting started
-# Non-interactive: Downloads recommended models automatically
+# Quick setup: directory structure + ComfyUI starter models (SDXL + VAE).
+# ComfyUI has no built-in downloader; this script downloads starters. Use the same
+# script for more models (see docs/model-downloads.md for Hugging Face / Civitai).
 
 set -e
 
-echo "Freya Model Setup"
-echo "===================="
-echo ""
-echo "This script will download essential Stable Diffusion models."
-echo "This may take a while depending on your internet connection."
+echo "Freya Quick Setup"
+echo "================="
 echo ""
 
-# Check if setup.sh was run
+# Run full setup if not done yet
 if [ ! -d "comfyui/models/checkpoints" ]; then
     echo "Running initial setup..."
     chmod +x scripts/setup.sh
     ./scripts/setup.sh
+else
+    echo "Directory structure already present."
 fi
 
-# Make download scripts executable
+echo ""
 chmod +x scripts/download-model.sh
-chmod +x scripts/download-video-models.sh
-
-echo "Downloading Stable Diffusion XL checkpoint (6.94 GB) - Most Popular..."
-./scripts/download-model.sh checkpoint \
-    "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors" \
-    "sd_xl_base_1.0.safetensors"
-
-echo ""
-echo "Downloading SDXL VAE (335 MB)..."
-./scripts/download-model.sh vae \
-    "https://huggingface.co/stabilityai/sdxl-vae/resolve/main/sdxl_vae.safetensors" \
-    "sdxl_vae.safetensors"
-
-echo ""
-echo "Downloading SwarmUI video models (Wan 2.1 14B fp8 + LTX Video 2B fp8, ~20 GB total)..."
-./scripts/download-video-models.sh
+./scripts/download-model.sh starter
 
 echo ""
 echo "✓ Setup complete!"
 echo ""
-echo "Models are located in:"
-echo "  - comfyui/models/checkpoints/"
-echo "  - comfyui/models/vae/"
-echo "  - swarmui/data/Models/diffusion_models/  (Wan video)"
-echo "  - swarmui/data/Models/Stable-Diffusion/   (LTX video)"
+echo "Add more ComfyUI models: make download-model TYPE=<type> URL=<url> [FILE=<filename>]"
+echo "  Types: checkpoint, lora, vae, controlnet, upscale, embedding"
+echo "  See docs/model-downloads.md for Hugging Face and Civitai (account + API key required)."
+echo ""
+echo "SwarmUI: use its built-in model download utility (http://localhost:7801)."
 echo ""
 echo "Start the services with: make up"
-echo "ComfyUI: http://localhost:8188  |  SwarmUI: http://localhost:7801"

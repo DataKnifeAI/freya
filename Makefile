@@ -9,20 +9,21 @@ help: ## Show this help message
 setup: ## Run initial directory setup
 	chmod +x scripts/setup.sh && ./scripts/setup.sh
 
-quick-setup: ## Non-interactive setup with model downloads (ComfyUI + SwarmUI video models)
+quick-setup: ## Non-interactive setup: directories + ComfyUI starter models (SDXL + VAE)
 	chmod +x scripts/quick-setup.sh && ./scripts/quick-setup.sh
 
-download-video-models: ## Download Wan 2.1 14B fp8 + LTX Video 2B fp8 for SwarmUI (~20 GB)
-	chmod +x scripts/download-video-models.sh && ./scripts/download-video-models.sh
+download-starter-models: ## Download ComfyUI starter models (SDXL base + VAE, ~7.3 GB)
+	chmod +x scripts/download-model.sh && ./scripts/download-model.sh starter
 
-download-model: ## Download a model (usage: make download-model TYPE=checkpoint URL=... FILE=...)
+download-model: ## Download one ComfyUI model (make download-model TYPE=checkpoint URL=... [FILE=...])
 	@if [ -z "$(TYPE)" ] || [ -z "$(URL)" ]; then \
 		echo "Usage: make download-model TYPE=<type> URL=<url> [FILE=<filename>]"; \
 		echo "Types: checkpoint, lora, vae, controlnet, upscale, embedding"; \
+		echo "See docs/model-downloads.md for Hugging Face / Civitai (account + API key required)."; \
 		exit 1; \
 	fi
 	chmod +x scripts/download-model.sh
-	./scripts/download-model.sh $(TYPE) $(URL) $(FILE)
+	./scripts/download-model.sh "$(TYPE)" "$(URL)" "$(FILE)"
 
 build: ## Build all Docker images
 	docker compose build

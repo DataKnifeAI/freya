@@ -31,7 +31,7 @@ See [Installation Guide](docs/installation.md) for detailed setup instructions.
 # Setup directories
 make setup
 
-# Optional: Interactive setup with model downloads
+# Optional: Quick setup = dirs + ComfyUI starter models (SDXL + VAE); add more via make download-model
 make quick-setup
 
 # Build images
@@ -71,6 +71,7 @@ See [Architecture Guide](docs/architecture.md) for complete command reference.
 - [GPU Compatibility](docs/gpu-compatibility.md) - Compatible GPU cards
 - [Kubernetes Deployment](docs/kubernetes.md) - Deploy to Kubernetes
 - [Model Management](docs/MODELS.md) - Download and manage models
+- [SwarmUI Video Guide](docs/swarmui-video-guide.md) - Beginner’s guide to T2V/I2V with SwarmUI (links to [HF guide](https://huggingface.co/blog/MonsterMMORPG/beginners-guide-generate-videos-with-swarmui))
 - [Architecture](docs/architecture.md) - Project structure and services
 - [Open WebUI prompt agent](docs/open-webui-prompt-agent.md) - Use Open WebUI + Ollama as SD prompt generator
 - [Troubleshooting](docs/troubleshooting.md) - Common issues and solutions
