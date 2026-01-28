@@ -11,8 +11,9 @@ Extensions live in `swarmui/extensions/` (source); the recompiled app lives in `
 1. **Start SwarmUI and Ollama** (e.g. `make up` or `make sui`; or `make llm` for Ollama only).
 2. **Pull an Ollama model** (if needed):
    ```bash
-   make setup-ollama MODEL=llama3.2:1b
+   make llm-pull MODEL=llama3.2:1b
    ```
+   Browse available models: **`make llm-list`** (shows installed + link to [ollama.com/library](https://ollama.com/library)) or visit [ollama.com/library](https://ollama.com/library) directly.
 3. In SwarmUI go to **Server → Extensions**, find **MagicPrompt**, and click **Install**. Let it download and follow the prompts to restart Swarm.
 4. Open the **MagicPrompt** tab (or **Enhance Prompt** / **Magic Vision** in the Generate tab), then **Settings** and set:
    - **Chat Backend**: Ollama (or another supported backend)
@@ -62,3 +63,27 @@ For enhancing or generating SD prompts you want something **fast and small** so 
 - **Balanced (7–8B):** `llama3.2`, `mistral`, `gemma2:7b` — better quality and nuance for more detailed or creative prompts; still reasonable VRAM (~5–7 GB).
 
 If you run **SwarmUI + Ollama on one GPU**, prefer 1B or 3B so enough VRAM stays free for image/video models. If you run Ollama alone (`make llm`) or on a separate machine, 7B is a good default for prompt quality.
+
+## Managing Ollama models
+
+**Browse available models:**  
+Visit [ollama.com/library](https://ollama.com/library) or run **`make llm-list`** to see installed models plus the library link and popular suggestions.
+
+**Pull additional models:**  
+```bash
+make llm-pull MODEL=<model-name>
+```
+Examples:
+- `make llm-pull MODEL=llama3.2:3b` (larger than 1b)
+- `make llm-pull MODEL=mistral` (7B, good quality)
+- `make llm-pull MODEL=gemma2:7b` (alternative 7B)
+- `make llm-pull MODEL=phi3:mini` (very small, fast)
+
+**List installed models:**  
+```bash
+make llm-list
+```
+Shows all models you’ve pulled (stored in `ollama/models/`, persisted across restarts).
+
+**Use different models in MagicPrompt:**  
+After pulling multiple models, select which one to use in MagicPrompt **Settings** → **Chat Model** or **Vision Model** dropdown. You can switch models per batch or per feature without restarting SwarmUI.

@@ -1,4 +1,4 @@
-.PHONY: help build build-comfyui build-swarmui up down sui sui-rebuild cui llm swarmui-rebuild swarmui-extensions-check restart logs clean
+.PHONY: help build build-comfyui build-swarmui up down sui sui-rebuild cui llm llm-pull llm-list llm-logs swarmui-rebuild swarmui-extensions-check restart logs clean
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -68,7 +68,7 @@ logs-comfyui: ## Show logs from ComfyUI service
 logs-swarmui: ## Show logs from SwarmUI service
 	docker compose logs -f swarmui
 
-logs-ollama: ## Show logs from Ollama service
+llm-logs: ## Show logs from Ollama service
 	docker compose logs -f ollama
 
 clean: ## Remove containers, volumes, and images
@@ -94,16 +94,32 @@ swarmui-extensions-check: ## List extension dir and run build (use if extension 
 	@echo "=== Rebuild (update script or dotnet build; watch for errors) ==="
 	docker compose exec swarmui bash -c "cd /app/SwarmUI && (test -x ./launchtools/update-linuxmac.sh && ./launchtools/update-linuxmac.sh || (cd src && dotnet build SwarmUI.csproj -c Release -v minimal))"
 
-setup-ollama: ## Download Ollama model (usage: make setup-ollama MODEL=llama3.2:1b)
+llm-pull: ## Download Ollama model (usage: make llm-pull MODEL=llama3.2:1b)
 	@if [ -z "$(MODEL)" ]; then \
-		echo "Usage: make setup-ollama MODEL=<model_name>"; \
-		echo "Example: make setup-ollama MODEL=llama3.2:1b"; \
-		echo "Available models: llama3.2:1b, llama3.2:3b, mistral:7b, etc."; \
+		echo "Usage: make llm-pull MODEL=<model_name>"; \
+		echo "Example: make llm-pull MODEL=llama3.2:1b"; \
+		echo "Browse available models: https://ollama.com/library"; \
+		echo "Popular: llama3.2:1b, llama3.2:3b, llama3.2, mistral, gemma2:7b, phi3:mini"; \
 		exit 1; \
 	fi
 	@echo "Pulling Ollama model: $(MODEL)"
 	@docker compose exec ollama ollama pull $(MODEL) || \
 		docker compose run --rm ollama ollama pull $(MODEL)
+
+llm-list: ## List installed Ollama models and show available models link
+	@echo "=== Available models ==="
+	@echo "Browse: https://ollama.com/library"
+	@echo ""
+	@echo "Popular for prompt generation (MagicPrompt):"
+	@echo "  Light (1-3B): llama3.2:1b, llama3.2:3b, phi3:mini"
+	@echo "  Balanced (7-8B): llama3.2, mistral, gemma2:7b"
+	@echo ""
+	@echo "=== Installed models ==="
+	@docker compose exec ollama ollama list 2>/dev/null || \
+		docker compose run --rm ollama ollama list || \
+		(echo "Ollama not running. Start with: make llm" && exit 1)
+	@echo ""
+	@echo "Pull a model: make llm-pull MODEL=<name>"
 
 check-gpu: ## Run GPU diagnostic check
 	chmod +x scripts/check-gpu.sh && ./scripts/check-gpu.sh
