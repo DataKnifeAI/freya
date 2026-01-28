@@ -55,7 +55,7 @@ do_starter() {
     echo "VAE already present: $BASE/vae/sdxl_vae.safetensors"
   fi
 
-  echo "Starter models complete. Add more with: ./scripts/download-model.sh <type> <url> [filename]"
+  echo "Starter models complete. Add more with: ./scripts/linux/download-model.sh <type> <url> [filename]"
   echo "See docs/model-downloads.md for Hugging Face and Civitai (account + API key required)."
 }
 

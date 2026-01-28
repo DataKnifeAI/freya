@@ -11,8 +11,10 @@ freya/
 ├── docker-compose.yml      # Docker Compose configuration
 ├── k8s/                    # Kubernetes manifests
 │   ├── comfyui/           # ComfyUI Kubernetes resources
-│   ├── swarmui/          # SwarmUI Kubernetes resources
-│   └── ingress.yaml      # Ingress configuration
+│   ├── swarmui/           # SwarmUI Kubernetes resources
+│   ├── ollama/            # Ollama Kubernetes resources
+│   ├── ingress.yaml       # Ingress configuration
+│   └── deploy-to-prd-apps.sh  # Deploy script (prd-apps context)
 ├── comfyui/                # ComfyUI data directories
 │   ├── models/           # Model files (mounted as volume)
 │   ├── output/           # Generated images
@@ -26,8 +28,11 @@ freya/
 │   └── swarmui-models/   # SwarmUI internal model storage (persistent)
 ├── ollama/                # Ollama models (gitignored)
 ├── docs/                  # Documentation
-├── scripts/               # Utility scripts
-└── Makefile               # Build automation
+├── scripts/
+│   ├── linux/              # Bash scripts (setup, check-deps, download-model, etc.)
+│   └── windows/            # PowerShell scripts (freya.ps1, check-deps.ps1)
+├── Makefile                # Build automation (Linux/WSL2: run "make" from root)
+└── make.ps1                # Windows entry point (run ".\make.ps1" from root, same name as "make")
 ```
 
 ## Docker Compose Services

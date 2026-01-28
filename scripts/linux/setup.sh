@@ -1,7 +1,15 @@
 #!/bin/bash
-# Setup script for Freya - Creates directory structure for models
+# Setup script for Freya - Creates directory structure for models.
+# Runs dependency check first (Docker, Docker Compose, Git; optional NVIDIA).
 
 set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
+chmod +x "$SCRIPT_DIR/check-deps.sh" 2>/dev/null || true
+"$SCRIPT_DIR/check-deps.sh"
 
 echo "Setting up Freya model directories..."
 

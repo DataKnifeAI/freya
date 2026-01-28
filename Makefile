@@ -1,4 +1,4 @@
-.PHONY: help build build-comfyui build-swarmui up down sui sui-rebuild cui llm llm-pull llm-list llm-rm llm-logs swarmui-rebuild swarmui-extensions-check restart logs clean
+.PHONY: help check-deps build build-comfyui build-swarmui up down sui sui-rebuild cui llm llm-pull llm-list llm-rm llm-logs swarmui-rebuild swarmui-extensions-check restart logs clean
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -6,14 +6,17 @@ help: ## Show this help message
 	@echo 'Available targets:'
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  %-15s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
-setup: ## Run initial directory setup
-	chmod +x scripts/setup.sh && ./scripts/setup.sh
+check-deps: ## Check Docker, Docker Compose, Git; install Git on Linux if missing; warn on NVIDIA
+	chmod +x scripts/linux/check-deps.sh && ./scripts/linux/check-deps.sh
+
+setup: ## Run initial directory setup (runs check-deps first, then creates dirs)
+	chmod +x scripts/linux/setup.sh && ./scripts/linux/setup.sh
 
 quick-setup: ## Non-interactive setup: directories + ComfyUI starter models (SDXL + VAE)
-	chmod +x scripts/quick-setup.sh && ./scripts/quick-setup.sh
+	chmod +x scripts/linux/quick-setup.sh && ./scripts/linux/quick-setup.sh
 
 download-starter-models: ## Download ComfyUI starter models (SDXL base + VAE, ~7.3 GB)
-	chmod +x scripts/download-model.sh && ./scripts/download-model.sh starter
+	chmod +x scripts/linux/download-model.sh && ./scripts/linux/download-model.sh starter
 
 download-model: ## Download one ComfyUI model (make download-model TYPE=checkpoint URL=... [FILE=...])
 	@if [ -z "$(TYPE)" ] || [ -z "$(URL)" ]; then \
@@ -22,8 +25,8 @@ download-model: ## Download one ComfyUI model (make download-model TYPE=checkpoi
 		echo "See docs/model-downloads.md for Hugging Face / Civitai (account + API key required)."; \
 		exit 1; \
 	fi
-	chmod +x scripts/download-model.sh
-	./scripts/download-model.sh "$(TYPE)" "$(URL)" "$(FILE)"
+	chmod +x scripts/linux/download-model.sh
+	./scripts/linux/download-model.sh "$(TYPE)" "$(URL)" "$(FILE)"
 
 build: ## Build all Docker images
 	docker compose build
@@ -133,7 +136,7 @@ llm-rm: ## Remove an Ollama model (usage: make llm-rm MODEL=dolphin3)
 		docker compose run --rm ollama ollama rm $(MODEL)
 
 check-gpu: ## Run GPU diagnostic check
-	chmod +x scripts/check-gpu.sh && ./scripts/check-gpu.sh
+	chmod +x scripts/linux/check-gpu.sh && ./scripts/linux/check-gpu.sh
 
 check-gpu-comfyui: ## Check GPU availability in ComfyUI container
 	docker compose exec comfyui python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU count: {torch.cuda.device_count()}'); [torch.cuda.is_available()] and print(f'GPU name: {torch.cuda.get_device_name(0)}')"

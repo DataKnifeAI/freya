@@ -35,6 +35,15 @@ imagePullPolicy: Always
 
 ## Deploy to Kubernetes
 
+**Option 1: Deploy script (prd-apps context)**  
+From the repo root, run the script in `k8s/` to deploy to the prd-apps cluster (creates namespace, applies all manifests, waits for deployments):
+
+```bash
+./k8s/deploy-to-prd-apps.sh
+```
+
+**Option 2: Manual apply**
+
 ```bash
 # Create namespace
 kubectl create namespace freya

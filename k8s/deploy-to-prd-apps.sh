@@ -1,8 +1,13 @@
 #!/bin/bash
 # Deploy Freya to prd-apps cluster
-# This script deploys ComfyUI and SwarmUI to the prd-apps Kubernetes cluster
+# Run from repo root: ./k8s/deploy-to-prd-apps.sh
+# This script deploys ComfyUI, SwarmUI, and Ollama to the prd-apps Kubernetes cluster
 
 set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
 
 CONTEXT="prd-apps"
 NAMESPACE="freya"

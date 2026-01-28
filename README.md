@@ -18,12 +18,12 @@ A Kubernetes-ready platform for running ComfyUI and SwarmUI Stable Diffusion int
 
 ### Prerequisites
 
-- **Linux**: Supported distros include Ubuntu, Debian, Fedora, RHEL/CentOS, openSUSE, Arch (see [Installation Guide](docs/installation.md))
-- Docker & Docker Compose v2.0+
-- NVIDIA GPU with 8GB+ VRAM (16GB+ recommended)
-- NVIDIA Container Toolkit installed
+- **Platform**: Linux (primary) or Windows only (NVIDIA support; macOS not supported). See [Installation Guide](docs/installation.md).
+- **Linux / WSL2**: Docker Engine 20.10+ and Docker Compose v2 — [check and install](docs/installation.md#checking-and-installing-docker) per your OS.
+- **Windows**: From repo root run **PowerShell** `.\make.ps1` (same name as Linux `make`); or use WSL2 and `make`. Docker Desktop (WSL2 backend) recommended.
+- **GPU**: NVIDIA GPU with 8GB+ VRAM (16GB+ recommended); NVIDIA Container Toolkit required on Linux.
 
-See [Installation Guide](docs/installation.md) for detailed setup and per-distro NVIDIA toolkit install.
+See [Installation Guide](docs/installation.md) for dependency check/install and [Windows / PowerShell](docs/installation.md#windows) setup.
 
 ### Getting Started
 
@@ -69,6 +69,8 @@ bad quality, bad anatomy, worst quality, low quality, low resolution, extra fing
 
 ## Makefile Commands
 
+On **Linux** or **WSL2** run `make` from the repo root. On **Windows** run `.\make.ps1` from the repo root (e.g. `.\make.ps1 help`, `.\make.ps1 up`). See [Installation Guide](docs/installation.md#windows).
+
 ```bash
 make help              # Show all available commands
 make build             # Build all Docker images
@@ -104,7 +106,7 @@ See [Architecture Guide](docs/architecture.md) for complete command reference.
 
 ## Requirements
 
-- **OS**: Linux (Ubuntu, Debian, Fedora, RHEL, openSUSE, Arch — see [installation](docs/installation.md))
+- **OS**: Linux (Ubuntu, Debian, Fedora, RHEL, openSUSE, Arch) or Windows via WSL2 — see [installation](docs/installation.md)
 - **GPU**: NVIDIA GPU with CUDA 12.4+ or 13.x (images use 13.1.1)
 - **VRAM**: Minimum 8GB (16GB+ recommended for both services)
 - **RAM**: Minimum 16GB system RAM

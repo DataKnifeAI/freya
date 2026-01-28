@@ -12,8 +12,8 @@ echo ""
 # Run full setup if not done yet
 if [ ! -d "comfyui/models/checkpoints" ]; then
     echo "Running initial setup..."
-    chmod +x scripts/setup.sh
-    ./scripts/setup.sh
+    chmod +x scripts/linux/setup.sh
+    ./scripts/linux/setup.sh
 else
     echo "Directory structure already present."
 fi

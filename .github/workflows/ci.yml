@@ -125,17 +125,44 @@ jobs:
 
       - name: Make scripts executable
         run: |
-          chmod +x scripts/*.sh || true
+          chmod +x scripts/linux/*.sh k8s/*.sh 2>/dev/null || true
 
-      - name: Check script syntax
+      - name: Check bash script syntax
         run: |
-          for script in scripts/*.sh; do
+          for script in scripts/linux/*.sh k8s/*.sh; do
             if [ -f "$script" ]; then
               echo "Checking $script"
               bash -n "$script" || exit 1
             fi
           done
-          echo "✅ All scripts have valid syntax"
+          echo "✅ All bash scripts have valid syntax"
+
+      - name: Setup PowerShell
+        uses: actions/setup-powershell@v1
+        with:
+          pwsh-version: "latest"
+
+      - name: Check Windows script syntax (PowerShell)
+        run: |
+          pwsh -NoProfile -Command "
+            \$ErrorActionPreference = 'Stop'
+            Push-Location '${{ github.workspace }}'
+            \$files = @('make.ps1') + (Get-ChildItem -Path 'scripts/windows/*.ps1' -ErrorAction SilentlyContinue | ForEach-Object { \$_.FullName })
+            foreach (\$f in \$files) {
+              if (-not (Test-Path \$f)) { continue }
+              \$errs = \$null
+              [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path \$f).Path, [ref]\$null, [ref]\$errs)
+              if (\$errs) {
+                Write-Host \"Parse errors in \$f\"
+                \$errs | Format-List *
+                Pop-Location
+                exit 1
+              }
+              Write-Host \"OK \$f\"
+            }
+            Pop-Location
+            Write-Host '✅ All Windows scripts have valid syntax'
+          "
 
   security:
     name: Security Checks
@@ -147,7 +174,7 @@ jobs:
       - name: Check for secrets
         run: |
           # Basic check for common secret patterns
-          if grep -rE "(password|secret|token|api_key|apikey)\s*[=:]\s*['\"][^'\"]{10,}" --include="*.yml" --include="*.yaml" --include="*.sh" .; then
+          if grep -rE "(password|secret|token|api_key|apikey)\s*[=:]\s*['\"][^'\"]{10,}" --include="*.yml" --include="*.yaml" --include="*.sh" --include="*.ps1" .; then
             echo "⚠️  Potential secrets found, please review"
             exit 1
           fi

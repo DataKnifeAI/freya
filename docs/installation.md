@@ -1,8 +1,54 @@
 # Installation Guide
 
-## Supported Linux distributions
+This guide covers Docker-based setup for Freya (ComfyUI, SwarmUI, Ollama). For security and isolation benefits of containers, see [SwarmUI’s Docker overview](https://github.com/mcmonkeyprojects/SwarmUI/blob/master/docs/Docker.md#why-use-docker).
 
-Freya supports Docker Compose on these distributions (NVIDIA Container Toolkit available):
+## Supported platforms
+
+Freya supports **Linux** and **Windows** only (NVIDIA GPU support only; macOS is not supported).
+
+| Platform | Docker setup | GPU support |
+|----------|--------------|-------------|
+| **Linux** | Docker Engine + Docker Compose v2 | ✅ NVIDIA (via NVIDIA Container Toolkit) |
+| **Windows** | PowerShell + Docker Desktop, or WSL2 | ✅ NVIDIA (WSL2 or Docker Desktop) — see [Windows](#windows) |
+
+**Linux** is the primary supported platform (run `make` from repo root; scripts in `scripts/linux/`). **Windows** users run `.\make.ps1` from repo root (PowerShell, same name as `make`) or use WSL2 with Docker Desktop. **macOS** is not supported (no NVIDIA GPU).
+
+---
+
+## Checking and installing Docker
+
+Before installing Freya, ensure Docker and Docker Compose are available.
+
+### Check if Docker is installed
+
+```bash
+docker --version
+docker compose version
+```
+
+You need **Docker Engine 20.10+** and **Docker Compose v2** (the `docker compose` plugin, not the legacy `docker-compose` standalone). If either command is missing or too old, install or upgrade as below.
+
+### Install Docker by platform
+
+- **Linux:** Install [Docker Engine](https://docs.docker.com/engine/install/) using your distro’s package manager (apt, dnf, zypper, pacman). You do **not** need Docker Desktop; the Engine is enough.  
+  Then do the [Linux post-install steps](https://docs.docker.com/engine/install/linux-postinstall/) so you can run Docker as a normal user (add your user to the `docker` group and `newgrp docker` or log out and back in).
+- **Windows:** Install [Docker Desktop for Windows](https://docs.docker.com/desktop/setup/install/windows-install/) with the **WSL2** backend. Enable “Use the WSL 2 based engine” in Docker Desktop settings. Then use **WSL2** (e.g. Ubuntu from the Microsoft Store) to clone Freya and run `make` / `docker compose`; see [Windows](#windows) below.
+
+After installing, run the check again or use Freya’s dependency checker from the repo root:
+
+```bash
+docker --version
+docker compose version
+# Or: make check-deps   (checks Docker, Docker Compose, Git; tries to install Git on Linux; warns on NVIDIA)
+```
+
+---
+
+## Linux
+
+### Supported distributions
+
+Freya supports Docker Compose on these Linux distributions (NVIDIA Container Toolkit available):
 
 | Distribution        | Versions tested / recommended     |
 |---------------------|-----------------------------------|
@@ -13,13 +59,13 @@ Freya supports Docker Compose on these distributions (NVIDIA Container Toolkit a
 | **openSUSE**        | Leap 15.x, Tumbleweed             |
 | **Arch Linux**      | Rolling (incl. CachyOS, EndeavourOS) |
 
-Install **Docker Engine** and **Docker Compose v2** using your distro’s packages (e.g. `apt`, `dnf`, `zypper`, `pacman`) before following the steps below. See [Docker: Install Docker Engine](https://docs.docker.com/engine/install/) for per-distro instructions.
+Install **Docker Engine** and **Docker Compose v2** using your distro’s packages, then complete the [post-install steps](https://docs.docker.com/engine/install/linux-postinstall/) (add your user to the `docker` group so you can run Docker without `sudo`).
 
 ## System Requirements
 
-- **OS**: Linux (see supported distributions above)
-- **Docker**: Docker Engine 20.10+ and Docker Compose v2.0+
-- **GPU**: NVIDIA GPU with CUDA support (CUDA 12.4+ or 13.x; images use 13.1.1)
+- **OS**: Linux (primary) or Windows via WSL2 (see [Supported platforms](#supported-platforms))
+- **Docker**: Docker Engine 20.10+ and Docker Compose v2.0+ (see [Checking and installing Docker](#checking-and-installing-docker))
+- **GPU**: NVIDIA GPU with CUDA support (CUDA 12.4+ or 13.x; images use 13.1.1). Required for acceleration on Linux and Windows (WSL2).
 - **GPU Memory**: Minimum 8GB VRAM (16GB+ recommended for both services)
 - **RAM**: Minimum 16GB system RAM (32GB+ recommended)
 - **Storage**: Minimum 50GB free space for models and images
@@ -78,7 +124,7 @@ sudo nvidia-ctk runtime configure --runtime=docker
 sudo systemctl restart docker
 ```
 
-Alternatively use the helper script (Arch and Ubuntu/Debian): `sudo ./scripts/install-nvidia-toolkit.sh`
+Alternatively use the helper script (Arch and Ubuntu/Debian): `sudo ./scripts/linux/install-nvidia-toolkit.sh`
 
 ### Verify Installation
 
@@ -86,7 +132,38 @@ Alternatively use the helper script (Arch and Ubuntu/Debian): `sudo ./scripts/in
 docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi
 ```
 
+---
+
+## Windows
+
+On Windows you can run Freya in two ways: **PowerShell** (native) or **WSL2** with Docker Desktop. From the repo root, run `.\make.ps1 <target>` (same as `make <target>` on Linux).
+
+1. **Install Docker Desktop for Windows**  
+   [Install Docker Desktop on Windows](https://docs.docker.com/desktop/setup/install/windows-install/). Use the **WSL2** backend (default in recent installers). Ensure WSL2 is enabled and you have a Linux distro installed (e.g. Ubuntu from the Microsoft Store).
+
+2. **Install NVIDIA drivers on Windows** (for GPU passthrough to WSL2)  
+   Install the latest [NVIDIA driver for Windows](https://www.nvidia.com/Download/index.aspx) that supports [WSL GPU](https://developer.nvidia.com/cuda/wsl). Docker Desktop will use the GPU inside WSL2.
+
+3. **Open a WSL2 terminal** (e.g. “Ubuntu” from the Start menu) and run the same steps as Linux:
+   - Install Docker inside WSL2 per [Docker Engine on Linux](https://docs.docker.com/engine/install/) (or use Docker Desktop’s integration so the WSL2 distro uses the host Docker).
+   - If using Docker Desktop: it can expose Docker to WSL2; then install [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) inside the WSL2 distro if you want GPU in containers.
+   - Clone Freya, run `make setup`, `make build`, `make up` from the repo directory inside WSL2.
+
+4. **Access the UIs**  
+   From Windows, open a browser to http://localhost:8188 (ComfyUI) and http://localhost:7801 (SwarmUI). Docker Desktop forwards ports from WSL2 to Windows.
+
+**PowerShell (same as `make` on Linux):** From the repo root in PowerShell, run:
+
+- **Help / any target:** `.\make.ps1 <target>` — e.g. `.\make.ps1 help`, `.\make.ps1 setup`, `.\make.ps1 build`, `.\make.ps1 up`, `.\make.ps1 llm-pull -Model dolphin3`.
+- **Check dependencies only:** `.\scripts\windows\check-deps.ps1` — checks Docker, Docker Compose, and Git (or run `.\make.ps1 check-deps`).
+
+The root `make.ps1` forwards to `scripts\windows\freya.ps1`. Run from the repo root (where `docker-compose.yml` is). GPU in containers on native Windows may require Docker Desktop with WSL2 backend; for full NVIDIA support, use WSL2 as above.
+
+---
+
 ## Initial Setup
+
+The steps below work on **Linux** and on **Windows** (inside a WSL2 terminal). Run `make setup` first; it checks Docker, Docker Compose, and Git (and will try to install Git on Linux if missing), then creates directories. See [Checking and installing Docker](#checking-and-installing-docker) if you need to install dependencies.
 
 1. **Clone the repository:**
    ```bash

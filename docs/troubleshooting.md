@@ -50,8 +50,8 @@ docker run --rm --gpus all nvidia/cuda:13.1.1-base-ubuntu24.04 nvidia-smi
 ### Run diagnostic script
 
 ```bash
-chmod +x scripts/check-gpu.sh
-./scripts/check-gpu.sh
+chmod +x scripts/linux/check-gpu.sh
+./scripts/linux/check-gpu.sh
 ```
 
 ## Port Conflicts

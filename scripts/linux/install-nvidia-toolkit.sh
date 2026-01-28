@@ -1,7 +1,7 @@
 #!/bin/bash
 # Install NVIDIA Container Toolkit on supported Linux distributions.
 # Supported: Ubuntu, Debian, Fedora, RHEL, CentOS, openSUSE, Arch Linux (and derivatives).
-# Run with: sudo ./scripts/install-nvidia-toolkit.sh
+# Run with: sudo ./scripts/linux/install-nvidia-toolkit.sh
 
 set -e
 

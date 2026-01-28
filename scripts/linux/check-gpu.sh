@@ -25,7 +25,7 @@ else
     echo ""
     echo "Install NVIDIA Container Toolkit for your distribution."
     echo "  See docs/installation.md (Ubuntu, Debian, Fedora, RHEL, openSUSE, Arch)"
-    echo "  Or run: sudo ./scripts/install-nvidia-toolkit.sh (supported distros only)"
+    echo "  Or run: sudo ./scripts/linux/install-nvidia-toolkit.sh (supported distros only)"
     echo ""
     exit 1
 fi
