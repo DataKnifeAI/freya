@@ -137,32 +137,26 @@ jobs:
           done
           echo "✅ All bash scripts have valid syntax"
 
-      - name: Setup PowerShell
-        uses: actions/setup-powershell@v1
-        with:
-          pwsh-version: "latest"
-
       - name: Check Windows script syntax (PowerShell)
+        shell: pwsh
         run: |
-          pwsh -NoProfile -Command "
-            \$ErrorActionPreference = 'Stop'
-            Push-Location '${{ github.workspace }}'
-            \$files = @('make.ps1') + (Get-ChildItem -Path 'scripts/windows/*.ps1' -ErrorAction SilentlyContinue | ForEach-Object { \$_.FullName })
-            foreach (\$f in \$files) {
-              if (-not (Test-Path \$f)) { continue }
-              \$errs = \$null
-              [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path \$f).Path, [ref]\$null, [ref]\$errs)
-              if (\$errs) {
-                Write-Host \"Parse errors in \$f\"
-                \$errs | Format-List *
-                Pop-Location
-                exit 1
-              }
-              Write-Host \"OK \$f\"
+          $ErrorActionPreference = 'Stop'
+          Push-Location $env:GITHUB_WORKSPACE
+          $files = @('make.ps1') + (Get-ChildItem -Path 'scripts/windows/*.ps1' -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+          foreach ($f in $files) {
+            if (-not (Test-Path $f)) { continue }
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$null, [ref]$errs)
+            if ($errs) {
+              Write-Host "Parse errors in $f"
+              $errs | Format-List *
+              Pop-Location
+              exit 1
             }
-            Pop-Location
-            Write-Host '✅ All Windows scripts have valid syntax'
-          "
+            Write-Host "OK $f"
+          }
+          Pop-Location
+          Write-Host '✅ All Windows scripts have valid syntax'
 
   security:
     name: Security Checks
