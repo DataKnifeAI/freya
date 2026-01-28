@@ -47,6 +47,26 @@ make up
 - **SwarmUI**: http://localhost:7801
 - **Ollama API**: http://localhost:11434 (use from SwarmUI via MagicPrompt extension)
 
+### Example: SwarmUI with a sample prompt and model
+
+![Freya UI](freya-ui.png)
+
+Try this in **SwarmUI** (http://localhost:7801) after downloading the model:
+
+**Model:** [SDXL Yamer's Anime Unstable Illustrator](https://civitai.com/models/76489/sdxl-yamers-anime-unstable-illustrator?modelVersionId=377674) (Civitai — checkpoint, ~6.46 GB SafeTensors). Place the file in `swarmui/data/Models/` or use SwarmUI’s built-in downloader.
+
+**Positive prompt:**
+```
+45 megapixel, the ethereal beauty of a mystical landscape under the red moonlight, The scene should be illuminated by a large, radiant moon, casting its glow upon a twisted, yet majestic tree with blossoms that seem to sparkle in the night, The tree's roots should be deeply embedded into rocky terrain, symbolizing its ancient existence, In the background, towering mountains loom, their peaks veiled in mist, A serene lake at the foot of the mountains reflects the moon's luminescence, Incorporate elements that evoke a sense of magic and mystery
+```
+
+**Negative prompt:**
+```
+bad quality, bad anatomy, worst quality, low quality, low resolution, extra fingers, blur, blurry, ugly, wrong proportions, watermark, image artifacts, lowres, ugly, jpeg artifacts, deformed, noisy image
+```
+
+**Suggested settings (from model page):** Resolution 1024×1024 (or 576×1024, 768×1024), Steps 20–50, CFG 5–20.
+
 ## Makefile Commands
 
 ```bash
