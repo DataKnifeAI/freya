@@ -8,7 +8,7 @@ A Kubernetes-ready platform for running ComfyUI and SwarmUI Stable Diffusion int
 
 - 🎨 **ComfyUI**: Advanced node-based workflow interface for Stable Diffusion (built from source)
 - 🐝 **SwarmUI**: Modular AI image and video generation web interface (built from source)
-- 💬 **Open WebUI + Ollama**: Stable Diffusion prompt generator agent (chat UI backed by local LLMs)
+- 💬 **Ollama**: Local LLM API; use inside SwarmUI via the [MagicPrompt extension](https://github.com/HartsyAI/SwarmUI-MagicPromptExtension) for prompt generation and enhancement
 - 🐳 **Docker Support**: Custom-built containers with GPU support for local development
 - ☸️ **Kubernetes Ready**: Designed to run in Kubernetes clusters
 - 🚀 **GPU Accelerated**: Full CUDA support for discrete GPUs
@@ -45,7 +45,7 @@ make up
 
 - **ComfyUI**: http://localhost:8188
 - **SwarmUI**: http://localhost:7801
-- **Open WebUI** (SD prompt generator): http://localhost:8080
+- **Ollama API**: http://localhost:11434 (use from SwarmUI via MagicPrompt extension)
 
 ## Makefile Commands
 
@@ -54,13 +54,17 @@ make help              # Show all available commands
 make build             # Build all Docker images
 make up                # Start all services
 make down              # Stop all services
+make sui               # SwarmUI + Ollama only (stops others first)
+make cui               # ComfyUI only (stops others first)
+make llm               # Ollama only (stops others first)
+make swarmui-rebuild   # Recompile SwarmUI/extensions; then make down && make sui
 make logs              # View logs from all services
 make restart           # Restart services
 make status            # Show service status and URLs
 make check-gpu-comfyui # Verify GPU access in ComfyUI
 make check-gpu-swarmui # Verify GPU access in SwarmUI
-make setup-ollama MODEL=llama3.2:1b  # Pull an Ollama model for Open WebUI
-make logs-open-webui   # View Open WebUI logs
+make setup-ollama MODEL=llama3.2:1b  # Pull an Ollama model (for SwarmUI MagicPrompt)
+make logs-ollama       # View Ollama logs
 ```
 
 See [Architecture Guide](docs/architecture.md) for complete command reference.
@@ -73,7 +77,7 @@ See [Architecture Guide](docs/architecture.md) for complete command reference.
 - [Model Management](docs/MODELS.md) - Download and manage models
 - [SwarmUI Video Guide](docs/swarmui-video-guide.md) - Beginner’s guide to T2V/I2V with SwarmUI (links to [HF guide](https://huggingface.co/blog/MonsterMMORPG/beginners-guide-generate-videos-with-swarmui))
 - [Architecture](docs/architecture.md) - Project structure and services
-- [Open WebUI prompt agent](docs/open-webui-prompt-agent.md) - Use Open WebUI + Ollama as SD prompt generator
+- [SwarmUI MagicPrompt](docs/swarmui-magicprompt.md) - Use Ollama inside SwarmUI for prompt generation (MagicPrompt extension)
 - [Troubleshooting](docs/troubleshooting.md) - Common issues and solutions
 
 ## Requirements

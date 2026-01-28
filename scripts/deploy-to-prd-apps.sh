@@ -1,6 +1,6 @@
 #!/bin/bash
 # Deploy Freya to prd-apps cluster
-# This script deploys ComfyUI, SwarmUI, Ollama, and Open WebUI to the prd-apps Kubernetes cluster
+# This script deploys ComfyUI and SwarmUI to the prd-apps Kubernetes cluster
 
 set -e
 
@@ -30,14 +30,6 @@ kubectl apply -f k8s/comfyui/deployment.yaml
 echo "🐝 Deploying SwarmUI..."
 kubectl apply -f k8s/swarmui/deployment.yaml
 
-# Deploy Ollama (required for Open WebUI)
-echo "🦙 Deploying Ollama..."
-kubectl apply -f k8s/ollama/deployment.yaml
-
-# Deploy Open WebUI (depends on Ollama)
-echo "💬 Deploying Open WebUI..."
-kubectl apply -f k8s/open-webui/deployment.yaml
-
 # Deploy Ingress (optional)
 echo "🌐 Deploying Ingress..."
 kubectl apply -f k8s/ingress.yaml
@@ -46,8 +38,6 @@ kubectl apply -f k8s/ingress.yaml
 echo "⏳ Waiting for deployments to be ready..."
 kubectl wait --for=condition=available --timeout=300s deployment/comfyui -n "$NAMESPACE" || echo "⚠️  ComfyUI deployment not ready yet"
 kubectl wait --for=condition=available --timeout=300s deployment/swarmui -n "$NAMESPACE" || echo "⚠️  SwarmUI deployment not ready yet"
-kubectl wait --for=condition=available --timeout=300s deployment/ollama -n "$NAMESPACE" || echo "⚠️  Ollama deployment not ready yet"
-kubectl wait --for=condition=available --timeout=300s deployment/open-webui -n "$NAMESPACE" || echo "⚠️  Open WebUI deployment not ready yet"
 
 # Show status
 echo ""
@@ -65,10 +55,7 @@ echo ""
 echo "To access services:"
 echo "  ComfyUI:    kubectl port-forward -n $NAMESPACE svc/comfyui 8188:8188"
 echo "  SwarmUI:    kubectl port-forward -n $NAMESPACE svc/swarmui 7801:7801"
-echo "  Ollama:     kubectl port-forward -n $NAMESPACE svc/ollama 11434:11434"
-echo "  Open WebUI: kubectl port-forward -n $NAMESPACE svc/open-webui 8080:8080"
 echo ""
 echo "Or via Ingress:"
 echo "  ComfyUI:    http://comfyui.dataknife.net"
 echo "  SwarmUI:    http://swarmui.dataknife.net"
-echo "  Open WebUI: http://openwebui.dataknife.net"

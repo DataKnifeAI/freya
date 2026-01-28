@@ -13,3 +13,18 @@ It walks through:
 5. **Going further** — Other model classes, high-res/longer gens, performance tweaks, and batch I2V via Image Edit Batcher.
 
 For supported model classes, paths, and options, use SwarmUI’s [Video Model Support](https://github.com/mcmonkeyprojects/SwarmUI/blob/master/docs/Video%20Model%20Support.md) doc. In Freya, SwarmUI model roots live under `swarmui/data/Models/` (see [MODELS.md](MODELS.md)).
+
+## Recommended settings (Wan 2.1 14B fp8, RTX 4090)
+
+From the [Hugging Face beginner’s guide](https://huggingface.co/blog/MonsterMMORPG/beginners-guide-generate-videos-with-swarmui); use **Quick Tools → Reset Params to Default** first, then adjust.
+
+| Setting | T2V (text-to-video) | I2V (image-to-video) |
+|--------|----------------------|------------------------|
+| **CFG** | **6** | **6** (Wan default; leave Video CFG unchecked to use class default) |
+| **Frames** | **49** (faster); default Wan = 81 for longer clips. Use a value your model supports (see Video Model Support doc). | **33** for quick gens; increase for longer clips. |
+| **Steps** | Leave at model default after reset. | Leave at model default. |
+| **Resolution** | **640×640** for speed; **960×960** for quality (Wan 14B default). | **512×512** or **640×640** for speed; set Video Resolution to “Image” to match init image. |
+| **Format** | **webp** (best compatibility); **gif-hd** for GitHub/embedding. | **webp**; **gif-hd** for sharing. |
+
+- Lower resolution and fewer frames = faster and less VRAM; higher = better quality, slower, more VRAM.
+- For I2V with Init Image: set **Init Image Creativity** to **0** and prompt only the motion.

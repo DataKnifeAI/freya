@@ -25,7 +25,6 @@ freya/
 │   ├── dlbackend/        # ComfyUI backend installation (persistent)
 │   └── swarmui-models/   # SwarmUI internal model storage (persistent)
 ├── ollama/                # Ollama models (gitignored)
-├── openwebui/             # Open WebUI data (gitignored)
 ├── docs/                  # Documentation
 ├── scripts/               # Utility scripts
 └── Makefile               # Build automation
@@ -54,21 +53,15 @@ freya/
   - `./swarmui/output` → Generated images (Output path)
   - `./swarmui/dlbackend` → ComfyUI backend installation (persistent)
   - `./swarmui/swarmui-models` → SwarmUI internal model storage (persistent)
+  - `./swarmui/extensions` → SwarmUI Extensions source (e.g. MagicPrompt)
+  - `./swarmui/bin` → SwarmUI build output (persisted so recompiled app with extensions is used after restart)
 
 ### Ollama
 
 - **Image**: `ollama/ollama:latest`
 - **Port**: 11434 (API)
 - **Volumes**: `./ollama/models` → `~/.ollama` (model storage)
-- **Role**: Local LLM runtime used by Open WebUI for the SD prompt generator agent.
-
-### Open WebUI
-
-- **Image**: `ghcr.io/open-webui/open-webui:main`
-- **Port**: 8080
-- **Volumes**: `./openwebui/data` → backend data (users, assistants, chats)
-- **Environment**: `OLLAMA_BASE_URL=http://localhost:11434`
-- **Role**: Chat UI and assistant framework; use with an Ollama model and a system prompt to act as a Stable Diffusion prompt generator. See [Open WebUI prompt agent](open-webui-prompt-agent.md).
+- **Role**: Local LLM API; use inside SwarmUI via the [MagicPrompt extension](https://github.com/HartsyAI/SwarmUI-MagicPromptExtension) for prompt enhancement, captions, and LLM-backed generation. See [SwarmUI MagicPrompt](swarmui-magicprompt.md).
 
 ## Building Images
 

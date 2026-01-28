@@ -19,6 +19,8 @@ swarmui/data/
 swarmui/output/
 swarmui/dlbackend/
 swarmui/swarmui-models/
+swarmui/extensions/
+swarmui/bin/
 ollama/
 openwebui/
 *.ckpt

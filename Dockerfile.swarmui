@@ -31,7 +31,12 @@ RUN git clone https://github.com/mcmonkeyprojects/SwarmUI.git /app/SwarmUI && \
     /usr/share/dotnet/dotnet restore /app/SwarmUI/src/SwarmUI.csproj && \
     /usr/share/dotnet/dotnet build /app/SwarmUI/src/SwarmUI.csproj -c Release --no-restore && \
     mkdir -p /app/SwarmUI/Data/Models /app/SwarmUI/Data/Outputs /app/SwarmUI/Data/Inputs && \
-    printf '%s\n' '#!/bin/bash' 'cd /app/SwarmUI' 'exec dotnet src/bin/Release/net8.0/SwarmUI.dll --urls http://0.0.0.0:7801 "$@"' > /app/run-swarmui.sh && \
+    cp -a /app/SwarmUI/src/bin /app/SwarmUI/src/bin.initial && \
+    printf '%s\n' '#!/bin/bash' \
+    'set -e' \
+    'cd /app/SwarmUI' \
+    'if [ ! -f src/bin/Release/net8.0/SwarmUI.dll ]; then cp -a src/bin.initial/. src/bin/; fi' \
+    'exec dotnet src/bin/Release/net8.0/SwarmUI.dll --urls http://0.0.0.0:7801 --launch_mode none "$@"' > /app/run-swarmui.sh && \
     chmod +x /app/run-swarmui.sh
 
 WORKDIR /app/SwarmUI

@@ -34,6 +34,8 @@ services:
       - ./swarmui/output:/app/SwarmUI/Output
       - ./swarmui/dlbackend:/app/SwarmUI/dlbackend
       - ./swarmui/swarmui-models:/app/SwarmUI/Models
+      - ./swarmui/extensions:/app/SwarmUI/src/Extensions
+      - ./swarmui/bin:/app/SwarmUI/src/bin
     env_file:
       - .env
     deploy:
@@ -64,18 +66,4 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
-    restart: unless-stopped
-
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: freya-open-webui
-    network_mode: host
-    volumes:
-      - ./openwebui/data:/app/backend/data
-    environment:
-      - OLLAMA_BASE_URL=http://localhost:11434
-      - WEBUI_AUTH=true
-      - ENABLE_SIGNUP=true
-    depends_on:
-      - ollama
     restart: unless-stopped

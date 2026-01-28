@@ -1,4 +1,4 @@
-.PHONY: help build build-comfyui build-swarmui up down restart logs clean
+.PHONY: help build build-comfyui build-swarmui up down sui sui-rebuild cui llm swarmui-rebuild swarmui-extensions-check restart logs clean
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -37,8 +37,21 @@ build-swarmui: ## Build SwarmUI image only
 build-no-cache: ## Build all images without cache
 	docker compose build --no-cache
 
-up: ## Start all services (ComfyUI and SwarmUI)
+up: ## Start all services
 	docker compose up -d
+
+sui: ## SwarmUI + Ollama (stops other compose services first)
+	docker compose down && docker compose up -d swarmui ollama
+
+sui-rebuild: ## Start SwarmUI + Ollama, then recompile extensions (slower; use after adding/changing extensions)
+	docker compose down && docker compose up -d swarmui ollama && \
+	sleep 5 && $(MAKE) swarmui-rebuild
+
+cui: ## ComfyUI only (stops other compose services first)
+	docker compose down && docker compose up -d comfyui
+
+llm: ## Ollama only (for SwarmUI MagicPrompt / LLM API; stops other compose services first)
+	docker compose down && docker compose up -d ollama
 
 down: ## Stop all services
 	docker compose down
@@ -58,9 +71,6 @@ logs-swarmui: ## Show logs from SwarmUI service
 logs-ollama: ## Show logs from Ollama service
 	docker compose logs -f ollama
 
-logs-open-webui: ## Show logs from Open WebUI service
-	docker compose logs -f open-webui
-
 clean: ## Remove containers, volumes, and images
 	docker compose down -v
 
@@ -73,8 +83,16 @@ shell-comfyui: ## Open shell in ComfyUI container
 shell-swarmui: ## Open shell in SwarmUI container
 	docker compose exec swarmui /bin/bash
 
-shell-open-webui: ## Open shell in Open WebUI container
-	docker compose exec open-webui /bin/bash
+swarmui-rebuild: ## Recompile SwarmUI (use SwarmUI update script if present, else dotnet build); then restart: make down && make sui
+	docker compose exec swarmui bash -c "cd /app/SwarmUI && (test -x ./launchtools/update-linuxmac.sh && ./launchtools/update-linuxmac.sh || (cd src && dotnet build SwarmUI.csproj -c Release))"
+
+swarmui-extensions-check: ## List extension dir and run build (use if extension still not seen after rebuild)
+	@echo "=== Extension dir (host: swarmui/extensions) ==="
+	@docker compose exec swarmui ls -la /app/SwarmUI/src/Extensions/ 2>/dev/null || true
+	@echo "=== Extension subdirs (.cs) ==="
+	@docker compose exec swarmui find /app/SwarmUI/src/Extensions -maxdepth 2 -type f -name "*.cs" 2>/dev/null || true
+	@echo "=== Rebuild (update script or dotnet build; watch for errors) ==="
+	docker compose exec swarmui bash -c "cd /app/SwarmUI && (test -x ./launchtools/update-linuxmac.sh && ./launchtools/update-linuxmac.sh || (cd src && dotnet build SwarmUI.csproj -c Release -v minimal))"
 
 setup-ollama: ## Download Ollama model (usage: make setup-ollama MODEL=llama3.2:1b)
 	@if [ -z "$(MODEL)" ]; then \
@@ -103,5 +121,4 @@ status: ## Show service status and URLs
 	@echo "\n=== Access URLs ==="
 	@echo "ComfyUI:         http://localhost:8188"
 	@echo "SwarmUI:         http://localhost:7801"
-	@echo "Open WebUI:      http://localhost:8080"
 	@echo "Ollama API:      http://localhost:11434"
