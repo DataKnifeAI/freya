@@ -102,7 +102,8 @@ See [Architecture Guide](docs/architecture.md) for complete command reference.
 - [SwarmUI Video Guide](docs/swarmui-video-guide.md) - Beginner’s guide to T2V/I2V with SwarmUI (links to [HF guide](https://huggingface.co/blog/MonsterMMORPG/beginners-guide-generate-videos-with-swarmui))
 - [Architecture](docs/architecture.md) - Project structure and services
 - [SwarmUI MagicPrompt](docs/swarmui-magicprompt.md) - Use Ollama inside SwarmUI for prompt generation (MagicPrompt extension)
-- [MagicPrompt Custom Instructions](docs/magicprompt-custom-instructions.md) - Customize system prompts for chat, vision, caption, and enhance
+- [MagicPrompt Default Prompts](docs/magicprompt-default-prompts.md) - Optimized Freya system prompts for Ollama/dolphin3
+- [MagicPrompt Custom Instructions](docs/magicprompt-custom-instructions.md) - Create custom instructions for specific styles and workflows
 - [Troubleshooting](docs/troubleshooting.md) - Common issues and solutions
 
 ## Requirements
