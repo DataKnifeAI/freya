@@ -22,6 +22,8 @@ Extensions live in `swarmui/extensions/` (source); the recompiled app lives in `
 
 You can then enhance prompts, generate captions from images, use `<mpprompt:…>` tags in prompts for batch LLM processing, and more. See the [MagicPrompt README](https://github.com/HartsyAI/SwarmUI-MagicPromptExtension) for full features and configuration (OpenRouter, OpenAI, Anthropic, etc.).
 
+To customize how the AI behaves (chat, vision, captions, prompt enhancement), see [Customizing MagicPrompt System Instructions](magicprompt-custom-instructions.md).
+
 ## Manual install
 
 If you prefer to clone the extension yourself (e.g. the UI install isn’t working):
