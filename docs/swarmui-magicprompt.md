@@ -97,5 +97,18 @@ Examples:
 - `make llm-rm MODEL=dolphin3`
 - `make llm-rm MODEL=mistral`
 
+**Import a GGUF model from Hugging Face into Ollama:**  
+Ollama can pull GGUF models directly from Hugging Face (no Modelfile needed). After import, select the model in MagicPrompt (Chat Model / Vision Model). The model name in Ollama will be `hf.co/<user>/<repo>` or `hf.co/<user>/<repo>:<quant>`.
+```bash
+make llm-import-hf REPO=<user/repo> [QUANT=<quantization>]
+```
+Examples:
+- `make llm-import-hf REPO=bartowski/Llama-3.2-1B-Instruct-GGUF`
+- `make llm-import-hf REPO=bartowski/Llama-3.2-3B-Instruct-GGUF QUANT=IQ3_M`
+
+Browse GGUF models: [Hugging Face – GGUF](https://huggingface.co/models?library=gguf). Enable Ollama under [HF Local Apps](https://huggingface.co/settings/local-apps) for the best experience.
+
+**Limitation:** Only GGUF models can be imported this way. Transformers/Safetensors models (e.g. [dphn/dolphin-vision-7b](https://huggingface.co/dphn/dolphin-vision-7b)) are not GGUF and cannot be imported unless a community GGUF version is published. Otherwise use Ollama library models (`make llm-pull`) or run them with Python/transformers.
+
 **Use different models in MagicPrompt:**  
 After pulling multiple models, select which one to use in MagicPrompt **Settings** → **Chat Model** or **Vision Model** dropdown. You can switch models per batch or per feature without restarting SwarmUI. Models are available immediately after pulling—no restart needed.

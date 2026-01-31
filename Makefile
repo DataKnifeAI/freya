@@ -1,4 +1,4 @@
-.PHONY: help check-deps build build-comfyui build-swarmui up down sui sui-rebuild cui llm llm-pull llm-list llm-rm llm-logs swarmui-rebuild swarmui-extensions-check restart logs clean
+.PHONY: help check-deps build build-comfyui build-swarmui up down sui sui-rebuild cui llm llm-pull llm-import-hf llm-list llm-rm llm-logs swarmui-rebuild swarmui-extensions-check restart logs clean
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -109,6 +109,24 @@ llm-pull: ## Download Ollama model (usage: make llm-pull MODEL=dolphin3)
 	@docker compose exec ollama ollama pull $(MODEL) || \
 		docker compose run --rm ollama ollama pull $(MODEL)
 
+llm-import-hf: ## Import GGUF model from Hugging Face into Ollama (usage: make llm-import-hf REPO=user/repo [QUANT=Q4_K_M])
+	@if [ -z "$(REPO)" ]; then \
+		echo "Usage: make llm-import-hf REPO=<user/repo> [QUANT=<quantization>]"; \
+		echo "Example: make llm-import-hf REPO=bartowski/Llama-3.2-1B-Instruct-GGUF"; \
+		echo "Example: make llm-import-hf REPO=bartowski/Llama-3.2-3B-Instruct-GGUF QUANT=IQ3_M"; \
+		echo "Browse GGUF models: https://huggingface.co/models?library=gguf"; \
+		echo "Ollama uses hf.co/REPO; default quant is Q4_K_M when present."; \
+		echo ""; \
+		echo "Note: Only GGUF repos work. Transformers/Safetensors models (e.g. dphn/dolphin-vision-72b)"; \
+		echo "cannot be imported unless a GGUF version exists on Hugging Face."; \
+		exit 1; \
+	fi
+	@HF_MODEL="hf.co/$(REPO)"; \
+	if [ -n "$(QUANT)" ]; then HF_MODEL="$$HF_MODEL:$(QUANT)"; fi; \
+	echo "Importing from Hugging Face: $$HF_MODEL"; \
+	docker compose exec ollama ollama pull "$$HF_MODEL" || \
+		docker compose run --rm ollama ollama pull "$$HF_MODEL"
+
 llm-list: ## List installed Ollama models and show available models link
 	@echo "=== Available models ==="
 	@echo "Browse: https://ollama.com/library"
@@ -122,6 +140,7 @@ llm-list: ## List installed Ollama models and show available models link
 		(echo "Ollama not running. Start with: make llm" && exit 1)
 	@echo ""
 	@echo "Pull a model: make llm-pull MODEL=<name>"
+	@echo "Import from Hugging Face (GGUF): make llm-import-hf REPO=user/repo [QUANT=...]"
 	@echo "Remove a model: make llm-rm MODEL=<name>"
 
 llm-rm: ## Remove an Ollama model (usage: make llm-rm MODEL=dolphin3)
