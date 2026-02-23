@@ -36,7 +36,7 @@ mkdir -p swarmui/data/Models/Stable-Diffusion
 mkdir -p swarmui/data/Inputs
 mkdir -p swarmui/output
 mkdir -p swarmui/dlbackend
-mkdir -p swarmui/swarmui-models
+mkdir -p swarmui/models
 mkdir -p swarmui/extensions
 mkdir -p swarmui/bin
 

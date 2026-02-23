@@ -179,34 +179,11 @@ Then re-apply and restart: `kubectl apply -f k8s/swarmui/deployment.yaml && kube
 
 ### SwarmUI: Extensions not persisting or UI not detecting them after reboot
 
-**Symptom:** Extensions (e.g. MagicPrompt) disappear after container or host reboot, or the extension files are in `swarmui/extensions/` but the UI doesn’t show the extension.
+**Symptom:** Extensions (e.g. MagicPrompt) disappear after container or host reboot, or the extension files are in `swarmui/extensions/` but the UI doesn't show the extension.
 
-**Cause:** SwarmUI compiles extensions into the app and writes the new build to `src/bin/`. If that directory isn’t persisted, after restart the container uses the original image DLL (without your extension). The extension **source** in `swarmui/extensions/` is persisted, but the **compiled** app that loads it was only in the container and is lost.
+**Recommended: Use the UI for extensions.** Install entirely via **Server → Extensions → Install** in SwarmUI. SwarmUI downloads, compiles at startup, and persists the build to `swarmui/bin/`. No manual rebuild commands needed.
 
-**Fix:** Freya persists the build output with a `swarmui/bin` volume. You must **rebuild the SwarmUI image** and run **`make setup`** so `swarmui/bin` exists, then restart:
+**Fix:** Run **`make setup`** (creates `swarmui/extensions` and `swarmui/bin`), then **`make sui`**. In SwarmUI use **Server → Extensions → Install**. SwarmUI builds extensions at startup; no `make swarmui-rebuild` needed.
 
-```bash
-make setup          # creates swarmui/extensions and swarmui/bin
-make build-swarmui  # image with --launch_mode none and bin.initial copy
-make down && make sui
-```
+**Extension still not showing?** SwarmUI builds extensions when it starts. If the build fails (e.g. "Could not locate assembly SwarmUI"), the extension project expects `SwarmUI.dll` at `src/bin/live_release/`. The Freya image provides a symlink fallback. Rebuild: **`make build-swarmui`** then **`make down && make sui`**. Run **`make swarmui-extensions-check`** to see build errors.
 
-Then in SwarmUI install the extension again (Server → Extensions → Install). After SwarmUI restarts and recompiles, the new build is written to `swarmui/bin/` and will still be there after the next container reboot. The first time you start with the new setup, the run script copies the initial build from the image into `swarmui/bin` if it’s empty; after you install an extension, SwarmUI overwrites it with a build that includes the extension.
-
-**How do I recompile?**  
-- **Via UI:** Use **Server → Extensions → Install** for the extension. SwarmUI will download it into `swarmui/extensions/` and should run a build and restart; the new build is written to `swarmui/bin/` (persisted).  
-- **Manual (you added or changed files in `swarmui/extensions/`):** Recompile and restart. Either:
-  ```bash
-  make swarmui-rebuild && make down && make sui
-  ```
-  or start and recompile in one go (slower):
-  ```bash
-  make sui-rebuild
-  ```
-  The container sees changes in `swarmui/extensions/` immediately (same volume), but SwarmUI only loads extension code that’s compiled into the DLL in `swarmui/bin/`, so you must recompile and restart to “see” new or changed extensions.
-
-**Extension still not seen after rebuild:** The [MagicPrompt Installation](https://github.com/HartsyAI/SwarmUI-MagicPromptExtension?tab=readme-ov-file#installation) doc says that after a **manual** install you must run SwarmUI’s **`update-linuxmac.sh`** (or `update-windows.bat`) to recompile. In Freya, **`make swarmui-rebuild`** runs that script if it exists in the container, otherwise runs `dotnet build`. Then restart: **`make down && make sui`**. For automatic install, use **Server → Extensions → Install** and let SwarmUI download and recompile.  
-Run **`make swarmui-extensions-check`** (with SwarmUI container running) to list `src/Extensions/` and run the build with output so you can see:
-- Whether the extension folder is present (e.g. `Extensions/SwarmUI-MagicPromptExtension/`) and contains `MagicPromptExtension.cs` (the filename must match the class name).
-- Whether the build fails (e.g. missing package references for the extension). If the build fails, the old DLL is still in use and the extension won’t load.
-- Required layout: `swarmui/extensions/<FolderName>/<ClassName>.cs` (e.g. `swarmui/extensions/SwarmUI-MagicPromptExtension/MagicPromptExtension.cs`). If you cloned the repo, the folder name is usually the repo name.

@@ -25,7 +25,7 @@ freya/
 │   │   └── Inputs/       # Input images
 │   ├── output/           # Generated images (Output path)
 │   ├── dlbackend/        # ComfyUI backend installation (persistent)
-│   └── swarmui-models/   # SwarmUI internal model storage (persistent)
+│   └── models/   # SwarmUI internal model storage (persistent)
 ├── ollama/                # Ollama models (gitignored)
 ├── docs/                  # Documentation
 ├── scripts/
@@ -57,7 +57,7 @@ freya/
   - `./swarmui/data` → Data (Models, Inputs, settings, databases)
   - `./swarmui/output` → Generated images (Output path)
   - `./swarmui/dlbackend` → ComfyUI backend installation (persistent)
-  - `./swarmui/swarmui-models` → SwarmUI internal model storage (persistent)
+  - `./swarmui/models` → SwarmUI internal model storage (persistent)
   - `./swarmui/extensions` → SwarmUI Extensions source (e.g. MagicPrompt)
   - `./swarmui/bin` → SwarmUI build output (persisted so recompiled app with extensions is used after restart)
 

@@ -79,7 +79,7 @@ make down              # Stop all services
 make sui               # SwarmUI + Ollama only (stops others first)
 make cui               # ComfyUI only (stops others first)
 make llm               # Ollama only (stops others first)
-make swarmui-rebuild   # Recompile SwarmUI/extensions; then make down && make sui
+make swarmui-rebuild   # [Debug] Recompile extensions manually; normally use Server → Extensions → Install in UI
 make logs              # View logs from all services
 make restart           # Restart services
 make status            # Show service status and URLs

@@ -2,13 +2,13 @@
 
 You can use **Ollama** (local LLMs) directly inside SwarmUI for prompt generation, enhancement, captions, and vision—no separate chat UI needed.
 
-Installation options follow the [MagicPrompt Installation](https://github.com/HartsyAI/SwarmUI-MagicPromptExtension?tab=readme-ov-file#installation) guide: **automatic** (recommended) or **manual**.
+**Extensions are best handled entirely via the SwarmUI UI.** Use **Server → Extensions → Install**; SwarmUI downloads, compiles, and restarts. No manual rebuild commands needed.
 
-Extensions live in `swarmui/extensions/` (source); the recompiled app lives in `swarmui/bin/` (persisted). Run `make setup` before first use so both directories exist.
+Extensions live in `swarmui/extensions/` (source); the compiled app lives in `swarmui/bin/` (persisted). Run `make setup` before first use so both directories exist.
 
-## Automatic install (recommended)
+## Install via UI (recommended)
 
-1. **Start SwarmUI and Ollama** (e.g. `make up` or `make sui`; or `make llm` for Ollama only).
+1. **Start SwarmUI and Ollama** (e.g. `make sui`).
 2. **Pull an Ollama model** (if needed). Default for most control and compatibility: **[dolphin3](https://ollama.com/library/dolphin3)** (Dolphin 3.0 Llama 3.1 8B, ~4.9GB, 128K context):
    ```bash
    make llm-pull MODEL=dolphin3
@@ -24,21 +24,20 @@ You can then enhance prompts, generate captions from images, use `<mpprompt:…>
 
 To customize how the AI behaves: [MagicPrompt Default Prompts](magicprompt-default-prompts.md) (optimized Freya examples) and [MagicPrompt Custom Instructions](magicprompt-custom-instructions.md) (create your own).
 
-## Manual install
+## Manual install (fallback)
 
-If you prefer to clone the extension yourself (e.g. the UI install isn’t working):
+If the UI install fails and you prefer to clone the extension yourself:
 
 1. **Clone into the Extensions volume** (so SwarmUI sees it as `src/Extensions/<repo-name>`):
    ```bash
    make setup    # ensure swarmui/extensions exists
    git clone https://github.com/HartsyAI/SwarmUI-MagicPromptExtension.git swarmui/extensions/SwarmUI-MagicPromptExtension
    ```
-2. **Recompile SwarmUI.** In Freya: **`make swarmui-rebuild`** (runs SwarmUI’s update script if present, otherwise `dotnet build`).
-3. **Restart** so the new build is used: **`make down && make sui`**.
+2. **Restart SwarmUI** so it builds extensions at startup: **`make down && make sui`**.
 
-Working sequence after adding or changing an extension: **`make swarmui-rebuild`** then **`make down && make sui`**.
+SwarmUI builds extensions when it starts; no separate rebuild needed. If the extension still doesn't appear, run **`make swarmui-extensions-check`** to see build errors. See [Troubleshooting](troubleshooting.md#swarmui-extensions-not-persisting-or-ui-not-detecting-them-after-reboot).
 
-Then configure MagicPrompt as in the automatic install section (Settings → Base URL, model, etc.).
+Then configure MagicPrompt as in the Install via UI section (Settings → Base URL, model, etc.).
 
 ## Ollama URL when running in Docker
 

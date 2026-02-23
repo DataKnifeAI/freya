@@ -103,7 +103,7 @@ Models are stored in **PersistentVolumeClaims (PVCs)** that persist across pod r
 
 **SwarmUI:**
 - `swarmui-data` (130Gi) → `/app/SwarmUI/Data` - Main data directory (includes `Models/` subdirectory)
-- `swarmui-swarmui-models` (50Gi) → `/app/SwarmUI/Models` - SwarmUI internal model storage
+- `swarmui-models` (50Gi) → `/app/SwarmUI/Models` - SwarmUI internal model storage
 - `swarmui-output` (50Gi) → `/app/SwarmUI/Output` - Generated images
 - `swarmui-dlbackend` (50Gi) → `/app/SwarmUI/dlbackend` - Download backend cache
 - `swarmui-extensions` (10Gi) → `/app/SwarmUI/src/Extensions` - Extension source code (e.g. MagicPrompt)

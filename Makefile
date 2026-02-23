@@ -49,9 +49,9 @@ up: ## Start all services
 sui: ## SwarmUI + Ollama (stops other compose services first)
 	docker compose down && docker compose up -d swarmui ollama
 
-sui-rebuild: ## Start SwarmUI + Ollama, then recompile extensions (slower; use after adding/changing extensions)
-	docker compose down && docker compose up -d swarmui ollama && \
-	sleep 5 && $(MAKE) swarmui-rebuild
+sui-rebuild: ## Restart SwarmUI + Ollama (SwarmUI builds extensions at startup; use after adding extension via UI)
+	@docker ps >/dev/null 2>&1 || (echo "Error: Docker not accessible. Run: make fix-docker-group, then newgrp docker" && exit 1)
+	docker compose down && docker compose up -d swarmui ollama
 
 cui: ## ComfyUI only (stops other compose services first)
 	docker compose down && docker compose up -d comfyui
@@ -89,16 +89,20 @@ shell-comfyui: ## Open shell in ComfyUI container
 shell-swarmui: ## Open shell in SwarmUI container
 	docker compose exec swarmui /bin/bash
 
-swarmui-rebuild: ## Recompile SwarmUI (use SwarmUI update script if present, else dotnet build); then restart: make down && make sui
-	docker compose exec swarmui bash -c "cd /app/SwarmUI && (test -x ./launchtools/update-linuxmac.sh && ./launchtools/update-linuxmac.sh || (cd src && dotnet build SwarmUI.csproj -c Release))"
+swarmui-rebuild: ## [Debug] Force rebuild inside container; normally not needed (SwarmUI builds at startup). Then: make down && make sui
+	@docker ps >/dev/null 2>&1 || (echo "Error: Docker not accessible. Run: make fix-docker-group, then newgrp docker" && exit 1)
+	@docker compose ps swarmui 2>/dev/null | grep -q Up || (echo "Error: SwarmUI not running. Start with: make sui" && exit 1)
+	docker compose exec swarmui bash -c "cd /app/SwarmUI/src && dotnet build SwarmUI.csproj -c Release -o ../bin/live_release"
 
-swarmui-extensions-check: ## List extension dir and run build (use if extension still not seen after rebuild)
+swarmui-extensions-check: ## [Debug] List extensions dir and run build; use if extension not showing after restart
+	@docker ps >/dev/null 2>&1 || (echo "Error: Docker not accessible. Run: make fix-docker-group, then newgrp docker" && exit 1)
+	@docker compose ps swarmui 2>/dev/null | grep -q Up || (echo "Error: SwarmUI not running. Start with: make sui" && exit 1)
 	@echo "=== Extension dir (host: swarmui/extensions) ==="
 	@docker compose exec swarmui ls -la /app/SwarmUI/src/Extensions/ 2>/dev/null || true
 	@echo "=== Extension subdirs (.cs) ==="
 	@docker compose exec swarmui find /app/SwarmUI/src/Extensions -maxdepth 2 -type f -name "*.cs" 2>/dev/null || true
-	@echo "=== Rebuild (update script or dotnet build; watch for errors) ==="
-	docker compose exec swarmui bash -c "cd /app/SwarmUI && (test -x ./launchtools/update-linuxmac.sh && ./launchtools/update-linuxmac.sh || (cd src && dotnet build SwarmUI.csproj -c Release -v minimal))"
+	@echo "=== Manual build (SwarmUI usually builds at startup) ==="
+	docker compose exec swarmui bash -c "cd /app/SwarmUI/src && dotnet build SwarmUI.csproj -c Release -o ../bin/live_release -v minimal"
 
 llm-pull: ## Download Ollama model (usage: make llm-pull MODEL=dolphin3)
 	@if [ -z "$(MODEL)" ]; then \

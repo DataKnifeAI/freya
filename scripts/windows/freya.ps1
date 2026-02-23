@@ -82,7 +82,7 @@ switch ($Target.ToLower()) {
             "comfyui\models\clip", "comfyui\models\clip_vision", "comfyui\models\style_models", "comfyui\models\unet",
             "comfyui\output", "comfyui\input",
             "swarmui\data\Models", "swarmui\data\Models\diffusion_models", "swarmui\data\Models\Stable-Diffusion",
-            "swarmui\data\Inputs", "swarmui\output", "swarmui\dlbackend", "swarmui\swarmui-models",
+            "swarmui\data\Inputs", "swarmui\output", "swarmui\dlbackend", "swarmui\models",
             "swarmui\extensions", "swarmui\bin",
             "ollama\models"
         )
