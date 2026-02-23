@@ -22,6 +22,26 @@ try {
     $Failed = $true
 }
 
+# Docker daemon access (can we talk to the engine?)
+if (-not $Failed -and (Get-Command docker -ErrorAction SilentlyContinue)) {
+    $dockerPsOut = docker ps 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $errText = if ($dockerPsOut) { $dockerPsOut | Out-String } else { "" }
+        if ($errText -match "permission denied|access is denied") {
+            Write-Host "X Docker daemon: permission denied." -ForegroundColor Red
+            Write-Host "  Ensure your user is in the docker-users group, or run Docker Desktop as administrator."
+            Write-Host "  See $InstallDoc (Post-install: Windows)."
+        } else {
+            Write-Host "X Cannot connect to Docker daemon. Is Docker Desktop running?" -ForegroundColor Red
+            Write-Host "  Start Docker Desktop from the Start menu, then run this check again."
+            Write-Host "  See $InstallDoc"
+        }
+        $Failed = $true
+    } else {
+        Write-Host "OK Docker daemon accessible" -ForegroundColor Green
+    }
+}
+
 # Docker Compose v2
 try {
     $composeVersion = docker compose version 2>$null
