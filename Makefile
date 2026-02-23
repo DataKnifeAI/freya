@@ -1,4 +1,4 @@
-.PHONY: help check-deps build build-comfyui build-swarmui up down sui sui-rebuild cui llm llm-pull llm-import-hf llm-list llm-rm llm-logs swarmui-rebuild swarmui-extensions-check restart logs clean
+.PHONY: help check-deps fix-docker-group build build-comfyui build-swarmui up down sui sui-rebuild cui llm llm-pull llm-import-hf llm-list llm-rm llm-logs swarmui-rebuild swarmui-extensions-check restart logs clean
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -8,6 +8,9 @@ help: ## Show this help message
 
 check-deps: ## Check Docker, Docker Compose, Git; install Git on Linux if missing; warn on NVIDIA
 	chmod +x scripts/linux/check-deps.sh && ./scripts/linux/check-deps.sh
+
+fix-docker-group: ## Create docker group if missing, add current user (fixes permission denied)
+	chmod +x scripts/linux/add-docker-group.sh && ./scripts/linux/add-docker-group.sh
 
 setup: ## Run initial directory setup (runs check-deps first, then creates dirs)
 	chmod +x scripts/linux/setup.sh && ./scripts/linux/setup.sh
