@@ -1,5 +1,6 @@
 #!/bin/bash
 # Check Freya dependencies (Docker, Docker Compose, Git, NVIDIA driver/toolkit).
+# Check order aligned with scripts/windows/check-deps.ps1: Docker -> Compose -> daemon access -> Git (+ service on Linux, NVIDIA warn).
 # Install Git on Linux when possible; otherwise print install instructions.
 # Supported platforms: Linux, Windows (WSL2). NVIDIA support only.
 

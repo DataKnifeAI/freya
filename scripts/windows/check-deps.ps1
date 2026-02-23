@@ -1,4 +1,5 @@
 # Check Freya dependencies on Windows (Docker, Docker Compose, Git).
+# Check order aligned with scripts/linux/check-deps.sh: Docker -> Compose -> daemon access -> Git.
 # NVIDIA: Install driver for WSL2; use WSL2 + Linux for GPU in containers.
 # Run from repo root: .\scripts\windows\check-deps.ps1
 
@@ -22,6 +23,18 @@ try {
     $Failed = $true
 }
 
+# Docker Compose v2
+try {
+    $composeVersion = docker compose version 2>$null
+    if ($LASTEXITCODE -ne 0) { throw "not found" }
+    Write-Host "OK Docker Compose found" -ForegroundColor Green
+} catch {
+    Write-Host "X Docker Compose v2 is not available." -ForegroundColor Red
+    Write-Host "  Install Docker Desktop (includes Compose v2)"
+    Write-Host "  See $InstallDoc"
+    $Failed = $true
+}
+
 # Docker daemon access (can we talk to the engine?)
 if (-not $Failed -and (Get-Command docker -ErrorAction SilentlyContinue)) {
     $dockerPsOut = docker ps 2>&1
@@ -40,18 +53,6 @@ if (-not $Failed -and (Get-Command docker -ErrorAction SilentlyContinue)) {
     } else {
         Write-Host "OK Docker daemon accessible" -ForegroundColor Green
     }
-}
-
-# Docker Compose v2
-try {
-    $composeVersion = docker compose version 2>$null
-    if ($LASTEXITCODE -ne 0) { throw "not found" }
-    Write-Host "OK Docker Compose found" -ForegroundColor Green
-} catch {
-    Write-Host "X Docker Compose v2 is not available." -ForegroundColor Red
-    Write-Host "  Install Docker Desktop (includes Compose v2)"
-    Write-Host "  See $InstallDoc"
-    $Failed = $true
 }
 
 # Git
