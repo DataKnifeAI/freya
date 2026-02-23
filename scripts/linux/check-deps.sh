@@ -33,6 +33,23 @@ else
     echo "✓ Docker Compose found: $(docker compose version --short 2>/dev/null || docker compose version)"
 fi
 
+# --- Docker daemon access ---
+if command -v docker &>/dev/null; then
+    if DOCKER_ERR=$(docker ps 2>&1); then
+        echo "✓ Docker daemon accessible"
+    else
+        if echo "$DOCKER_ERR" | grep -q "permission denied"; then
+            echo "✗ Docker daemon socket: permission denied."
+            echo "  Fix: make fix-docker-group  (or: sudo usermod -aG docker \$USER)"
+            echo "  Then log out and back in (or run: newgrp docker)."
+        else
+            echo "✗ Cannot connect to Docker daemon (is it running? run: sudo systemctl start docker)"
+        fi
+        echo "  See $INSTALL_DOC (Post-install: Linux users)."
+        FAILED=1
+    fi
+fi
+
 # --- Git ---
 if ! command -v git &>/dev/null; then
     echo "✗ Git is not installed or not in PATH."
