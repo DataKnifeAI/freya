@@ -33,7 +33,7 @@ services:
       - ./swarmui/data:/app/SwarmUI/Data
       - ./swarmui/output:/app/SwarmUI/Output
       - ./swarmui/dlbackend:/app/SwarmUI/dlbackend
-      - ./swarmui/swarmui-models:/app/SwarmUI/Models
+      - ./swarmui/models:/app/SwarmUI/Models
       - ./swarmui/extensions:/app/SwarmUI/src/Extensions
       - ./swarmui/bin:/app/SwarmUI/src/bin
     env_file:

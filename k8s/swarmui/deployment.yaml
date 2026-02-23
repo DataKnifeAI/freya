@@ -85,7 +85,7 @@ spec:
           claimName: swarmui-dlbackend
       - name: swarmui-models
         persistentVolumeClaim:
-          claimName: swarmui-swarmui-models
+          claimName: swarmui-models
       - name: extensions
         persistentVolumeClaim:
           claimName: swarmui-extensions
@@ -149,7 +149,7 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: swarmui-swarmui-models
+  name: swarmui-models
   namespace: freya
 spec:
   accessModes:
