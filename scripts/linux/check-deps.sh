@@ -1,5 +1,6 @@
 #!/bin/bash
 # Check Freya dependencies (Docker, Docker Compose, Git, NVIDIA driver/toolkit).
+# Check order aligned with scripts/windows/check-deps.ps1: Docker -> Compose -> daemon access -> Git (+ service on Linux, NVIDIA warn).
 # Install Git on Linux when possible; otherwise print install instructions.
 # Supported platforms: Linux, Windows (WSL2). NVIDIA support only.
 
@@ -47,6 +48,24 @@ if command -v docker &>/dev/null; then
         fi
         echo "  See $INSTALL_DOC (Post-install: Linux users)."
         FAILED=1
+    fi
+
+    # --- Docker service (systemd): running and enabled ---
+    if command -v systemctl &>/dev/null && systemctl list-unit-files docker.service &>/dev/null; then
+        DOCKER_ACTIVE=$(systemctl is-active docker 2>/dev/null || true)
+        DOCKER_ENABLED=$(systemctl is-enabled docker 2>/dev/null || true)
+        if [ "$DOCKER_ACTIVE" = "active" ] && [ "$DOCKER_ENABLED" = "enabled" ]; then
+            echo "✓ Docker service: running, enabled"
+        else
+            if [ "$DOCKER_ACTIVE" != "active" ]; then
+                echo "✗ Docker service is not running. Start it: sudo systemctl start docker"
+                FAILED=1
+            fi
+            if [ "$DOCKER_ENABLED" != "enabled" ] && [ "$DOCKER_ENABLED" != "static" ]; then
+                echo "✗ Docker service is not enabled at boot. Enable it: sudo systemctl enable docker"
+                FAILED=1
+            fi
+        fi
     fi
 fi
 
