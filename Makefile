@@ -46,16 +46,44 @@ build-no-cache: ## Build all images without cache
 up: ## Start all services
 	docker compose up -d
 
-sui: ## SwarmUI + Ollama (stops other compose services first; updates SwarmUI before start)
-	docker compose down && docker compose up -d swarmui ollama
+sui: ## SwarmUI + Ollama (stops ComfyUI first; updates SwarmUI; preserves running containers)
+	-docker compose stop comfyui 2>/dev/null || true
+	docker compose up -d swarmui ollama
 	@$(MAKE) swarmui-update
 
-swarmui-update: ## Pull latest SwarmUI, rebuild, and restart (requires swarmui container)
+swarmui-update: ## Pull latest SwarmUI, rebuild if needed, and restart (requires swarmui container)
 	@docker ps >/dev/null 2>&1 || (echo "Error: Docker not accessible. Run: make fix-docker-group, then newgrp docker" && exit 1)
-	@docker compose ps swarmui 2>/dev/null | grep -q Up || (echo "Error: SwarmUI not running. Start with: docker compose up -d swarmui" && exit 1)
-	@echo "Updating SwarmUI (git pull + dotnet build)..."
-	docker compose exec swarmui bash -c "set -e; cd /app/SwarmUI && git pull && rm -f src/bin/must_rebuild && dotnet build src/SwarmUI.csproj -c Release -o src/bin/live_release"
-	docker compose restart swarmui
+	@docker compose up -d swarmui 2>/dev/null || true
+	@i=0; while [ $$i -lt 90 ]; do \
+		status=$$(docker compose ps swarmui --format '{{.Health}}' 2>/dev/null); \
+		echo "$$status" | grep -q healthy && break; \
+		docker compose ps swarmui --status running -q 2>/dev/null | grep -q . || { sleep 1; i=$$((i+1)); continue; }; \
+		[ -z "$$status" ] && break; \
+		i=$$((i+1)); sleep 1; \
+	done
+	@docker compose ps swarmui --status running -q 2>/dev/null | grep -q . \
+		|| (echo "Error: SwarmUI not running. Start with: docker compose up -d swarmui" && exit 1)
+	@echo "Updating SwarmUI (git pull + dotnet build if needed)..."
+	@docker compose exec -T swarmui bash -c 'set -e; cd /app/SwarmUI; \
+		prior=$$(git rev-parse HEAD); \
+		for attempt in 1 2 3 4 5; do \
+			if git fetch origin master && git reset --hard origin/master; then break; fi; \
+			[ "$$attempt" -eq 5 ] && exit 1; \
+			echo "Git fetch failed (attempt $$attempt), retrying..."; sleep 2; \
+		done; \
+		new=$$(git rev-parse HEAD); \
+		rm -f src/bin/must_rebuild; \
+		if [ "$$prior" != "$$new" ] || [ ! -f src/bin/live_release/SwarmUI.dll ]; then \
+			echo "Building SwarmUI ($$prior -> $$new)..."; \
+			dotnet build src/SwarmUI.csproj -c Release -o src/bin/live_release; \
+			touch src/bin/.swarmui_restarted; \
+		else \
+			echo "SwarmUI source already up to date; skipping build."; \
+		fi'
+	@if docker compose exec -T swarmui test -f /app/SwarmUI/src/bin/.swarmui_restarted 2>/dev/null; then \
+		docker compose exec -T swarmui rm -f /app/SwarmUI/src/bin/.swarmui_restarted; \
+		docker compose restart swarmui; \
+	fi
 
 sui-rebuild: ## Restart SwarmUI + Ollama (SwarmUI builds extensions at startup; use after adding extension via UI)
 	@docker ps >/dev/null 2>&1 || (echo "Error: Docker not accessible. Run: make fix-docker-group, then newgrp docker" && exit 1)
