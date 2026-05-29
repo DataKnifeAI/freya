@@ -177,13 +177,36 @@ args: ["--launch_mode", "none"]
 ```
 Then re-apply and restart: `kubectl apply -f k8s/swarmui/deployment.yaml && kubectl rollout restart deployment/swarmui -n freya`.
 
+### SwarmUI: In-UI update button does not work
+
+**Symptom:** SwarmUI shows many updates available (e.g. “230 update(s) available”) but clicking **Update** does nothing useful — the version does not change after restart.
+
+**Cause:** On a native install, SwarmUI’s update flow runs `git pull`, sets a rebuild flag, and recompiles via `launch-linux.sh`. Freya’s container uses a custom startup script that runs the existing `SwarmUI.dll` from the mounted `swarmui/bin` volume and skips that rebuild step. The UI may pull new source, but the running binary stays old.
+
+**Fix (Docker Compose):**
+
+```bash
+make swarmui-update
+```
+
+This runs `git pull`, builds to `src/bin/live_release`, and restarts SwarmUI. **`make sui`** runs `swarmui-update` automatically when starting SwarmUI + Ollama.
+
+To re-clone SwarmUI at image build time instead:
+
+```bash
+make build-swarmui
+make sui
+```
+
+**ComfyUI backend updates** (under `swarmui/dlbackend`) are separate — use **Server → Backends → Edit → AutoUpdate** in the SwarmUI UI.
+
 ### SwarmUI: Extensions not persisting or UI not detecting them after reboot
 
 **Symptom:** Extensions (e.g. MagicPrompt) disappear after container or host reboot, or the extension files are in `swarmui/extensions/` but the UI doesn't show the extension.
 
 **Recommended: Use the UI for extensions.** Install entirely via **Server → Extensions → Install** in SwarmUI. SwarmUI downloads, compiles at startup, and persists the build to `swarmui/bin/`. No manual rebuild commands needed.
 
-**Fix:** Run **`make setup`** (creates `swarmui/extensions` and `swarmui/bin`), then **`make sui`**. In SwarmUI use **Server → Extensions → Install**. SwarmUI builds extensions at startup; no `make swarmui-rebuild` needed.
+**Fix:** Run **`make setup`** (creates `swarmui/extensions` and `swarmui/bin`), then **`make sui`**. In SwarmUI use **Server → Extensions → Install**. SwarmUI builds extensions when it starts.
 
-**Extension still not showing?** SwarmUI builds extensions when it starts. If the build fails (e.g. "Could not locate assembly SwarmUI"), the extension project expects `SwarmUI.dll` at `src/bin/live_release/`. The Freya image provides a symlink fallback. Rebuild: **`make build-swarmui`** then **`make down && make sui`**. Run **`make swarmui-extensions-check`** to see build errors.
+**Extension still not showing?** SwarmUI builds extensions when it starts. If the build fails (e.g. "Could not locate assembly SwarmUI"), the extension project expects `SwarmUI.dll` at `src/bin/live_release/`. The Freya image provides a symlink fallback. Run **`make swarmui-update`** or **`make build-swarmui`** then **`make sui`**. Run **`make swarmui-extensions-check`** to see build errors.
 

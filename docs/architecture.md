@@ -61,6 +61,8 @@ freya/
   - `./swarmui/extensions` → SwarmUI Extensions source (e.g. MagicPrompt)
   - `./swarmui/bin` → SwarmUI build output (persisted so recompiled app with extensions is used after restart)
 
+**Updates:** The Freya container does not use SwarmUI’s native `launch-linux.sh` startup path, so the in-UI **Server → Update** button will not rebuild the running app. Use **`make swarmui-update`** to `git pull`, rebuild to `src/bin/live_release`, and restart. **`make sui`** runs this automatically when starting SwarmUI + Ollama. To refresh the Docker image itself (re-clone at build time): **`make build-swarmui`**. ComfyUI backend updates inside SwarmUI are separate — configure **Server → Backends → AutoUpdate**.
+
 ### Ollama
 
 - **Image**: `ollama/ollama:0.24.0`
@@ -84,6 +86,14 @@ make build-swarmui
 ### Build Without Cache
 ```bash
 make build-no-cache
+```
+
+### Update SwarmUI (Docker Compose)
+
+```bash
+make swarmui-update   # git pull + dotnet build + restart (container must be running)
+make sui              # start SwarmUI + Ollama and run swarmui-update
+make build-swarmui    # rebuild image from latest upstream (slower; use when in-container update fails)
 ```
 
 **Note**: First build may take 15-30 minutes as it clones repositories and installs dependencies.

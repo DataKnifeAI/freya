@@ -8,7 +8,7 @@ Extensions live in `swarmui/extensions/` (source); the compiled app lives in `sw
 
 ## Install via UI (recommended)
 
-1. **Start SwarmUI and Ollama** (e.g. `make sui`).
+1. **Start SwarmUI and Ollama** (e.g. `make sui` — also updates SwarmUI core to the latest git revision).
 2. **Pull an Ollama model** (if needed). Default for most control and compatibility: **[dolphin3](https://ollama.com/library/dolphin3)** (Dolphin 3.0 Llama 3.1 8B, ~4.9GB, 128K context):
    ```bash
    make llm-pull MODEL=dolphin3

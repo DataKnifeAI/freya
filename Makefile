@@ -1,4 +1,4 @@
-.PHONY: help check-deps fix-docker-group build build-comfyui build-swarmui up down sui sui-rebuild cui llm llm-pull llm-import-hf llm-list llm-rm llm-logs swarmui-rebuild swarmui-extensions-check restart logs clean
+.PHONY: help check-deps fix-docker-group build build-comfyui build-swarmui up down sui sui-rebuild swarmui-update cui llm llm-pull llm-import-hf llm-list llm-rm llm-logs swarmui-rebuild swarmui-extensions-check restart logs clean
 
 help: ## Show this help message
 	@echo 'Usage: make [target]'
@@ -46,8 +46,16 @@ build-no-cache: ## Build all images without cache
 up: ## Start all services
 	docker compose up -d
 
-sui: ## SwarmUI + Ollama (stops other compose services first)
+sui: ## SwarmUI + Ollama (stops other compose services first; updates SwarmUI before start)
 	docker compose down && docker compose up -d swarmui ollama
+	@$(MAKE) swarmui-update
+
+swarmui-update: ## Pull latest SwarmUI, rebuild, and restart (requires swarmui container)
+	@docker ps >/dev/null 2>&1 || (echo "Error: Docker not accessible. Run: make fix-docker-group, then newgrp docker" && exit 1)
+	@docker compose ps swarmui 2>/dev/null | grep -q Up || (echo "Error: SwarmUI not running. Start with: docker compose up -d swarmui" && exit 1)
+	@echo "Updating SwarmUI (git pull + dotnet build)..."
+	docker compose exec swarmui bash -c "set -e; cd /app/SwarmUI && git pull && rm -f src/bin/must_rebuild && dotnet build src/SwarmUI.csproj -c Release -o src/bin/live_release"
+	docker compose restart swarmui
 
 sui-rebuild: ## Restart SwarmUI + Ollama (SwarmUI builds extensions at startup; use after adding extension via UI)
 	@docker ps >/dev/null 2>&1 || (echo "Error: Docker not accessible. Run: make fix-docker-group, then newgrp docker" && exit 1)
@@ -89,10 +97,11 @@ shell-comfyui: ## Open shell in ComfyUI container
 shell-swarmui: ## Open shell in SwarmUI container
 	docker compose exec swarmui /bin/bash
 
-swarmui-rebuild: ## [Debug] Force rebuild inside container; normally not needed (SwarmUI builds at startup). Then: make down && make sui
+swarmui-rebuild: ## [Debug] Force rebuild inside container without git pull. Prefer: make swarmui-update
 	@docker ps >/dev/null 2>&1 || (echo "Error: Docker not accessible. Run: make fix-docker-group, then newgrp docker" && exit 1)
 	@docker compose ps swarmui 2>/dev/null | grep -q Up || (echo "Error: SwarmUI not running. Start with: make sui" && exit 1)
-	docker compose exec swarmui bash -c "cd /app/SwarmUI/src && dotnet build SwarmUI.csproj -c Release -o ../bin/live_release"
+	docker compose exec swarmui bash -c "set -e; cd /app/SwarmUI && dotnet build src/SwarmUI.csproj -c Release -o src/bin/live_release"
+	docker compose restart swarmui
 
 swarmui-extensions-check: ## [Debug] List extensions dir and run build; use if extension not showing after restart
 	@docker ps >/dev/null 2>&1 || (echo "Error: Docker not accessible. Run: make fix-docker-group, then newgrp docker" && exit 1)
@@ -102,7 +111,7 @@ swarmui-extensions-check: ## [Debug] List extensions dir and run build; use if e
 	@echo "=== Extension subdirs (.cs) ==="
 	@docker compose exec swarmui find /app/SwarmUI/src/Extensions -maxdepth 2 -type f -name "*.cs" 2>/dev/null || true
 	@echo "=== Manual build (SwarmUI usually builds at startup) ==="
-	docker compose exec swarmui bash -c "cd /app/SwarmUI/src && dotnet build SwarmUI.csproj -c Release -o ../bin/live_release -v minimal"
+	docker compose exec swarmui bash -c "set -e; cd /app/SwarmUI && dotnet build src/SwarmUI.csproj -c Release -o src/bin/live_release -v minimal"
 
 llm-pull: ## Download Ollama model (usage: make llm-pull MODEL=dolphin3)
 	@if [ -z "$(MODEL)" ]; then \

@@ -76,10 +76,11 @@ make help              # Show all available commands
 make build             # Build all Docker images
 make up                # Start all services
 make down              # Stop all services
-make sui               # SwarmUI + Ollama only (stops others first)
+make sui               # SwarmUI + Ollama (stops others first; updates SwarmUI)
 make cui               # ComfyUI only (stops others first)
 make llm               # Ollama only (stops others first)
-make swarmui-rebuild   # [Debug] Recompile extensions manually; normally use Server → Extensions → Install in UI
+make swarmui-update    # Pull latest SwarmUI, rebuild, and restart
+make swarmui-rebuild   # Rebuild SwarmUI from current source (no git pull)
 make logs              # View logs from all services
 make restart           # Restart services
 make status            # Show service status and URLs
