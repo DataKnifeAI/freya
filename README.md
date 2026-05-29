@@ -37,19 +37,24 @@ In the UI **Settings** tab you can paste:
 ## Cluster
 
 ```bash
-make manifests install
-kubectl apply -k config/default
-
-kubectl create ns freya
-kubectl -n freya create secret generic freya-openrouter --from-literal=apiKey="$OPENROUTER_API_KEY"
-kubectl -n freya create secret generic freya-civitai --from-literal=apiKey="$CIVITAI_API_KEY"
-
-# remote GPU box
-kubectl apply -f config/samples/freya_v1alpha1_freyadiffusionworker_external.yaml
-# or in-cluster GPU
-# kubectl apply -f config/samples/freya_v1alpha1_freyadiffusionworker_incluster.yaml
-
-kubectl apply -f config/samples/freya_v1alpha1_freyastudio.yaml
+make help              # Show all available commands
+make build             # Build all Docker images
+make up                # Start all services
+make down              # Stop all services
+make sui               # SwarmUI + Ollama (stops others first; updates SwarmUI)
+make cui               # ComfyUI only (stops others first)
+make llm               # Ollama only (stops others first)
+make swarmui-update    # Pull latest SwarmUI, rebuild, and restart
+make swarmui-rebuild   # Rebuild SwarmUI from current source (no git pull)
+make logs              # View logs from all services
+make restart           # Restart services
+make status            # Show service status and URLs
+make check-gpu-comfyui # Verify GPU access in ComfyUI
+make check-gpu-swarmui # Verify GPU access in SwarmUI
+make llm-pull MODEL=dolphin3  # Pull default Ollama model (MagicPrompt); see https://ollama.com/library/dolphin3
+make llm-list          # List installed models + browse link
+make llm-rm MODEL=dolphin3  # Remove an Ollama model
+make llm-logs          # View Ollama logs
 ```
 
 ### Workers: in-cluster or remote physical
