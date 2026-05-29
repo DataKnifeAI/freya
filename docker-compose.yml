@@ -51,7 +51,7 @@ services:
     restart: unless-stopped
 
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.24.0
     container_name: freya-ollama
     network_mode: host
     volumes:

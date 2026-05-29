@@ -63,7 +63,7 @@ freya/
 
 ### Ollama
 
-- **Image**: `ollama/ollama:latest`
+- **Image**: `ollama/ollama:0.24.0`
 - **Port**: 11434 (API)
 - **Volumes**: `./ollama/models` → `~/.ollama` (model storage)
 - **Role**: Local LLM API; use inside SwarmUI via the [MagicPrompt extension](https://github.com/HartsyAI/SwarmUI-MagicPromptExtension) for prompt enhancement, captions, and LLM-backed generation. See [SwarmUI MagicPrompt](swarmui-magicprompt.md).
