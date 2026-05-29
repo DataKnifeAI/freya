@@ -202,3 +202,5 @@ The steps below work on **Linux** and on **Windows** (inside a WSL2 terminal). R
    make llm-pull MODEL=dolphin3
    ```
    See [SwarmUI MagicPrompt](swarmui-magicprompt.md) for configuration.
+
+8. **Updating SwarmUI:** The in-UI update button does not rebuild the app in Freya’s Docker setup. Use **`make swarmui-update`**, or **`make sui`** (which updates automatically). See [Troubleshooting — SwarmUI updates](troubleshooting.md#swarmui-in-ui-update-button-does-not-work).
