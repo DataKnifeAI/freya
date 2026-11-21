@@ -1,0 +1,14 @@
+# Install a Civitai LoRA onto the worker (uses FreyaStudio civitai secret via Job token, or remote install API)
+apiVersion: freya.dataknife.ai/v1alpha1
+kind: FreyaModelAsset
+metadata:
+  name: example-lora
+  namespace: freya
+spec:
+  source: civitai
+  url: https://civitai.com/api/download/models/VERSION_ID
+  destPath: loras/example.safetensors
+  workerRef: freya-gpu
+  secretRef:
+    name: freya-civitai
+    key: apiKey

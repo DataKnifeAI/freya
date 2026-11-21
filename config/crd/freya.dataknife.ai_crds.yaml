@@ -1,0 +1,615 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: freyastudios.freya.dataknife.ai
+spec:
+  group: freya.dataknife.ai
+  names:
+    categories: []
+    kind: FreyaStudio
+    plural: freyastudios
+    shortNames:
+    - fstudio
+    singular: freyastudio
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for FreyaStudioSpec via `CustomResource`
+        properties:
+          spec:
+            description: 'Namespaced Freya studio: API + UI + gallery.'
+            properties:
+              apiImage:
+                description: Image reference for Freya components.
+                nullable: true
+                properties:
+                  pullPolicy:
+                    nullable: true
+                    type: string
+                  repository:
+                    nullable: true
+                    type: string
+                  tag:
+                    nullable: true
+                    type: string
+                type: object
+              apiTokenSecretRef:
+                description: Secret holding `FREYA_API_TOKEN` for the API. Set for non-dev / Ingress; UI sends the bearer from Settings.
+                nullable: true
+                properties:
+                  key:
+                    default: apiKey
+                    type: string
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              chatBackend:
+                default:
+                  kind: openrouter
+                properties:
+                  baseUrl:
+                    description: When kind=vllm, OpenAI-compatible base URL.
+                    nullable: true
+                    type: string
+                  kind:
+                    default: openrouter
+                    enum:
+                    - openrouter
+                    - vllm
+                    type: string
+                type: object
+              civitai:
+                default: {}
+                description: Civitai API key for browsing/installing LoRAs & checkpoints onto workers.
+                properties:
+                  secretRef:
+                    description: Secret holding the Civitai API token (create from UI or `kubectl create secret`).
+                    nullable: true
+                    properties:
+                      key:
+                        default: apiKey
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                type: object
+              diffusionWorkerRef:
+                description: Optional FreyaDiffusionWorker name in the same namespace.
+                nullable: true
+                type: string
+              huggingFace:
+                default: {}
+                description: Optional Hugging Face token for gated checkpoints.
+                properties:
+                  secretRef:
+                    description: Reference to a Secret key holding credentials.
+                    nullable: true
+                    properties:
+                      key:
+                        default: apiKey
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                type: object
+              ingress:
+                default:
+                  enabled: false
+                properties:
+                  className:
+                    nullable: true
+                    type: string
+                  enabled:
+                    default: false
+                    type: boolean
+                  host:
+                    nullable: true
+                    type: string
+                type: object
+              openRouter:
+                default:
+                  baseUrl: https://openrouter.ai/api/v1
+                  chatModel: openrouter/auto
+                  imageModel: black-forest-labs/flux.2-klein-4b
+                  secretRef:
+                    key: apiKey
+                    name: freya-openrouter
+                properties:
+                  baseUrl:
+                    default: https://openrouter.ai/api/v1
+                    type: string
+                  chatModel:
+                    default: openrouter/auto
+                    description: Default chat / plan model id (OpenRouter).
+                    type: string
+                  imageModel:
+                    default: black-forest-labs/flux.2-klein-4b
+                    description: Default cloud image model id (OpenRouter).
+                    type: string
+                  secretRef:
+                    description: Reference to a Secret key holding credentials.
+                    properties:
+                      key:
+                        default: apiKey
+                        type: string
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
+                required:
+                - secretRef
+                type: object
+              replicas:
+                default: 1
+                format: int32
+                type: integer
+              storage:
+                default:
+                  gallerySize: 20Gi
+                properties:
+                  gallerySize:
+                    default: 20Gi
+                    type: string
+                  storageClassName:
+                    nullable: true
+                    type: string
+                type: object
+              uiImage:
+                description: Image reference for Freya components.
+                nullable: true
+                properties:
+                  pullPolicy:
+                    nullable: true
+                    type: string
+                  repository:
+                    nullable: true
+                    type: string
+                  tag:
+                    nullable: true
+                    type: string
+                type: object
+            type: object
+          status:
+            nullable: true
+            properties:
+              apiEndpoint:
+                nullable: true
+                type: string
+              observedGeneration:
+                format: int64
+                nullable: true
+                type: integer
+              phase:
+                nullable: true
+                type: string
+              uiEndpoint:
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: FreyaStudio
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: freyagenerations.freya.dataknife.ai
+spec:
+  group: freya.dataknife.ai
+  names:
+    categories: []
+    kind: FreyaGeneration
+    plural: freyagenerations
+    shortNames:
+    - fgen
+    singular: freyageneration
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.backend
+      name: Backend
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for FreyaGenerationSpec via `CustomResource`
+        properties:
+          spec:
+            description: Declarative image generation request.
+            properties:
+              backend:
+                default: auto
+                description: Generation backend selection.
+                enum:
+                - auto
+                - openrouter
+                - local
+                type: string
+              enhance:
+                default: auto
+                description: '`off` | `on` | `auto`'
+                type: string
+              loras:
+                items:
+                  properties:
+                    name:
+                      type: string
+                    scale:
+                      default: 1.0
+                      format: float
+                      type: number
+                  required:
+                  - name
+                  type: object
+                type: array
+              model:
+                nullable: true
+                type: string
+              negativePrompt:
+                nullable: true
+                type: string
+              prompt:
+                type: string
+              seed:
+                format: int64
+                nullable: true
+                type: integer
+              size:
+                nullable: true
+                type: string
+              studioRef:
+                description: FreyaStudio that owns API routing (same namespace).
+                nullable: true
+                type: string
+              styleRef:
+                nullable: true
+                type: string
+            required:
+            - prompt
+            type: object
+          status:
+            nullable: true
+            properties:
+              artifactPath:
+                nullable: true
+                type: string
+              backend:
+                nullable: true
+                type: string
+              enhancedPrompt:
+                nullable: true
+                type: string
+              message:
+                nullable: true
+                type: string
+              phase:
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: FreyaGeneration
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: freyastyles.freya.dataknife.ai
+spec:
+  group: freya.dataknife.ai
+  names:
+    categories: []
+    kind: FreyaStyle
+    plural: freyastyles
+    shortNames:
+    - fstyle
+    singular: freyastyle
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for FreyaStyleSpec via `CustomResource`
+        properties:
+          spec:
+            description: Curated style pack (Civitai-inspired metadata, not weight hosting by itself).
+            properties:
+              backend:
+                default: auto
+                description: Generation backend selection.
+                enum:
+                - auto
+                - openrouter
+                - local
+                type: string
+              displayName:
+                type: string
+              examplePrompt:
+                type: string
+              localCheckpoint:
+                nullable: true
+                type: string
+              loras:
+                items:
+                  properties:
+                    name:
+                      type: string
+                    scale:
+                      default: 1.0
+                      format: float
+                      type: number
+                  required:
+                  - name
+                  type: object
+                type: array
+              openRouterModel:
+                nullable: true
+                type: string
+              recommendedSize:
+                nullable: true
+                type: string
+              tags:
+                items:
+                  type: string
+                type: array
+              thumbnailUrl:
+                nullable: true
+                type: string
+              triggerWords:
+                nullable: true
+                type: string
+            required:
+            - displayName
+            - examplePrompt
+            type: object
+          status:
+            nullable: true
+            properties:
+              phase:
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: FreyaStyle
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: freyadiffusionworkers.freya.dataknife.ai
+spec:
+  group: freya.dataknife.ai
+  names:
+    categories: []
+    kind: FreyaDiffusionWorker
+    plural: freyadiffusionworkers
+    shortNames:
+    - fdiff
+    singular: freyadiffusionworker
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .spec.engine
+      name: Engine
+      type: string
+    - jsonPath: .spec.placement
+      name: Placement
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for FreyaDiffusionWorkerSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Optional GPU worker for local SD / LoRA (vLLM-Omni by default).
+
+              Placement: - `incluster` — operator deploys the engine on a GPU node when the cluster has GPUs. - `external` — point `externalEndpoint` at a remote physical system running vLLM-Omni (or compatible `/v1/images/generations` + LoRA install API). Freya UI/API use that endpoint; `FreyaModelAsset` installs LoRAs onto the remote worker for the UI catalog.
+            properties:
+              authSecretRef:
+                description: Optional admin/API token Secret for remote LoRA install + generate.
+                nullable: true
+                properties:
+                  key:
+                    default: apiKey
+                    type: string
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              engine:
+                default: vllm-omni
+                enum:
+                - vllm-omni
+                - sglang
+                type: string
+              externalEndpoint:
+                description: 'Required when `placement: external` — e.g. `http://gpu-box.lan:8091`.'
+                nullable: true
+                type: string
+              gpuCount:
+                default: 1
+                format: int32
+                type: integer
+              image:
+                description: Image reference for Freya components.
+                nullable: true
+                properties:
+                  pullPolicy:
+                    nullable: true
+                    type: string
+                  repository:
+                    nullable: true
+                    type: string
+                  tag:
+                    nullable: true
+                    type: string
+                type: object
+              model:
+                default: stabilityai/stable-diffusion-xl-base-1.0
+                description: HuggingFace / local model id passed to the engine (in-cluster).
+                type: string
+              modelsPvcSize:
+                default: 100Gi
+                type: string
+              nodeSelector:
+                additionalProperties:
+                  type: string
+                nullable: true
+                type: object
+              placement:
+                default: incluster
+                description: |-
+                  Where the diffusion / LoRA engine runs.
+
+                  CRD enum values are lowercase (`incluster`, `external`). The `inCluster` alias is accepted by Rust serde for convenience; kubectl/OpenAPI only allow `incluster`.
+                enum:
+                - incluster
+                - external
+                type: string
+              port:
+                default: 8091
+                format: int32
+                type: integer
+              storageClassName:
+                nullable: true
+                type: string
+            type: object
+          status:
+            nullable: true
+            properties:
+              endpoint:
+                nullable: true
+                type: string
+              phase:
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: FreyaDiffusionWorker
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: freyamodelassets.freya.dataknife.ai
+spec:
+  group: freya.dataknife.ai
+  names:
+    categories: []
+    kind: FreyaModelAsset
+    plural: freyamodelassets
+    shortNames:
+    - fasset
+    singular: freyamodelasset
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for FreyaModelAssetSpec via `CustomResource`
+        properties:
+          spec:
+            description: Declarative model/LoRA download into a worker PVC.
+            properties:
+              destPath:
+                description: Relative path under the worker models PVC (e.g. `loras/my.safetensors`).
+                type: string
+              secretRef:
+                description: Reference to a Secret key holding credentials.
+                nullable: true
+                properties:
+                  key:
+                    default: apiKey
+                    type: string
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              source:
+                description: '`huggingface` | `civitai` | `url`'
+                type: string
+              url:
+                type: string
+              workerRef:
+                type: string
+            required:
+            - destPath
+            - source
+            - url
+            - workerRef
+            type: object
+          status:
+            nullable: true
+            properties:
+              message:
+                nullable: true
+                type: string
+              phase:
+                nullable: true
+                type: string
+            type: object
+        required:
+        - spec
+        title: FreyaModelAsset
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+

@@ -1,0 +1,13 @@
+[package]
+name = "freya-crd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Freya Kubernetes CRD types (v1alpha1)"
+
+[dependencies]
+kube = { workspace = true, features = ["derive"] }
+k8s-openapi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }

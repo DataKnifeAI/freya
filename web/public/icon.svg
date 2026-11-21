@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Freya">
+  <title>Freya — portrait</title>
+  <!-- Portrait headshot cropped from freya.png: face + shoulders + brown eagle
+       wings, lacquer-mist (ink) edge, apricot hairline. The painted detail lives
+       in /icon-512.png; this SVG is a scalable wrapper around that raster. -->
+  <defs><clipPath id="r"><rect width="64" height="64" rx="14"/></clipPath></defs>
+  <rect width="64" height="64" rx="14" fill="#0e1418"/>
+  <image href="/icon-512.png" width="64" height="64" clip-path="url(#r)" preserveAspectRatio="xMidYMid slice"/>
+  <rect x="0.75" y="0.75" width="62.5" height="62.5" rx="13" fill="none" stroke="#e8c4a8" stroke-opacity=".5" stroke-width="1"/>
+</svg>

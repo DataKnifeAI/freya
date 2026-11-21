@@ -1,0 +1,14 @@
+{
+  "name": "Freya — agentic image studio",
+  "short_name": "Freya",
+  "description": "Freya is an agentic image studio.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0e1418",
+  "theme_color": "#0e1418",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

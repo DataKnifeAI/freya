@@ -1,0 +1,13 @@
+FROM node:22-bookworm AS build
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm install
+COPY web/ ./
+RUN npm run build
+
+FROM nginx:1.27-alpine
+# Official image runs envsubst on /etc/nginx/templates/*.template → conf.d/
+ENV FREYA_API_UPSTREAM=http://freya-api:8080
+COPY web/nginx.conf /etc/nginx/templates/default.conf.template
+COPY --from=build /web/dist /usr/share/nginx/html
+EXPOSE 80

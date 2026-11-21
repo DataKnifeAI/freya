@@ -1,0 +1,17 @@
+# In-cluster GPU Deployment (requires nvidia.com/gpu)
+apiVersion: freya.dataknife.ai/v1alpha1
+kind: FreyaDiffusionWorker
+metadata:
+  name: freya-gpu
+  namespace: freya
+spec:
+  placement: incluster
+  engine: vllm-omni
+  model: stabilityai/stable-diffusion-xl-base-1.0
+  gpuCount: 1
+  modelsPvcSize: 100Gi
+  port: 8091
+  # Same secret as FreyaStudio → FREYA_WORKER_TOKEN on API + worker
+  authSecretRef:
+    name: freya-worker-token
+    key: apiKey
