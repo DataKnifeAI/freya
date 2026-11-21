@@ -503,15 +503,13 @@ pub async fn civitai_install(
     }
     let worker = state.worker.read().await;
     let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
-    // Prefer authenticated Civitai URL; worker performs the fetch with Freya-provided source tag.
-    let url = if req.download_url.contains('?') {
-        format!("{}&token={}", req.download_url, cfg.civitai_api_key)
-    } else {
-        format!("{}?token={}", req.download_url, cfg.civitai_api_key)
-    };
+    // Pass the key as authToken (Bearer on download) — never append to the URL
+    // (reqwest errors include the full URL and would leak the secret).
+    let auth = cfg.civitai_api_key.clone();
+    let url = req.download_url.clone();
     drop(cfg);
     client
-        .install_asset("civitai", &url, &req.dest_path)
+        .install_asset("civitai", &url, &req.dest_path, Some(&auth))
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({
