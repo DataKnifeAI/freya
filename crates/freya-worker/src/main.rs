@@ -123,17 +123,99 @@ struct GenReq {
 }
 
 async fn generate(Json(req): Json<GenReq>) -> Json<serde_json::Value> {
-    // 1x1 PNG stub so Freya gallery path works without a GPU.
-    let png: &[u8] = &[
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
-        0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8,
-        0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe, 0xd4, 0xef, 0x00, 0x00,
-        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ];
-    let _ = req.prompt;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
+    // Visible stub PNG (no GPU) so gallery / local Generate can be smoke-tested.
+    let png = stub_png_from_prompt(&req.prompt, 256, 256);
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
     Json(json!({ "data": [{ "b64_json": b64 }] }))
+}
+
+/// Build a valid RGB PNG whose colors derive from the prompt (deterministic stub).
+fn stub_png_from_prompt(prompt: &str, w: u32, h: u32) -> Vec<u8> {
+    let mut hash: u32 = 2166136261;
+    for b in prompt.as_bytes() {
+        hash ^= u32::from(*b);
+        hash = hash.wrapping_mul(16777619);
+    }
+    let r0 = ((hash >> 16) & 0xff) as u8;
+    let g0 = ((hash >> 8) & 0xff) as u8;
+    let b0 = (hash & 0xff) as u8;
+
+    let mut raw = Vec::with_capacity(((w * 3 + 1) * h) as usize);
+    for y in 0..h {
+        raw.push(0); // filter: none
+        for x in 0..w {
+            let t = (x + y) as u8;
+            raw.push(r0.wrapping_add(t));
+            raw.push(g0.wrapping_add(t.wrapping_mul(3)));
+            raw.push(b0.wrapping_add(t.wrapping_mul(5)));
+        }
+    }
+    encode_png_rgb(w, h, &raw)
+}
+
+fn encode_png_rgb(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB
+    write_png_chunk(&mut out, b"IHDR", &ihdr);
+    write_png_chunk(&mut out, b"IDAT", &deflate_zlib(raw));
+    write_png_chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+fn write_png_chunk(out: &mut Vec<u8>, ctype: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(ctype);
+    out.extend_from_slice(data);
+    out.extend_from_slice(&crc32_ieee(ctype, data).to_be_bytes());
+}
+
+/// Stored-block zlib wrapper (no external compress crate).
+fn deflate_zlib(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 16 + data.len().div_ceil(65535) * 5);
+    out.extend_from_slice(&[0x78, 0x01]); // zlib cmf/flg — no compression
+    let mut offset = 0;
+    while offset < data.len() {
+        let end = (offset + 65535).min(data.len());
+        let chunk = &data[offset..end];
+        let last = end == data.len();
+        out.push(if last { 0x01 } else { 0x00 });
+        let n = chunk.len() as u16;
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(&(!n).to_le_bytes());
+        out.extend_from_slice(chunk);
+        offset = end;
+    }
+    if data.is_empty() {
+        out.extend_from_slice(&[0x01, 0x00, 0x00, 0xff, 0xff]);
+    }
+    out.extend_from_slice(&adler32(data).to_be_bytes());
+    out
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+    for &x in data {
+        a = (a + u32::from(x)) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+fn crc32_ieee(ctype: &[u8], data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xffff_ffff;
+    for &x in ctype.iter().chain(data.iter()) {
+        crc ^= u32::from(x);
+        for _ in 0..8 {
+            let mask = (!(crc & 1)).wrapping_add(1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 #[derive(Deserialize)]
