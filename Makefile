@@ -55,12 +55,14 @@ run-worker: ## Run diffusion worker stub locally
 run-operator: ## Run operator (needs kubeconfig)
 	$(CARGO) run -p freya-operator --bin freya-operator
 
-up-local: ## API + notes for UI (OPENROUTER_API_KEY / CIVITAI_API_KEY in env)
+up-local: ## API + notes for UI (copy .env.example → .env first)
+	@echo "cp .env.example .env  # fill OPENROUTER_API_KEY (required)"
+	@echo "set -a && source .env && set +a"
 	@echo "Terminal A: make run-api"
 	@echo "Terminal B: cd web && npm install && npm run dev"
-	@echo "UI mock only:  cd web && npm install && npm run dev:mock"
-	@echo "Optional worker: make run-worker  then set worker URL http://127.0.0.1:8091 in Settings"
-	@echo "Set OPENROUTER_API_KEY and optionally CIVITAI_API_KEY before run-api"
+	@echo "UI mock only:  make mock-ui"
+	@echo "Optional worker: make run-worker  then Settings → http://127.0.0.1:8091"
+	@echo "Optional: CIVITAI_API_KEY, FREYA_API_TOKEN, FREYA_WORKER_TOKEN, FREYA_CORS_ORIGINS"
 
 .PHONY: mock-ui
 mock-ui: ## Interactive Freya UI mock (no API / keys required)

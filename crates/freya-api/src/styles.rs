@@ -64,6 +64,11 @@ pub async fn load_styles(packs_dir: &Path) -> Result<Vec<StylePack>> {
     if out.is_empty() {
         return Ok(builtin_styles());
     }
+    // Featured brand pack first so UI "Use example" matches freya.png NL seed.
+    out.sort_by(|a, b| {
+        let rank = |id: &str| if id == "freya-winged-warrior" { 0 } else { 1 };
+        rank(&a.id).cmp(&rank(&b.id)).then_with(|| a.id.cmp(&b.id))
+    });
     Ok(out)
 }
 
@@ -97,12 +102,26 @@ pub async fn load_instruction(packs_dir: &Path, mode: &str) -> String {
 }
 
 fn builtin_styles() -> Vec<StylePack> {
+    // NL examples (not SD tag soup). First entry seeds UI "Use example" — freya.png brand art.
     vec![
+        StylePack {
+            id: "freya-winged-warrior".into(),
+            display_name: "Freya (brand art)".into(),
+            tags: vec!["character".into(), "fantasy".into(), "wings".into()],
+            example_prompt: "A young woman with large brown eagle wings and fantasy leather armor, standing in a green canyon with a waterfall behind her".into(),
+            backend: "openrouter".into(),
+            open_router_model: Some("black-forest-labs/flux.2-klein-4b".into()),
+            local_checkpoint: None,
+            loras: vec![],
+            trigger_words: None,
+            recommended_size: Some("1024x1024".into()),
+            thumbnail_url: None,
+        },
         StylePack {
             id: "ethereal-moon".into(),
             display_name: "Ethereal Moon Landscape".into(),
             tags: vec!["landscape".into(), "fantasy".into(), "moon".into()],
-            example_prompt: "ethereal mystical landscape under a radiant red moon, twisted blossoming tree on rocky terrain, misty mountains, serene lake reflecting moonlight, magical atmosphere, highly detailed".into(),
+            example_prompt: "A mystical landscape under a radiant red moon — a twisted blossoming tree on rocky ground, misty mountains beyond a lake that mirrors the moonlight".into(),
             backend: "openrouter".into(),
             open_router_model: Some("black-forest-labs/flux.2-klein-4b".into()),
             local_checkpoint: None,
@@ -115,7 +134,7 @@ fn builtin_styles() -> Vec<StylePack> {
             id: "anime-portrait".into(),
             display_name: "Anime Portrait (cloud)".into(),
             tags: vec!["anime".into(), "portrait".into()],
-            example_prompt: "anime style portrait, soft lighting, expressive eyes, detailed hair, clean linework, vibrant colors".into(),
+            example_prompt: "An anime-style portrait with soft lighting, expressive eyes, and clean colorful linework".into(),
             backend: "openrouter".into(),
             open_router_model: Some("black-forest-labs/flux.2-klein-4b".into()),
             local_checkpoint: None,
@@ -177,5 +196,14 @@ mod tests {
         let packs = PathBuf::from("/nonexistent-packs-dir");
         let text = load_instruction(&packs, "../../etc/passwd").await;
         assert_eq!(text, builtin_instruction("chat"));
+    }
+
+    #[test]
+    fn builtin_styles_feature_freya_brand_nl() {
+        let styles = builtin_styles();
+        assert_eq!(styles[0].id, "freya-winged-warrior");
+        assert!(styles[0].example_prompt.contains("eagle wings"));
+        // Prose NL, not SD tag soup (no weight syntax).
+        assert!(!styles[0].example_prompt.contains(":1."));
     }
 }
