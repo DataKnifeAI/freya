@@ -36,6 +36,17 @@ pub struct AssistRequest {
     pub message: String,
     #[serde(default)]
     pub model: Option<String>,
+    /// Optional prior turns for agentic session context.
+    #[serde(default)]
+    pub session: Option<serde_json::Value>,
+}
+
+fn strip_json_fence(raw: &str) -> &str {
+    raw.trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim()
 }
 
 pub async fn assist(
@@ -43,12 +54,73 @@ pub async fn assist(
     Json(req): Json<AssistRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let system = styles::load_instruction(&state.packs_dir, &req.mode).await;
+    let user_msg = if let Some(sess) = &req.session {
+        format!(
+            "{}\n\n--- session context ---\n{}",
+            req.message,
+            serde_json::to_string_pretty(sess).unwrap_or_default()
+        )
+    } else {
+        req.message.clone()
+    };
     let or = state.openrouter.read().await;
     let text = or
-        .chat(&system, &req.message, req.model.as_deref())
+        .chat(&system, &user_msg, req.model.as_deref())
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(json!({ "mode": req.mode, "text": text })))
+
+    let mut out = json!({ "mode": req.mode, "text": text });
+
+    // Structured modes: parse plan JSON and optionally search Civitai for LoRAs.
+    if matches!(req.mode.as_str(), "suggest" | "session" | "plan") {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(strip_json_fence(&text)) {
+            out["plan"] = parsed.clone();
+            if let Some(ideas) = parsed.get("ideas") {
+                out["ideas"] = ideas.clone();
+            }
+            if let Some(batch) = parsed.get("batchPrompts") {
+                out["batchPrompts"] = batch.clone();
+            }
+            if let Some(note) = parsed.get("sessionNote").and_then(|n| n.as_str()) {
+                out["sessionNote"] = json!(note);
+            }
+            let query = parsed
+                .get("civitaiQuery")
+                .and_then(|q| q.as_str())
+                .map(str::trim)
+                .filter(|q| !q.is_empty());
+            if let Some(q) = query {
+                out["civitaiQuery"] = json!(q);
+                let civ = state.civitai.read().await;
+                if civ.configured() {
+                    match civ.search(q, 8).await {
+                        Ok(items) => {
+                            let loras: Vec<_> = items
+                                .into_iter()
+                                .filter(|c| {
+                                    c.model_type.eq_ignore_ascii_case("LORA")
+                                        || c.model_type.eq_ignore_ascii_case("LoCon")
+                                        || c.model_type.to_lowercase().contains("lora")
+                                })
+                                .take(6)
+                                .collect();
+                            out["loras"] = json!(if loras.is_empty() {
+                                // fall back to whatever matched the vibe
+                                civ.search(q, 6).await.unwrap_or_default()
+                            } else {
+                                loras
+                            });
+                        }
+                        Err(e) => {
+                            out["civitaiError"] = json!(e.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(out))
 }
 
 #[derive(Debug, Deserialize)]
@@ -311,7 +383,9 @@ pub async fn gallery_remix(
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(json!({
-        "prompt": meta.enhanced_prompt.clone().unwrap_or(meta.prompt.clone()),
+        // Prefer the user's natural-language prompt for remix; model brief is secondary
+        "prompt": meta.prompt.clone(),
+        "enhancedPrompt": meta.enhanced_prompt,
         "backend": meta.backend,
         "model": meta.model,
         "styleRef": meta.style_ref,

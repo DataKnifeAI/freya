@@ -58,8 +58,13 @@ run-operator: ## Run operator (needs kubeconfig)
 up-local: ## API + notes for UI (OPENROUTER_API_KEY / CIVITAI_API_KEY in env)
 	@echo "Terminal A: make run-api"
 	@echo "Terminal B: cd web && npm install && npm run dev"
+	@echo "UI mock only:  cd web && npm install && npm run dev:mock"
 	@echo "Optional worker: make run-worker  then set worker URL http://127.0.0.1:8091 in Settings"
 	@echo "Set OPENROUTER_API_KEY and optionally CIVITAI_API_KEY before run-api"
+
+.PHONY: mock-ui
+mock-ui: ## Interactive Freya UI mock (no API / keys required)
+	cd web && npm install && npm run dev:mock
 
 clean:
 	$(CARGO) clean

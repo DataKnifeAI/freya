@@ -6,14 +6,22 @@ Kubernetes operator and approachable NL image studio for [DataKnifeAI](https://d
 
 Freya removes the old “download GB → open Comfy/Swarm → click forever” loop:
 
-1. **Describe** what you want  
-2. Freya **plans** (OpenRouter chat) and **enhances** the prompt  
+1. **Describe** in natural language (no comma-tag recipes)  
+2. Optionally **ask for suggestions**; Freya **plans** and writes the model brief for you  
 3. **Generate** via OpenRouter image models **or** a local/remote diffusion worker with LoRAs  
 4. Browse the **gallery** and remix  
 
 The previous Compose/ComfyUI/SwarmUI/Ollama stack is preserved under [`legacy/`](legacy/) for reference — it is not required for the new path.
 
 ## Quick start (local)
+
+**UI mock only** (no keys/API — for layout and flow tweaks):
+
+```bash
+make mock-ui          # or: cd web && npm i && npm run dev:mock
+```
+
+**Full stack:**
 
 ```bash
 export OPENROUTER_API_KEY=sk-or-...
