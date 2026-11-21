@@ -21,5 +21,5 @@ Never put API keys in CRD string fields — only Secret references.
 
 ## Worker placement
 
-- **inCluster** — operator creates Deployment + models PVC + Service; Job downloads for `FreyaModelAsset`.
+- **incluster** — operator creates Deployment + models PVC + Service; Job downloads for `FreyaModelAsset`.
 - **external** — status.endpoint = `spec.externalEndpoint`; asset reconcile POSTs `/v1/assets/install` on the remote host.

@@ -75,12 +75,16 @@ impl AppState {
             }
         }
         if let Some(k) = secrets.civitai_api_key {
-            cfg.civitai_api_key = k.clone();
-            let mut civ = self.civitai.write().await;
-            *civ = CivitaiClient::new(k);
+            if !k.is_empty() {
+                cfg.civitai_api_key = k.clone();
+                let mut civ = self.civitai.write().await;
+                *civ = CivitaiClient::new(k);
+            }
         }
         if let Some(k) = secrets.hf_token {
-            cfg.hf_token = k;
+            if !k.is_empty() {
+                cfg.hf_token = k;
+            }
         }
     }
 

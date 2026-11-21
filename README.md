@@ -64,7 +64,7 @@ kubectl apply -f config/samples/freya_v1alpha1_freyastudio.yaml
 
 | Placement | Spec | Use when |
 |-----------|------|----------|
-| `inCluster` | GPU Deployment + models PVC | Cluster has `nvidia.com/gpu` |
+| `incluster` | GPU Deployment + models PVC | Cluster has `nvidia.com/gpu` |
 | `external` | `externalEndpoint: http://host:8091` | Physical box / bare-metal GPU |
 
 `FreyaModelAsset` (or UI **Civitai → Install to worker**) pushes LoRAs onto that worker so they show up for local generation.

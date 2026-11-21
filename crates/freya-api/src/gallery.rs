@@ -78,6 +78,9 @@ impl Gallery {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<ArtifactMeta>> {
+        let Some(id) = sanitize_gallery_id(id) else {
+            return Ok(None);
+        };
         let path = self.root.join(format!("{id}.json"));
         if !path.exists() {
             return Ok(None);
@@ -88,5 +91,14 @@ impl Gallery {
 
     pub fn image_path(&self, meta: &ArtifactMeta) -> PathBuf {
         self.root.join(&meta.filename)
+    }
+}
+
+/// Gallery ids are UUIDs written by [`Gallery::save`]. Reject path traversal.
+fn sanitize_gallery_id(id: &str) -> Option<&str> {
+    if Uuid::parse_str(id).is_ok() {
+        Some(id)
+    } else {
+        None
     }
 }

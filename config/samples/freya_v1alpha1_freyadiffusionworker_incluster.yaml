@@ -5,7 +5,7 @@ metadata:
   name: freya-gpu
   namespace: freya
 spec:
-  placement: inCluster
+  placement: incluster
   engine: vllm-omni
   model: stabilityai/stable-diffusion-xl-base-1.0
   gpuCount: 1
