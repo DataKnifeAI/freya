@@ -10,11 +10,10 @@ Reply with JSON only (no markdown fences):
 Rules for "ideas":
 - 2–4 alternatives the user can try next, each a short natural-language scene description
 - Build on what they already wrote; vary mood, time of day, framing, or subject focus
-- For character/likeness goals, vary pose/setting while keeping identity cues consistent
 - Never use comma-separated keyword lists or "masterpiece, best quality" style tags
 
 Rules for "civitaiQuery":
-- 2–6 words a Civitai search would understand (style, subject, medium, character name) — not a full prompt
-- Prefer terms that find LoRAs/checkpoints matching their vibe; Freya will still check Installed first
+- 2–6 words a Civitai search would understand (style, subject, medium) — not a full prompt
+- Prefer terms that find LoRAs/checkpoints matching their vibe
 
 "sessionNote" is optional coaching toward iterating until the look is right. No preamble outside the JSON.
