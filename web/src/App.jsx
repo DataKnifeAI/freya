@@ -363,6 +363,8 @@ export default function App() {
     blankSessionEntry();
 
   const [mock] = useState(() => isMockMode());
+  /** `make mock-ui` / `npm run dev:mock` bake mock in — Exit cannot leave. */
+  const mockLocked = import.meta.env.VITE_FREYA_MOCK === "true";
   const [tab, setTab] = useState("gallery");
   const [prompt, setPrompt] = useState(() => bootSession.prompt || "");
   const [busy, setBusy] = useState(false);
@@ -447,7 +449,11 @@ export default function App() {
   useEffect(() => {
     if (readStoredTheme()) return;
     const mq = window.matchMedia("(prefers-color-scheme: light)");
-    const onChange = (e) => setTheme(e.matches ? "light" : "dark");
+    const onChange = (e) => {
+      // Ignore OS changes after an explicit toggle writes freya.theme.
+      if (readStoredTheme()) return;
+      setTheme(e.matches ? "light" : "dark");
+    };
     mq.addEventListener?.("change", onChange);
     return () => mq.removeEventListener?.("change", onChange);
   }, []);
@@ -706,11 +712,13 @@ export default function App() {
   };
 
   const runBody = (nlPrompt) => {
+    const loras = pinnedPayload();
+    // Pinned LoRAs only apply on the local worker — prefer local when a worker is set.
     const body = {
       prompt: nlPrompt,
       enhance: "auto",
-      backend: "auto",
-      loras: pinnedPayload(),
+      backend: loras.length && hasWorker() ? "local" : "auto",
+      loras,
       automationMode,
     };
     if (imageModel && imageModel !== "auto") body.model = imageModel;
@@ -759,17 +767,21 @@ export default function App() {
   };
 
   const executeBatch = async (batch, goal) => {
+    const sessionId = activeIdRef.current;
     const results = [];
     for (const bp of batch) {
       const data = await runOne(bp);
+      if (activeIdRef.current !== sessionId) return results;
       results.push({ ...data, prompt: bp });
     }
+    if (activeIdRef.current !== sessionId) return results;
     setBatchResults(results);
     setResult(results[0] || null);
     setModelBrief(results[0]?.enhancedPrompt || "");
     setPrompt(batch[0] || goal);
     pushTurn(goal, results.map((r) => r.artifactId).filter(Boolean));
     const g = await api("/v1/gallery");
+    if (activeIdRef.current !== sessionId) return results;
     setGallery(g.items || []);
     return results;
   };
@@ -839,20 +851,23 @@ export default function App() {
   };
 
   const run = async () => {
+    const sessionId = activeIdRef.current;
     setBusy(true);
     setError("");
     setBatchResults([]);
     try {
       const data = await runOne(prompt);
+      if (activeIdRef.current !== sessionId) return;
       setResult(data);
       setModelBrief(data.enhancedPrompt || "");
       pushTurn(prompt, data.artifactId ? [data.artifactId] : []);
       const g = await api("/v1/gallery");
+      if (activeIdRef.current !== sessionId) return;
       setGallery(g.items || []);
     } catch (e) {
-      setError(e.message);
+      if (activeIdRef.current === sessionId) setError(e.message);
     } finally {
-      setBusy(false);
+      if (activeIdRef.current === sessionId) setBusy(false);
     }
   };
 
@@ -984,6 +999,7 @@ export default function App() {
 
   /** Agentic session — gated by Plan / Auto / YOLO. */
   const runSession = async () => {
+    const sessionId = activeIdRef.current;
     setBusy(true);
     setError("");
     setBatchResults([]);
@@ -991,6 +1007,7 @@ export default function App() {
     setPendingQuestion(null);
     try {
       const plan = await fetchSessionPlan();
+      if (activeIdRef.current !== sessionId) return;
 
       if (automationMode === "plan") {
         setPendingPlan({ ...plan, status: "plan" });
@@ -1023,9 +1040,9 @@ export default function App() {
       setPendingPlan(null);
       await executePlan(plan, { installs: "all", yolo: true });
     } catch (e) {
-      setError(e.message);
+      if (activeIdRef.current === sessionId) setError(e.message);
     } finally {
-      setBusy(false);
+      if (activeIdRef.current === sessionId) setBusy(false);
     }
   };
 
@@ -1244,9 +1261,15 @@ export default function App() {
             <button type="button" className="ghost mock-banner-btn" onClick={stayInMock}>
               Remember
             </button>
-            <button type="button" className="ghost mock-banner-btn" onClick={leaveMock}>
-              Exit
-            </button>
+            {mockLocked ? (
+              <span className="mock-banner-text" title="Started with VITE_FREYA_MOCK=true">
+                Dev mock (restart without VITE_FREYA_MOCK to use live API)
+              </span>
+            ) : (
+              <button type="button" className="ghost mock-banner-btn" onClick={leaveMock}>
+                Exit
+              </button>
+            )}
           </div>
         </div>
       )}

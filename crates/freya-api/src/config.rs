@@ -56,6 +56,15 @@ pub struct Config {
         default_value = "./data/secrets.json"
     )]
     pub secrets_file: PathBuf,
+
+    /// Optional bearer token for mutating `/v1/*` routes. Empty = open (local/dev only).
+    #[arg(long, env = "FREYA_API_TOKEN", default_value = "")]
+    pub api_token: String,
+
+    /// Comma-separated allowed CORS origins. Empty + no token → permissive (dev warning).
+    /// Empty + token set → same-origin only (no `*`).
+    #[arg(long, env = "FREYA_CORS_ORIGINS", default_value = "")]
+    pub cors_origins: String,
 }
 
 impl Config {

@@ -5,7 +5,7 @@ use crate::reconcile::{
     LABEL_NAME, MANAGED_BY,
 };
 use crate::Ctx;
-use freya_crd::FreyaStudio;
+use freya_crd::{FreyaDiffusionWorker, FreyaStudio, WorkerPlacement};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EnvVar, EnvVarSource, PersistentVolumeClaim,
@@ -46,6 +46,23 @@ pub async fn reconcile(studio: Arc<FreyaStudio>, ctx: Arc<Ctx>) -> Result<Action
     patch_status(&ctx, &ns, &name, "Ready", &api_svc, &ui_svc).await?;
 
     Ok(Action::requeue(Duration::from_secs(120)))
+}
+
+async fn resolve_worker_url(ctx: &Ctx, ns: &str, worker_name: &str) -> Result<String, Error> {
+    let workers: Api<FreyaDiffusionWorker> = Api::namespaced(ctx.client.clone(), ns);
+    let worker = workers.get(worker_name).await.map_err(Error::Kube)?;
+    match worker.spec.placement {
+        WorkerPlacement::External => worker
+            .spec
+            .external_endpoint
+            .clone()
+            .or_else(|| worker.status.as_ref().and_then(|s| s.endpoint.clone()))
+            .ok_or(Error::MissingWorkerEndpoint),
+        WorkerPlacement::InCluster => Ok(format!(
+            "http://{worker_name}.{ns}.svc.cluster.local:{}",
+            worker.spec.port
+        )),
+    }
 }
 
 fn labels(instance: &str, component: &str) -> BTreeMap<String, String> {
@@ -178,15 +195,16 @@ async fn ensure_api_deployment(
         secret_env("OPENROUTER_API_KEY", secret, false),
     ];
 
-    if let Some(ref worker) = studio.spec.diffusion_worker_ref {
+    if let Some(ref worker_name) = studio.spec.diffusion_worker_ref {
         env.push(EnvVar {
             name: "FREYA_DIFFUSION_WORKER_REF".into(),
-            value: Some(worker.clone()),
+            value: Some(worker_name.clone()),
             ..Default::default()
         });
+        let worker_url = resolve_worker_url(ctx, ns, worker_name).await?;
         env.push(EnvVar {
             name: "FREYA_DIFFUSION_WORKER_URL".into(),
-            value: Some(format!("http://{worker}.{ns}.svc.cluster.local:8091")),
+            value: Some(worker_url),
             ..Default::default()
         });
     }
@@ -322,7 +340,8 @@ async fn ensure_ui_deployment(
                             ..Default::default()
                         }]),
                         env: Some(vec![EnvVar {
-                            name: "FREYA_API_URL".into(),
+                            // Consumed by nginx envsubst template → upstream for /v1/.
+                            name: "FREYA_API_UPSTREAM".into(),
                             value: Some(format!("http://{name}-api:8080")),
                             ..Default::default()
                         }]),
@@ -493,6 +512,8 @@ pub enum Error {
     MissingNamespace,
     #[error("owner reference")]
     OwnerRef,
+    #[error("diffusion worker missing externalEndpoint")]
+    MissingWorkerEndpoint,
     #[error("kube: {0}")]
     Kube(#[from] kube::Error),
 }

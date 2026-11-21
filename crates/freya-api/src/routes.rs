@@ -84,6 +84,12 @@ pub async fn assist(
             if let Some(note) = parsed.get("sessionNote").and_then(|n| n.as_str()) {
                 out["sessionNote"] = json!(note);
             }
+            if let Some(goal) = parsed.get("goal") {
+                out["goal"] = goal.clone();
+            }
+            if let Some(steps) = parsed.get("steps") {
+                out["steps"] = steps.clone();
+            }
             let query = parsed
                 .get("civitaiQuery")
                 .and_then(|q| q.as_str())
@@ -235,6 +241,14 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
                 req.prompt = format!("{tw}, {}", req.prompt);
             }
         }
+    }
+
+    // LoRAs only apply on the local worker — prefer local when weights are pinned and a worker exists.
+    if !req.loras.is_empty()
+        && (req.backend.is_none() || req.backend.as_deref() == Some("auto"))
+        && state.worker.read().await.is_some()
+    {
+        req.backend = Some("local".into());
     }
 
     let backend = req.backend.clone().unwrap_or_else(|| "openrouter".into());
@@ -454,6 +468,23 @@ pub struct InstallCivitaiRequest {
     pub name: Option<String>,
 }
 
+/// Allowlist Civitai hosts before attaching the API token (never send token to untrusted URLs).
+fn civitai_download_url_ok(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return false;
+    }
+    match parsed.host_str() {
+        Some(h) => {
+            h.eq_ignore_ascii_case("civitai.com")
+                || h.to_ascii_lowercase().ends_with(".civitai.com")
+        }
+        None => false,
+    }
+}
+
 /// Install a Civitai download onto the configured diffusion worker (remote or in-cluster URL).
 pub async fn civitai_install(
     State(state): State<AppState>,
@@ -463,6 +494,11 @@ pub async fn civitai_install(
     if !cfg.civitai_configured() {
         return Err(ApiError::Msg(
             "Civitai API key required — set it in Settings".into(),
+        ));
+    }
+    if !civitai_download_url_ok(&req.download_url) {
+        return Err(ApiError::Msg(
+            "downloadUrl must be an http(s) civitai.com URL".into(),
         ));
     }
     let worker = state.worker.read().await;
@@ -530,6 +566,7 @@ pub async fn settings_put(
     State(state): State<AppState>,
     Json(upd): Json<SettingsUpdate>,
 ) -> ApiResult<Json<SettingsPublic>> {
+    let models_changed = upd.chat_model.is_some() || upd.image_model.is_some();
     {
         let mut cfg = state.config.write().await;
         if let Some(url) = upd.diffusion_worker_url {
@@ -556,6 +593,13 @@ pub async fn settings_put(
     };
     state.apply_secrets(secrets).await;
     let _ = state.persist_secrets().await;
+
+    // OpenRouterClient captures chat/image model at construction — rebuild after changes.
+    if models_changed {
+        let cfg = state.config.read().await;
+        let mut or = state.openrouter.write().await;
+        *or = crate::openrouter::OpenRouterClient::new(&cfg);
+    }
 
     Ok(settings_get(State(state)).await)
 }

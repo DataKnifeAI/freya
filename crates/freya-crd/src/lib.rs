@@ -332,11 +332,15 @@ pub enum DiffusionEngine {
 }
 
 /// Where the diffusion / LoRA engine runs.
+///
+/// CRD enum values are lowercase (`incluster`, `external`). The `inCluster` alias
+/// is accepted by Rust serde for convenience; kubectl/OpenAPI only allow `incluster`.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkerPlacement {
     /// Operator creates a GPU Deployment in-cluster.
     #[default]
+    #[serde(alias = "inCluster")]
     InCluster,
     /// Reach a remote physical (or other) host Freya already can HTTP to.
     External,
@@ -345,7 +349,7 @@ pub enum WorkerPlacement {
 /// Optional GPU worker for local SD / LoRA (vLLM-Omni by default).
 ///
 /// Placement:
-/// - `inCluster` — operator deploys the engine on a GPU node when the cluster has GPUs.
+/// - `incluster` — operator deploys the engine on a GPU node when the cluster has GPUs.
 /// - `external` — point `externalEndpoint` at a remote physical system running vLLM-Omni
 ///   (or compatible `/v1/images/generations` + LoRA install API). Freya UI/API use that
 ///   endpoint; `FreyaModelAsset` installs LoRAs onto the remote worker for the UI catalog.

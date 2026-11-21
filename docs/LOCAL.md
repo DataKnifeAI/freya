@@ -29,4 +29,16 @@ make run-worker
 # Settings → paste Civitai API key → Civitai tab → Install to worker
 ```
 
+### API auth (non-dev)
+
+By default `FREYA_API_TOKEN` is empty and mutating `/v1` routes are open — freya-api logs a warning (local/dev). For anything exposed beyond localhost:
+
+```bash
+export FREYA_API_TOKEN='long-random-secret'
+# optional: restrict browser origins (comma-separated)
+export FREYA_CORS_ORIGINS='https://freya.example.com,http://127.0.0.1:5173'
+```
+
+Send `Authorization: Bearer $FREYA_API_TOKEN` on POST/PUT. GET gallery/image stays open so the UI can load artifacts.
+
 `make ci` runs fmt, clippy, and tests.

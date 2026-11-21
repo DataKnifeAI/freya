@@ -8,7 +8,7 @@ use base64::Engine;
 use clap::Parser;
 use serde::Deserialize;
 use serde_json::json;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 use tower_http::trace::TraceLayer;
@@ -98,20 +98,52 @@ struct InstallReq {
     dest_path: String,
 }
 
+/// Resolve `dest_path` under `models_dir`, rejecting absolute paths and `..` escape.
+fn resolve_dest(models_dir: &Path, dest_path: &str) -> Result<PathBuf, String> {
+    let rel = Path::new(dest_path);
+    if dest_path.is_empty() || rel.is_absolute() {
+        return Err("destPath must be a non-empty relative path under models dir".into());
+    }
+    if rel
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::RootDir))
+    {
+        return Err("destPath must not contain '..' or absolute components".into());
+    }
+    let models_root = models_dir
+        .canonicalize()
+        .map_err(|e| format!("models dir: {e}"))?;
+    let dest = models_root.join(rel);
+    // Ensure the joined path still lives under models_root (defense in depth).
+    if !dest.starts_with(&models_root) {
+        return Err("destPath escapes models dir".into());
+    }
+    Ok(dest)
+}
+
 async fn install(
     State(app): State<Arc<App>>,
     Json(req): Json<InstallReq>,
 ) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
-    let dest = app.models_dir.join(&req.dest_path);
+    let dest = resolve_dest(&app.models_dir, &req.dest_path).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e })),
+        )
+    })?;
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).await.map_err(internal)?;
     }
-    let bytes = reqwest::get(&req.url)
-        .await
-        .map_err(internal)?
-        .bytes()
-        .await
-        .map_err(internal)?;
+    let resp = reqwest::get(&req.url).await.map_err(internal)?;
+    if !resp.status().is_success() {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("download failed with HTTP {}", resp.status())
+            })),
+        ));
+    }
+    let bytes = resp.bytes().await.map_err(internal)?;
     fs::write(&dest, &bytes).await.map_err(internal)?;
     info!(path = %dest.display(), bytes = bytes.len(), "installed asset");
     Ok(Json(json!({ "ok": true, "path": req.dest_path })))
@@ -122,4 +154,25 @@ fn internal(e: impl std::fmt::Display) -> (axum::http::StatusCode, Json<serde_js
         axum::http::StatusCode::BAD_REQUEST,
         Json(json!({ "error": e.to_string() })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn reject_path_escape() {
+        let dir = tempfile_dir();
+        assert!(resolve_dest(&dir, "../etc/passwd").is_err());
+        assert!(resolve_dest(&dir, "/etc/passwd").is_err());
+        assert!(resolve_dest(&dir, "loras/../../etc/passwd").is_err());
+        assert!(resolve_dest(&dir, "loras/ok.safetensors").is_ok());
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("freya-worker-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(dir.join("loras"));
+        dir
+    }
 }
