@@ -6,7 +6,10 @@ metadata:
   namespace: freya
 spec:
   placement: external
-  externalEndpoint: http://gpu-box.lan:8091
+  # kind→host: Service/Endpoints to a worker on the kind Docker network, or
+  # host gateway (often firewalled on Linux). Example for kind-local worker:
+  #   http://freya-gpu-host.freya.svc.cluster.local:8091
+  externalEndpoint: http://freya-gpu-host.freya.svc.cluster.local:8091
   engine: vllm-omni
   # Must match FREYA_WORKER_TOKEN on the remote worker process
   authSecretRef:
