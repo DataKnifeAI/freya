@@ -42,6 +42,18 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              apiTokenSecretRef:
+                description: Secret holding `FREYA_API_TOKEN` for the API (and UI nginx proxy). Set for non-dev / Ingress.
+                nullable: true
+                properties:
+                  key:
+                    default: apiKey
+                    type: string
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
               chatBackend:
                 default:
                   kind: openrouter
@@ -491,7 +503,10 @@ spec:
                 type: object
               placement:
                 default: incluster
-                description: Where the diffusion / LoRA engine runs.
+                description: |-
+                  Where the diffusion / LoRA engine runs.
+
+                  CRD enum values are lowercase (`incluster`, `external`). The `inCluster` alias is accepted by Rust serde for convenience; kubectl/OpenAPI only allow `incluster`.
                 enum:
                 - incluster
                 - external

@@ -29,16 +29,20 @@ make run-worker
 # Settings → paste Civitai API key → Civitai tab → Install to worker
 ```
 
-### API auth (non-dev)
+### API / worker auth (non-dev)
 
-By default `FREYA_API_TOKEN` is empty and mutating `/v1` routes are open — freya-api logs a warning (local/dev). For anything exposed beyond localhost:
+By default `FREYA_API_TOKEN` / `FREYA_WORKER_TOKEN` are empty and `/v1` routes are open — both binaries log a warning (local/dev). For anything exposed beyond localhost:
 
 ```bash
 export FREYA_API_TOKEN='long-random-secret'
+export FREYA_WORKER_TOKEN='long-random-secret'   # same value on API + worker
 # optional: restrict browser origins (comma-separated)
 export FREYA_CORS_ORIGINS='https://freya.example.com,http://127.0.0.1:5173'
+# optional for Vite UI: VITE_FREYA_API_TOKEN=$FREYA_API_TOKEN
 ```
 
-Send `Authorization: Bearer $FREYA_API_TOKEN` on POST/PUT. GET gallery/image stays open so the UI can load artifacts.
+Send `Authorization: Bearer $FREYA_API_TOKEN` on `/v1` calls (UI nginx injects this in-cluster). Gallery image GETs stay open so `<img src>` works; list/search/settings require the bearer when the token is set.
+
+In-cluster: set `FreyaStudio.spec.apiTokenSecretRef` and `FreyaDiffusionWorker.spec.authSecretRef`.
 
 `make ci` runs fmt, clippy, and tests.

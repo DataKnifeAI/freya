@@ -57,9 +57,13 @@ pub struct Config {
     )]
     pub secrets_file: PathBuf,
 
-    /// Optional bearer token for mutating `/v1/*` routes. Empty = open (local/dev only).
+    /// Optional bearer token for `/v1/*` routes. Empty = open (local/dev only).
     #[arg(long, env = "FREYA_API_TOKEN", default_value = "")]
     pub api_token: String,
+
+    /// Bearer token the API sends to the diffusion worker (`FREYA_WORKER_TOKEN`).
+    #[arg(long, env = "FREYA_WORKER_TOKEN", default_value = "")]
+    pub worker_token: String,
 
     /// Comma-separated allowed CORS origins. Empty + no token → permissive (dev warning).
     /// Empty + token set → same-origin only (no `*`).

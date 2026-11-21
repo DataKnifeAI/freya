@@ -161,23 +161,47 @@ async fn ensure_deployment(
                             name: Some("http".into()),
                             ..Default::default()
                         }]),
-                        env: Some(vec![
-                            EnvVar {
-                                name: "FREYA_WORKER_MODEL".into(),
-                                value: Some(worker.spec.model.clone()),
-                                ..Default::default()
-                            },
-                            EnvVar {
-                                name: "FREYA_WORKER_PORT".into(),
-                                value: Some(port.to_string()),
-                                ..Default::default()
-                            },
-                            EnvVar {
-                                name: "FREYA_MODELS_DIR".into(),
-                                value: Some("/models".into()),
-                                ..Default::default()
-                            },
-                        ]),
+                        env: Some({
+                            let mut env = vec![
+                                EnvVar {
+                                    name: "FREYA_WORKER_MODEL".into(),
+                                    value: Some(worker.spec.model.clone()),
+                                    ..Default::default()
+                                },
+                                EnvVar {
+                                    name: "FREYA_WORKER_PORT".into(),
+                                    value: Some(port.to_string()),
+                                    ..Default::default()
+                                },
+                                EnvVar {
+                                    name: "FREYA_MODELS_DIR".into(),
+                                    value: Some("/models".into()),
+                                    ..Default::default()
+                                },
+                            ];
+                            if let Some(ref auth) = worker.spec.auth_secret_ref {
+                                env.push(EnvVar {
+                                    name: "FREYA_WORKER_TOKEN".into(),
+                                    value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+                                        secret_key_ref: Some(
+                                            k8s_openapi::api::core::v1::SecretKeySelector {
+                                                name: auth.name.clone(),
+                                                key: auth.key.clone(),
+                                                optional: Some(false),
+                                            },
+                                        ),
+                                        ..Default::default()
+                                    }),
+                                    ..Default::default()
+                                });
+                            } else {
+                                warn!(
+                                    worker = %name,
+                                    "authSecretRef unset — worker /v1 routes are open on the cluster network"
+                                );
+                            }
+                            env
+                        }),
                         resources: Some(resources),
                         volume_mounts: Some(vec![VolumeMount {
                             name: "models".into(),

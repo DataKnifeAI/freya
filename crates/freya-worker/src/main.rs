@@ -1,7 +1,10 @@
 //! Minimal diffusion worker: OpenAI-compatible images + asset install for Freya.
 //! Production: replace with vLLM-Omni. This stub enables LoRA install + API wiring.
 
-use axum::extract::State;
+use axum::extract::{Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
@@ -12,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
 use tower_http::trace::TraceLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 #[derive(Parser, Clone)]
 struct Config {
@@ -20,11 +23,15 @@ struct Config {
     port: u16,
     #[arg(long, env = "FREYA_MODELS_DIR", default_value = "./data/models")]
     models_dir: PathBuf,
+    /// Optional bearer token for `/v1/*`. Empty = open (local/dev only).
+    #[arg(long, env = "FREYA_WORKER_TOKEN", default_value = "")]
+    token: String,
 }
 
 #[derive(Clone)]
 struct App {
     models_dir: PathBuf,
+    token: String,
 }
 
 #[tokio::main]
@@ -36,16 +43,31 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let cfg = Config::parse();
+    if cfg.token.trim().is_empty() {
+        warn!(
+            "FREYA_WORKER_TOKEN unset — /v1 routes are open (local/dev only). \
+             Set FreyaDiffusionWorker authSecretRef in-cluster."
+        );
+    } else {
+        info!("FREYA_WORKER_TOKEN set — bearer auth required on /v1 routes");
+    }
     fs::create_dir_all(cfg.models_dir.join("loras")).await?;
     fs::create_dir_all(cfg.models_dir.join("checkpoints")).await?;
     let state = Arc::new(App {
         models_dir: cfg.models_dir.clone(),
+        token: cfg.token.trim().to_string(),
     });
-    let app = Router::new()
-        .route("/health", get(|| async { Json(json!({"ok": true})) }))
+    let protected = Router::new()
         .route("/v1/loras", get(list_loras))
         .route("/v1/images/generations", post(generate))
         .route("/v1/assets/install", post(install))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_worker_token,
+        ));
+    let app = Router::new()
+        .route("/health", get(|| async { Json(json!({"ok": true})) }))
+        .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let bind = format!("0.0.0.0:{}", cfg.port);
@@ -53,6 +75,29 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn require_worker_token(
+    State(app): State<Arc<App>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if app.token.is_empty() {
+        return Ok(next.run(req).await);
+    }
+    let auth = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let ok = auth
+        .strip_prefix("Bearer ")
+        .map(|t| t == app.token)
+        .unwrap_or(false);
+    if !ok {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(req).await)
 }
 
 async fn list_loras(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
@@ -121,6 +166,41 @@ fn resolve_dest(models_dir: &Path, dest_path: &str) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+fn install_host_ok(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    h == "civitai.com"
+        || h.ends_with(".civitai.com")
+        || h == "huggingface.co"
+        || h.ends_with(".huggingface.co")
+        || h == "hf.co"
+        || h.ends_with(".hf.co")
+}
+
+fn install_url_ok(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return false;
+    }
+    parsed.host_str().is_some_and(install_host_ok)
+}
+
+fn download_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.error("too many redirects");
+            }
+            match attempt.url().host_str() {
+                Some(h) if install_host_ok(h) => attempt.follow(),
+                _ => attempt.error("redirect to disallowed host"),
+            }
+        }))
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 async fn install(
     State(app): State<Arc<App>>,
     Json(req): Json<InstallReq>,
@@ -131,10 +211,19 @@ async fn install(
             Json(json!({ "error": e })),
         )
     })?;
+    if !install_url_ok(&req.url) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "url must be http(s) on civitai.com, huggingface.co, or hf.co"
+            })),
+        ));
+    }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).await.map_err(internal)?;
     }
-    let resp = reqwest::get(&req.url).await.map_err(internal)?;
+    let client = download_client().map_err(internal)?;
+    let resp = client.get(&req.url).send().await.map_err(internal)?;
     if !resp.status().is_success() {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
@@ -168,6 +257,18 @@ mod tests {
         assert!(resolve_dest(&dir, "/etc/passwd").is_err());
         assert!(resolve_dest(&dir, "loras/../../etc/passwd").is_err());
         assert!(resolve_dest(&dir, "loras/ok.safetensors").is_ok());
+    }
+
+    #[test]
+    fn allowlist_install_hosts() {
+        assert!(install_url_ok(
+            "https://civitai.com/api/download/models/1?token=x"
+        ));
+        assert!(install_url_ok(
+            "https://huggingface.co/org/model/resolve/main/file.safetensors"
+        ));
+        assert!(!install_url_ok("https://evil.example/steal"));
+        assert!(!install_url_ok("file:///etc/passwd"));
     }
 
     fn tempfile_dir() -> PathBuf {

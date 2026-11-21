@@ -8,6 +8,7 @@ use serde_json::Value;
 pub struct DiffusionWorkerClient {
     http: reqwest::Client,
     base: String,
+    token: Option<String>,
 }
 
 impl DiffusionWorkerClient {
@@ -15,6 +16,20 @@ impl DiffusionWorkerClient {
         Self {
             http: reqwest::Client::new(),
             base: base.into().trim_end_matches('/').to_string(),
+            token: None,
+        }
+    }
+
+    pub fn with_token(mut self, token: impl Into<String>) -> Self {
+        let t = token.into();
+        self.token = if t.trim().is_empty() { None } else { Some(t) };
+        self
+    }
+
+    fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.token {
+            Some(t) => req.bearer_auth(t),
+            None => req,
         }
     }
 
@@ -29,8 +44,7 @@ impl DiffusionWorkerClient {
 
     pub async fn list_loras(&self) -> Result<Vec<LocalAsset>> {
         let resp = self
-            .http
-            .get(format!("{}/v1/loras", self.base))
+            .apply_auth(self.http.get(format!("{}/v1/loras", self.base)))
             .send()
             .await
             .context("list loras")?;
@@ -95,9 +109,11 @@ impl DiffusionWorkerClient {
         }
 
         let resp = self
-            .http
-            .post(format!("{}/v1/images/generations", self.base))
-            .json(&body)
+            .apply_auth(
+                self.http
+                    .post(format!("{}/v1/images/generations", self.base))
+                    .json(&body),
+            )
             .send()
             .await
             .context("worker generate")?;
@@ -124,9 +140,11 @@ impl DiffusionWorkerClient {
             "destPath": dest_path,
         });
         let resp = self
-            .http
-            .post(format!("{}/v1/assets/install", self.base))
-            .json(&body)
+            .apply_auth(
+                self.http
+                    .post(format!("{}/v1/assets/install", self.base))
+                    .json(&body),
+            )
             .send()
             .await
             .context("worker install")?;

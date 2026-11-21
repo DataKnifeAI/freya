@@ -37,7 +37,7 @@ impl AppState {
         let worker = cfg
             .diffusion_worker_url
             .as_ref()
-            .map(|u| DiffusionWorkerClient::new(u.clone()));
+            .map(|u| DiffusionWorkerClient::new(u.clone()).with_token(cfg.worker_token.clone()));
         let packs_dir = cfg.packs_dir.clone();
         let state = Self {
             config: Arc::new(RwLock::new(cfg)),

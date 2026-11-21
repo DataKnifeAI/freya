@@ -8,3 +8,7 @@ spec:
   placement: external
   externalEndpoint: http://gpu-box.lan:8091
   engine: vllm-omni
+  # Must match FREYA_WORKER_TOKEN on the remote worker process
+  authSecretRef:
+    name: freya-worker-token
+    key: apiKey

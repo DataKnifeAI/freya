@@ -2,6 +2,15 @@ import { isMockMode, mockApi } from "./mockApi.js";
 
 export { isMockMode };
 
+function apiAuthHeaders() {
+  const token =
+    (typeof import.meta !== "undefined" && import.meta.env?.VITE_FREYA_API_TOKEN) ||
+    (typeof localStorage !== "undefined" && localStorage.getItem("freya.apiToken")) ||
+    "";
+  if (!token) return {};
+  return { Authorization: `Bearer ${token}` };
+}
+
 export async function api(path, opts) {
   if (isMockMode()) {
     const data = await mockApi(path, opts);
@@ -12,8 +21,12 @@ export async function api(path, opts) {
   }
 
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(opts?.headers || {}) },
     ...opts,
+    headers: {
+      "Content-Type": "application/json",
+      ...apiAuthHeaders(),
+      ...(opts?.headers || {}),
+    },
   });
 
   // Image endpoints may return binary — not used by App today (uses URL strings).
