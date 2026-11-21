@@ -1,5 +1,4 @@
-# Optional alternate — only when the cluster itself has nvidia.com/gpu.
-# Recommended default is *_external.yaml (local GPU host via URL). See docs/ARCHITECTURE.md.
+# In-cluster GPU Deployment (requires nvidia.com/gpu)
 apiVersion: freya.dataknife.ai/v1alpha1
 kind: FreyaDiffusionWorker
 metadata:

@@ -3,7 +3,7 @@ name = "freya-worker"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Freya diffusion worker (OpenAI images API + LoRA/checkpoint install; GPU via Diffusers engine)"
+description = "Minimal Freya diffusion worker stub (OpenAI images API + LoRA install)"
 
 [[bin]]
 name = "freya-worker"
@@ -22,4 +22,3 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
-libc = "0.2"

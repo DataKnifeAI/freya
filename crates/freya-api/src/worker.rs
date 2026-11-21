@@ -12,18 +12,9 @@ pub struct DiffusionWorkerClient {
 }
 
 impl DiffusionWorkerClient {
-    #[allow(dead_code)]
     pub fn new(base: impl Into<String>) -> Self {
-        Self::new_with_tls(base, false)
-    }
-
-    pub fn new_with_tls(base: impl Into<String>, tls_insecure: bool) -> Self {
-        let http = reqwest::Client::builder()
-            .danger_accept_invalid_certs(tls_insecure)
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http,
+            http: reqwest::Client::new(),
             base: base.into().trim_end_matches('/').to_string(),
             token: None,
         }
@@ -43,62 +34,20 @@ impl DiffusionWorkerClient {
     }
 
     pub async fn health(&self) -> bool {
-        self.health_detail().await.is_some()
-    }
-
-    /// Fetch worker `/health` JSON when reachable.
-    pub async fn health_detail(&self) -> Option<Value> {
-        let resp = self
-            .http
+        self.http
             .get(format!("{}/health", self.base))
             .send()
             .await
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        resp.json::<Value>().await.ok()
-    }
-
-    /// Prefer authenticated `/v1/stats`, fall back to public `/health`.
-    pub async fn stats_detail(&self) -> Option<Value> {
-        let resp = self
-            .apply_auth(self.http.get(format!("{}/v1/stats", self.base)))
-            .send()
-            .await
-            .ok();
-        if let Some(resp) = resp {
-            if resp.status().is_success() {
-                if let Ok(v) = resp.json::<Value>().await {
-                    return Some(v);
-                }
-            }
-        }
-        self.health_detail().await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
     }
 
     pub async fn list_loras(&self) -> Result<Vec<LocalAsset>> {
-        self.list_assets("/v1/loras").await
-    }
-
-    pub async fn list_checkpoints(&self) -> Result<Vec<LocalAsset>> {
-        self.list_assets("/v1/checkpoints").await
-    }
-
-    pub async fn list_embeddings(&self) -> Result<Vec<LocalAsset>> {
-        self.list_assets("/v1/embeddings").await
-    }
-
-    pub async fn list_vaes(&self) -> Result<Vec<LocalAsset>> {
-        self.list_assets("/v1/vae").await
-    }
-
-    async fn list_assets(&self, path: &str) -> Result<Vec<LocalAsset>> {
         let resp = self
-            .apply_auth(self.http.get(format!("{}{path}", self.base)))
+            .apply_auth(self.http.get(format!("{}/v1/loras", self.base)))
             .send()
             .await
-            .with_context(|| format!("list assets {path}"))?;
+            .context("list loras")?;
         if !resp.status().is_success() {
             return Ok(Vec::new());
         }
@@ -123,70 +72,10 @@ impl DiffusionWorkerClient {
                         .and_then(|x| x.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    base_model: a
-                        .get("baseModel")
-                        .and_then(|x| x.as_str())
-                        .map(str::to_string),
-                    name: a
-                        .get("name")
-                        .and_then(|x| x.as_str())
-                        .map(str::to_string),
-                    size_bytes: a
-                        .get("sizeBytes")
-                        .and_then(|x| x.as_u64())
-                        .or_else(|| a.get("sizeBytes").and_then(|x| x.as_i64()).map(|n| n as u64)),
-                    model_type: a
-                        .get("modelType")
-                        .and_then(|x| x.as_str())
-                        .map(str::to_string),
-                    version_id: a.get("versionId").and_then(|x| x.as_i64()),
-                    model_id: a.get("modelId").and_then(|x| x.as_i64()),
-                    source: a
-                        .get("source")
-                        .and_then(|x| x.as_str())
-                        .map(str::to_string),
-                    thumbnail_url: a
-                        .get("thumbnailUrl")
-                        .and_then(|x| x.as_str())
-                        .map(str::to_string),
                 });
             }
         }
         Ok(out)
-    }
-
-    pub async fn get_active_base(&self) -> Result<Value> {
-        let resp = self
-            .apply_auth(self.http.get(format!("{}/v1/base-model", self.base)))
-            .send()
-            .await
-            .context("get active base")?;
-        if !resp.status().is_success() {
-            let t = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("get base-model failed: {t}"));
-        }
-        Ok(resp.json().await.unwrap_or(Value::Null))
-    }
-
-    pub async fn set_active_base(&self, model: &str, base_model: Option<&str>) -> Result<Value> {
-        let mut body = serde_json::json!({ "model": model });
-        if let Some(b) = base_model.map(str::trim).filter(|s| !s.is_empty()) {
-            body["baseModel"] = Value::String(b.into());
-        }
-        let resp = self
-            .apply_auth(
-                self.http
-                    .put(format!("{}/v1/base-model", self.base))
-                    .json(&body),
-            )
-            .send()
-            .await
-            .context("set active base")?;
-        if !resp.status().is_success() {
-            let t = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("set base-model failed: {t}"));
-        }
-        Ok(resp.json().await.unwrap_or(Value::Null))
     }
 
     pub async fn generate(
@@ -244,108 +133,21 @@ impl DiffusionWorkerClient {
             .context("decode worker image")
     }
 
-    /// Local multi-frame GIF via Diffusers engine (`POST /v1/videos/generations` format=gif).
-    pub async fn generate_gif(
-        &self,
-        prompt: &str,
-        model: Option<&str>,
-        size: Option<&str>,
-        seed: Option<i64>,
-        negative: Option<&str>,
-    ) -> Result<Vec<u8>> {
-        let mut body = serde_json::json!({
-            "prompt": prompt,
-            "format": "gif",
-            "frames": 6,
-        });
-        if let Some(m) = model {
-            body["model"] = Value::String(m.into());
-        }
-        if let Some(s) = size {
-            body["size"] = Value::String(s.into());
-        }
-        if let Some(seed) = seed {
-            body["seed"] = Value::from(seed);
-        }
-        if let Some(neg) = negative {
-            body["negative_prompt"] = Value::String(neg.into());
-        }
-        let resp = self
-            .apply_auth(
-                self.http
-                    .post(format!("{}/v1/videos/generations", self.base))
-                    .json(&body),
-            )
-            .send()
-            .await
-            .context("worker gif generate")?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("worker gif {status}: {text}"));
-        }
-        let v: Value = serde_json::from_str(&text)?;
-        let b64 = v
-            .pointer("/data/0/b64_json")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| anyhow!("worker gif missing b64_json"))?;
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .context("decode worker gif")
-    }
-
-    fn install_body(
-        &self,
-        source: &str,
-        url: &str,
-        dest_path: &str,
-        auth_token: Option<&str>,
-        meta: Option<&InstallMeta>,
-        r#async: bool,
-    ) -> Value {
-        let mut body = serde_json::json!({
-            "source": source,
-            "url": url,
-            "destPath": dest_path,
-            "async": r#async,
-        });
-        if let Some(t) = auth_token.map(str::trim).filter(|t| !t.is_empty()) {
-            body["authToken"] = Value::String(t.into());
-        }
-        if let Some(m) = meta {
-            if let Some(n) = m.name.as_deref().filter(|s| !s.is_empty()) {
-                body["name"] = Value::String(n.into());
-            }
-            if let Some(b) = m.base_model.as_deref().filter(|s| !s.is_empty()) {
-                body["baseModel"] = Value::String(b.into());
-            }
-            if let Some(v) = m.version_id {
-                body["versionId"] = Value::from(v);
-            }
-            if let Some(mid) = m.model_id {
-                body["modelId"] = Value::from(mid);
-            }
-            if let Some(t) = m.model_type.as_deref().filter(|s| !s.is_empty()) {
-                body["modelType"] = Value::String(t.into());
-            }
-            if let Some(thumb) = m.thumbnail_url.as_deref().filter(|s| !s.is_empty()) {
-                body["thumbnailUrl"] = Value::String(thumb.into());
-            }
-        }
-        body
-    }
-
-    /// Synchronous install (blocks until complete). Prefer `enqueue_install` for UI/agent.
     pub async fn install_asset(
         &self,
         source: &str,
         url: &str,
         dest_path: &str,
         auth_token: Option<&str>,
-        meta: Option<&InstallMeta>,
     ) -> Result<()> {
-        let body = self.install_body(source, url, dest_path, auth_token, meta, false);
+        let mut body = serde_json::json!({
+            "source": source,
+            "url": url,
+            "destPath": dest_path,
+        });
+        if let Some(t) = auth_token.map(str::trim).filter(|t| !t.is_empty()) {
+            body["authToken"] = Value::String(t.into());
+        }
         let resp = self
             .apply_auth(
                 self.http
@@ -361,132 +163,6 @@ impl DiffusionWorkerClient {
         }
         Ok(())
     }
-
-    /// Enqueue a background install job; returns worker JSON (`jobId`, `status`, `job`, …).
-    pub async fn enqueue_install(
-        &self,
-        source: &str,
-        url: &str,
-        dest_path: &str,
-        auth_token: Option<&str>,
-        meta: Option<&InstallMeta>,
-    ) -> Result<Value> {
-        let body = self.install_body(source, url, dest_path, auth_token, meta, true);
-        let resp = self
-            .apply_auth(
-                self.http
-                    .post(format!("{}/v1/assets/jobs", self.base))
-                    .json(&body),
-            )
-            .send()
-            .await
-            .context("worker enqueue install")?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("enqueue failed: {text}"));
-        }
-        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
-    }
-
-    pub async fn list_install_jobs(&self) -> Result<Value> {
-        let resp = self
-            .apply_auth(self.http.get(format!("{}/v1/assets/jobs", self.base)))
-            .send()
-            .await
-            .context("list install jobs")?;
-        if !resp.status().is_success() {
-            let t = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("list jobs failed: {t}"));
-        }
-        Ok(resp.json().await.unwrap_or(Value::Null))
-    }
-
-    pub async fn get_install_job(&self, id: &str) -> Result<Value> {
-        let resp = self
-            .apply_auth(
-                self.http
-                    .get(format!("{}/v1/assets/jobs/{}", self.base, id)),
-            )
-            .send()
-            .await
-            .context("get install job")?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if status.as_u16() == 404 {
-            return Err(anyhow!("job not found"));
-        }
-        if !status.is_success() {
-            return Err(anyhow!("get job failed: {text}"));
-        }
-        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
-    }
-
-    pub async fn cancel_install_job(&self, id: &str) -> Result<Value> {
-        let resp = self
-            .apply_auth(
-                self.http
-                    .post(format!("{}/v1/assets/jobs/{}/cancel", self.base, id)),
-            )
-            .send()
-            .await
-            .context("cancel install job")?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("cancel failed: {text}"));
-        }
-        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
-    }
-
-    /// Clear finished install jobs on the worker (succeeded/failed/cancelled).
-    pub async fn clear_install_jobs(&self, include_queued: bool) -> Result<Value> {
-        let body = serde_json::json!({ "includeQueued": include_queued });
-        let resp = self
-            .apply_auth(
-                self.http
-                    .post(format!("{}/v1/assets/jobs/clear", self.base))
-                    .json(&body),
-            )
-            .send()
-            .await
-            .context("clear install jobs")?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("clear jobs failed: {text}"));
-        }
-        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
-    }
-
-    pub async fn delete_asset(&self, path: &str) -> Result<Value> {
-        let body = serde_json::json!({ "path": path });
-        let resp = self
-            .apply_auth(
-                self.http
-                    .delete(format!("{}/v1/assets", self.base))
-                    .json(&body),
-            )
-            .send()
-            .await
-            .context("delete asset")?;
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow!("delete failed: {text}"));
-        }
-        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct InstallMeta {
-    pub name: Option<String>,
-    pub base_model: Option<String>,
-    pub version_id: Option<i64>,
-    pub model_id: Option<i64>,
-    pub model_type: Option<String>,
-    pub thumbnail_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,20 +181,4 @@ pub struct LocalAsset {
     pub id: String,
     pub kind: String,
     pub path: String,
-    #[serde(default)]
-    pub base_model: Option<String>,
-    #[serde(default)]
-    pub name: Option<String>,
-    #[serde(default)]
-    pub size_bytes: Option<u64>,
-    #[serde(default)]
-    pub model_type: Option<String>,
-    #[serde(default)]
-    pub version_id: Option<i64>,
-    #[serde(default)]
-    pub model_id: Option<i64>,
-    #[serde(default)]
-    pub source: Option<String>,
-    #[serde(default)]
-    pub thumbnail_url: Option<String>,
 }

@@ -1,410 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import { api, AUTH_REQUIRED_EVENT, hasBrowserBearer, isMockMode } from "./api.js";
-import { BEGINNER_EXAMPLE, demoCivitaiQuery, generateOfferForTurn } from "./mockApi.js";
+import { api, isMockMode } from "./api.js";
+import HeroCanvas from "./HeroCanvas.jsx";
+import {
+  BEGINNER_CIVITAI_QUERY,
+  BEGINNER_EXAMPLE,
+  demoCivitaiQuery,
+} from "./mockApi.js";
 
 const AUTOMATION_MODES = ["plan", "auto", "yolo"];
 const AUTOMATION_LABELS = { plan: "Plan", auto: "Auto", yolo: "YOLO" };
 const AUTOMATION_STORAGE_KEY = "freya.automationMode";
 const MODELS_STORAGE_KEY = "freya.models";
-/** Composer generation path: `cloud` (OpenRouter) | `local` (worker). */
-const GENERATE_BACKEND_STORAGE_KEY = "freya.generateBackend";
 const SESSIONS_STORAGE_KEY = "freya.sessions";
 const SIDEBAR_STORAGE_KEY = "freya.sidebarOpen";
-const WORKSPACE_SPLIT_STORAGE_KEY = "freya.workspaceSplit";
-/** Default / clamp for left chat pane width as % of `.workspace`. */
-const WORKSPACE_SPLIT_DEFAULT = 45;
-const WORKSPACE_SPLIT_MIN_LEFT_PX = 340;
-const WORKSPACE_SPLIT_MIN_RIGHT_PX = 280;
 const THEME_STORAGE_KEY = "freya.theme";
-const TAB_STORAGE_KEY = "freya.tab";
-/** Top-level Studio tabs (nav + restore must stay in sync). */
-const STUDIO_TABS = [
-  "gallery",
-  "styles",
-  "civitai",
-  "worker",
-  "metrics",
-  "models",
-  "settings",
-  "help",
-  "guidelines",
-];
-
-/** Empty Auto fallbacks → API uses Privacy/Alignment built-in matrix. */
-const EMPTY_AUTO_FALLBACKS = {
-  agent: "",
-  agentZdr: "",
-  image: "",
-  imageZdr: "",
-  video: "",
-  videoZdr: "",
-  router: "",
-  costTier: "medium",
-};
-
-function normalizeAutoFallbacks(raw) {
-  const r = raw && typeof raw === "object" ? raw : {};
-  const pick = (k) => {
-    const v = typeof r[k] === "string" ? r[k].trim() : "";
-    return v.toLowerCase() === "auto" ? "" : v;
-  };
-  const cost = String(r.costTier || "medium").trim().toLowerCase();
-  return {
-    agent: pick("agent"),
-    agentZdr: pick("agentZdr"),
-    image: pick("image"),
-    imageZdr: pick("imageZdr"),
-    video: pick("video"),
-    videoZdr: pick("videoZdr"),
-    router: pick("router"),
-    costTier: ["low", "high", "max"].includes(cost) ? cost : "medium",
-  };
-}
-/** First-login / first-use acknowledgment of user liability guidelines. */
-const GUIDELINES_ACK_STORAGE_KEY = "freya.guidelinesAck";
-/** Persistent Civitai library (survives sessions). Distinct from session Pin. */
-const FAVORITES_STORAGE_KEY = "freya.civitaiFavorites";
-
-/** Third-party policy links (README + Settings + Guidelines tab stay in sync). */
-const POLICY_LINKS = {
-  openrouter: [
-    { label: "Terms", href: "https://openrouter.ai/terms" },
-    { label: "Privacy", href: "https://openrouter.ai/privacy" },
-    {
-      label: "Data collection",
-      href: "https://openrouter.ai/docs/guides/privacy/data-collection",
-    },
-    { label: "ZDR", href: "https://openrouter.ai/docs/guides/features/zdr" },
-  ],
-  civitai: [
-    { label: "Terms", href: "https://civitai.com/content/tos" },
-    { label: "Privacy", href: "https://civitai.com/content/privacy" },
-    { label: "Content moderation", href: "https://civitai.com/content/moderation" },
-    { label: "Real-people rules", href: "https://civitai.com/content/rules/real-people" },
-  ],
-  huggingface: [
-    { label: "Terms", href: "https://huggingface.co/terms-of-service" },
-    { label: "Privacy", href: "https://huggingface.co/privacy" },
-    { label: "Content policy", href: "https://huggingface.co/content-policy" },
-  ],
-};
-
-function readGuidelinesAck() {
-  try {
-    return localStorage.getItem(GUIDELINES_ACK_STORAGE_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-function persistGuidelinesAck() {
-  try {
-    localStorage.setItem(GUIDELINES_ACK_STORAGE_KEY, "1");
-  } catch {
-    /* private mode / quota */
-  }
-}
-
-function PolicyLinkRow({ links }) {
-  return links.map((l, i) => (
-    <span key={l.href}>
-      {i > 0 ? " · " : null}
-      <a href={l.href} target="_blank" rel="noreferrer">
-        {l.label}
-      </a>
-    </span>
-  ));
-}
-
-/** Compact “?” control — opens Help tab at a section id (`help-zdr`, …). */
-function HelpQ({ topic, onOpen, label }) {
-  const title = label ? `Help: ${label}` : "Help";
-  return (
-    <button
-      type="button"
-      className="help-q"
-      title={title}
-      aria-label={title}
-      onClick={(e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        onOpen?.(topic);
-      }}
-    >
-      ?
-    </button>
-  );
-}
-
-function HelpSection({ id, title, children, active }) {
-  return (
-    <article id={id} className={`help-section${active ? " is-active" : ""}`}>
-      <h3 className="help-section-title">{title}</h3>
-      <div className="help-section-body">{children}</div>
-    </article>
-  );
-}
-
-function GuidelinesBody({ compact = false }) {
-  return (
-    <div className={compact ? "guidelines-body is-compact" : "guidelines-body"}>
-      <p>
-        <strong>Freya is a tool.</strong> It helps you plan prompts and call image/chat APIs you
-        configure. It does not decide what is legal where you live, and it does not police your
-        prompts or outputs beyond what third-party providers already enforce.
-      </p>
-      <p>
-        <strong>You are responsible.</strong> Generated or downloaded content may be illegal or
-        restricted under your country or state law. You alone are liable for how you use Freya,
-        what you generate, and what you publish or share — not Freya, DataKnifeAI, or the
-        operators of this instance.
-      </p>
-      <p>
-        <strong>Bring your own keys and hardware.</strong> You supply OpenRouter / Civitai / HF
-        credentials and any local GPU worker. Those accounts and machines are yours; Freya only
-        relays requests you initiate.
-      </p>
-      <p>
-        <strong>Follow third-party policies.</strong> Using Freya means you agree to comply with
-        each provider’s terms, privacy, and content rules for any keys you configure and any
-        prompts or assets you send or download:
-      </p>
-      <ul className="guidelines-policy-list">
-        <li>
-          <strong>OpenRouter</strong> — <PolicyLinkRow links={POLICY_LINKS.openrouter} />
-        </li>
-        <li>
-          <strong>Civitai</strong> — <PolicyLinkRow links={POLICY_LINKS.civitai} />
-        </li>
-        <li>
-          <strong>Hugging Face</strong> — <PolicyLinkRow links={POLICY_LINKS.huggingface} />
-        </li>
-      </ul>
-      {!compact && (
-        <p className="hint">
-          Acknowledgment is stored in this browser as{" "}
-          <code>{GUIDELINES_ACK_STORAGE_KEY}</code>. Clear site data to see the prompt again.
-        </p>
-      )}
-    </div>
-  );
-}
-const CIVITAI_SUBVIEW_STORAGE_KEY = "freya.civitaiSubview";
-/** Left cluster then Downloads (rightmost in subnav). */
-const CIVITAI_SUBVIEWS = ["search", "favorites", "installed", "downloads"];
-/** Debounce for Civitai search-as-you-type (ms). */
-const CIVITAI_SEARCH_DEBOUNCE_MS = 350;
-const CIVITAI_SEARCH_TYPES = "LORA,LoCon,DoRA,Checkpoint,TextualInversion,VAE";
-/** Local freya-worker / freya-local-worker defaults (see .env.example, docs/LOCAL.md). */
-const DEFAULT_WORKER_HOST = "localhost";
-const DEFAULT_WORKER_PORT = "8091";
-
-/** Status suffix for active base — reflects Diffusers engine, not stub-era copy. */
-function activeBaseEngineHint(modelLoaded, workerStats) {
-  if (!modelLoaded?.model) return "";
-  const engineName =
-    modelLoaded.engine ||
-    workerStats?.engine?.engine ||
-    workerStats?.worker?.engine?.engine ||
-    "";
-  const enginePayload = workerStats?.engine || workerStats?.worker?.engine || null;
-  const engineOk = enginePayload?.ok === true;
-  if (modelLoaded.loadedInVram === true) {
-    return engineName ? ` — loaded in VRAM (${engineName})` : " — loaded in VRAM";
-  }
-  if (engineName === "diffusers-unreachable") {
-    return " — selected; Diffusers engine unavailable";
-  }
-  if (engineName === "diffusers" || (engineOk && engineName)) {
-    return " — selected; Diffusers loads on demand";
-  }
-  if (!engineName || engineName === "stub") {
-    return " — selected on disk; no Diffusers engine configured";
-  }
-  return ` — selected (${engineName})`;
-}
-
-/** Label container vs host models path when both are known. */
-function modelsDirHint(workerStats) {
-  const dir = workerStats?.modelsDir;
-  if (!dir) return null;
-  const host = workerStats?.modelsDirHost || workerStats?.worker?.modelsDirHost || null;
-  const containerish =
-    dir === "/models" || dir === "/data/models" || dir.startsWith("/models/");
-  if (host) {
-    return `Models dir: ${host} (container: ${dir})`;
-  }
-  if (containerish) {
-    return `Models dir (container path): ${dir}`;
-  }
-  return `Models dir: ${dir}`;
-}
-
-function parseWorkerEndpoint(url) {
-  // No saved URL → show local defaults in the fields (hasWorker still uses persisted settings).
-  const empty = {
-    host: DEFAULT_WORKER_HOST,
-    port: DEFAULT_WORKER_PORT,
-    advancedUrl: "",
-    useAdvanced: false,
-  };
-  if (!url || !String(url).trim()) return empty;
-  try {
-    const u = new URL(String(url).trim());
-    const path = (u.pathname || "/").replace(/\/$/, "") || "";
-    const simpleHttp =
-      u.protocol === "http:" && !path && !u.search && !u.hash && Boolean(u.hostname);
-    if (simpleHttp) {
-      return {
-        host: u.hostname,
-        port: u.port || DEFAULT_WORKER_PORT,
-        advancedUrl: "",
-        useAdvanced: false,
-      };
-    }
-    return {
-      host: "",
-      port: "",
-      advancedUrl: String(url).trim(),
-      useAdvanced: true,
-    };
-  } catch {
-    return {
-      host: "",
-      port: "",
-      advancedUrl: String(url).trim(),
-      useAdvanced: true,
-    };
-  }
-}
-
-function composeWorkerUrl(host, port) {
-  const h = String(host || "").trim();
-  if (!h) return "";
-  const p = String(port || DEFAULT_WORKER_PORT).trim() || DEFAULT_WORKER_PORT;
-  return `http://${h}:${p}`;
-}
-
-/** Studio origin for setup script URLs (same host that serves /scripts/…). */
-function studioOrigin() {
-  try {
-    if (typeof window !== "undefined" && window.location?.origin) {
-      return window.location.origin;
-    }
-  } catch {
-    /* ignore */
-  }
-  return "";
-}
-
-function shellSingleQuote(s) {
-  return `'${String(s ?? "").replace(/'/g, `'\\''`)}'`;
-}
-
-/** Linux one-liner with machine token substituted (Worker tab Setup). */
-function buildLinuxWorkerSetupCmd({ origin, token, apiUrl }) {
-  const base = (origin || "").replace(/\/$/, "") || "<studio-origin>";
-  const tok = token?.trim() || "<machine-token>";
-  const api = (apiUrl || base).replace(/\/$/, "");
-  return `curl -fsSL ${base}/scripts/setup-local-worker.sh | bash -s -- --token ${shellSingleQuote(tok)} --api-url ${shellSingleQuote(api)}`;
-}
-
-/** Windows PowerShell one-liner with machine token substituted. */
-function buildWindowsWorkerSetupCmd({ origin, token, apiUrl }) {
-  const base = (origin || "").replace(/\/$/, "") || "<studio-origin>";
-  const tok = (token?.trim() || "<machine-token>").replace(/'/g, "''");
-  const api = ((apiUrl || base).replace(/\/$/, "") || base).replace(/'/g, "''");
-  // PowerShell subexpression $(irm …) — escape $ so JS template literals leave it alone.
-  return `iex "& { \$(irm '${base}/scripts/setup-local-worker.ps1') } -Token '${tok}' -ApiUrl '${api}'"`;
-}
-
-function readFavorites() {
-  try {
-    const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((x) => x && (x.id != null || x.name)) : [];
-  } catch {
-    return [];
-  }
-}
-
-function writeFavorites(list) {
-  try {
-    localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(list.slice(0, 200)));
-  } catch {
-    /* ignore quota */
-  }
-}
-
-/** Human-readable byte size for storage meters (Worker tab). */
-function formatBytes(n) {
-  const v = Number(n);
-  if (!Number.isFinite(v) || v < 0) return "—";
-  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
-  let x = v;
-  let i = 0;
-  while (x >= 1024 && i < units.length - 1) {
-    x /= 1024;
-    i += 1;
-  }
-  const digits = i === 0 ? 0 : x >= 10 ? 1 : 2;
-  return `${x.toFixed(digits)} ${units[i]}`;
-}
-
-/** Compact used/total progress bar (gallery PVC + worker models). */
-function StorageMeter({ label, disk, fallbackHint }) {
-  const used = disk?.usedBytes;
-  const total = disk?.totalBytes;
-  const free = disk?.freeBytes;
-  const pct =
-    typeof disk?.usedPercent === "number"
-      ? Math.min(100, Math.max(0, Math.round(disk.usedPercent)))
-      : typeof used === "number" && typeof total === "number" && total > 0
-        ? Math.min(100, Math.round((used / total) * 100))
-        : null;
-  const meta =
-    pct != null && typeof used === "number" && typeof total === "number"
-      ? `${formatBytes(used)} / ${formatBytes(total)} (${pct}%)${
-          typeof free === "number" ? ` · ${formatBytes(free)} free` : ""
-        }`
-      : fallbackHint || "n/a";
-  return (
-    <div className="worker-vram worker-disk" title={disk?.path || undefined}>
-      <div className="worker-vram-meta">
-        <span>{label}</span>
-        <span>{meta}</span>
-      </div>
-      <div
-        className="worker-vram-bar"
-        role="progressbar"
-        aria-label={label}
-        aria-valuenow={pct ?? 0}
-        aria-valuemin={0}
-        aria-valuemax={100}
-      >
-        <div className="worker-vram-fill" style={{ width: `${pct ?? 0}%` }} />
-      </div>
-    </div>
-  );
-}
-
-function formatStat(n) {
-  if (n == null || Number.isNaN(Number(n))) return null;
-  const v = Number(n);
-  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
-  if (v >= 1_000) return `${(v / 1_000).toFixed(1)}K`;
-  return String(v);
-}
-
-/** Format OpenRouter USD credit amounts for the Metrics tab. */
-function fmtUsd(n) {
-  if (n == null || Number.isNaN(Number(n))) return "—";
-  const v = Number(n);
-  const abs = Math.abs(v);
-  const digits = abs >= 100 ? 2 : abs >= 1 ? 3 : 4;
-  return `$${v.toFixed(digits)}`;
-}
 
 function readStoredTheme() {
   try {
@@ -414,55 +23,6 @@ function readStoredTheme() {
     /* ignore */
   }
   return null;
-}
-
-function readHelpHash() {
-  try {
-    const h = String(window.location.hash || "").replace(/^#/, "");
-    if (h.startsWith("help-")) return h;
-  } catch {
-    /* ignore */
-  }
-  return null;
-}
-
-function readStoredTab() {
-  try {
-    if (readHelpHash()) return "help";
-    const v = localStorage.getItem(TAB_STORAGE_KEY);
-    if (STUDIO_TABS.includes(v)) return v;
-  } catch {
-    /* ignore */
-  }
-  return "gallery";
-}
-
-function persistTab(tab) {
-  try {
-    if (STUDIO_TABS.includes(tab)) localStorage.setItem(TAB_STORAGE_KEY, tab);
-  } catch {
-    /* ignore */
-  }
-}
-
-function readStoredCivitaiSubview() {
-  try {
-    const v = localStorage.getItem(CIVITAI_SUBVIEW_STORAGE_KEY);
-    if (CIVITAI_SUBVIEWS.includes(v)) return v;
-  } catch {
-    /* ignore */
-  }
-  return "search";
-}
-
-function persistCivitaiSubview(subview) {
-  try {
-    if (CIVITAI_SUBVIEWS.includes(subview)) {
-      localStorage.setItem(CIVITAI_SUBVIEW_STORAGE_KEY, subview);
-    }
-  } catch {
-    /* ignore */
-  }
 }
 
 function systemTheme() {
@@ -481,290 +41,31 @@ function resolveInitialTheme() {
 }
 
 const MODE_HINTS = {
-  plan: "Plan — Freya proposes tool calls (generate/install). Confirm before they run.",
-  auto: "Auto — Freya runs tools, but asks when installs are ambiguous.",
-  yolo: "YOLO — Freya runs tools freely (generate, search, install when a worker is set).",
+  plan: "Plan only — steps, Civitai query, LoRAs, batch prompts. No generate or install.",
+  auto: "Run & ask when unsure — pauses on ambiguous LoRAs. Installs only if a worker is set; otherwise generates via OpenRouter.",
+  yolo: "Full auto — search, install only when a worker is set, otherwise generate via OpenRouter. No questions.",
 };
 
-/** Auto-only placeholders until live lists arrive from GET /v1/models. */
-const AUTO_AGENT = { id: "auto", label: "Auto", short: "Auto" };
-const UPSTREAM_ROUTER_ID = "openrouter/auto";
-const AUTO_IMAGE = { id: "auto", label: "Auto", short: "Auto" };
-const AUTO_VIDEO = { id: "auto", label: "Auto", short: "Auto" };
-const PLACEHOLDER_VIDEO_MODELS = [AUTO_VIDEO];
+const AGENT_MODELS = [
+  { id: "openrouter/auto", label: "Auto", short: "Auto" },
+  { id: "anthropic/claude-sonnet-4", label: "Claude Sonnet 4", short: "Sonnet 4" },
+  { id: "openai/gpt-4.1-mini", label: "GPT-4.1 Mini", short: "GPT-4.1 Mini" },
+  { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash", short: "Gemini Flash" },
+];
 
-function artifactMime(item) {
-  return (
-    item?.mime ||
-    item?.meta?.mime ||
-    (typeof item?.filename === "string" && item.filename.endsWith(".mp4")
-      ? "video/mp4"
-      : typeof item?.filename === "string" && item.filename.endsWith(".webm")
-        ? "video/webm"
-        : typeof item?.filename === "string" && item.filename.endsWith(".gif")
-          ? "image/gif"
-          : "")
-  );
-}
-
-function isVideoArtifact(item) {
-  const m = String(artifactMime(item) || "").toLowerCase();
-  return m.includes("mp4") || m.includes("webm") || m.startsWith("video/");
-}
-
-function isGifArtifact(item) {
-  const m = String(artifactMime(item) || "").toLowerCase();
-  return m.includes("gif");
-}
-
-/** Gallery / chat media: video player, animated gif, or still image. */
-function MediaFigure({ item, src, alt, className }) {
-  if (isVideoArtifact(item)) {
-    return (
-      <video
-        className={className}
-        src={src}
-        controls
-        playsInline
-        loop
-        muted
-        preload="metadata"
-        aria-label={alt || "Generated video"}
-      />
-    );
-  }
-  return <img className={className} src={src} alt={alt || ""} />;
-}
-const AUTO_ROUTER = { id: "auto", label: "Auto", short: "Auto" };
-const PLACEHOLDER_AGENT_MODELS = [AUTO_AGENT];
-const PLACEHOLDER_IMAGE_MODELS = [AUTO_IMAGE];
-/** @type {{ id: string, label: string, short: string }[]} */
-const EMPTY_VIDEO_CATALOG = PLACEHOLDER_VIDEO_MODELS;
-const PLACEHOLDER_ROUTER_MODELS = [AUTO_ROUTER];
-const MODELS_API_HINT = "LLM API access needed to list models";
-const AUTH_SIGN_IN_HINT = "Sign in required";
-const OPENROUTER_HINT = "OpenRouter key required";
-/** Debounce before auto-saving privacy/alignment so `/v1/models` pickers can refresh. */
-const PREFS_MODELS_DEBOUNCE_MS = 400;
-/** Debounce before auto-saving pasted API keys (empty = leave on-file key alone). */
-const API_KEYS_DEBOUNCE_MS = 600;
-
-/** Normalize chat-provider checkbox prefs (unchecked = excluded). */
-function normalizeChatProviders(raw) {
-  const cp = raw && typeof raw === "object" ? raw : {};
-  const excluded = Array.isArray(cp.excluded)
-    ? [...new Set(cp.excluded.map((s) => String(s || "").trim().toLowerCase()).filter(Boolean))].sort()
-    : [];
-  let legacyOnly = null;
-  if (Array.isArray(cp.legacyOnly) && cp.legacyOnly.length) {
-    legacyOnly = [
-      ...new Set(cp.legacyOnly.map((s) => String(s || "").trim().toLowerCase()).filter(Boolean)),
-    ].sort();
-  }
-  return { excluded, legacyOnly };
-}
-
-/** Normalize privacy + alignment for PUT / fingerprint (catalog-affecting prefs). */
-function privacyAlignmentSnapshot({
-  privacyZdr,
-  privacyDataCollection,
-  chatProviders,
-  modelAlignment,
-  allowNsfwLocal,
-  instructionTone,
-  autoFallbacks,
-}) {
-  return {
-    privacy: {
-      zeroDataRetention: Boolean(privacyZdr),
-      dataCollection: privacyDataCollection === "deny" ? "deny" : "allow",
-      chatProviders: normalizeChatProviders(chatProviders),
-    },
-    alignment: {
-      modelAlignment: String(modelAlignment || "balanced").trim() || "balanced",
-      allowNsfwLocal: Boolean(allowNsfwLocal),
-      instructionTone: String(instructionTone || "warm").trim() || "warm",
-    },
-    autoFallbacks: normalizeAutoFallbacks(autoFallbacks),
-  };
-}
-
-function privacyAlignmentFromSettings(st) {
-  const p = st?.privacy || {};
-  const a = st?.alignment || {};
-  // Migrate any leftover free-text fields from older API responses.
-  let chatProviders = normalizeChatProviders(p.chatProviders);
-  if (
-    !chatProviders.excluded.length &&
-    !chatProviders.legacyOnly &&
-    (typeof p.providerIgnore === "string" || typeof p.providerOnly === "string")
-  ) {
-    const ignore = String(p.providerIgnore || "")
-      .split(/[,\s]+/)
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean);
-    const only = String(p.providerOnly || "")
-      .split(/[,\s]+/)
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean);
-    chatProviders = normalizeChatProviders({
-      excluded: ignore,
-      legacyOnly: only.length ? only : null,
-    });
-  }
-  return privacyAlignmentSnapshot({
-    privacyZdr: Boolean(p.zeroDataRetention),
-    privacyDataCollection: p.dataCollection === "deny" ? "deny" : "allow",
-    chatProviders,
-    modelAlignment:
-      typeof a.modelAlignment === "string" && a.modelAlignment.trim()
-        ? a.modelAlignment.trim()
-        : "balanced",
-    allowNsfwLocal: Boolean(a.allowNsfwLocal),
-    instructionTone:
-      typeof a.instructionTone === "string" && a.instructionTone.trim()
-        ? a.instructionTone.trim()
-        : "warm",
-    autoFallbacks: st?.autoFallbacks,
-  });
-}
-
-/** Checked = included in chat picker. */
-function chatProviderIsChecked(slug, chatProviders) {
-  const v = String(slug || "").trim().toLowerCase();
-  if (!v) return false;
-  const cp = normalizeChatProviders(chatProviders);
-  if (cp.legacyOnly) return cp.legacyOnly.includes(v);
-  return !cp.excluded.includes(v);
-}
-
-/** Build prefs after toggling one vendor checkbox (clears legacy-only include). */
-function chatProvidersAfterToggle(available, chatProviders, slug, checked) {
-  const list = Array.isArray(available) ? available : [];
-  const nextChecked = new Set();
-  for (const s of list) {
-    const v = String(s || "").trim().toLowerCase();
-    if (!v) continue;
-    if (chatProviderIsChecked(v, chatProviders)) nextChecked.add(v);
-  }
-  const target = String(slug || "").trim().toLowerCase();
-  if (target) {
-    if (checked) nextChecked.add(target);
-    else nextChecked.delete(target);
-  }
-  const excluded = list
-    .map((s) => String(s || "").trim().toLowerCase())
-    .filter((v) => v && !nextChecked.has(v))
-    .sort();
-  return normalizeChatProviders({ excluded, legacyOnly: null });
-}
-
-function chatProvidersSelectAll(available, allChecked) {
-  const list = (Array.isArray(available) ? available : [])
-    .map((s) => String(s || "").trim().toLowerCase())
-    .filter(Boolean)
-    .sort();
-  if (allChecked) return normalizeChatProviders({ excluded: [], legacyOnly: null });
-  return normalizeChatProviders({ excluded: list, legacyOnly: null });
-}
-
-function privacyAlignmentFingerprint(snap) {
-  return JSON.stringify(snap);
-}
-
-function shortFromName(name, id) {
-  let s = String(name || id || "").trim();
-  const colon = s.indexOf(": ");
-  if (colon > 0 && colon < 32) s = s.slice(colon + 2).trim();
-  if (s.length > 22) s = `${s.slice(0, 20)}…`;
-  return s || id;
-}
-
-/** OpenRouter vendor slug: id prefix before `/` (e.g. `openai/gpt-5.2` → `openai`). */
-function modelVendor(id) {
-  const s = String(id || "");
-  const slash = s.indexOf("/");
-  return slash > 0 ? s.slice(0, slash).toLowerCase() : s.toLowerCase();
-}
-
-/** Sort catalog rows by vendor, then display name, then id. */
-function cmpModelVendorName(a, b) {
-  const va = modelVendor(a.id);
-  const vb = modelVendor(b.id);
-  if (va !== vb) return va < vb ? -1 : 1;
-  const na = String(a.label || a.name || a.id || "").toLowerCase();
-  const nb = String(b.label || b.name || b.id || "").toLowerCase();
-  if (na !== nb) return na < nb ? -1 : 1;
-  const ia = String(a.id || "").toLowerCase();
-  const ib = String(b.id || "").toLowerCase();
-  return ia < ib ? -1 : ia > ib ? 1 : 0;
-}
-
-/** Map API catalog rows → CompactMenu options; Auto first, rest vendor → name. */
-function catalogToOptions(items, { auto }) {
-  const mapped = (Array.isArray(items) ? items : [])
-    .filter((m) => m && m.id)
-    .map((m) => ({
-      id: m.id,
-      label:
-        m.id === UPSTREAM_ROUTER_ID
-          ? "OpenRouter router (upstream)"
-          : m.name || m.id,
-      short:
-        m.id === UPSTREAM_ROUTER_ID
-          ? "OR router"
-          : shortFromName(m.name, m.id),
-    }))
-    .sort(cmpModelVendorName);
-  if (!mapped.length) return [auto];
-  return [auto, ...mapped];
-}
-
-function ensureSelectedOption(list, id) {
-  if (!id || list.some((m) => m.id === id)) return list;
-  return [...list, { id, label: id, short: shortFromName(id, id) }];
-}
+const IMAGE_MODELS = [
+  { id: "auto", label: "Auto", short: "Auto" },
+  { id: "black-forest-labs/flux.2-klein-4b", label: "FLUX.2 Klein 4B", short: "FLUX Klein" },
+  { id: "black-forest-labs/flux.1-schnell", label: "FLUX.1 Schnell", short: "FLUX Schnell" },
+  { id: "stabilityai/sdxl-turbo", label: "SDXL Turbo", short: "SDXL Turbo" },
+];
 
 const emptySession = () => ({
   goal: "",
   pinnedLoras: [],
   turns: [],
-  messages: [],
   sessionNote: "",
 });
-
-/** Normalize persisted session: promote legacy turns into chat messages. */
-function normalizeSession(raw) {
-  if (!raw || typeof raw !== "object") return emptySession();
-  const pinnedLoras = Array.isArray(raw.pinnedLoras) ? raw.pinnedLoras : [];
-  const turns = Array.isArray(raw.turns) ? raw.turns : [];
-  let messages = Array.isArray(raw.messages) ? raw.messages : [];
-  if (!messages.length && turns.length) {
-    messages = turns
-      .slice()
-      .reverse()
-      .flatMap((t) => {
-        const at = t.at || new Date().toISOString();
-        const out = [{ role: "user", content: t.prompt || "", at }];
-        if (t.artifactIds?.length) {
-          out.push({
-            role: "assistant",
-            content: `Generated ${t.artifactIds.length} image${t.artifactIds.length === 1 ? "" : "s"}.`,
-            at,
-            artifactIds: t.artifactIds,
-          });
-        }
-        return out;
-      });
-  }
-  return {
-    goal: raw.goal || "",
-    pinnedLoras,
-    turns,
-    messages,
-    sessionNote: raw.sessionNote || "",
-  };
-}
 
 function makeSessionId() {
   return `s_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
@@ -834,24 +135,6 @@ function readStoredSidebarOpen() {
   return true;
 }
 
-function readStoredWorkspaceSplit() {
-  try {
-    const n = Number(localStorage.getItem(WORKSPACE_SPLIT_STORAGE_KEY));
-    if (Number.isFinite(n) && n >= 15 && n <= 85) return n;
-  } catch {
-    /* ignore */
-  }
-  return WORKSPACE_SPLIT_DEFAULT;
-}
-
-function persistWorkspaceSplit(pct) {
-  try {
-    localStorage.setItem(WORKSPACE_SPLIT_STORAGE_KEY, String(Math.round(pct * 10) / 10));
-  } catch {
-    /* ignore */
-  }
-}
-
 function readStoredSessions() {
   try {
     const raw = localStorage.getItem(SESSIONS_STORAGE_KEY);
@@ -880,66 +163,7 @@ function persistSessionsStore(activeId, sessions) {
 }
 
 function loraKey(l) {
-  if (l?.path) return `path:${l.path}`;
   return String(l.id ?? l.name);
-}
-
-/** Session pin is for LoRAs / adapters / embeddings — never checkpoints or VAE. */
-function isPinnableAsset(item) {
-  if (!item) return false;
-  const path = String(item.path || "");
-  if (path.startsWith("checkpoints/") || path.startsWith("vae/")) return false;
-  const t = String(item.modelType || item.kind || "").toLowerCase().replace(/[\s_-]/g, "");
-  if (!t) {
-    // Search cards without type default to LoRA-like; path-based rows need a folder hint.
-    if (path.startsWith("loras/") || path.startsWith("embeddings/")) return true;
-    return !path;
-  }
-  if (["checkpoint", "vae", "model"].includes(t)) return false;
-  return [
-    "lora",
-    "locon",
-    "dora",
-    "lycoris",
-    "textualinversion",
-    "embedding",
-    "hypernet",
-    "hypernetwork",
-  ].includes(t);
-}
-
-/** Stable fingerprint so poll refreshes skip setState when nothing meaningful changed. */
-function installedListFingerprint(list) {
-  return (list || [])
-    .map(
-      (a) =>
-        `${a.path || ""}|${a.thumbnailUrl || ""}|${a.modelId ?? ""}|${a.versionId ?? ""}|${a.sizeBytes ?? ""}`,
-    )
-    .join("\n");
-}
-
-function downloadJobsFingerprint(jobs) {
-  return (jobs || [])
-    .map(
-      (j) =>
-        `${j.id}|${j.status}|${j.percent ?? ""}|${j.bytesDone ?? ""}|${j.error || ""}`,
-    )
-    .join("\n");
-}
-
-/** Civitai model id for detail fetch — never treat installed file-stem `id` as Civitai. */
-function resolveCivitaiModelId(item) {
-  if (!item) return null;
-  const explicit = item.modelId ?? item.civitaiModelId;
-  if (explicit != null && explicit !== "") {
-    const n = Number(explicit);
-    if (Number.isFinite(n) && n > 0) return n;
-    return explicit;
-  }
-  // Search / favorites cards use numeric Civitai ids; installed rows have `path`.
-  if (item.path) return null;
-  if (item.id != null && /^\d+$/.test(String(item.id))) return Number(item.id);
-  return null;
 }
 
 function readStoredMode() {
@@ -959,142 +183,23 @@ function readStoredModels() {
     const raw = localStorage.getItem(MODELS_STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      let agent =
-        typeof parsed.agentModel === "string" && parsed.agentModel.trim()
-          ? parsed.agentModel.trim()
-          : AUTO_AGENT.id;
-      // Old Auto sentinel was the upstream router. Migrate once so Auto is internal.
-      try {
-        if (!localStorage.getItem("freya.migratedUpstreamAuto")) {
-          if (agent === UPSTREAM_ROUTER_ID) agent = AUTO_AGENT.id;
-          localStorage.setItem("freya.migratedUpstreamAuto", "1");
-        }
-      } catch {
-        /* ignore */
-      }
-      const image =
-        typeof parsed.imageModel === "string" && parsed.imageModel.trim()
-          ? parsed.imageModel.trim()
-          : AUTO_IMAGE.id;
-      const router =
-        typeof parsed.routerModel === "string" && parsed.routerModel.trim()
-          ? parsed.routerModel.trim()
-          : AUTO_ROUTER.id;
-      const video =
-        typeof parsed.videoModel === "string" && parsed.videoModel.trim()
-          ? parsed.videoModel.trim()
-          : AUTO_VIDEO.id;
-      return { agentModel: agent, imageModel: image, routerModel: router, videoModel: video };
+      return {
+        agentModel: AGENT_MODELS.some((m) => m.id === parsed.agentModel)
+          ? parsed.agentModel
+          : "openrouter/auto",
+        imageModel: IMAGE_MODELS.some((m) => m.id === parsed.imageModel)
+          ? parsed.imageModel
+          : "auto",
+      };
     }
   } catch {
     /* ignore */
   }
-  return {
-    agentModel: AUTO_AGENT.id,
-    imageModel: AUTO_IMAGE.id,
-    routerModel: AUTO_ROUTER.id,
-    videoModel: AUTO_VIDEO.id,
-  };
-}
-
-function readGenerateBackend() {
-  try {
-    const v = localStorage.getItem(GENERATE_BACKEND_STORAGE_KEY);
-    if (v === "local" || v === "cloud") return v;
-  } catch {
-    /* ignore */
-  }
-  return "cloud";
-}
-
-function persistGenerateBackend(value) {
-  try {
-    localStorage.setItem(GENERATE_BACKEND_STORAGE_KEY, value);
-  } catch {
-    /* ignore */
-  }
+  return { agentModel: "openrouter/auto", imageModel: "auto" };
 }
 
 function installableLoras(loras = []) {
-  return (loras || []).filter((l) => l.downloadUrl || l.versionId);
-}
-
-function pickPrimaryCivitaiFile(files = []) {
-  return files.find((f) => f.primary) || files[0] || null;
-}
-
-/** Dest filename extension from selected file name/format (not hardcoded safetensors). */
-function fileExtFromVariant(item) {
-  const name = item?.fileName || "";
-  const m = String(name).match(/(\.[A-Za-z0-9]+)$/);
-  if (m) return m[1].toLowerCase();
-  const fmt = String(item?.fileFormat || "").toLowerCase();
-  if (fmt.includes("safe")) return ".safetensors";
-  if (fmt.includes("ckpt") || fmt.includes("pickl")) return ".ckpt";
-  if (fmt === "pt" || fmt.includes("pytorch")) return ".pt";
-  if (fmt.includes("gguf")) return ".gguf";
-  return ".safetensors";
-}
-
-function formatCivitaiFileSize(file) {
-  if (file?.sizeBytes != null && !Number.isNaN(Number(file.sizeBytes))) {
-    const v = Number(file.sizeBytes);
-    if (v >= 1024 * 1024 * 1024) return `${(v / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-    if (v >= 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB`;
-    if (v >= 1024) return `${(v / 1024).toFixed(1)} KB`;
-    return `${v} B`;
-  }
-  if (file?.sizeKB != null && !Number.isNaN(Number(file.sizeKB))) {
-    const kb = Number(file.sizeKB);
-    if (kb >= 1024 * 1024) return `${(kb / (1024 * 1024)).toFixed(2)} GB`;
-    if (kb >= 1024) return `${(kb / 1024).toFixed(1)} MB`;
-    return `${Math.round(kb)} KB`;
-  }
-  return "";
-}
-
-/** Apply version + file selection onto a model card (updates downloadUrl / baseModel / etc.). */
-function applyCivitaiVariant(model, versionId, fileId) {
-  if (!model) return model;
-  const versions = model.modelVersions || [];
-  if (!versions.length) return model;
-  const ver =
-    versions.find((v) => String(v.id) === String(versionId)) ||
-    versions.find((v) => String(v.id) === String(model.versionId)) ||
-    versions[0];
-  if (!ver) return model;
-  const files = ver.files || [];
-  const file =
-    (fileId != null && files.find((f) => String(f.id) === String(fileId))) ||
-    pickPrimaryCivitaiFile(files);
-  const baseModel = ver.baseModel || model.baseModel;
-  const isCheckpoint = String(model.modelType || "").toLowerCase() === "checkpoint";
-  let needsBase = model.needsBase;
-  if (isCheckpoint) {
-    needsBase = null;
-  } else if (baseModel) {
-    needsBase = `Needs base model family: ${baseModel}`;
-  }
-  return {
-    ...model,
-    versionId: ver.id,
-    versionName: ver.name,
-    baseModel,
-    downloadUrl: file?.downloadUrl || model.downloadUrl,
-    fileId: file?.id ?? null,
-    fileName: file?.name || null,
-    fileFormat: file?.format || file?.type || null,
-    trainedWords: ver.trainedWords?.length ? ver.trainedWords : model.trainedWords,
-    triggerWord: ver.trainedWords?.[0] || model.triggerWord,
-    imageUrls: ver.imageUrls?.length ? ver.imageUrls : model.imageUrls,
-    thumbnailUrl:
-      (ver.imageUrls?.length ? ver.imageUrls[0] : null) ||
-      model.thumbnailUrl ||
-      model.imageUrls?.[0] ||
-      null,
-    examplePrompt: ver.examplePrompt || model.examplePrompt,
-    needsBase: needsBase || undefined,
-  };
+  return (loras || []).filter((l) => l.downloadUrl);
 }
 
 function modelLabel(list, id) {
@@ -1123,33 +228,11 @@ const Svg = ({ children, filled = false }) => (
     {children}
   </svg>
 );
-/** Up-arrow submit — modern chat send control (not a right-pointing “send”). */
-const IconSend = () => (
-  <Svg>
-    <path d="M12 19V5M5 12l7-7 7 7" />
+const IconPlay = () => (
+  <Svg filled>
+    <path d="M8 5.5v13l11-6.5z" stroke="none" />
   </Svg>
 );
-/** Plan mode — checklist / proposed steps. */
-const IconPlan = () => (
-  <Svg>
-    <path d="M9 6h11M9 12h11M9 18h11" />
-    <path d="M4.5 6.5 5.5 7.5 7 5.5M4.5 12.5 5.5 13.5 7 11.5M4.5 18.5 5.5 19.5 7 17.5" />
-  </Svg>
-);
-/** Auto mode — refresh / autonomous loop. */
-const IconAuto = () => (
-  <Svg>
-    <path d="M20 12a8 8 0 1 1-2.3-5.7" />
-    <path d="M20 4v5h-5" />
-  </Svg>
-);
-/** YOLO mode — lightning / unrestricted run. */
-const IconYolo = () => (
-  <Svg>
-    <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
-  </Svg>
-);
-const MODE_ICONS = { plan: IconPlan, auto: IconAuto, yolo: IconYolo };
 const IconSpinner = () => (
   <span className="icon-spin">
     <Svg>
@@ -1189,30 +272,9 @@ const IconImage = () => (
     <path d="M21 15.5 16 11l-8.5 8" />
   </Svg>
 );
-/** Video modality — film frame + play triangle (distinct from Image landscape). */
-const IconVideo = () => (
-  <Svg>
-    <rect x="2.5" y="6" width="13" height="12" rx="1.5" />
-    <path d="m15.5 10 5.5-3.2v10.4L15.5 14z" />
-  </Svg>
-);
-const IconRouter = () => (
-  <Svg>
-    <circle cx="6" cy="12" r="2" />
-    <circle cx="18" cy="6" r="2" />
-    <circle cx="18" cy="18" r="2" />
-    <path d="M8 12h6M14 8.5 12 12l2 3.5" />
-  </Svg>
-);
 const IconChevron = () => (
   <Svg>
     <path d="m6 9 6 6 6-6" />
-  </Svg>
-);
-const IconTrash = () => (
-  <Svg>
-    <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6" />
-    <path d="M10 11v6M14 11v6" />
   </Svg>
 );
 const IconSessions = () => (
@@ -1232,167 +294,10 @@ const IconMoon = () => (
     <path d="M20 13.5A8.5 8.5 0 1 1 10.5 4a6.8 6.8 0 0 0 9.5 9.5z" />
   </Svg>
 );
-const IconSearch = () => (
-  <Svg>
-    <circle cx="11" cy="11" r="6.5" />
-    <path d="m16.5 16.5 4 4" />
-  </Svg>
-);
-const IconStar = ({ filled = false }) => (
-  <Svg filled={filled}>
-    <path d="m12 3.2 2.4 4.9 5.4.8-3.9 3.8.9 5.4L12 15.6 7.2 18.1l.9-5.4-3.9-3.8 5.4-.8L12 3.2z" />
-  </Svg>
-);
-const IconPin = () => (
-  <Svg>
-    <path d="M15 4.5 19.5 9l-4 1.5L9 17l-2-2 6.5-6.5L15 4.5z" />
-    <path d="m9 17-5 5" />
-  </Svg>
-);
-const IconDownload = () => (
-  <Svg>
-    <path d="M12 4v11M8 11l4 4 4-4" />
-    <path d="M5 19h14" />
-  </Svg>
-);
-const IconClear = () => (
-  <Svg>
-    <path d="M5 7h14M9 7V5h6v2M8 7l1 12h6l1-12" />
-  </Svg>
-);
 
-/** Civitai subnav: worded labels; Downloads stays right-aligned. */
-const CIVITAI_SUBNAV = [
-  { id: "search", label: "Search" },
-  { id: "favorites", label: "Favorites" },
-  { id: "installed", label: "Installed" },
-  { id: "downloads", label: "Downloads", end: true },
-];
+function CompactMenu({ label, valueLabel, options, value, onChange, open, onOpen, icon, title }) {
+  const ref = useRef(null);
 
-/** Installed section order / labels by kind or modelType. */
-const INSTALLED_SECTION_ORDER = [
-  { id: "loras", title: "LoRAs", match: (t) => ["lora", "locon", "dora", "lycoris"].includes(t) },
-  { id: "checkpoints", title: "Checkpoints", match: (t) => t === "checkpoint" },
-  { id: "models", title: "Models", match: (t) => t === "model" },
-  {
-    id: "embeddings",
-    title: "Embeddings",
-    match: (t) => t === "textualinversion" || t === "embedding",
-  },
-  { id: "vae", title: "VAEs", match: (t) => t === "vae" },
-];
-
-function installedSectionId(asset) {
-  const raw = String(asset?.modelType || asset?.kind || "").toLowerCase();
-  // Prefer path prefix when kind/type is missing or generic.
-  const path = String(asset?.path || "");
-  if (path.startsWith("loras/")) return "loras";
-  if (path.startsWith("checkpoints/")) return "checkpoints";
-  if (path.startsWith("embeddings/")) return "embeddings";
-  if (path.startsWith("vae/")) return "vae";
-  for (const sec of INSTALLED_SECTION_ORDER) {
-    if (sec.id === "models") continue; // only via explicit kind
-    if (sec.match(raw)) return sec.id;
-  }
-  if (raw === "model") return "models";
-  return "models";
-}
-
-function groupInstalledAssets(assets) {
-  const buckets = new Map();
-  for (const a of assets || []) {
-    const id = installedSectionId(a);
-    if (!buckets.has(id)) buckets.set(id, []);
-    buckets.get(id).push(a);
-  }
-  const order = ["loras", "checkpoints", "models", "embeddings", "vae"];
-  const titles = {
-    loras: "LoRAs",
-    checkpoints: "Checkpoints",
-    models: "Models",
-    embeddings: "Embeddings",
-    vae: "VAEs",
-  };
-  const out = [];
-  for (const id of order) {
-    const items = buckets.get(id);
-    if (items?.length) out.push({ id, title: titles[id], items });
-  }
-  for (const [id, items] of buckets) {
-    if (!order.includes(id) && items.length) {
-      out.push({ id, title: id.charAt(0).toUpperCase() + id.slice(1), items });
-    }
-  }
-  return out;
-}
-
-const CIVITAI_THUMB_CACHE_KEY = "freya.civitaiThumbCache";
-
-function readThumbCache() {
-  try {
-    const raw = localStorage.getItem(CIVITAI_THUMB_CACHE_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function writeThumbCache(map) {
-  try {
-    localStorage.setItem(CIVITAI_THUMB_CACHE_KEY, JSON.stringify(map));
-  } catch {
-    /* ignore */
-  }
-}
-
-function thumbCacheKey(item) {
-  const mid = item?.modelId ?? item?.civitaiModelId;
-  if (mid != null && mid !== "") return `m:${mid}`;
-  if (item?.versionId != null && item.versionId !== "") return `v:${item.versionId}`;
-  return null;
-}
-
-function rememberCivitaiThumb(item, url) {
-  if (!url) return;
-  const key = thumbCacheKey(item);
-  if (!key) return;
-  const map = readThumbCache();
-  if (map[key] === url) return;
-  map[key] = url;
-  const keys = Object.keys(map);
-  if (keys.length > 400) {
-    for (const k of keys.slice(0, keys.length - 300)) delete map[k];
-  }
-  writeThumbCache(map);
-}
-
-function cachedCivitaiThumb(item) {
-  const key = thumbCacheKey(item);
-  if (!key) return null;
-  return readThumbCache()[key] || null;
-}
-
-/** Prefer real image URLs — meta, imageUrls, localStorage cache, then favorites. */
-function pickCivitaiThumb(item, favoritesList = []) {
-  if (!item) return null;
-  const direct = item.thumbnailUrl || item.imageUrls?.[0] || null;
-  if (direct) return direct;
-  const cached = cachedCivitaiThumb(item);
-  if (cached) return cached;
-  const mid = resolveCivitaiModelId(item);
-  const vid = item.versionId;
-  const fromFav = (favoritesList || []).find(
-    (f) =>
-      (mid != null && resolveCivitaiModelId(f) === mid) ||
-      (vid != null && String(f.versionId) === String(vid)),
-  );
-  return fromFav?.thumbnailUrl || fromFav?.imageUrls?.[0] || null;
-}
-
-/** Dismiss helpers shared by compact + grouped chrome menus. */
-function useChromeMenuDismiss(open, onOpen, ref) {
   useEffect(() => {
     if (!open) return;
     const onDoc = (e) => {
@@ -1407,23 +312,7 @@ function useChromeMenuDismiss(open, onOpen, ref) {
       document.removeEventListener("mousedown", onDoc);
       document.removeEventListener("keydown", onKey);
     };
-  }, [open, onOpen, ref]);
-}
-
-function CompactMenu({
-  label,
-  valueLabel,
-  options,
-  value,
-  onChange,
-  open,
-  onOpen,
-  icon,
-  title,
-  menuNote,
-}) {
-  const ref = useRef(null);
-  useChromeMenuDismiss(open, onOpen, ref);
+  }, [open, onOpen]);
 
   return (
     <div className="chrome-menu" ref={ref}>
@@ -1456,149 +345,11 @@ function CompactMenu({
                   onOpen(false);
                 }}
               >
-                {opt.icon ? (
-                  <span className="chrome-menu-opt-icon" aria-hidden="true">
-                    {opt.icon}
-                  </span>
-                ) : null}
-                <span className="chrome-menu-opt-label">{opt.label}</span>
+                {opt.label}
               </button>
             </li>
           ))}
-          {menuNote ? (
-            <li className="chrome-menu-note" role="note">
-              {menuNote}
-            </li>
-          ) : null}
         </ul>
-      )}
-    </div>
-  );
-}
-
-/**
- * Icon trigger → popover above with accordion option groups
- * (Agent + Router + Mode, or Image + Video / Base).
- * Section lists stay collapsed; click a section row to expand and pick.
- * Stays open across picks so several settings can be changed in one open.
- */
-function GroupedChromeMenu({
-  label,
-  valueLabel,
-  icon,
-  title,
-  open,
-  onOpen,
-  sections,
-  /** `end` → popover right-aligned above the trigger (gen / Image+Video). */
-  align = "start",
-  /** Extra class on the menu root (e.g. composer model size bump). */
-  className = "",
-}) {
-  const ref = useRef(null);
-  const [expandedId, setExpandedId] = useState(null);
-  useChromeMenuDismiss(open, onOpen, ref);
-
-  useEffect(() => {
-    if (!open) setExpandedId(null);
-  }, [open]);
-
-  return (
-    <div
-      className={`chrome-menu chrome-menu-grouped${align === "end" ? " chrome-menu-align-end" : ""}${className ? ` ${className}` : ""}`}
-      ref={ref}
-    >
-      <button
-        type="button"
-        className={`ghost icon-btn chrome-chip chrome-chip-icon-only${open ? " open" : ""}`}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        aria-label={`${label}: ${valueLabel}`}
-        title={title || `${label}: ${valueLabel}`}
-        onClick={() => onOpen(!open)}
-      >
-        <span className="chrome-chip-icon" aria-hidden="true">
-          {icon}
-        </span>
-      </button>
-      {open && (
-        <div className="chrome-popover" role="dialog" aria-label={label}>
-          {sections.map((sec) => {
-            const expanded = expandedId === sec.id;
-            return (
-              <div
-                key={sec.id}
-                className={`chrome-popover-section${expanded ? " is-expanded" : ""}`}
-              >
-                <button
-                  type="button"
-                  className="chrome-popover-head"
-                  aria-expanded={expanded}
-                  aria-controls={`chrome-popover-list-${sec.id}`}
-                  id={`chrome-popover-head-${sec.id}`}
-                  onClick={() =>
-                    setExpandedId((cur) => (cur === sec.id ? null : sec.id))
-                  }
-                >
-                  {sec.icon ? (
-                    <span className="chrome-popover-head-icon" aria-hidden="true">
-                      {sec.icon}
-                    </span>
-                  ) : null}
-                  <span className="chrome-popover-head-label">{sec.label}</span>
-                  {sec.valueLabel ? (
-                    <span className="chrome-popover-head-value">{sec.valueLabel}</span>
-                  ) : null}
-                  <span
-                    className={`chrome-popover-head-caret${expanded ? " is-open" : ""}`}
-                    aria-hidden="true"
-                  >
-                    <IconChevron />
-                  </span>
-                </button>
-                {expanded ? (
-                  <>
-                    <ul
-                      id={`chrome-popover-list-${sec.id}`}
-                      className="chrome-popover-list"
-                      role="listbox"
-                      aria-label={sec.label}
-                      aria-labelledby={`chrome-popover-head-${sec.id}`}
-                    >
-                      {sec.options.map((opt) => (
-                        <li key={opt.id}>
-                          <button
-                            type="button"
-                            role="option"
-                            aria-selected={opt.id === sec.value}
-                            className={opt.id === sec.value ? "active" : ""}
-                            disabled={opt.disabled}
-                            onClick={() => {
-                              if (opt.disabled) return;
-                              sec.onChange(opt.id);
-                            }}
-                          >
-                            {opt.icon ? (
-                              <span className="chrome-menu-opt-icon" aria-hidden="true">
-                                {opt.icon}
-                              </span>
-                            ) : null}
-                            <span className="chrome-menu-opt-label">{opt.label}</span>
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
-                    {sec.menuNote ? (
-                      <p className="chrome-menu-note chrome-popover-note" role="note">
-                        {sec.menuNote}
-                      </p>
-                    ) : null}
-                  </>
-                ) : null}
-              </div>
-            );
-          })}
-        </div>
       )}
     </div>
   );
@@ -1614,33 +365,7 @@ export default function App() {
   const [mock] = useState(() => isMockMode());
   /** `make mock-ui` / `npm run dev:mock` bake mock in — Exit cannot leave. */
   const mockLocked = import.meta.env.VITE_FREYA_MOCK === "true";
-  const [tab, setTabState] = useState(readStoredTab);
-  const [helpFocus, setHelpFocus] = useState(() => readHelpHash());
-  const setTab = (next) => {
-    setTabState(next);
-    persistTab(next);
-    if (next !== "help") {
-      setHelpFocus(null);
-      try {
-        if (String(window.location.hash || "").startsWith("#help-")) {
-          history.replaceState(null, "", window.location.pathname + window.location.search);
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-  };
-  const openHelp = (topic) => {
-    const id = topic && String(topic).startsWith("help-") ? String(topic) : "help-overview";
-    setHelpFocus(id);
-    setTabState("help");
-    persistTab("help");
-    try {
-      history.replaceState(null, "", `#${id}`);
-    } catch {
-      /* ignore */
-    }
-  };
+  const [tab, setTab] = useState("gallery");
   const [prompt, setPrompt] = useState(() => bootSession.prompt || "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -1653,118 +378,14 @@ export default function App() {
   const [settings, setSettings] = useState(null);
   const [civitaiKey, setCivitaiKey] = useState("");
   const [openrouterKey, setOpenrouterKey] = useState("");
-  const [orMetrics, setOrMetrics] = useState(null);
-  const [orMetricsBusy, setOrMetricsBusy] = useState(false);
-  const [privacyZdr, setPrivacyZdr] = useState(false);
-  const [privacyDataCollection, setPrivacyDataCollection] = useState("allow");
-  const [chatProviders, setChatProviders] = useState({ excluded: [], legacyOnly: null });
-  const [chatProviderAvailable, setChatProviderAvailable] = useState([]);
-  const [chatProviderSearch, setChatProviderSearch] = useState("");
-  const [modelAlignment, setModelAlignment] = useState("balanced");
-  const [allowNsfwLocal, setAllowNsfwLocal] = useState(false);
-  const [instructionTone, setInstructionTone] = useState("warm");
-  const [autoFallbacks, setAutoFallbacks] = useState(EMPTY_AUTO_FALLBACKS);
-  /** Editable system prompts from GET /v1/settings → instructions[]. */
-  const [instructions, setInstructions] = useState([]);
-  const [instructionMode, setInstructionMode] = useState("converse");
-  const [instructionDraft, setInstructionDraft] = useState("");
-  const [instructionBusy, setInstructionBusy] = useState(false);
-  /** Synced fingerprint of privacy/alignment — skips debounce PUT when unchanged. */
-  const prefsFpRef = useRef("");
-  const prefsReadyRef = useRef(false);
-  const prefsDebounceRef = useRef(null);
-  const prefsGenRef = useRef(0);
-  const apiKeysDebounceRef = useRef(null);
-  const apiKeysGenRef = useRef(0);
-
-  const markPrivacyAlignmentSynced = (snapOrSettings) => {
-    const snap =
-      snapOrSettings?.privacy != null || snapOrSettings?.alignment != null
-        ? privacyAlignmentFromSettings(snapOrSettings)
-        : snapOrSettings;
-    if (!snap) return;
-    prefsFpRef.current = privacyAlignmentFingerprint(snap);
-    prefsReadyRef.current = true;
-  };
-
-  const applyPrivacyAlignmentFromSettings = (st) => {
-    if (!st) return;
-    const snap = privacyAlignmentFromSettings(st);
-    setPrivacyZdr(snap.privacy.zeroDataRetention);
-    setPrivacyDataCollection(snap.privacy.dataCollection);
-    setChatProviders(normalizeChatProviders(snap.privacy.chatProviders));
-    setModelAlignment(snap.alignment.modelAlignment);
-    setAllowNsfwLocal(snap.alignment.allowNsfwLocal);
-    setInstructionTone(snap.alignment.instructionTone);
-    setAutoFallbacks(normalizeAutoFallbacks(snap.autoFallbacks));
-    markPrivacyAlignmentSynced(snap);
-  };
-
-  const applyInstructionsFromSettings = (st, preferredMode) => {
-    const list = Array.isArray(st?.instructions) ? st.instructions : [];
-    setInstructions(list);
-    if (list.length === 0) {
-      setInstructionDraft("");
-      return;
-    }
-    const want = preferredMode || instructionMode;
-    const match = list.find((i) => i.id === want) || list[0];
-    setInstructionMode(match.id);
-    setInstructionDraft(typeof match.text === "string" ? match.text : "");
-  };
   const [studioToken, setStudioToken] = useState(
     () =>
       (typeof localStorage !== "undefined" && localStorage.getItem("freya.apiToken")) || "",
   );
-  const [generatedToken, setGeneratedToken] = useState(null);
-  const [tokenBusy, setTokenBusy] = useState(false);
-  const [tokenCopyMsg, setTokenCopyMsg] = useState("");
-  const [setupCmdCopyMsg, setSetupCmdCopyMsg] = useState("");
-  const [workerHost, setWorkerHost] = useState(DEFAULT_WORKER_HOST);
-  const [workerPort, setWorkerPort] = useState(DEFAULT_WORKER_PORT);
-  const [workerUrlOverride, setWorkerUrlOverride] = useState("");
-  const [useWorkerUrlOverride, setUseWorkerUrlOverride] = useState(false);
-  const [workerStats, setWorkerStats] = useState(null);
-  const [workerCtlBusy, setWorkerCtlBusy] = useState(false);
-  const [civitaiQ, setCivitaiQ] = useState("");
-  const installedFingerprintRef = useRef("");
-  const downloadJobsFingerprintRef = useRef("");
-  const enrichAttemptedRef = useRef(new Set());
-  const enrichTimerRef = useRef(null);
-  const lastSucceededJobIdsRef = useRef(new Set());
+  const [workerUrl, setWorkerUrl] = useState("");
+  const [civitaiQ, setCivitaiQ] = useState(BEGINNER_CIVITAI_QUERY);
   const [civitaiItems, setCivitaiItems] = useState([]);
-  const [civitaiSubview, setCivitaiSubviewState] = useState(readStoredCivitaiSubview);
-  const setCivitaiSubview = (next) => {
-    setCivitaiSubviewState(next);
-    persistCivitaiSubview(next);
-  };
-  const [favorites, setFavorites] = useState(readFavorites);
-  const [civitaiDetail, setCivitaiDetail] = useState(null);
-  const [civitaiDetailBusy, setCivitaiDetailBusy] = useState(false);
-  const [detailImageIdx, setDetailImageIdx] = useState(0);
-  const [downloadJobs, setDownloadJobs] = useState([]);
-  const [installedAssets, setInstalledAssets] = useState([]);
-  const [installedBusy, setInstalledBusy] = useState(false);
-  const [activeBasePath, setActiveBasePath] = useState("");
-  const [videoModels, setVideoModels] = useState(EMPTY_VIDEO_CATALOG);
-  const [agentModels, setAgentModels] = useState(PLACEHOLDER_AGENT_MODELS);
-  const [imageModels, setImageModels] = useState(PLACEHOLDER_IMAGE_MODELS);
-  const [routerModels, setRouterModels] = useState(PLACEHOLDER_ROUTER_MODELS);
-  /** True after a successful GET /v1/models (auth + OpenRouter). */
-  const [modelsCatalogReady, setModelsCatalogReady] = useState(false);
-  /** Public /v1/auth/status — drives Login banner without needing a bearer. */
-  const [authStatus, setAuthStatus] = useState(null);
-  const [showLogin, setShowLogin] = useState(false);
-  const [loginUser, setLoginUser] = useState("admin");
-  const [loginPass, setLoginPass] = useState("");
-  const [loginBusy, setLoginBusy] = useState(false);
-  const [loginError, setLoginError] = useState("");
-  const [authCta, setAuthCta] = useState("");
-  const [guidelinesAcked, setGuidelinesAcked] = useState(readGuidelinesAck);
   const [savedMsg, setSavedMsg] = useState("");
-  /** Brief UI flash after Settings / Worker save — drives button checkmark + toast. */
-  const [saveFlash, setSaveFlash] = useState(null);
-  const saveFlashTimerRef = useRef(null);
   const [ideas, setIdeas] = useState(() =>
     Array.isArray(bootSession.ideas) ? bootSession.ideas : [],
   );
@@ -1774,21 +395,22 @@ export default function App() {
   const [suggestNote, setSuggestNote] = useState(() => bootSession.suggestNote || "");
   const [civitaiQuery, setCivitaiQuery] = useState(() => bootSession.civitaiQuery || "");
   const [modelBrief, setModelBrief] = useState(() => bootSession.modelBrief || "");
-  const [session, setSession] = useState(() => normalizeSession(bootSession.session));
+  const [session, setSession] = useState(() =>
+    bootSession.session
+      ? {
+          goal: bootSession.session.goal || "",
+          pinnedLoras: Array.isArray(bootSession.session.pinnedLoras)
+            ? bootSession.session.pinnedLoras
+            : [],
+          turns: Array.isArray(bootSession.session.turns) ? bootSession.session.turns : [],
+          sessionNote: bootSession.session.sessionNote || "",
+        }
+      : emptySession(),
+  );
   const [automationMode, setAutomationMode] = useState(readStoredMode);
   const storedModels = readStoredModels();
   const [agentModel, setAgentModel] = useState(storedModels.agentModel);
   const [imageModel, setImageModel] = useState(storedModels.imageModel);
-  const [videoModel, setVideoModel] = useState(
-    typeof storedModels.videoModel === "string" && storedModels.videoModel.trim()
-      ? storedModels.videoModel.trim()
-      : AUTO_VIDEO.id,
-  );
-  const [routerModel, setRouterModel] = useState(storedModels.routerModel);
-  const [generateBackend, setGenerateBackend] = useState(readGenerateBackend);
-  const [localCheckpoints, setLocalCheckpoints] = useState([]);
-  const [localBaseModel, setLocalBaseModel] = useState("");
-  const [localBaseBusy, setLocalBaseBusy] = useState(false);
   const [pendingPlan, setPendingPlan] = useState(() => bootSession.pendingPlan ?? null);
   const [pendingQuestion, setPendingQuestion] = useState(
     () => bootSession.pendingQuestion ?? null,
@@ -1799,8 +421,6 @@ export default function App() {
   const [menuOpen, setMenuOpen] = useState(null);
   const [theme, setTheme] = useState(resolveInitialTheme);
   const [sidebarOpen, setSidebarOpen] = useState(readStoredSidebarOpen);
-  const [workspaceSplit, setWorkspaceSplit] = useState(readStoredWorkspaceSplit);
-  const [workspaceResizing, setWorkspaceResizing] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState(
     () => bootSession.id || makeSessionId(),
   );
@@ -1810,31 +430,6 @@ export default function App() {
   const sessionsRef = useRef(sessions);
   const activeIdRef = useRef(activeSessionId);
   const timelineRef = useRef(null);
-  const workspaceRef = useRef(null);
-  const workspaceSplitRef = useRef(workspaceSplit);
-  const civitaiAbortRef = useRef(null);
-  const lastCivitaiSearchQRef = useRef("");
-
-  const flashSave = (kind, msg) => {
-    setSavedMsg(msg);
-    setSaveFlash(kind);
-    if (saveFlashTimerRef.current) clearTimeout(saveFlashTimerRef.current);
-    saveFlashTimerRef.current = setTimeout(() => {
-      setSaveFlash(null);
-      setSavedMsg("");
-      saveFlashTimerRef.current = null;
-    }, 2800);
-  };
-
-  useEffect(() => {
-    return () => {
-      if (saveFlashTimerRef.current) clearTimeout(saveFlashTimerRef.current);
-    };
-  }, []);
-
-  useEffect(() => {
-    workspaceSplitRef.current = workspaceSplit;
-  }, [workspaceSplit]);
 
   useEffect(() => {
     sessionsRef.current = sessions;
@@ -1894,7 +489,6 @@ export default function App() {
         goal: session.goal || "",
         pinnedLoras: session.pinnedLoras || [],
         turns: session.turns || [],
-        messages: session.messages || [],
         sessionNote: session.sessionNote || "",
       },
       ideas,
@@ -1912,7 +506,18 @@ export default function App() {
 
   const applySessionEntry = (entry) => {
     setPrompt(entry.prompt || "");
-    setSession(normalizeSession(entry.session));
+    setSession(
+      entry.session
+        ? {
+            goal: entry.session.goal || "",
+            pinnedLoras: Array.isArray(entry.session.pinnedLoras)
+              ? entry.session.pinnedLoras
+              : [],
+            turns: Array.isArray(entry.session.turns) ? entry.session.turns : [],
+            sessionNote: entry.session.sessionNote || "",
+          }
+        : emptySession(),
+    );
     setIdeas(Array.isArray(entry.ideas) ? entry.ideas : []);
     setSuggestedLoras(Array.isArray(entry.suggestedLoras) ? entry.suggestedLoras : []);
     setSuggestNote(entry.suggestNote || "");
@@ -1975,73 +580,6 @@ export default function App() {
     }
   };
 
-  const clampWorkspaceSplit = (clientX) => {
-    const el = workspaceRef.current;
-    if (!el) return workspaceSplitRef.current;
-    const rect = el.getBoundingClientRect();
-    const gutter = 6;
-    const usable = Math.max(1, rect.width - gutter);
-    const minLeftPct = (WORKSPACE_SPLIT_MIN_LEFT_PX / usable) * 100;
-    const minRightPct = (WORKSPACE_SPLIT_MIN_RIGHT_PX / usable) * 100;
-    const raw = ((clientX - rect.left) / usable) * 100;
-    const lo = Math.min(minLeftPct, 85);
-    const hi = Math.max(100 - Math.min(minRightPct, 85), lo);
-    return Math.min(hi, Math.max(lo, raw));
-  };
-
-  const onWorkspaceSplitPointerDown = (e) => {
-    if (e.button != null && e.button !== 0) return;
-    e.preventDefault();
-    const handle = e.currentTarget;
-    handle.setPointerCapture?.(e.pointerId);
-    setWorkspaceResizing(true);
-    const pct = clampWorkspaceSplit(e.clientX);
-    workspaceSplitRef.current = pct;
-    setWorkspaceSplit(pct);
-
-    const onMove = (ev) => {
-      const next = clampWorkspaceSplit(ev.clientX);
-      workspaceSplitRef.current = next;
-      setWorkspaceSplit(next);
-    };
-    const onUp = (ev) => {
-      handle.releasePointerCapture?.(ev.pointerId);
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-      window.removeEventListener("pointercancel", onUp);
-      setWorkspaceResizing(false);
-      persistWorkspaceSplit(workspaceSplitRef.current);
-    };
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onUp);
-  };
-
-  const onWorkspaceSplitKeyDown = (e) => {
-    const step = e.shiftKey ? 5 : 2;
-    let next = workspaceSplitRef.current;
-    if (e.key === "ArrowLeft") next -= step;
-    else if (e.key === "ArrowRight") next += step;
-    else if (e.key === "Home") next = 20;
-    else if (e.key === "End") next = 80;
-    else return;
-    e.preventDefault();
-    const el = workspaceRef.current;
-    if (el) {
-      const rect = el.getBoundingClientRect();
-      const gutter = 6;
-      const usable = Math.max(1, rect.width - gutter);
-      const minLeftPct = (WORKSPACE_SPLIT_MIN_LEFT_PX / usable) * 100;
-      const minRightPct = (WORKSPACE_SPLIT_MIN_RIGHT_PX / usable) * 100;
-      next = Math.min(100 - Math.min(minRightPct, 85), Math.max(Math.min(minLeftPct, 85), next));
-    } else {
-      next = Math.min(80, Math.max(20, next));
-    }
-    workspaceSplitRef.current = next;
-    setWorkspaceSplit(next);
-    persistWorkspaceSplit(next);
-  };
-
   // Keep the active session entry fresh for reload / switch (mock persistence).
   useEffect(() => {
     const snap = snapshotCurrent();
@@ -2066,111 +604,7 @@ export default function App() {
     sessionLog,
   ]);
 
-  const applyModelCatalog = (models) => {
-    const videoOpts = catalogToOptions(
-      (Array.isArray(models?.video) ? models.video : []).filter(
-        (m) =>
-          m?.id &&
-          !String(m.id).startsWith("openrouter/") &&
-          !String(m.id).includes("heygen") &&
-          !String(m.id).includes("avatar") &&
-          String(m.modality || "video").toLowerCase() === "video",
-      ),
-      { auto: AUTO_VIDEO },
-    );
-    setVideoModels(videoOpts.length ? videoOpts : EMPTY_VIDEO_CATALOG);
-    const chatRows = (Array.isArray(models?.chat) ? models.chat : []).filter(
-      (m) => !m?.modality || String(m.modality).toLowerCase() === "chat",
-    );
-    const routerRows = (Array.isArray(models?.router) ? models.router : []).filter(
-      (m) => !m?.modality || String(m.modality).toLowerCase() === "chat",
-    );
-    const imageRows = (Array.isArray(models?.openrouter) ? models.openrouter : []).filter(
-      (m) => m?.id && !String(m.id).startsWith("openrouter/") && String(m.modality || "image").toLowerCase() === "image",
-    );
-    setAgentModels(catalogToOptions(chatRows, { auto: AUTO_AGENT }));
-    setImageModels(catalogToOptions(imageRows, { auto: AUTO_IMAGE }));
-    setRouterModels(catalogToOptions(routerRows, { auto: AUTO_ROUTER }));
-    const avail = Array.isArray(models?.chatProviders?.available)
-      ? models.chatProviders.available
-          .map((s) => String(s || "").trim().toLowerCase())
-          .filter(Boolean)
-          .sort()
-      : [];
-    if (avail.length) setChatProviderAvailable(avail);
-    setModelsCatalogReady(true);
-  };
-
-  /** GET /v1/models → picker catalogs (privacy/alignment already applied server-side). */
-  const refreshModels = async () => {
-    try {
-      applyModelCatalog(await api("/v1/models"));
-    } catch {
-      /* No auth / OpenRouter / fetch — Auto-only until a real catalog arrives.
-         Persisted agent/image ids stay in state for restore after a successful load. */
-      setAgentModels(PLACEHOLDER_AGENT_MODELS);
-      setImageModels(PLACEHOLDER_IMAGE_MODELS);
-      setRouterModels(PLACEHOLDER_ROUTER_MODELS);
-      setVideoModels([]);
-      setModelsCatalogReady(false);
-    }
-  };
-
-  const cancelPrefsAutosave = () => {
-    if (prefsDebounceRef.current) {
-      clearTimeout(prefsDebounceRef.current);
-      prefsDebounceRef.current = null;
-    }
-    prefsGenRef.current += 1;
-    if (apiKeysDebounceRef.current) {
-      clearTimeout(apiKeysDebounceRef.current);
-      apiKeysDebounceRef.current = null;
-    }
-    apiKeysGenRef.current += 1;
-  };
-
-  const refreshAuthStatus = async () => {
-    if (mock) {
-      const st = {
-        authRequired: false,
-        adminLoginConfigured: true,
-        apiTokenConfigured: false,
-        openRouterConfigured: true,
-        adminUsername: "admin",
-        note: "Mock mode — sign-in optional.",
-      };
-      setAuthStatus(st);
-      return st;
-    }
-    try {
-      const st = await api("/v1/auth/status");
-      setAuthStatus(st);
-      if (st.adminUsername) setLoginUser(st.adminUsername);
-      if (st.authRequired && !hasBrowserBearer()) {
-        setShowLogin(true);
-        setAuthCta(AUTH_SIGN_IN_HINT);
-      }
-      return st;
-    } catch {
-      /* health-only clusters may lack the route during rolling deploys */
-      return null;
-    }
-  };
-
   const refresh = async () => {
-    const st = await refreshAuthStatus();
-    // Without a browser bearer, skip protected calls so the UI stays honest (locked).
-    if (!mock && st?.authRequired && !hasBrowserBearer()) {
-      setModelsCatalogReady(false);
-      setAgentModels(PLACEHOLDER_AGENT_MODELS);
-      setImageModels(PLACEHOLDER_IMAGE_MODELS);
-      setRouterModels(PLACEHOLDER_ROUTER_MODELS);
-      setVideoModels([]);
-      setError("");
-      return;
-    }
-    // Studio payload and OpenRouter catalogs are independent: a 401/failure on
-    // styles/gallery must not skip model discovery once a bearer is present.
     try {
       const [s, st, g] = await Promise.all([
         api("/v1/styles"),
@@ -2180,228 +614,16 @@ export default function App() {
       const items = s.items || [];
       setStyles(items);
       setSettings(st);
-      applyPrivacyAlignmentFromSettings(st);
-      applyInstructionsFromSettings(st);
-      if (typeof st.routerModel === "string" && st.routerModel.trim()) {
-        setRouterModel(st.routerModel.trim());
-        persistModels(
-          agentModel,
-          imageModel,
-          st.routerModel.trim(),
+      setWorkerUrl(st.diffusionWorkerUrl || "");
+      setGallery(g.items || []);
+      const featured = items[0]?.examplePrompt;
+      if (featured) {
+        setCivitaiQ((prev) =>
+          !prev.trim() || prev === BEGINNER_CIVITAI_QUERY ? demoCivitaiQuery(featured) : prev,
         );
       }
-      {
-        const ep = parseWorkerEndpoint(st.diffusionWorkerUrl || "");
-        setWorkerHost(ep.host);
-        setWorkerPort(ep.port);
-        setWorkerUrlOverride(ep.advancedUrl);
-        setUseWorkerUrlOverride(ep.useAdvanced);
-      }
-      setGallery(g.items || []);
-      setError("");
-      setAuthCta("");
     } catch (e) {
       setError(e.message);
-    }
-    await refreshModels();
-  };
-
-  const submitLogin = async (e) => {
-    e?.preventDefault?.();
-    setLoginBusy(true);
-    setLoginError("");
-    try {
-      const res = await api("/v1/auth/login", {
-        method: "POST",
-        body: JSON.stringify({ username: loginUser, password: loginPass }),
-      });
-      const tok = res.token || "";
-      localStorage.setItem("freya.apiToken", tok);
-      setStudioToken(tok);
-      setLoginPass("");
-      setShowLogin(false);
-      setAuthCta("");
-      setSavedMsg(res.note || "Signed in.");
-      if (!readGuidelinesAck()) setGuidelinesAcked(false);
-      await refresh();
-    } catch (err) {
-      setLoginError(err.message || "Sign-in failed");
-    } finally {
-      setLoginBusy(false);
-    }
-  };
-
-  const acceptGuidelines = () => {
-    persistGuidelinesAck();
-    setGuidelinesAcked(true);
-    // No sticky status under the prompt — Guidelines tab still shows “Acknowledged”.
-  };
-
-  const signOut = () => {
-    localStorage.removeItem("freya.apiToken");
-    setStudioToken("");
-    setModelsCatalogReady(false);
-    setAgentModels(PLACEHOLDER_AGENT_MODELS);
-    setImageModels(PLACEHOLDER_IMAGE_MODELS);
-    setRouterModels(PLACEHOLDER_ROUTER_MODELS);
-    setShowLogin(true);
-    setAuthCta(AUTH_SIGN_IN_HINT);
-    setSavedMsg("Signed out.");
-  };
-
-  const isFavorite = (item) =>
-    favorites.some((f) => loraKey(f) === loraKey(item));
-
-  const toggleFavorite = (item) => {
-    setFavorites((prev) => {
-      const key = loraKey(item);
-      const exists = prev.some((f) => loraKey(f) === key);
-      const civitaiId = resolveCivitaiModelId(item);
-      const next = exists
-        ? prev.filter((f) => loraKey(f) !== key)
-        : [
-            {
-              id: civitaiId ?? item.id,
-              modelId: civitaiId ?? item.modelId ?? null,
-              versionId: item.versionId ?? null,
-              name: item.name,
-              modelType: item.modelType,
-              downloadUrl: item.downloadUrl,
-              thumbnailUrl: item.thumbnailUrl,
-              triggerWord: item.triggerWord || item.trainedWords?.[0],
-              baseModel: item.baseModel,
-              civitaiUrl:
-                item.civitaiUrl ||
-                (civitaiId ? `https://civitai.com/models/${civitaiId}` : null),
-              trainedWords: item.trainedWords,
-            },
-            ...prev,
-          ].slice(0, 200);
-      writeFavorites(next);
-      return next;
-    });
-  };
-
-  const closeCivitaiDetail = () => {
-    setCivitaiDetail(null);
-    setDetailImageIdx(0);
-  };
-
-  const selectCivitaiVariant = (versionId, fileId) => {
-    setCivitaiDetail((prev) => {
-      if (!prev?.model) return prev;
-      const next = applyCivitaiVariant(prev.model, versionId, fileId);
-      return { ...prev, model: next };
-    });
-    setDetailImageIdx(0);
-  };
-
-  const openCivitaiDetail = async (item) => {
-    if (!item?.id && !item?.name && !item?.path) return;
-    setCivitaiDetailBusy(true);
-    setDetailImageIdx(0);
-    let civitaiId = resolveCivitaiModelId(item);
-    const versionId = item.versionId != null && item.versionId !== "" ? item.versionId : null;
-    const canFetch = Boolean(settings?.civitaiConfigured);
-    const willFetch = canFetch && (civitaiId != null || versionId != null);
-    const thumbHint = pickCivitaiThumb(
-      { ...item, modelId: civitaiId ?? item.modelId, versionId },
-      favorites,
-    );
-    const initial = applyCivitaiVariant(
-      {
-        ...item,
-        modelId: civitaiId ?? item.modelId,
-        thumbnailUrl: thumbHint || item.thumbnailUrl,
-        localAsset: Boolean(item.path) && !willFetch,
-      },
-      item.versionId,
-      item.fileId,
-    );
-    setCivitaiDetail({
-      model: initial,
-      related: [],
-      loading: willFetch,
-      localOnly: !willFetch && Boolean(item.path),
-    });
-    try {
-      if (willFetch) {
-        let data;
-        if (civitaiId != null) {
-          data = await api(`/v1/civitai/models/${civitaiId}`);
-        } else {
-          // Installed sidecars often have versionId but null modelId — resolve via version.
-          data = await api(`/v1/civitai/model-versions/${versionId}`);
-        }
-        // Accept nested { model, related } or a flat detail payload.
-        const model = data.model || data;
-        const related = Array.isArray(data.related)
-          ? data.related
-          : Array.isArray(model.related)
-            ? model.related
-            : [];
-        const resolvedId = model.id ?? model.modelId ?? civitaiId;
-        if (resolvedId != null) civitaiId = resolvedId;
-        const merged = applyCivitaiVariant(
-          {
-            ...item,
-            ...model,
-            modelId: civitaiId,
-            id: civitaiId ?? model.id ?? item.id,
-            path: item.path || model.path,
-            thumbnailUrl:
-              model.thumbnailUrl ||
-              model.imageUrls?.[0] ||
-              thumbHint ||
-              item.thumbnailUrl,
-          },
-          item.versionId ?? model.versionId,
-          item.fileId ?? model.fileId,
-        );
-        const resolvedThumb = merged.thumbnailUrl || merged.imageUrls?.[0] || null;
-        rememberCivitaiThumb(
-          { modelId: civitaiId, versionId: merged.versionId ?? versionId },
-          resolvedThumb,
-        );
-        if (item.path && resolvedThumb) {
-          setInstalledAssets((prev) =>
-            prev.map((a) =>
-              a.path === item.path
-                ? {
-                    ...a,
-                    thumbnailUrl: a.thumbnailUrl || resolvedThumb,
-                    modelId: a.modelId ?? civitaiId ?? null,
-                    imageUrls: a.imageUrls?.length ? a.imageUrls : merged.imageUrls,
-                  }
-                : a,
-            ),
-          );
-        }
-        setCivitaiDetail({
-          model: merged,
-          related,
-          loading: false,
-          localOnly: false,
-        });
-      } else {
-        setCivitaiDetail({
-          model: initial,
-          related: item.related || [],
-          loading: false,
-          localOnly: Boolean(item.path) && civitaiId == null,
-        });
-      }
-    } catch (e) {
-      // Keep the list/suggest card usable if detail fetch misses (e.g. mock catalog vs live id).
-      setCivitaiDetail({
-        model: initial,
-        related: [],
-        loading: false,
-        localOnly: Boolean(item.path),
-        error: item?.name ? null : e.message,
-      });
-    } finally {
-      setCivitaiDetailBusy(false);
     }
   };
 
@@ -2409,102 +631,14 @@ export default function App() {
     refresh();
   }, []);
 
-  useEffect(() => {
-    const onAuthRequired = () => {
-      setAuthCta(AUTH_SIGN_IN_HINT);
-      setShowLogin(true);
-    };
-    window.addEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
-    return () => window.removeEventListener(AUTH_REQUIRED_EVENT, onAuthRequired);
-  }, []);
-
-  useEffect(() => {
-    if (tab !== "help" || !helpFocus) return undefined;
-    const t = window.setTimeout(() => {
-      const el = document.getElementById(helpFocus);
-      if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
-    }, 40);
-    return () => window.clearTimeout(t);
-  }, [tab, helpFocus]);
-
-  const refreshWorkerStats = async () => {
-    if (!mock && !hasBrowserBearer() && authStatus?.authRequired) {
-      setWorkerStats(null);
-      return;
-    }
-    try {
-      const st = await api("/v1/worker/stats");
-      setWorkerStats(st);
-    } catch {
-      setWorkerStats(null);
-    }
-  };
-
-  useEffect(() => {
-    if (mock) return undefined;
-    // Keep topbar Worker status fresh; poll faster while on the Worker tab.
-    refreshWorkerStats();
-    const ms = tab === "worker" ? 5000 : 20000;
-    const id = setInterval(refreshWorkerStats, ms);
-    return () => clearInterval(id);
-  }, [tab, mock, studioToken, authStatus?.authRequired]);
-
-  const workerControl = async (action) => {
-    if (action !== "start" && action !== "stop") return;
-    setWorkerCtlBusy(true);
-    setError("");
-    setSavedMsg("");
-    try {
-      await api(`/v1/worker/${action}`, { method: "POST", body: "{}" });
-      const st = await api("/v1/settings");
-      setSettings(st);
-      applyWorkerEndpoint(st.diffusionWorkerUrl || "");
-      await refreshWorkerStats();
-      const health = await api("/v1/health").catch(() => null);
-      setSavedMsg(
-        action === "stop"
-          ? `Worker stop requested${health ? ` · health diffusionWorker=${health.diffusionWorker}` : ""}`
-          : `Worker start requested${health ? ` · health diffusionWorker=${health.diffusionWorker}` : ""}`,
-      );
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setWorkerCtlBusy(false);
-    }
-  };
-
-  const persistModels = (
-    nextAgent,
-    nextImage,
-    nextRouter = routerModel,
-    nextVideo = videoModel,
-  ) => {
+  const persistModels = (nextAgent, nextImage) => {
     try {
       localStorage.setItem(
         MODELS_STORAGE_KEY,
-        JSON.stringify({
-          agentModel: nextAgent,
-          imageModel: nextImage,
-          routerModel: nextRouter,
-          videoModel: nextVideo,
-        }),
+        JSON.stringify({ agentModel: nextAgent, imageModel: nextImage }),
       );
     } catch {
       /* ignore */
-    }
-  };
-
-  const persistRouterToApi = async (id) => {
-    if (mock) return;
-    try {
-      const st = await api("/v1/settings", {
-        method: "PUT",
-        body: JSON.stringify({ routerModel: id }),
-      });
-      // API flattens SettingsPublic + persisted
-      setSettings(st);
-    } catch {
-      /* offline / unauth — localStorage still holds the pick */
     }
   };
 
@@ -2519,289 +653,48 @@ export default function App() {
   };
 
   const changeAgentModel = (id) => {
-    // Placeholder Auto chip must not clobber a persisted id before catalog loads.
-    if (!modelsCatalogReady && id === AUTO_AGENT.id) return;
     setAgentModel(id);
-    persistModels(id, imageModel, routerModel, videoModel);
+    persistModels(id, imageModel);
   };
 
   const changeImageModel = (id) => {
-    if (!modelsCatalogReady && id === AUTO_IMAGE.id) return;
     setImageModel(id);
-    persistModels(agentModel, id, routerModel, videoModel);
+    persistModels(agentModel, id);
   };
 
-  const changeVideoModel = (id) => {
-    if (!modelsCatalogReady && id === AUTO_VIDEO.id) return;
-    setVideoModel(id);
-    persistModels(agentModel, imageModel, routerModel, id);
-  };
-
-  const changeRouterModel = (id) => {
-    if (!modelsCatalogReady && id === AUTO_ROUTER.id) return;
-    setRouterModel(id);
-    persistModels(agentModel, imageModel, id, videoModel);
-    void persistRouterToApi(id);
-  };
-
-  const composedWorkerUrl = () =>
-    useWorkerUrlOverride
-      ? workerUrlOverride.trim()
-      : composeWorkerUrl(workerHost, workerPort);
-  // Prefer persisted URL so default placeholders do not fake a configured worker.
-  const hasWorker = () => Boolean(settings?.diffusionWorkerUrl);
-  const workerReachable = Boolean(workerStats?.reachable);
-  const localBackendOk = hasWorker() && workerReachable;
-  const localBackendReason = !hasWorker()
-    ? "Set a worker URL on the Worker tab first"
-    : !workerReachable
-      ? "Worker URL set but unreachable"
-      : "";
-  const changeGenerateBackend = (next) => {
-    if (next === "local" && !localBackendOk) return;
-    setGenerateBackend(next);
-    persistGenerateBackend(next);
-    if (menuOpen === "gen-bundle") setMenuOpen(null);
-  };
+  const hasWorker = () => Boolean(settings?.diffusionWorkerUrl || workerUrl.trim());
   const canAutoInstall = () => Boolean(settings?.civitaiConfigured && hasWorker());
-
-  const refreshLocalBases = async () => {
-    if (!hasWorker()) {
-      setLocalCheckpoints([]);
-      setLocalBaseModel("");
-      return;
-    }
-    try {
-      const [cps, base] = await Promise.all([
-        api("/v1/worker/checkpoints").catch(() => ({ data: [] })),
-        api("/v1/worker/base-model").catch(() => null),
-      ]);
-      const list = Array.isArray(cps?.data) ? cps.data : [];
-      setLocalCheckpoints(list);
-      if (base?.model) setLocalBaseModel(base.model);
-      else if (list[0]?.path) setLocalBaseModel(list[0].path);
-    } catch {
-      /* ignore */
-    }
-  };
-
-  useEffect(() => {
-    if (generateBackend !== "local" && !hasWorker()) return undefined;
-    refreshLocalBases();
-    return undefined;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [generateBackend, settings?.diffusionWorkerUrl, workerStats?.reachable]);
-
-  const setComposerBaseModel = async (path) => {
-    if (!path?.trim()) return;
-    setLocalBaseBusy(true);
-    setError("");
-    try {
-      const match = localCheckpoints.find((c) => c.path === path);
-      const res = await api("/v1/worker/base-model", {
-        method: "PUT",
-        body: JSON.stringify({
-          model: path.trim(),
-          baseModel: match?.baseModel || undefined,
-        }),
-      });
-      setLocalBaseModel(res?.model || path);
-      setSavedMsg(`Active base set to ${res?.model || path}`);
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setLocalBaseBusy(false);
-    }
-  };
-
-  const applyWorkerEndpoint = (url) => {
-    const ep = parseWorkerEndpoint(url || "");
-    setWorkerHost(ep.host);
-    setWorkerPort(ep.port);
-    setWorkerUrlOverride(ep.advancedUrl);
-    setUseWorkerUrlOverride(ep.useAdvanced);
-  };
-
-  const generateApiToken = async () => {
-    setTokenBusy(true);
-    setError("");
-    setSavedMsg("");
-    setTokenCopyMsg("");
-    try {
-      const res = await api("/v1/auth/token", { method: "POST", body: "{}" });
-      const tok = res?.token || "";
-      if (!tok) throw new Error("API returned no token");
-      setGeneratedToken(tok);
-      setStudioToken(tok);
-      localStorage.setItem("freya.apiToken", tok);
-      await refresh();
-      flashSave(
-        "token",
-        res.note ||
-          (res.rotated
-            ? "Machine API token rotated — copy it now."
-            : "Machine API token created — copy it now."),
-      );
-    } catch (e) {
-      setError(
-        e.message === "Unauthorized" || /401|Unauthorized/i.test(e.message || "")
-          ? "Sign in first, then generate a machine API token."
-          : e.message,
-      );
-    } finally {
-      setTokenBusy(false);
-    }
-  };
-
-  const copyGeneratedToken = async () => {
-    if (!generatedToken) return;
-    try {
-      await navigator.clipboard.writeText(generatedToken);
-      setTokenCopyMsg("Copied");
-    } catch {
-      setTokenCopyMsg("Select and copy manually");
-    }
-  };
-
-  /** Prefer freshly generated token, else browser-saved machine token. */
-  const effectiveMachineToken = () =>
-    (generatedToken || studioToken || "").trim();
-
-  const linuxWorkerSetupCmd = () =>
-    buildLinuxWorkerSetupCmd({
-      origin: studioOrigin(),
-      token: effectiveMachineToken(),
-      apiUrl: studioOrigin(),
-    });
-
-  const windowsWorkerSetupCmd = () =>
-    buildWindowsWorkerSetupCmd({
-      origin: studioOrigin(),
-      token: effectiveMachineToken(),
-      apiUrl: studioOrigin(),
-    });
-
-  const copyWorkerSetupCmd = async (which) => {
-    const text = which === "windows" ? windowsWorkerSetupCmd() : linuxWorkerSetupCmd();
-    try {
-      await navigator.clipboard.writeText(text);
-      setSetupCmdCopyMsg(which === "windows" ? "Windows copied" : "Linux copied");
-    } catch {
-      setSetupCmdCopyMsg("Select and copy manually");
-    }
-  };
-
-  const applyLocalWorkerDefaults = () => {
-    setUseWorkerUrlOverride(false);
-    setWorkerUrlOverride("");
-    setWorkerHost(DEFAULT_WORKER_HOST);
-    setWorkerPort(DEFAULT_WORKER_PORT);
-    setSavedMsg(
-      `Local worker endpoint set to http://${DEFAULT_WORKER_HOST}:${DEFAULT_WORKER_PORT} — Save worker to apply.`,
-    );
-  };
-
-  const persistStudioTokenLocal = () => {
-    if (studioToken.trim()) {
-      localStorage.setItem("freya.apiToken", studioToken.trim());
-    } else {
-      localStorage.removeItem("freya.apiToken");
-    }
-  };
-
-  /** Persist machine API token in this browser and reload catalogs. */
-  const applyStudioToken = async () => {
-    persistStudioTokenLocal();
-    setError("");
-    setSavedMsg("");
-    setSaveFlash(null);
-    try {
-      await refresh();
-      flashSave(
-        "token",
-        studioToken.trim() ? "Machine token saved in this browser." : "Machine token cleared.",
-      );
-    } catch (e) {
-      setError(e.message);
-    }
-  };
-
-  const saveWorkerEndpoint = async () => {
-    setBusy(true);
-    setError("");
-    setSavedMsg("");
-    setSaveFlash(null);
-    try {
-      persistStudioTokenLocal();
-      const st = await api("/v1/settings", {
-        method: "PUT",
-        body: JSON.stringify({ diffusionWorkerUrl: composedWorkerUrl() }),
-      });
-      setSettings(st);
-      applyWorkerEndpoint(st.diffusionWorkerUrl || "");
-      await refreshWorkerStats();
-      flashSave(
-        "worker",
-        mock
-          ? "Worker endpoint saved (mock)."
-          : `Worker endpoint saved: ${st.diffusionWorkerUrl || "(cleared — OpenRouter only)"}.`,
-      );
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
-    }
-  };
   const canCloudGenerate = () => Boolean(settings?.openRouterConfigured);
 
   const pinnedPayload = () =>
-    (session.pinnedLoras || [])
-      .filter((l) => isPinnableAsset(l))
-      .map((l) => ({
-        name: l.path
-          ? String(l.path).split("/").pop().replace(/\.safetensors$/i, "")
-          : l.name,
-        scale: l.scale ?? 0.8,
-        path: l.path || undefined,
-        baseModel: l.baseModel || undefined,
-      }));
+    (session.pinnedLoras || []).map((l) => ({
+      name: l.name,
+      scale: l.scale ?? 0.8,
+    }));
 
   const isPinned = (item) =>
-    (session.pinnedLoras || []).some(
-      (p) => isPinnableAsset(p) && loraKey(p) === loraKey(item),
-    );
+    (session.pinnedLoras || []).some((p) => loraKey(p) === loraKey(item));
 
-  const pinLora = (item, extra = {}) => {
-    if (!isPinnableAsset(item)) {
-      setError(
-        `“${item?.name || "Asset"}” is a checkpoint/base — set it as active base on Worker (or ask the agent), not as a session pin.`,
-      );
-      return;
-    }
+  const pinLora = (item) => {
     setSession((prev) => {
       if ((prev.pinnedLoras || []).some((p) => loraKey(p) === loraKey(item))) return prev;
       const next = {
         id: item.id,
         name: item.name,
-        modelType: item.modelType || item.kind || "LORA",
+        modelType: item.modelType,
         downloadUrl: item.downloadUrl,
         triggerWord: item.triggerWord || null,
-        baseModel: item.baseModel || null,
-        path: extra.path || item.path || null,
-        versionId: item.versionId || null,
         scale: 0.8,
       };
-      const baseHint = item.baseModel
-        ? ` Needs base family “${item.baseModel}” on the local worker (Worker → active base / install checkpoint).`
-        : "";
       return {
         ...prev,
-        pinnedLoras: [...(prev.pinnedLoras || []).filter(isPinnableAsset), next],
+        pinnedLoras: [...(prev.pinnedLoras || []), next],
         sessionNote: item.triggerWord
-          ? `Pinned “${item.name}”. Trigger word “${item.triggerWord}” is optional — Freya keeps your prompt as you wrote it.${baseHint}`
-          : `Pinned “${item.name}” for this session. Your prompt stays as you wrote it.${baseHint}`,
+          ? `Pinned “${item.name}”. Trigger word “${item.triggerWord}” is optional — Freya keeps your prompt as you wrote it.`
+          : `Pinned “${item.name}” for this session. Your prompt stays as you wrote it.`,
       };
     });
+    setSavedMsg(`Pinned ${item.name} for this session.`);
   };
 
   const unpinLora = (item) => {
@@ -2812,314 +705,27 @@ export default function App() {
   };
 
   const pushTurn = (text, artifactIds = []) => {
-    const at = new Date().toISOString();
     setSession((prev) => ({
       ...prev,
       goal: prev.goal || text,
-      turns: [{ prompt: text, at, artifactIds }, ...(prev.turns || [])].slice(0, 12),
-      messages: [
-        ...(prev.messages || []),
-        { role: "user", content: text, at },
-        ...(artifactIds?.length
-          ? [
-              {
-                role: "assistant",
-                content: `Generated ${artifactIds.length} image${artifactIds.length === 1 ? "" : "s"}.`,
-                at,
-                artifactIds,
-              },
-            ]
-          : []),
-      ].slice(-40),
+      turns: [{ prompt: text, at: new Date().toISOString(), artifactIds }, ...(prev.turns || [])].slice(
+        0,
+        12,
+      ),
     }));
-  };
-
-  const appendMessages = (...msgs) => {
-    setSession((prev) => ({
-      ...prev,
-      messages: [...(prev.messages || []), ...msgs].slice(-40),
-    }));
-  };
-
-  const applyChatResponse = (data, userText) => {
-    const actions = Array.isArray(data.actions) ? data.actions : [];
-    const artifacts = Array.isArray(data.artifacts)
-      ? data.artifacts.filter((a) => a && (a.artifactId || a.url))
-      : [];
-    const artifactIds = artifacts.map((a) => a.artifactId).filter(Boolean);
-    const ideasNext = Array.isArray(data.ideas) ? data.ideas : [];
-    const lorasNext = Array.isArray(data.loras) ? data.loras : [];
-    const query = data.civitaiQuery || "";
-
-    if (ideasNext.length) setIdeas(ideasNext);
-    if (lorasNext.length) setSuggestedLoras(lorasNext);
-    if (query) {
-      setCivitaiQuery(query);
-      setCivitaiQ(query);
-    }
-
-    if (artifacts.length) {
-      setBatchResults(artifacts.length > 1 ? artifacts : []);
-      setResult(artifacts[0]);
-      setModelBrief(artifacts[0]?.enhancedPrompt || "");
-    }
-
-    const proposed = actions.filter((a) => a.status === "proposed");
-    if (data.pendingConfirmation && proposed.length) {
-      setPendingPlan({
-        status: automationMode === "plan" ? "plan" : "auto",
-        goal: userText,
-        actions: proposed,
-        batchPrompts: proposed
-          .filter((a) => a.type === "generate_image" || a.type === "run_session")
-          .map((a) => a.args?.prompt || a.args?.goal)
-          .filter(Boolean),
-        pendingInstalls: proposed
-          .filter((a) => a.type === "install_asset")
-          .map((a) => ({
-            name: a.args?.name,
-            downloadUrl: a.args?.downloadUrl,
-            destPath: a.args?.destPath,
-          })),
-        steps: proposed.map((a) => ({
-          kind: a.type,
-          note: a.args?.prompt || a.args?.query || a.args?.goal || a.type,
-        })),
-        civitaiQuery: query,
-        sessionNote: data.reply || "",
-      });
-    } else {
-      setPendingPlan(null);
-    }
-
-    if (data.question) {
-      setPendingQuestion({
-        kind: data.question.kind || "tool",
-        text: data.question.text || "Freya needs a decision before continuing.",
-        choices: data.question.choices || [
-          { id: "confirm", label: "Confirm & run", value: "confirm" },
-          { id: "skip", label: "Skip tools", value: "skip" },
-        ],
-      });
-    } else if (!data.pendingConfirmation) {
-      setPendingQuestion(null);
-    }
-
-    const toolLines = actions
-      .filter((a) => a.status === "executed" || a.status === "error" || a.status === "proposed")
-      .map((a) => {
-        if (a.status === "proposed") return `Proposed: ${a.type}`;
-        if (a.status === "error") return `${a.type} failed: ${a.error || "error"}`;
-        if (a.type === "generate_image") return `Generated image`;
-        if (a.type === "run_session")
-          return `Generated ${(a.result?.results || []).length || "a"} variation(s)`;
-        if (a.type === "search_civitai")
-          return `Searched Civitai for “${a.result?.query || a.args?.query || "…"}”`;
-        if (a.type === "suggest_ideas")
-          return `Suggested ${(a.result?.ideas || []).length || "some"} ideas`;
-        if (a.type === "install_asset") {
-          // Queued downloads are signaled by the Downloads label color cycle — no status line.
-          if (a.result?.jobId) return null;
-          return `Installed “${a.args?.name || "asset"}”`;
-        }
-        if (a.type === "worker_status")
-          return `Worker ${
-            a.result?.reachable
-              ? "reachable"
-              : a.result?.workerConfigured || a.result?.workerEnabled
-                ? "unreachable"
-                : "not configured"
-          }`;
-        if (a.type === "list_checkpoints")
-          return `Listed ${(a.result?.checkpoints || []).length || 0} checkpoint(s)`;
-        if (a.type === "get_base_model")
-          return `Active base: ${a.result?.model || "—"}${
-            a.result?.baseModel ? ` (${a.result.baseModel})` : ""
-          }`;
-        if (a.type === "set_base_model")
-          return `Set active base to ${a.result?.model || a.args?.model || "—"}`;
-        if (a.type === "generate_video") return `Generated ${a.result?.modality || "video"}`;
-        if (a.type === "gallery_list")
-          return `Gallery: ${(a.result?.items || []).length || 0} item(s)`;
-        if (a.type === "gallery_get") return `Gallery item ${a.result?.id || a.args?.id || "—"}`;
-        if (a.type === "list_styles")
-          return `Listed ${(a.result?.items || []).length || 0} style(s)`;
-        if (a.type === "apply_style")
-          return `Style ${a.result?.displayName || a.args?.styleRef || "—"}`;
-        if (a.type === "list_models") return `Listed models`;
-        if (a.type === "get_settings") return `Read settings`;
-        if (a.type === "get_route_defaults") return `Route defaults`;
-        if (a.type === "set_chat_models")
-          return `Saved models (image=${a.result?.imageModel || a.args?.imageModel || "—"})`;
-        if (a.type === "openrouter_metrics") return `OpenRouter metrics`;
-        return `${a.type}: ${a.status}`;
-      })
-      .filter(Boolean);
-    if (toolLines.length) setSessionLog(toolLines);
-
-    const zdrErr = actions.find(
-      (a) =>
-        a.status === "error" &&
-        (a.type === "generate_image" || a.type === "generate_video") &&
-        /zdr|zero data retention|data-policy|data policy|no endpoints matching/i.test(
-          String(a.error || ""),
-        ),
-    );
-    if (zdrErr?.error) {
-      setError(
-        `${zdrErr.error} — Freya Settings → Privacy (Zero Data Retention), or https://openrouter.ai/settings/privacy`,
-      );
-    }
-
-    const route = data.route || null;
-    const routeContext = data.routeContext || null;
-    const resolvedModels = data.resolvedModels || null;
-    const genBackend =
-      artifacts.find((a) => a?.backend)?.backend ||
-      actions.find(
-        (a) =>
-          (a.type === "generate_image" || a.type === "generate_video") &&
-          a.status === "executed" &&
-          a.result?.backend,
-      )?.result?.backend ||
-      null;
-    const at = new Date().toISOString();
-    appendMessages({
-      role: "assistant",
-      content: data.reply || (artifacts.length ? "Done." : "…"),
-      at,
-      actions,
-      artifactIds,
-      ideas: ideasNext,
-      loras: lorasNext,
-      route,
-      routeContext,
-      resolvedModels,
-      genBackend: genBackend || routeContext?.backend || null,
-    });
-
-    if (artifactIds.length) {
-      setSession((prev) => ({
-        ...prev,
-        goal: prev.goal || userText,
-        turns: [
-          { prompt: userText, at, artifactIds },
-          ...(prev.turns || []),
-        ].slice(0, 12),
-      }));
-    }
-
-    return artifacts;
-  };
-
-  const chatBody = (message, extra = {}) => {
-    const body = {
-      message,
-      automationMode,
-      backend: generateBackend === "local" ? "local" : "openrouter",
-      messages: (session.messages || []).slice(-8).map((m) => ({
-        role: m.role,
-        content: m.content,
-      })),
-      session: {
-        goal: session.goal || message,
-        pinnedLoras: session.pinnedLoras,
-        recentPrompts: (session.turns || []).slice(0, 5).map((t) => t.prompt),
-      },
-      loras: pinnedPayload(),
-      ...extra,
-    };
-    if (agentModel && agentModel !== AUTO_AGENT.id) body.model = agentModel;
-    if (
-      generateBackend !== "local" &&
-      imageModel &&
-      imageModel !== AUTO_IMAGE.id
-    ) {
-      body.imageModel = imageModel;
-    }
-    return body;
-  };
-
-  /** Primary composer action — send a chat message; tools run per Plan/Auto/YOLO. */
-  const submitChat = async (overrideText, extra = {}) => {
-    const text = (overrideText ?? prompt).trim();
-    if (!text && !extra.confirm) return;
-    if (generateBackend === "local" && !localBackendOk) {
-      setError(localBackendReason || "Local worker unavailable");
-      return;
-    }
-    const sessionId = activeIdRef.current;
-    const userText = text || session.goal || examplePrompt;
-    setBusy(true);
-    setError("");
-    setSavedMsg("");
-    try {
-      if (!extra.confirm) {
-        const at = new Date().toISOString();
-        appendMessages({ role: "user", content: userText, at });
-        setSession((prev) => ({ ...prev, goal: prev.goal || userText }));
-        setPrompt("");
-      }
-      const data = await api("/v1/chat", {
-        method: "POST",
-        body: JSON.stringify(chatBody(userText, extra)),
-      });
-      if (activeIdRef.current !== sessionId) return;
-      applyChatResponse(data, userText);
-      const g = await api("/v1/gallery");
-      if (activeIdRef.current !== sessionId) return;
-      setGallery(g.items || []);
-    } catch (e) {
-      if (activeIdRef.current === sessionId) setError(e.message);
-    } finally {
-      if (activeIdRef.current === sessionId) setBusy(false);
-    }
-  };
-
-  /** Same generate path as asking in chat — uses the turn's prompt, not a retype. */
-  const runGenerateOffer = async (offer) => {
-    if (!offer?.prompt) return;
-    const type = offer.type || "generate_image";
-    const action =
-      type === "run_session"
-        ? { type, args: { goal: offer.prompt } }
-        : type === "generate_video"
-          ? { type, args: { prompt: offer.prompt, modality: offer.modality || "video" } }
-          : { type: "generate_image", args: { prompt: offer.prompt, batch: false } };
-    await submitChat(offer.prompt, { confirm: true, actions: [action] });
   };
 
   const runBody = (nlPrompt) => {
     const loras = pinnedPayload();
-    const lower = String(nlPrompt || "").toLowerCase();
-    const looksGif =
-      /\bgif\b/.test(lower) || lower.includes("animated gif") || lower.includes("looping animation");
-    const looksVideo =
-      !looksGif &&
-      (lower.includes("video") ||
-        lower.includes("t2v") ||
-        lower.includes("text-to-video") ||
-        lower.includes("mp4") ||
-        lower.includes("animate "));
-    const wantLocal = generateBackend === "local";
+    // Pinned LoRAs only apply on the local worker — prefer local when a worker is set.
     const body = {
       prompt: nlPrompt,
       enhance: "auto",
-      backend: wantLocal
-        ? "local"
-        : loras.length && hasWorker() && !looksGif && !looksVideo
-          ? "local"
-          : "openrouter",
+      backend: loras.length && hasWorker() ? "local" : "auto",
       loras,
       automationMode,
     };
-    if (looksGif) body.modality = "gif";
-    if (looksVideo) body.modality = "video";
-    if (looksGif || looksVideo) {
-      if (!wantLocal && videoModel && videoModel !== AUTO_VIDEO.id) body.model = videoModel;
-    } else if (!wantLocal && imageModel && imageModel !== AUTO_IMAGE.id) {
-      body.model = imageModel;
-    }
+    if (imageModel && imageModel !== "auto") body.model = imageModel;
     return body;
   };
 
@@ -3134,7 +740,7 @@ export default function App() {
         recentPrompts: (session.turns || []).slice(0, 5).map((t) => t.prompt),
       },
     };
-    if (agentModel && agentModel !== AUTO_AGENT.id) body.model = agentModel;
+    if (agentModel && agentModel !== "openrouter/auto") body.model = agentModel;
     return body;
   };
 
@@ -3146,283 +752,22 @@ export default function App() {
     return data;
   };
 
-  const destPathForAsset = (item) => {
-    const safe = (item.name || "model").replace(/[^a-zA-Z0-9._-]+/g, "_");
-    const ext = fileExtFromVariant(item);
-    const t = (item.modelType || "").toLowerCase();
-    if (t === "lora" || t === "locon" || t === "dora" || t === "lycoris" || t.includes("lora")) {
-      return `loras/${safe}${ext}`;
-    }
-    if (t === "textualinversion") return `embeddings/${safe}${ext}`;
-    if (t === "vae") return `vae/${safe}${ext}`;
-    return `checkpoints/${safe}${ext}`;
-  };
-
-  /** Match card/detail selection to an installed worker asset (path preferred). */
-  const findInstalledForItem = (item) => {
-    if (!item || !installedAssets.length) return null;
-    const dest = destPathForAsset(item);
-    const byDest = installedAssets.find((a) => a?.path && a.path === dest);
-    if (byDest) return byDest;
-    if (item.path) {
-      const byPath = installedAssets.find((a) => a?.path && a.path === item.path);
-      if (byPath) return byPath;
-    }
-    if (item.versionId != null && item.versionId !== "") {
-      const byVer = installedAssets.find(
-        (a) => a?.versionId != null && String(a.versionId) === String(item.versionId),
-      );
-      if (byVer) return byVer;
-    }
-    return null;
-  };
-
-  const activeJobForItem = (item) => {
-    if (!item || !downloadJobs.length) return null;
-    const dest = destPathForAsset(item);
-    return (
-      downloadJobs.find((j) => {
-        const st = String(j?.status || "").toLowerCase();
-        if (!["queued", "downloading"].includes(st)) return false;
-        const jp = j?.destPath || j?.path || "";
-        return jp === dest || (item.path && jp === item.path);
-      }) || null
-    );
-  };
-
-  const formatBytes = (n) => {
-    if (n == null || Number.isNaN(Number(n))) return "";
-    const v = Number(n);
-    if (v < 1024) return `${v} B`;
-    if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
-    if (v < 1024 * 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB`;
-    return `${(v / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-  };
-
-  const refreshDownloadJobs = async () => {
-    if (!hasWorker()) {
-      if (downloadJobsFingerprintRef.current !== "") {
-        downloadJobsFingerprintRef.current = "";
-        setDownloadJobs([]);
-      }
-      return [];
-    }
-    try {
-      const data = await api("/v1/civitai/jobs");
-      const jobs = Array.isArray(data?.data) ? data.data : [];
-      const fp = downloadJobsFingerprint(jobs);
-      if (fp !== downloadJobsFingerprintRef.current) {
-        downloadJobsFingerprintRef.current = fp;
-        setDownloadJobs(jobs);
-      }
-      return jobs;
-    } catch {
-      return downloadJobs;
-    }
-  };
-
-  const refreshInstalledAssets = async ({ quiet = false } = {}) => {
-    if (!hasWorker()) {
-      if (installedFingerprintRef.current !== "") {
-        installedFingerprintRef.current = "";
-        setInstalledAssets([]);
-      }
-      setActiveBasePath("");
-      return;
-    }
-    if (!quiet) setInstalledBusy(true);
-    try {
-      const [loras, cps, embeddings, vaes, base] = await Promise.all([
-        api("/v1/worker/loras").catch(() => ({ data: [] })),
-        api("/v1/worker/checkpoints").catch(() => ({ data: [] })),
-        api("/v1/worker/embeddings").catch(() => ({ data: [] })),
-        api("/v1/worker/vae").catch(() => ({ data: [] })),
-        api("/v1/worker/base-model").catch(() => ({})),
-      ]);
-      const list = [
-        ...(Array.isArray(loras?.data) ? loras.data : []),
-        ...(Array.isArray(cps?.data) ? cps.data : []),
-        ...(Array.isArray(embeddings?.data) ? embeddings.data : []),
-        ...(Array.isArray(vaes?.data) ? vaes.data : []),
-      ].map((a) => {
-        const thumb = pickCivitaiThumb(
-          { ...a, modelId: a.modelId ?? null, versionId: a.versionId ?? null },
-          favorites,
-        );
-        return thumb ? { ...a, thumbnailUrl: thumb } : a;
-      });
-      const fp = installedListFingerprint(list);
-      if (fp !== installedFingerprintRef.current) {
-        installedFingerprintRef.current = fp;
-        setInstalledAssets(list);
-      }
-      setActiveBasePath(base?.model || "");
-      // Older sidecars often lack thumbnailUrl — resolve via Civitai when possible.
-      if (settings?.civitaiConfigured) {
-        scheduleEnrichInstalledThumbs(list);
-      }
-    } catch (e) {
-      setError(e.message || "Failed to load installed assets");
-    } finally {
-      if (!quiet) setInstalledBusy(false);
-    }
-  };
-
-  /** Debounced thumb enrich — skip paths already attempted this session. */
-  const scheduleEnrichInstalledThumbs = (list) => {
-    if (enrichTimerRef.current) clearTimeout(enrichTimerRef.current);
-    enrichTimerRef.current = setTimeout(() => {
-      enrichTimerRef.current = null;
-      void enrichInstalledThumbs(list);
-    }, 400);
-  };
-
-  /** Fill missing Installed card thumbs from Civitai model / model-versions. */
-  const enrichInstalledThumbs = async (list) => {
-    const need = (list || []).filter((a) => {
-      if (!a?.path || a.thumbnailUrl) return false;
-      if (enrichAttemptedRef.current.has(a.path)) return false;
-      return a.versionId != null || (a.modelId != null && a.modelId !== "");
-    });
-    if (!need.length) return;
-    for (const a of need) enrichAttemptedRef.current.add(a.path);
-    const concurrency = Math.min(3, need.length);
-    let cursor = 0;
-    const worker = async () => {
-      while (cursor < need.length) {
-        const asset = need[cursor++];
-        try {
-          let data;
-          if (asset.modelId != null && asset.modelId !== "") {
-            data = await api(`/v1/civitai/models/${asset.modelId}`);
-          } else {
-            data = await api(`/v1/civitai/model-versions/${asset.versionId}`);
-          }
-          const model = data?.model || data;
-          const thumb = model?.thumbnailUrl || model?.imageUrls?.[0] || null;
-          if (!thumb) continue;
-          const resolvedModelId = model?.id ?? model?.modelId ?? asset.modelId ?? null;
-          rememberCivitaiThumb(
-            {
-              modelId: resolvedModelId,
-              versionId: asset.versionId ?? model?.versionId,
-            },
-            thumb,
-          );
-          setInstalledAssets((prev) => {
-            const next = prev.map((a) =>
-              a.path === asset.path
-                ? {
-                    ...a,
-                    thumbnailUrl: a.thumbnailUrl || thumb,
-                    modelId: a.modelId ?? resolvedModelId,
-                    imageUrls: a.imageUrls?.length ? a.imageUrls : model?.imageUrls,
-                  }
-                : a,
-            );
-            installedFingerprintRef.current = installedListFingerprint(next);
-            return next;
-          });
-        } catch {
-          /* ignore per-asset resolve failures */
-        }
-      }
-    };
-    await Promise.all(Array.from({ length: concurrency }, () => worker()));
-  };
-
-  const cancelDownloadJob = async (id) => {
-    if (!id) return;
-    try {
-      await api(`/v1/civitai/jobs/${encodeURIComponent(id)}/cancel`, {
-        method: "POST",
-      });
-      await refreshDownloadJobs();
-    } catch (e) {
-      setError(e.message);
-    }
-  };
-
-  /** Clear finished jobs (succeeded/failed/cancelled). Does not cancel in-flight downloads. */
-  const clearFinishedDownloadJobs = async () => {
-    if (!hasWorker()) return;
-    const finished = downloadJobs.filter((j) =>
-      ["succeeded", "failed", "cancelled"].includes(String(j?.status || "").toLowerCase()),
-    );
-    if (finished.length === 0) return;
-    try {
-      const data = await api("/v1/civitai/jobs/clear", {
-        method: "POST",
-        body: JSON.stringify({ includeQueued: false }),
-      });
-      const jobs = Array.isArray(data?.data) ? data.data : [];
-      downloadJobsFingerprintRef.current = downloadJobsFingerprint(jobs);
-      setDownloadJobs(jobs);
-    } catch (e) {
-      setError(e.message || "Failed to clear downloads");
-    }
-  };
-
-  const deleteInstalledAsset = async (asset) => {
-    if (!asset?.path) return;
-    if (
-      !window.confirm(
-        `Delete ${asset.name || asset.path} from the worker disk? This cannot be undone.`,
-      )
-    ) {
-      return;
-    }
-    try {
-      await api("/v1/worker/assets", {
-        method: "DELETE",
-        body: JSON.stringify({ path: asset.path }),
-      });
-      if (isPinned(asset)) unpinLora(asset);
-      await refreshInstalledAssets();
-    } catch (e) {
-      setError(e.message);
-    }
-  };
-
-  const setInstalledAsBase = async (asset) => {
-    if (!asset?.path) return;
-    try {
-      await api("/v1/worker/base-model", {
-        method: "PUT",
-        body: JSON.stringify({
-          model: asset.path,
-          baseModel: asset.baseModel || undefined,
-        }),
-      });
-      setActiveBasePath(asset.path);
-      setSavedMsg(`Active base → ${asset.name || asset.path}`);
-    } catch (e) {
-      setError(e.message);
-    }
-  };
-
   const installOne = async (item) => {
-    const dest = destPathForAsset(item);
-    const modelId = resolveCivitaiModelId(item);
-    const thumb = item.thumbnailUrl || item.imageUrls?.[0] || null;
-    if (thumb) rememberCivitaiThumb({ modelId, versionId: item.versionId }, thumb);
-    const res = await api("/v1/civitai/install", {
+    const safe = (item.name || "model").replace(/[^a-zA-Z0-9._-]+/g, "_");
+    const dest =
+      item.modelType === "LORA" || item.modelType === "LoCon"
+        ? `loras/${safe}.safetensors`
+        : `checkpoints/${safe}.safetensors`;
+    await api("/v1/civitai/install", {
       method: "POST",
       body: JSON.stringify({
-        downloadUrl: item.downloadUrl || undefined,
+        downloadUrl: item.downloadUrl,
         destPath: dest,
         name: item.name,
-        baseModel: item.baseModel || undefined,
-        versionId: item.versionId || undefined,
-        modelId: modelId ?? undefined,
-        fileId: item.fileId || undefined,
-        modelType: item.modelType || undefined,
-        thumbnailUrl: thumb || undefined,
       }),
     });
-    // Install/enqueue must not auto-pin — user pins LoRAs explicitly when wanted.
-    await refreshDownloadJobs();
-    return { dest, jobId: res?.jobId, status: res?.status || "queued" };
+    pinLora(item);
+    return dest;
   };
 
   const executeBatch = async (batch, goal) => {
@@ -3465,17 +810,8 @@ export default function App() {
 
     for (const item of list) {
       try {
-        if (findInstalledForItem(item)) {
-          log.push(`Already installed “${item.name}” → ${destPathForAsset(item)}`);
-          continue;
-        }
-        if (activeJobForItem(item)) {
-          // Active job → Downloads label color cycle; no chat/composer status line.
-          continue;
-        }
-        const { dest, jobId } = await installOne(item);
-        // Queued jobs use the Downloads label color cycle; only log sync installs.
-        if (!jobId) log.push(`Installed “${item.name}” → ${dest}`);
+        const dest = await installOne(item);
+        log.push(`Installed “${item.name}” → ${dest}`);
       } catch (e) {
         log.push(`Install skipped for “${item.name}”: ${e.message}`);
       }
@@ -3518,12 +854,64 @@ export default function App() {
     };
   };
 
-  /** Shortcut: inject a suggest request into chat (tool: suggest_ideas). */
+  const run = async () => {
+    const sessionId = activeIdRef.current;
+    setBusy(true);
+    setError("");
+    setBatchResults([]);
+    try {
+      const data = await runOne(prompt);
+      if (activeIdRef.current !== sessionId) return;
+      setResult(data);
+      setModelBrief(data.enhancedPrompt || "");
+      pushTurn(prompt, data.artifactId ? [data.artifactId] : []);
+      const g = await api("/v1/gallery");
+      if (activeIdRef.current !== sessionId) return;
+      setGallery(g.items || []);
+    } catch (e) {
+      if (activeIdRef.current === sessionId) setError(e.message);
+    } finally {
+      if (activeIdRef.current === sessionId) setBusy(false);
+    }
+  };
+
+  /** Ask Freya for NL alternatives + LoRA recommendations (never auto-installs). */
   const suggestIdeas = async () => {
-    const topic = prompt.trim() || session.goal || examplePrompt;
-    const msg = `Suggest ideas for: ${topic}`;
-    setPrompt(msg);
-    await submitChat(msg);
+    setBusy(true);
+    setError("");
+    try {
+      const message = prompt.trim() || examplePrompt;
+      if (!prompt.trim()) setPrompt(examplePrompt);
+      const data = await api("/v1/assist", {
+        method: "POST",
+        body: JSON.stringify(assistBody("suggest", message)),
+      });
+      const nextIdeas = Array.isArray(data.ideas)
+        ? data.ideas
+        : typeof data.text === "string"
+          ? data.text
+              .split("\n")
+              .map((l) => l.replace(/^\d+\.\s*/, "").trim())
+              .filter(Boolean)
+          : [];
+      setIdeas(nextIdeas);
+      setSuggestedLoras(Array.isArray(data.loras) ? data.loras : []);
+      setSuggestNote(data.sessionNote || "");
+      setCivitaiQuery(data.civitaiQuery || "");
+      if (data.civitaiQuery) setCivitaiQ(data.civitaiQuery);
+      if (data.sessionNote) {
+        setSession((prev) => ({ ...prev, sessionNote: data.sessionNote }));
+      }
+      if (!settings?.civitaiConfigured && (!data.loras || data.loras.length === 0)) {
+        setSavedMsg(
+          "LoRA suggestions need a Civitai key — add any non-empty value in Settings (mock).",
+        );
+      }
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
   };
 
   const fetchSessionPlan = async () => {
@@ -3597,14 +985,11 @@ export default function App() {
     log.push(`Generating ${plan.batchPrompts.length} variations…`);
     await executeBatch(plan.batchPrompts, plan.goal);
     log.push(`Generated ${plan.batchPrompts.length} images for “${plan.goal}”.`);
-    if (agentModel && agentModel !== AUTO_AGENT.id) {
-      log.push(`Agent model: ${modelLabel(agentModels, agentModel)}`);
+    if (agentModel && agentModel !== "openrouter/auto") {
+      log.push(`Agent model: ${modelLabel(AGENT_MODELS, agentModel)}`);
     }
-    if (imageModel && imageModel !== AUTO_IMAGE.id) {
-      log.push(`Image model: ${modelLabel(imageModels, imageModel)}`);
-    }
-    if (routerModel && routerModel !== AUTO_ROUTER.id) {
-      log.push(`Router model: ${modelLabel(routerModels, routerModel)}`);
+    if (imageModel && imageModel !== "auto") {
+      log.push(`Image model: ${modelLabel(IMAGE_MODELS, imageModel)}`);
     }
     setSessionLog(log);
     setPendingPlan(null);
@@ -3616,26 +1001,53 @@ export default function App() {
     );
   };
 
-  /** Shortcut: inject a run-session request into chat. */
+  /** Agentic session — gated by Plan / Auto / YOLO. */
   const runSession = async () => {
-    const goal = prompt.trim() || session.goal || examplePrompt;
-    const msg = `Run session for: ${goal}`;
-    setPrompt(msg);
-    await submitChat(msg);
-  };
-
-  const confirmPendingActions = async () => {
-    if (!pendingPlan?.actions?.length) return;
-    await submitChat(pendingPlan.goal || prompt || examplePrompt, {
-      confirm: true,
-      actions: pendingPlan.actions.map((a) => ({
-        type: a.type,
-        args: a.args || {},
-      })),
-    });
-    setPendingPlan(null);
+    const sessionId = activeIdRef.current;
+    setBusy(true);
+    setError("");
+    setBatchResults([]);
+    setSessionLog([]);
     setPendingQuestion(null);
-    setSavedMsg("Confirmed — Freya ran the proposed tools.");
+    try {
+      const plan = await fetchSessionPlan();
+      if (activeIdRef.current !== sessionId) return;
+
+      if (automationMode === "plan") {
+        setPendingPlan({ ...plan, status: "plan" });
+        setSuggestNote(
+          plan.sessionNote ||
+            "Plan ready — no generate or install. Run pieces manually, or switch to Auto/YOLO and Run session again.",
+        );
+        setSavedMsg("Plan mode — nothing executed yet.");
+        return;
+      }
+
+      if (automationMode === "auto") {
+        const q = detectAutoQuestion(plan);
+        if (q) {
+          setPendingPlan({ ...plan, status: "auto" });
+          setPendingQuestion(q);
+          setSuggestNote(plan.sessionNote || "Freya paused — answer below to continue.");
+          setSavedMsg("Auto mode — waiting on your answer.");
+          return;
+        }
+        setPendingPlan(null);
+        await executePlan(plan, {
+          installs: (plan.pendingInstalls || []).length === 1 ? plan.pendingInstalls : [],
+          yolo: false,
+        });
+        return;
+      }
+
+      // YOLO
+      setPendingPlan(null);
+      await executePlan(plan, { installs: "all", yolo: true });
+    } catch (e) {
+      if (activeIdRef.current === sessionId) setError(e.message);
+    } finally {
+      if (activeIdRef.current === sessionId) setBusy(false);
+    }
   };
 
   const answerQuestion = async (choice) => {
@@ -3643,41 +1055,37 @@ export default function App() {
 
     if (choice.value === "settings") {
       setTab("settings");
-      setSavedMsg(
-        "Add a worker URL (and Civitai key) for LoRA installs — OpenRouter still generates without one.",
-      );
+      setSavedMsg("Add a worker URL (and Civitai key) for LoRA installs — OpenRouter still generates without one.");
       return;
     }
 
-    if (choice.value === "skip" || choice.id === "skip") {
-      dismissPending();
-      appendMessages({
-        role: "assistant",
-        content: "Skipped proposed tools — keep chatting whenever you’re ready.",
-        at: new Date().toISOString(),
-      });
-      return;
-    }
-
-    if (choice.value === "confirm" || choice.id === "confirm" || choice.id === "all") {
-      await confirmPendingActions();
-      return;
-    }
-
-    // Single LoRA choice — confirm only that install (+ any generate)
-    const actions = (pendingPlan.actions || []).filter((a) => {
-      if (a.type !== "install_asset") return true;
-      if (choice.value && typeof choice.value === "object") {
-        return a.args?.name === choice.value.name || a.args?.downloadUrl === choice.value.downloadUrl;
+    setBusy(true);
+    setError("");
+    try {
+      let plan = pendingPlan;
+      if (pendingQuestion.kind === "goal" && choice.id === "example") {
+        setPrompt(examplePrompt);
+        plan = { ...plan, goal: examplePrompt };
       }
-      return false;
-    });
-    await submitChat(pendingPlan.goal || prompt || examplePrompt, {
-      confirm: true,
-      actions: actions.map((a) => ({ type: a.type, args: a.args || {} })),
-    });
-    setPendingPlan(null);
-    setPendingQuestion(null);
+
+      let installs = [];
+      if (pendingQuestion.kind === "lora") {
+        if (choice.value === "all") installs = "all";
+        else if (choice.value == null) installs = [];
+        else installs = [choice.value];
+      } else if (pendingQuestion.kind === "config") {
+        installs = [];
+      } else if ((plan.pendingInstalls || []).length === 1 && canAutoInstall()) {
+        installs = plan.pendingInstalls;
+      }
+
+      await executePlan(plan, { installs, yolo: false });
+      setSavedMsg("Continued after your answer.");
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
   };
 
   const dismissPending = () => {
@@ -3686,104 +1094,31 @@ export default function App() {
     setSavedMsg("Dismissed.");
   };
 
-  const persistApiKeys = async (orKey, civKey, { flash = true } = {}) => {
-    const wroteOr = Boolean(orKey);
-    const wroteCiv = Boolean(civKey);
-    if (!wroteOr && !wroteCiv) return null;
-    persistStudioTokenLocal();
-    const body = {};
-    if (wroteOr) body.openrouterApiKey = orKey;
-    if (wroteCiv) body.civitaiApiKey = civKey;
-    const st = await api("/v1/settings", {
-      method: "PUT",
-      body: JSON.stringify(body),
-    });
-    setSettings(st);
-    if (wroteOr) setOpenrouterKey("");
-    if (wroteCiv) setCivitaiKey("");
-    await refresh();
-    if (wroteOr) await refreshModels();
-    if (flash) {
-      const parts = [];
-      if (wroteOr) parts.push("OpenRouter");
-      if (wroteCiv) parts.push("Civitai");
-      const which = `${parts.join(" + ")} key${parts.length > 1 ? "s" : ""} saved`;
-      const disk =
-        st?.persisted === false
-          ? " (warning: secrets file write failed — may not survive API restart)"
-          : st?.persisted
-            ? " · on API secrets file"
-            : "";
-      flashSave(
-        "settings",
-        mock
-          ? "Mock API key saved in-memory (reload resets unless you keep this tab open)."
-          : `${which}${disk}.`,
-      );
-    }
-    return st;
-  };
-
   const saveSettings = async () => {
     setBusy(true);
     setError("");
     setSavedMsg("");
-    setSaveFlash(null);
-    cancelPrefsAutosave();
     try {
       // Persist studio bearer first so the PUT below authenticates when FREYA_API_TOKEN is set.
-      persistStudioTokenLocal();
-      const prefs = privacyAlignmentSnapshot({
-        privacyZdr,
-        privacyDataCollection,
-        chatProviders,
-        modelAlignment,
-        allowNsfwLocal,
-        instructionTone,
-        autoFallbacks,
-      });
-      const body = {
-        routerModel,
-        chatModel: agentModel,
-        imageModel,
-        ...prefs,
-      };
-      const wroteOr = Boolean(openrouterKey.trim());
-      const wroteCiv = Boolean(civitaiKey.trim());
-      if (wroteCiv) body.civitaiApiKey = civitaiKey.trim();
-      if (wroteOr) body.openrouterApiKey = openrouterKey.trim();
+      if (studioToken.trim()) {
+        localStorage.setItem("freya.apiToken", studioToken.trim());
+      } else {
+        localStorage.removeItem("freya.apiToken");
+      }
+      const body = { diffusionWorkerUrl: workerUrl };
+      if (civitaiKey.trim()) body.civitaiApiKey = civitaiKey.trim();
+      if (openrouterKey.trim()) body.openrouterApiKey = openrouterKey.trim();
       const st = await api("/v1/settings", {
         method: "PUT",
         body: JSON.stringify(body),
       });
       setSettings(st);
-      applyPrivacyAlignmentFromSettings(st);
-      applyInstructionsFromSettings(st, instructionMode);
-      markPrivacyAlignmentSynced(prefs);
-      // Clear inputs — keys are never echoed; show on-file badges instead of empty "lost" fields.
       setCivitaiKey("");
       setOpenrouterKey("");
-      // Bearer / OpenRouter key may have just been written — refresh catalogs.
-      await refresh();
-      // Strengthen: prefs affect `/v1/models` — ensure pickers update even if a
-      // styles/gallery failure somehow raced ahead of the models fetch.
-      await refreshModels();
-      const parts = [];
-      if (wroteOr) parts.push("OpenRouter");
-      if (wroteCiv) parts.push("Civitai");
-      const which =
-        parts.length > 0 ? `${parts.join(" + ")} key${parts.length > 1 ? "s" : ""} saved` : "Models saved";
-      const disk =
-        st?.persisted === false
-          ? " (warning: secrets file write failed — may not survive API restart)"
-          : st?.persisted
-            ? " · on API secrets file"
-            : "";
-      flashSave(
-        "models",
+      setSavedMsg(
         mock
-          ? "Mock models saved in-memory (reload resets unless you keep this tab open)."
-          : `${which}${disk}.`,
+          ? "Mock settings saved in-memory (reload resets unless you keep this tab open)."
+          : "Settings saved. Provider keys stay on the API; studio bearer stays in this browser.",
       );
     } catch (e) {
       setError(e.message);
@@ -3792,339 +1127,28 @@ export default function App() {
     }
   };
 
-  const saveInstructionPrompt = async () => {
-    if (!instructionMode) return;
-    setInstructionBusy(true);
-    setError("");
-    setSavedMsg("");
-    try {
-      persistStudioTokenLocal();
-      const st = await api("/v1/settings", {
-        method: "PUT",
-        body: JSON.stringify({
-          instructionOverrides: {
-            [instructionMode]: instructionDraft,
-          },
-        }),
-      });
-      setSettings(st);
-      applyInstructionsFromSettings(st, instructionMode);
-      const disk =
-        st?.persisted === false
-          ? " (warning: secrets file write failed)"
-          : st?.persisted
-            ? " · on API secrets file"
-            : "";
-      flashSave("settings", `System prompt “${instructionMode}” saved${disk}.`);
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setInstructionBusy(false);
-    }
-  };
-
-  const resetInstructionPrompt = async () => {
-    if (!instructionMode) return;
-    setInstructionBusy(true);
-    setError("");
-    setSavedMsg("");
-    try {
-      persistStudioTokenLocal();
-      const st = await api("/v1/settings", {
-        method: "PUT",
-        body: JSON.stringify({
-          instructionOverrides: {
-            [instructionMode]: "",
-          },
-        }),
-      });
-      setSettings(st);
-      applyInstructionsFromSettings(st, instructionMode);
-      flashSave(
-        "settings",
-        `System prompt “${instructionMode}” reset to pack default.`,
-      );
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setInstructionBusy(false);
-    }
-  };
-
-  const clearApiKey = async (which) => {
-    const label = which === "openrouter" ? "OpenRouter" : "Civitai";
-    if (
-      !window.confirm(
-        `Remove the saved ${label} API key from this Freya API? Generation / search that needs it will stop until you paste a new key.`,
-      )
-    ) {
-      return;
-    }
-    setBusy(true);
-    setError("");
-    setSavedMsg("");
-    setSaveFlash(null);
-    cancelPrefsAutosave();
-    try {
-      const body =
-        which === "openrouter"
-          ? { openrouterApiKey: "" }
-          : { civitaiApiKey: "" };
-      const st = await api("/v1/settings", {
-        method: "PUT",
-        body: JSON.stringify(body),
-      });
-      setSettings(st);
-      if (which === "openrouter") {
-        setOpenrouterKey("");
-        setOrMetrics(null);
-      } else {
-        setCivitaiKey("");
-      }
-      await refresh();
-      if (which === "openrouter") await refreshModels();
-      flashSave(
-        "settings",
-        mock
-          ? `${label} key cleared (mock).`
-          : `${label} key cleared · secrets file updated.`,
-      );
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const refreshOpenRouterMetrics = async () => {
-    setOrMetricsBusy(true);
-    setError("");
-    try {
-      const data = await api("/v1/metrics/openrouter");
-      setOrMetrics(data);
-    } catch (e) {
-      setOrMetrics(null);
-      setError(e.message);
-    } finally {
-      setOrMetricsBusy(false);
-    }
-  };
-
-  useEffect(() => {
-    if (tab !== "metrics") return undefined;
-    if (!mock && !hasBrowserBearer() && authStatus?.authRequired) return undefined;
-    refreshOpenRouterMetrics();
-    return undefined;
-  }, [tab, mock, studioToken, authStatus?.authRequired, settings?.openRouterConfigured]);
-
-  // Debounced auto-save of privacy/alignment → rebuild server catalogs → refresh pickers.
-  useEffect(() => {
-    if (!prefsReadyRef.current) return undefined;
-    const snap = privacyAlignmentSnapshot({
-      privacyZdr,
-      privacyDataCollection,
-      chatProviders,
-      modelAlignment,
-      allowNsfwLocal,
-      instructionTone,
-      autoFallbacks,
-    });
-    const fp = privacyAlignmentFingerprint(snap);
-    if (fp === prefsFpRef.current) return undefined;
-
-    if (prefsDebounceRef.current) clearTimeout(prefsDebounceRef.current);
-    const gen = ++prefsGenRef.current;
-    prefsDebounceRef.current = setTimeout(async () => {
-      prefsDebounceRef.current = null;
-      try {
-        persistStudioTokenLocal();
-        const st = await api("/v1/settings", {
-          method: "PUT",
-          body: JSON.stringify(snap),
-        });
-        if (gen !== prefsGenRef.current) return;
-        setSettings(st);
-        markPrivacyAlignmentSynced(snap);
-        await refreshModels();
-      } catch (e) {
-        if (gen === prefsGenRef.current) {
-          setError(e.message || "Failed to update model catalog prefs");
-        }
-      }
-    }, PREFS_MODELS_DEBOUNCE_MS);
-
-    return () => {
-      if (prefsDebounceRef.current) {
-        clearTimeout(prefsDebounceRef.current);
-        prefsDebounceRef.current = null;
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: debounce catalog prefs only
-  }, [
-    privacyZdr,
-    privacyDataCollection,
-    chatProviders,
-    modelAlignment,
-    allowNsfwLocal,
-    instructionTone,
-    autoFallbacks,
-  ]);
-
-  // Debounced auto-save of pasted API keys (empty fields leave on-file secrets alone).
-  useEffect(() => {
-    const orKey = openrouterKey.trim();
-    const civKey = civitaiKey.trim();
-    if (!orKey && !civKey) return undefined;
-
-    if (apiKeysDebounceRef.current) clearTimeout(apiKeysDebounceRef.current);
-    const gen = ++apiKeysGenRef.current;
-    apiKeysDebounceRef.current = setTimeout(async () => {
-      apiKeysDebounceRef.current = null;
-      try {
-        await persistApiKeys(orKey, civKey);
-      } catch (e) {
-        if (gen === apiKeysGenRef.current) {
-          setError(e.message || "Failed to save API key");
-        }
-      }
-    }, API_KEYS_DEBOUNCE_MS);
-
-    return () => {
-      if (apiKeysDebounceRef.current) {
-        clearTimeout(apiKeysDebounceRef.current);
-        apiKeysDebounceRef.current = null;
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: debounce key paste only
-  }, [openrouterKey, civitaiKey]);
-
-  const searchCivitai = async (opts = {}) => {
-    const q = String(opts.query ?? civitaiQ).trim();
-    const immediate = Boolean(opts.immediate);
-
-    if (!q) {
-      const pending = civitaiAbortRef.current;
-      civitaiAbortRef.current = null;
-      pending?.abort();
-      lastCivitaiSearchQRef.current = "";
-      setCivitaiItems([]);
-      setBusy(false);
-      return;
-    }
-    // Skip redundant debounced searches; Enter/button always re-runs.
-    if (!immediate && q === lastCivitaiSearchQRef.current) return;
-
-    civitaiAbortRef.current?.abort();
-    const ac = new AbortController();
-    civitaiAbortRef.current = ac;
-
+  const searchCivitai = async () => {
     setBusy(true);
     setError("");
     try {
-      // Default Freya types on the API; pass explicitly so mock + live stay aligned.
-      const data = await api(
-        `/v1/civitai/search?q=${encodeURIComponent(q)}&limit=12&types=${encodeURIComponent(CIVITAI_SEARCH_TYPES)}`,
-        { signal: ac.signal },
-      );
-      if (ac.signal.aborted) return;
+      const data = await api(`/v1/civitai/search?q=${encodeURIComponent(civitaiQ)}&limit=12`);
       setCivitaiItems(data.items || []);
-      lastCivitaiSearchQRef.current = q;
     } catch (e) {
-      if (e?.name === "AbortError" || ac.signal.aborted) return;
       setError(e.message);
     } finally {
-      if (civitaiAbortRef.current === ac) {
-        civitaiAbortRef.current = null;
-        setBusy(false);
-      }
+      setBusy(false);
     }
   };
-
-  // Search-as-you-type on the Civitai tab (debounced; AbortController cancels in-flight).
-  useEffect(() => {
-    if (tab !== "civitai" || civitaiSubview !== "search") return;
-    const q = civitaiQ.trim();
-    if (!q) {
-      const pending = civitaiAbortRef.current;
-      civitaiAbortRef.current = null;
-      pending?.abort();
-      lastCivitaiSearchQRef.current = "";
-      setCivitaiItems([]);
-      setBusy(false);
-      return;
-    }
-    if (q === lastCivitaiSearchQRef.current) return;
-    const t = setTimeout(() => {
-      searchCivitai({ query: q });
-    }, CIVITAI_SEARCH_DEBOUNCE_MS);
-    return () => clearTimeout(t);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: debounce on query/tab only
-  }, [civitaiQ, tab, civitaiSubview]);
-
-  useEffect(() => {
-    if (tab !== "civitai") return;
-    // Keep installed + jobs warm so search/favorites/detail can flip Install → Delete / Downloading…
-    refreshInstalledAssets();
-    refreshDownloadJobs();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, civitaiSubview]);
-
-  useEffect(() => {
-    if (tab !== "civitai") return;
-    const hasJobs = downloadJobs.length > 0;
-    const active = downloadJobs.some((j) =>
-      ["queued", "downloading"].includes(j.status),
-    );
-    if (!active && !hasJobs) return;
-    let cancelled = false;
-    const tick = async () => {
-      const jobs = await refreshDownloadJobs();
-      if (cancelled || !Array.isArray(jobs)) return;
-      const newlySucceeded = [];
-      for (const j of jobs) {
-        if (j.status !== "succeeded" || !j.id) continue;
-        if (!lastSucceededJobIdsRef.current.has(j.id)) {
-          lastSucceededJobIdsRef.current.add(j.id);
-          newlySucceeded.push(j.id);
-        }
-      }
-      if (newlySucceeded.length) {
-        await refreshInstalledAssets({ quiet: true });
-      }
-    };
-    const ms = active || civitaiSubview === "downloads" ? 1500 : 5000;
-    const t = setInterval(tick, ms);
-    return () => {
-      cancelled = true;
-      clearInterval(t);
-    };
-    // Poll cadence depends on whether anything is active — not on every jobs array identity.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    tab,
-    civitaiSubview,
-    downloadJobs.some((j) => ["queued", "downloading"].includes(j.status)),
-    downloadJobs.length > 0,
-  ]);
-
-  // Drop legacy pinned checkpoints / VAEs so they are never sent as session LoRAs.
-  useEffect(() => {
-    setSession((prev) => {
-      const pinned = prev.pinnedLoras || [];
-      const next = pinned.filter(isPinnableAsset);
-      if (next.length === pinned.length) return prev;
-      return { ...prev, pinnedLoras: next };
-    });
-  }, [session.pinnedLoras]);
 
   const installCivitai = async (item) => {
-    if (!item.downloadUrl && !item.versionId) {
+    if (!item.downloadUrl) {
       setError("No download URL on this card");
       return;
     }
     if (!hasWorker()) {
-      setError(
-        "Install needs a diffusion worker. Pin LoRAs manually if you want them for a later session, or use Cloud Generate via OpenRouter.",
+      pinLora(item);
+      setSavedMsg(
+        `Pinned “${item.name}” for later — Install needs a diffusion worker. Cloud Generate still works via OpenRouter.`,
       );
       return;
     }
@@ -4132,18 +1156,11 @@ export default function App() {
       setError("Add a Civitai API key in Settings to install LoRAs onto your worker.");
       return;
     }
-    if (findInstalledForItem(item)) return;
-    const activeJob = activeJobForItem(item);
-    if (activeJob) {
-      setCivitaiSubview("downloads");
-      return;
-    }
     setBusy(true);
     setError("");
     try {
-      await installOne(item);
-      // Progress is the Downloads label color cycle — no toast / status paragraph.
-      setCivitaiSubview("downloads");
+      const dest = await installOne(item);
+      setSavedMsg(`Queued install of ${item.name} → ${dest} on the diffusion worker. Pinned for session.`);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -4151,115 +1168,7 @@ export default function App() {
     }
   };
 
-  /** Install / Delete / Downloading… icon action for Civitai cards + detail. */
-  const renderInstallAction = (item) => {
-    const installed = findInstalledForItem(item);
-    if (installed) {
-      return (
-        <button
-          type="button"
-          className="ghost danger-ghost icon-btn"
-          disabled={busy}
-          title={`Delete ${installed.path} from the worker`}
-          aria-label="Delete"
-          onClick={() => deleteInstalledAsset(installed)}
-        >
-          <IconTrash />
-        </button>
-      );
-    }
-    const activeJob = activeJobForItem(item);
-    if (activeJob) {
-      return (
-        <button
-          type="button"
-          className="ghost icon-btn"
-          disabled
-          title={`Download in progress → ${activeJob.destPath || destPathForAsset(item)}`}
-          aria-label="Downloading"
-        >
-          <IconDownload />
-        </button>
-      );
-    }
-    return (
-      <button
-        type="button"
-        className="ghost icon-btn"
-        disabled={busy}
-        title={
-          hasWorker()
-            ? "Install onto your diffusion worker"
-            : "Needs a worker URL — pin for later, or open the Worker tab"
-        }
-        aria-label={hasWorker() ? "Install" : "Install (needs worker)"}
-        onClick={() => installCivitai(item)}
-      >
-        <IconDownload />
-      </button>
-    );
-  };
-
   const gallerySrc = (g) => g.url || `/v1/gallery/${g.id}/image`;
-
-  /** Map a gallery row into the session `result` preview shape. */
-  const galleryToResult = (g) => {
-    if (!g) return null;
-    const id = g.artifactId || g.id;
-    return {
-      ...g,
-      artifactId: id,
-      url: g.url || gallerySrc(g),
-    };
-  };
-
-  /** Main preview: explicit selection/generation, else latest gallery item. */
-  const previewResult = result || galleryToResult(gallery[0]);
-  const previewIsLatest =
-    !!previewResult &&
-    (!result ||
-      previewResult.artifactId === gallery[0]?.id ||
-      previewResult.artifactId === gallery[0]?.artifactId);
-
-  const selectGalleryPreview = (g) => {
-    const next = galleryToResult(g);
-    if (!next) return;
-    setResult(next);
-    setModelBrief(g.enhancedPrompt || "");
-    setTab("gallery");
-  };
-
-  const deleteGalleryItem = async (id) => {
-    if (!id) return;
-    if (
-      !window.confirm(
-        "Delete this generation from the gallery? This cannot be undone.",
-      )
-    ) {
-      return;
-    }
-    try {
-      await api(`/v1/gallery/${id}`, { method: "DELETE" });
-      setGallery((prev) =>
-        prev.filter((g) => g.id !== id && g.artifactId !== id),
-      );
-      setBatchResults((prev) => prev.filter((r) => r.artifactId !== id));
-      setResult((prev) => (prev?.artifactId === id ? null : prev));
-      setSession((prev) => ({
-        ...prev,
-        turns: (prev.turns || []).map((t) => ({
-          ...t,
-          artifactIds: (t.artifactIds || []).filter((aid) => aid !== id),
-        })),
-        messages: (prev.messages || []).map((m) => ({
-          ...m,
-          artifactIds: (m.artifactIds || []).filter((aid) => aid !== id),
-        })),
-      }));
-    } catch (e) {
-      setError(e.message);
-    }
-  };
 
   const leaveMock = () => {
     localStorage.removeItem("freya.mock");
@@ -4284,7 +1193,7 @@ export default function App() {
     setTab("gallery");
   };
 
-  const conversation = session.messages || [];
+  const chronologicalTurns = [...(session.turns || [])].reverse();
 
   // Keep the newest history in view above the pinned composer.
   useEffect(() => {
@@ -4292,7 +1201,7 @@ export default function App() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [
     activeSessionId,
-    conversation.length,
+    chronologicalTurns.length,
     sessionLog.length,
     ideas.length,
     pendingPlan,
@@ -4300,150 +1209,55 @@ export default function App() {
   ]);
 
   const hasTimeline =
-    conversation.length > 0 ||
     Boolean(session.goal) ||
+    chronologicalTurns.length > 0 ||
     (session.pinnedLoras || []).length > 0 ||
     Boolean(session.sessionNote);
 
-  const renderLoraCard = (item, { compact = false, onAfterPin } = {}) => {
+  const renderLoraCard = (item, { compact = false } = {}) => {
     const pinned = isPinned(item);
-    const favorited = isFavorite(item);
-    const pinnable = isPinnableAsset(item);
-    const typeLabel = item.modelType || item.kind || "LORA";
-    const downloads = formatStat(item.stats?.downloadCount);
-    const thumbUrl = pickCivitaiThumb(item, favorites);
-    const cardKey = item.path ? `path:${item.path}` : loraKey(item);
     return (
-      <article key={cardKey} className={`lora-card${compact ? " compact" : ""}`}>
-        <button
-          type="button"
-          className="lora-card-thumb lora-card-thumb-btn"
-          onClick={() => openCivitaiDetail(item)}
-          title="View details"
-        >
-          {thumbUrl ? (
-            <img
-              src={thumbUrl}
-              alt=""
-              loading="lazy"
-              onError={(e) => {
-                e.currentTarget.classList.add("is-broken");
-              }}
-            />
-          ) : null}
-          <div className="lora-card-thumb-fallback" aria-hidden="true">
-            {typeLabel.slice(0, 4)}
-          </div>
-          <span className="lora-type-badge">{typeLabel}</span>
-          {downloads ? <span className="lora-stat-badge">{downloads}</span> : null}
-        </button>
+      <article key={loraKey(item)} className={`lora-card${compact ? " compact" : ""}`}>
         <div className="lora-card-body">
-          <button type="button" className="lora-card-title" onClick={() => openCivitaiDetail(item)}>
-            <h4>{item.name}</h4>
-          </button>
-          {item.baseModel ? <p className="lora-card-meta">{item.baseModel}</p> : null}
-          {item.triggerWord ? <p>trigger: {item.triggerWord}</p> : null}
+          <h4>{item.name}</h4>
+          <p>
+            {item.modelType || "LORA"}
+            {item.triggerWord ? ` · trigger: ${item.triggerWord}` : ""}
+          </p>
         </div>
         <div className="row lora-card-actions">
           <button
             type="button"
-            className={`${favorited ? "primary" : "ghost"} icon-btn`}
-            title={favorited ? "Remove from favorites" : "Save to favorites library"}
-            aria-label={favorited ? "Unfavorite" : "Favorite"}
-            onClick={() => toggleFavorite(item)}
+            className={pinned ? "primary" : "ghost"}
+            onClick={() => (pinned ? unpinLora(item) : pinLora(item))}
           >
-            <IconStar filled={favorited} />
+            {pinned ? "Unpin" : "Pin"}
           </button>
-          {pinnable ? (
-            <button
-              type="button"
-              className={`${pinned ? "primary" : "ghost"} icon-btn`}
-              title={pinned ? "Unpin from this session" : "Pin to session"}
-              aria-label={pinned ? "Unpin from session" : "Pin to session"}
-              onClick={() => {
-                if (pinned) unpinLora(item);
-                else {
-                  pinLora(item, item.path ? { path: item.path } : undefined);
-                  onAfterPin?.(item);
-                }
-              }}
-            >
-              <IconPin />
-            </button>
-          ) : null}
-          {renderInstallAction(item)}
+          <button
+            type="button"
+            className="ghost"
+            disabled={busy}
+            title={
+              hasWorker()
+                ? "Install onto your diffusion worker"
+                : "Needs a worker URL — pin for later, or add a worker in Settings"
+            }
+            onClick={() => installCivitai(item)}
+          >
+            {hasWorker() ? "Install" : "Install (needs worker)"}
+          </button>
         </div>
       </article>
     );
   };
 
-  const detailModel = civitaiDetail?.model;
-  const detailVersions = detailModel?.modelVersions || [];
-  const detailSelectedVersion =
-    detailVersions.find((v) => String(v.id) === String(detailModel?.versionId)) ||
-    detailVersions[0] ||
-    null;
-  const detailFiles = detailSelectedVersion?.files || [];
-  const detailThumbHint = detailModel
-    ? pickCivitaiThumb(detailModel, favorites)
-    : null;
-  const detailImages =
-    (detailModel?.imageUrls?.length
-      ? detailModel.imageUrls
-      : detailThumbHint
-        ? [detailThumbHint]
-        : detailModel?.thumbnailUrl
-          ? [detailModel.thumbnailUrl]
-          : []) || [];
-  const detailRelated = civitaiDetail?.related || [];
-
   const showAssistPanel =
     ideas.length > 0 || suggestedLoras.length > 0 || suggestNote || civitaiQuery;
 
-  const ModeIcon = MODE_ICONS[automationMode] || IconSliders;
-  const modeOptions = AUTOMATION_MODES.map((id) => {
-    const OptIcon = MODE_ICONS[id] || IconSliders;
-    return {
-      id,
-      label: AUTOMATION_LABELS[id],
-      icon: <OptIcon />,
-    };
-  });
-  // Until /v1/models loads: Auto-only menu + Auto chip (persisted id kept for restore).
-  const agentMenuValue = modelsCatalogReady ? agentModel : AUTO_AGENT.id;
-  const imageMenuValue = modelsCatalogReady ? imageModel : AUTO_IMAGE.id;
-  const videoMenuValue = modelsCatalogReady ? videoModel : AUTO_VIDEO.id;
-  const routerMenuValue = modelsCatalogReady ? routerModel : AUTO_ROUTER.id;
-  const agentOptions = modelsCatalogReady
-    ? ensureSelectedOption(agentModels, agentModel)
-    : PLACEHOLDER_AGENT_MODELS;
-  const videoOptions = modelsCatalogReady
-    ? ensureSelectedOption(videoModels, videoModel)
-    : EMPTY_VIDEO_CATALOG;
-  const imageOptions = modelsCatalogReady
-    ? ensureSelectedOption(imageModels, imageModel)
-    : PLACEHOLDER_IMAGE_MODELS;
-  const routerOptions = modelsCatalogReady
-    ? ensureSelectedOption(routerModels, routerModel)
-    : PLACEHOLDER_ROUTER_MODELS;
-  const modelsMenuNote = modelsCatalogReady ? null : MODELS_API_HINT;
-
-  const signedIn =
-    mock || hasBrowserBearer() || !(authStatus?.authRequired || settings?.authRequired);
-  const needsSignIn = !mock && !signedIn;
-  const needsGuidelinesAck = signedIn && !guidelinesAcked;
-  const openRouterOk =
-    settings?.openRouterConfigured === true ||
-    (settings == null && authStatus?.openRouterConfigured === true);
-  const needsOpenRouter = !mock && signedIn && openRouterOk === false && (settings != null || authStatus != null);
-  const primaryLocked = needsSignIn || needsOpenRouter || needsGuidelinesAck;
-  const primaryLockReason = needsSignIn
-    ? AUTH_SIGN_IN_HINT
-    : needsGuidelinesAck
-      ? "Acknowledge guidelines first"
-      : needsOpenRouter
-        ? OPENROUTER_HINT
-        : "";
+  const modeOptions = AUTOMATION_MODES.map((id) => ({
+    id,
+    label: AUTOMATION_LABELS[id],
+  }));
 
   return (
     <div className="shell">
@@ -4466,108 +1280,6 @@ export default function App() {
                 Exit
               </button>
             )}
-          </div>
-        </div>
-      )}
-
-      {(needsSignIn || needsOpenRouter || authCta) && !mock && (
-        <div className={`auth-banner${needsSignIn ? " auth-banner-lock" : ""}`} role="status">
-          <span className="auth-banner-mark">{needsSignIn ? "Sign in" : "Setup"}</span>
-          <span className="auth-banner-text">
-            {needsSignIn
-              ? authStatus?.note || "Sign in required."
-              : needsOpenRouter
-                ? "OpenRouter key required — add it under Settings."
-                : authCta}
-          </span>
-          <div className="auth-banner-actions">
-            {needsSignIn && (
-              <button
-                type="button"
-                className="ghost auth-banner-btn"
-                onClick={() => setShowLogin(true)}
-              >
-                Sign in
-              </button>
-            )}
-            {needsOpenRouter && (
-              <button
-                type="button"
-                className="ghost auth-banner-btn"
-                onClick={() => setTab("settings")}
-              >
-                Open Settings
-              </button>
-            )}
-            {signedIn && (
-              <button type="button" className="ghost auth-banner-btn" onClick={signOut}>
-                Sign out
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-
-      {showLogin && !mock && (
-        <div className="login-overlay" role="dialog" aria-modal="true" aria-label="Studio sign in">
-          <form className="login-card" onSubmit={submitLogin}>
-            <h2 className="login-title">Sign in</h2>
-            <label className="login-field">
-              Username
-              <input
-                value={loginUser}
-                onChange={(e) => setLoginUser(e.target.value)}
-                autoComplete="username"
-                disabled={loginBusy}
-              />
-            </label>
-            <label className="login-field">
-              Password
-              <input
-                type="password"
-                value={loginPass}
-                onChange={(e) => setLoginPass(e.target.value)}
-                autoComplete="current-password"
-                disabled={loginBusy}
-              />
-            </label>
-            {loginError && <p className="err">{loginError}</p>}
-            <div className="login-actions">
-              <button type="submit" className="primary" disabled={loginBusy || !loginPass.trim()}>
-                {loginBusy ? "Signing in…" : "Sign in"}
-              </button>
-              <button
-                type="button"
-                className="ghost"
-                disabled={loginBusy}
-                onClick={() => setShowLogin(false)}
-              >
-                Cancel
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-
-      {needsGuidelinesAck && !showLogin && (
-        <div
-          className="login-overlay guidelines-overlay"
-          role="dialog"
-          aria-modal="true"
-          aria-label="User guidelines"
-        >
-          <div className="login-card guidelines-card">
-            <h2 className="login-title">Guidelines</h2>
-            <p className="guidelines-lead">
-              Before you continue, acknowledge that you understand how Freya works and who is
-              responsible for what you generate.
-            </p>
-            <GuidelinesBody compact />
-            <div className="login-actions">
-              <button type="button" className="primary" onClick={acceptGuidelines}>
-                Accept &amp; continue
-              </button>
-            </div>
           </div>
         </div>
       )}
@@ -4601,23 +1313,8 @@ export default function App() {
               OpenRouter
               <span className={`status-dot ${settings.civitaiConfigured ? "on" : ""}`} />
               Civitai
-              <button
-                type="button"
-                className="tabs-status-worker"
-                onClick={() => setTab("worker")}
-                title="Open Worker tab"
-              >
-                <span
-                  className={`status-dot ${
-                    workerStats?.reachable
-                      ? "on"
-                      : settings.diffusionWorkerUrl
-                        ? "warn"
-                        : ""
-                  }`}
-                />
-                Worker
-              </button>
+              <span className={`status-dot ${settings.diffusionWorkerUrl ? "on" : ""}`} />
+              Worker
             </span>
           )}
           <span className="topbar-mode">{AUTOMATION_LABELS[automationMode]}</span>
@@ -4670,19 +1367,15 @@ export default function App() {
           </ul>
         </aside>
 
-      <div
-        className={`workspace${workspaceResizing ? " is-resizing" : ""}`}
-        ref={workspaceRef}
-        style={{ "--workspace-split": `${workspaceSplit}%` }}
-      >
+      <div className="workspace">
         <section className="pane pane-left" aria-label="Prompt and session">
-          <div className="timeline" aria-label="Conversation" ref={timelineRef}>
+          <div className="timeline" aria-label="Session timeline" ref={timelineRef}>
             <div className="timeline-head">
-              <h2>Conversation</h2>
+              <h2>Session</h2>
               <span className="timeline-count">
-                {conversation.length
-                  ? `${conversation.length} message${conversation.length === 1 ? "" : "s"}`
-                  : "no messages yet"}
+                {chronologicalTurns.length
+                  ? `${chronologicalTurns.length} turn${chronologicalTurns.length === 1 ? "" : "s"}`
+                  : "no turns yet"}
               </span>
               <button
                 type="button"
@@ -4701,9 +1394,16 @@ export default function App() {
 
             {!hasTimeline && !pendingPlan && !pendingQuestion && sessionLog.length === 0 && (
               <p className="timeline-empty">
-                Chat with Freya here. Ask about style, or say “make an image of …” when you want a
-                generate. Suggest and Session shortcuts just send a message.
+                Your goals, plans, questions and turns will collect here. Try the featured example,
+                then Suggest ideas or Run session.
               </p>
+            )}
+
+            {session.goal && (
+              <article className="t-entry t-goal">
+                <span className="t-kind">Goal</span>
+                <p>{session.goal}</p>
+              </article>
             )}
 
             {(session.pinnedLoras || []).length > 0 && (
@@ -4714,7 +1414,6 @@ export default function App() {
                     <li key={loraKey(l)}>
                       <span>
                         {l.name}
-                        {l.baseModel ? ` · base ${l.baseModel}` : ""}
                         {l.triggerWord ? ` · ${l.triggerWord}` : ""}
                       </span>
                       <button type="button" className="ghost" onClick={() => unpinLora(l)}>
@@ -4726,152 +1425,52 @@ export default function App() {
               </article>
             )}
 
-            {conversation.map((m, i) => (
-              <article
-                key={`${m.at || i}-${m.role}-${i}`}
-                className={`t-entry t-msg t-${m.role === "user" ? "user" : "assistant"}`}
-              >
+            {chronologicalTurns.map((t, i) => (
+              <article key={`${t.at}-${i}`} className="t-entry t-turn">
                 <div className="t-meta">
-                  <span className="t-kind">{m.role === "user" ? "You" : "Freya"}</span>
-                  {m.at && (
+                  <span className="t-kind">Turn {i + 1}</span>
+                  {t.at && (
                     <time>
-                      {new Date(m.at).toLocaleTimeString([], {
+                      {new Date(t.at).toLocaleTimeString([], {
                         hour: "numeric",
                         minute: "2-digit",
                       })}
                     </time>
                   )}
-                  {m.role !== "user" && m.route?.modality && (
-                    <span
-                      className="t-route"
-                      title={[
-                        m.resolvedModels?.agent && `agent: ${m.resolvedModels.agent}`,
-                        m.resolvedModels?.router && `router: ${m.resolvedModels.router}`,
-                        (m.routeContext?.backend || m.genBackend) === "local" &&
-                          m.routeContext?.base &&
-                          `base: ${m.routeContext.base}`,
-                        (m.routeContext?.backend || m.genBackend) === "local" &&
-                          m.routeContext?.lora &&
-                          `lora: ${m.routeContext.lora}`,
-                        (m.routeContext?.backend || m.genBackend) !== "local" &&
-                          m.resolvedModels?.image &&
-                          `image: ${m.resolvedModels.image}`,
-                        (m.routeContext?.backend || m.genBackend) !== "local" &&
-                          m.resolvedModels?.video &&
-                          `video: ${m.resolvedModels.video}`,
-                        (m.routeContext?.backend || m.genBackend) &&
-                          `backend: ${m.routeContext?.backend || m.genBackend}`,
-                        m.routeContext?.mode && `mode: ${m.routeContext.mode}`,
-                        m.route?.reason,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
-                    >
-                      {m.route.modality}
-                      {(m.routeContext?.backend || m.genBackend)
-                        ? ` · ${m.routeContext?.backend || m.genBackend}`
-                        : ""}
-                      {(m.routeContext?.backend || m.genBackend) === "local" && m.routeContext?.base
-                        ? ` · ${m.routeContext.base}`
-                        : ""}
-                      {(m.routeContext?.backend || m.genBackend) !== "local" &&
-                      m.resolvedModels?.image &&
-                      m.route.modality === "picture"
-                        ? ` · ${String(m.resolvedModels.image).split("/").pop()}`
-                        : ""}
-                      {(m.routeContext?.backend || m.genBackend) !== "local" &&
-                      m.resolvedModels?.video &&
-                      (m.route.modality === "gif" || m.route.modality === "video")
-                        ? ` · ${String(m.resolvedModels.video).split("/").pop()}`
-                        : ""}
+                  {t.artifactIds?.length > 0 && (
+                    <span>
+                      {t.artifactIds.length} image{t.artifactIds.length === 1 ? "" : "s"} →
                     </span>
                   )}
                 </div>
-                <p className="t-bubble">{m.content}</p>
-                {m.role !== "user" &&
-                  (() => {
-                    const offer = generateOfferForTurn(conversation, i);
-                    if (!offer) return null;
-                    return (
-                      <div className="t-generate-row">
-                        <button
-                          type="button"
-                          className="primary t-generate"
-                          disabled={busy}
-                          onClick={() => runGenerateOffer(offer)}
-                        >
-                          Generate
-                        </button>
-                      </div>
-                    );
-                  })()}
-                {Array.isArray(m.actions) && m.actions.length > 0 && (
-                  <ul className="t-tools">
-                    {m.actions.map((a, ai) => (
-                      <li key={`${a.type}-${ai}`} className={`t-tool t-tool-${a.status || "done"}`}>
-                        <span className="t-tool-type">{a.type}</span>
-                        <span className="t-tool-status">{a.status || "done"}</span>
-                        {a.status === "error" && a.error ? ` — ${a.error}` : ""}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                {m.artifactIds?.length > 0 && (
-                  <div className="t-thumbs">
-                    {m.artifactIds.map((id) => {
-                      const art =
-                        batchResults.find((r) => r.artifactId === id) ||
-                        (result?.artifactId === id ? result : null) ||
-                        gallery.find((g) => g.id === id);
-                      const src = art?.url || (art ? gallerySrc(art) : `/v1/gallery/${id}/image`);
-                      return (
-                        <button
-                          key={id}
-                          type="button"
-                          className="t-thumb"
-                          onClick={() => {
-                            if (art) selectGalleryPreview(art);
-                          }}
-                        >
-                          {isVideoArtifact(art) ? (
-                            <video src={src} muted playsInline preload="metadata" />
-                          ) : (
-                            <img src={src} alt="" />
-                          )}
-                        </button>
-                      );
-                    })}
-                  </div>
-                )}
-                {Array.isArray(m.ideas) && m.ideas.length > 0 && (
-                  <div className="idea-chips">
-                    {m.ideas.map((idea) => (
-                      <button
-                        key={idea}
-                        type="button"
-                        className="idea-chip"
-                        onClick={() => setPrompt(idea)}
-                      >
-                        {idea}
-                      </button>
-                    ))}
-                  </div>
-                )}
+                <button type="button" className="t-prompt" onClick={() => setPrompt(t.prompt)}>
+                  {t.prompt}
+                </button>
               </article>
             ))}
 
-            {pendingPlan && (pendingPlan.status === "plan" || pendingPlan.actions?.length) && (
-              <aside className="pending-plan" aria-label="Proposed tools">
+            {session.sessionNote && (
+              <article className="t-entry t-note">
+                <span className="t-kind">Session note</span>
+                <p>{session.sessionNote}</p>
+              </article>
+            )}
+
+            {pendingPlan && pendingPlan.status === "plan" && (
+              <aside className="pending-plan" aria-label="Session plan">
                 <div className="pending-plan-head">
-                  <h3>Proposed tools</h3>
+                  <h3>Session plan</h3>
                   <button type="button" className="ghost" onClick={dismissPending}>
                     Dismiss
                   </button>
                 </div>
-                {pendingPlan.goal && (
-                  <p className="pending-goal">
-                    <span className="session-label">For</span>
-                    {pendingPlan.goal}
+                <p className="pending-goal">
+                  <span className="session-label">Goal</span>
+                  {pendingPlan.goal}
+                </p>
+                {pendingPlan.civitaiQuery && (
+                  <p className="civitai-search-line" role="status">
+                    Proposed Civitai search: <strong>{pendingPlan.civitaiQuery}</strong>
                   </p>
                 )}
                 {pendingPlan.steps?.length > 0 && (
@@ -4888,29 +1487,36 @@ export default function App() {
                       {pendingPlan.pendingInstalls.map((l) => (
                         <li key={loraKey(l)}>
                           “{l.name}”
-                          {renderInstallAction(l)}
+                          <button
+                            type="button"
+                            className="ghost"
+                            disabled={busy}
+                            onClick={() => installCivitai(l)}
+                          >
+                            Install
+                          </button>
                         </li>
                       ))}
                     </ul>
+                    <p className="hint">
+                      Plan mode has no side effects until you Install or Generate yourself — or
+                      switch to Auto/YOLO. Install needs a worker; Generate via OpenRouter does not.
+                    </p>
                   </div>
                 )}
-                <p className="hint">
-                  Confirm to run, or switch mode.{" "}
-                  <HelpQ topic="help-modes" label="Plan / Auto / YOLO" onOpen={openHelp} />
-                </p>
-                {pendingPlan.actions?.length > 0 && (
-                  <div className="pending-ask-choices">
-                    <button
-                      type="button"
-                      className="primary"
-                      disabled={busy}
-                      onClick={confirmPendingActions}
-                    >
-                      Confirm & run
-                    </button>
-                    <button type="button" className="ghost" disabled={busy} onClick={dismissPending}>
-                      Not now
-                    </button>
+                {pendingPlan.batchPrompts?.length > 0 && (
+                  <div className="pending-batch">
+                    <span className="session-label">Batch prompts</span>
+                    <ul>
+                      {pendingPlan.batchPrompts.map((bp) => (
+                        <li key={bp}>
+                          <button type="button" className="linkish" onClick={() => setPrompt(bp)}>
+                            {bp.slice(0, 100)}
+                            {bp.length > 100 ? "…" : ""}
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
                   </div>
                 )}
               </aside>
@@ -5001,9 +1607,8 @@ export default function App() {
                 )}
                 {suggestedLoras.length > 0 && (
                   <p className="hint">
-                    {suggestedLoras.length} Civitai{" "}
-                    {suggestedLoras.length === 1 ? "asset" : "assets"} in the gallery pane → pin or
-                    install there.
+                    {suggestedLoras.length} LoRA candidate{suggestedLoras.length === 1 ? "" : "s"}{" "}
+                    in the gallery pane → pin or install there.
                   </p>
                 )}
               </aside>
@@ -5013,7 +1618,7 @@ export default function App() {
           <div className="compose">
             <div className="compose-head">
               <label className="compose-label" htmlFor="freya-prompt">
-                Message Freya
+                What are you going for?
               </label>
               {!prompt.trim() && (
                 <button
@@ -5030,58 +1635,23 @@ export default function App() {
               id="freya-prompt"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  if (!busy && prompt.trim()) submitChat();
-                }
-              }}
               placeholder={examplePrompt}
               rows={3}
-              title="Chat with Freya — Enter to send, Shift+Enter for a new line"
+              title="Everyday language or classic SD prompts (tags, weights, triggers) — one box, Freya handles either"
               aria-describedby="freya-prompt-hint"
             />
             <p id="freya-prompt-hint" className="sr-only">
-              Chat with Freya. Ask to generate only when you want an image. Mode gates tool
-              autonomy. {MODE_HINTS[automationMode]}
+              Everyday language or classic SD prompts (tags, weights, triggers) — one box, Freya
+              handles either. Cloud Generate works with OpenRouter alone; add a worker for LoRAs and
+              custom local looks. {MODE_HINTS[automationMode]}
             </p>
-            {error && (
-              <p className="err compose-status">
-                {/zdr|zero data retention|data-policy|openrouter\.ai\/settings\/privacy/i.test(
-                  error,
-                ) ? (
-                  <>
-                    {error.replace(
-                      /https:\/\/openrouter\.ai\/settings\/privacy/gi,
-                      "",
-                    ).replace(/\s*[—-]\s*Freya Settings.*$/i, "").trim()}{" "}
-                    <button
-                      type="button"
-                      className="linkish"
-                      onClick={() => setTab("settings")}
-                    >
-                      Freya Settings → Privacy
-                    </button>
-                    {" · "}
-                    <a
-                      href="https://openrouter.ai/settings/privacy"
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      OpenRouter privacy
-                    </a>
-                  </>
-                ) : (
-                  error
-                )}
-              </p>
-            )}
+            {error && <p className="err compose-status">{error}</p>}
             {savedMsg && (
               <p className="hint saved-msg compose-status" role="status">
                 {savedMsg}
               </p>
             )}
-            <div className="composer-bar" aria-label="Chat controls">
+            <div className="composer-bar" aria-label="Session controls">
               <div className="compose-actions">
                 <button
                   type="button"
@@ -5097,193 +1667,61 @@ export default function App() {
                     {sidebarOpen ? "Hide sessions" : "Show sessions"}
                   </span>
                 </button>
-              </div>
-              <div className="chrome-strip" role="toolbar" aria-label="Generation backend">
-                <div
-                  className="backend-switch"
-                  role="group"
-                  aria-label="Generation backend"
-                >
-                  <button
-                    type="button"
-                    className={`backend-switch-btn${generateBackend === "cloud" ? " is-active" : ""}`}
-                    aria-pressed={generateBackend === "cloud"}
-                    onClick={() => changeGenerateBackend("cloud")}
-                    title="OpenRouter cloud generate"
-                  >
-                    Cloud
-                  </button>
-                  <button
-                    type="button"
-                    className={`backend-switch-btn${generateBackend === "local" ? " is-active" : ""}`}
-                    aria-pressed={generateBackend === "local"}
-                    disabled={!localBackendOk}
-                    onClick={() => changeGenerateBackend("local")}
-                    title={
-                      localBackendOk
-                        ? "Local GPU worker generate"
-                        : localBackendReason || "Local worker unavailable"
-                    }
-                  >
-                    Local
-                  </button>
-                </div>
-              </div>
-              <div
-                className="composer-primary-cluster"
-                role="group"
-                aria-label="Models, suggest, send, and run session"
-              >
-                <GroupedChromeMenu
-                  className="composer-model-menu"
-                  label="Agent, router & mode"
-                  icon={<ModeIcon />}
-                  align="end"
-                  valueLabel={`${modelShortLabel(agentOptions, agentMenuValue)} · ${AUTOMATION_LABELS[automationMode]}`}
-                  title={[
-                    modelsCatalogReady
-                      ? `Agent: ${modelLabel(agentOptions, agentModel)}`
-                      : `Agent: Auto — ${MODELS_API_HINT}`,
-                    modelsCatalogReady
-                      ? `Router: ${modelLabel(routerOptions, routerModel)}`
-                      : `Router: Auto — ${MODELS_API_HINT}`,
-                    `Mode: ${AUTOMATION_LABELS[automationMode]} — ${MODE_HINTS[automationMode]}`,
-                  ].join(" · ")}
-                  open={menuOpen === "agent-bundle"}
-                  onOpen={(v) => setMenuOpen(v ? "agent-bundle" : null)}
-                  sections={[
-                    {
-                      id: "agent",
-                      label: "Agent",
-                      icon: <IconAgent />,
-                      valueLabel: modelShortLabel(agentOptions, agentMenuValue),
-                      options: agentOptions,
-                      value: agentMenuValue,
-                      onChange: changeAgentModel,
-                      menuNote: modelsMenuNote,
-                    },
-                    {
-                      id: "router",
-                      label: "Router",
-                      icon: <IconRouter />,
-                      valueLabel: modelShortLabel(routerOptions, routerMenuValue),
-                      options: routerOptions,
-                      value: routerMenuValue,
-                      onChange: changeRouterModel,
-                      menuNote: modelsMenuNote,
-                    },
-                    {
-                      id: "mode",
-                      label: "Mode",
-                      icon: <ModeIcon />,
-                      valueLabel: AUTOMATION_LABELS[automationMode],
-                      options: modeOptions,
-                      value: automationMode,
-                      onChange: setMode,
-                    },
-                  ]}
-                />
-                {generateBackend === "cloud" ? (
-                  <GroupedChromeMenu
-                    className="composer-model-menu"
-                    label="Generation models"
-                    icon={<IconImage />}
-                    align="end"
-                    valueLabel={`${modelShortLabel(imageOptions, imageMenuValue)} · ${modelShortLabel(videoOptions, videoMenuValue)}`}
-                    title={[
-                      modelsCatalogReady
-                        ? `Image: ${modelLabel(imageOptions, imageModel)}`
-                        : `Image: Auto — ${MODELS_API_HINT}`,
-                      modelsCatalogReady
-                        ? `Video: ${modelLabel(videoOptions, videoModel)}`
-                        : `Video: Auto — ${MODELS_API_HINT}`,
-                    ].join(" · ")}
-                    open={menuOpen === "gen-bundle"}
-                    onOpen={(v) => setMenuOpen(v ? "gen-bundle" : null)}
-                    sections={[
-                      {
-                        id: "image",
-                        label: "Image",
-                        icon: <IconImage />,
-                        valueLabel: modelShortLabel(imageOptions, imageMenuValue),
-                        options: imageOptions,
-                        value: imageMenuValue,
-                        onChange: changeImageModel,
-                        menuNote: modelsMenuNote,
-                      },
-                      {
-                        id: "video",
-                        label: "Video",
-                        icon: <IconVideo />,
-                        valueLabel: modelShortLabel(videoOptions, videoMenuValue),
-                        options: videoOptions,
-                        value: videoMenuValue,
-                        onChange: changeVideoModel,
-                        menuNote:
-                          modelsCatalogReady && videoOptions.length <= 1
-                            ? "No T2V models in catalog — OpenRouter video key/plan may be required"
-                            : modelsMenuNote,
-                      },
-                    ]}
-                  />
-                ) : (
-                  <GroupedChromeMenu
-                    className="composer-model-menu"
-                    label="Local base"
-                    icon={<IconImage />}
-                    align="end"
-                    valueLabel={
-                      localBaseModel
-                        ? localBaseModel.split("/").pop() || localBaseModel
-                        : "Base"
-                    }
-                    title={
-                      localBaseModel
-                        ? `Active base: ${localBaseModel}`
-                        : "Select worker checkpoint / active base"
-                    }
-                    open={menuOpen === "gen-bundle"}
-                    onOpen={(v) => setMenuOpen(v ? "gen-bundle" : null)}
-                    sections={[
-                      {
-                        id: "base",
-                        label: "Base",
-                        icon: <IconImage />,
-                        valueLabel: localBaseModel
-                          ? localBaseModel.split("/").pop() || localBaseModel
-                          : "Base",
-                        options: localCheckpoints.length
-                          ? localCheckpoints.map((c) => ({
-                              id: c.path,
-                              label: `${c.name || c.id}${c.baseModel ? ` (${c.baseModel})` : ""}`,
-                            }))
-                          : [
-                              {
-                                id: "",
-                                label: "No checkpoints — install from Civitai",
-                                disabled: true,
-                              },
-                            ],
-                        value: localBaseModel,
-                        onChange: (id) => {
-                          if (id) setComposerBaseModel(id);
-                        },
-                        menuNote: localBaseBusy
-                          ? "Setting active base…"
-                          : localBackendReason ||
-                            (localCheckpoints.length
-                              ? "Worker checkpoint for local generate"
-                              : "Install a checkpoint on the worker first"),
-                      },
-                    ]}
-                  />
-                )}
                 <button
                   type="button"
                   className="ghost icon-btn"
-                  disabled={primaryLocked || busy}
+                  disabled={busy || (!prompt.trim() && !session.goal)}
+                  onClick={runSession}
+                  title={`Run session (${AUTOMATION_LABELS[automationMode]})`}
+                  aria-label="Run session"
+                >
+                  <IconLayers />
+                  <span className="sr-only">Run session</span>
+                </button>
+              </div>
+              <span className="composer-divider" aria-hidden="true" />
+              <div className="chrome-strip" role="toolbar" aria-label="Mode and models">
+                <CompactMenu
+                  label="Mode"
+                  icon={<IconSliders />}
+                  title={`Mode: ${AUTOMATION_LABELS[automationMode]} — ${MODE_HINTS[automationMode]}`}
+                  valueLabel={AUTOMATION_LABELS[automationMode]}
+                  options={modeOptions}
+                  value={automationMode}
+                  onChange={setMode}
+                  open={menuOpen === "mode"}
+                  onOpen={(v) => setMenuOpen(v ? "mode" : null)}
+                />
+                <CompactMenu
+                  label="Agent"
+                  icon={<IconAgent />}
+                  title={`Agent model: ${modelLabel(AGENT_MODELS, agentModel)}`}
+                  valueLabel={modelShortLabel(AGENT_MODELS, agentModel)}
+                  options={AGENT_MODELS}
+                  value={agentModel}
+                  onChange={changeAgentModel}
+                  open={menuOpen === "agent"}
+                  onOpen={(v) => setMenuOpen(v ? "agent" : null)}
+                />
+                <CompactMenu
+                  label="Image"
+                  icon={<IconImage />}
+                  title={`Image model: ${modelLabel(IMAGE_MODELS, imageModel)}`}
+                  valueLabel={modelShortLabel(IMAGE_MODELS, imageModel)}
+                  options={IMAGE_MODELS}
+                  value={imageModel}
+                  onChange={changeImageModel}
+                  open={menuOpen === "image"}
+                  onOpen={(v) => setMenuOpen(v ? "image" : null)}
+                />
+              </div>
+              <div className="composer-primary-cluster" role="group" aria-label="Suggest and generate">
+                <button
+                  type="button"
+                  className="ghost icon-btn"
+                  disabled={busy}
                   onClick={suggestIdeas}
-                  title={primaryLocked ? primaryLockReason : "Suggest ideas (sends a chat message)"}
+                  title="Suggest ideas"
                   aria-label="Suggest ideas"
                 >
                   <IconBulb />
@@ -5291,57 +1729,26 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  className="primary icon-btn icon-btn-primary composer-send"
-                  disabled={primaryLocked || busy || !prompt.trim()}
-                  onClick={() => submitChat()}
-                  title={
-                    primaryLocked ? primaryLockReason : busy ? "Working…" : "Send message"
-                  }
-                  aria-label={busy ? "Working" : "Send message"}
+                  className="primary icon-btn icon-btn-primary composer-generate"
+                  disabled={busy || !prompt.trim()}
+                  onClick={run}
+                  title={busy ? "Working…" : "Generate"}
+                  aria-label={busy ? "Working" : "Generate"}
                 >
-                  {busy ? <IconSpinner /> : <IconSend />}
-                  <span className="sr-only">{busy ? "Working…" : "Send"}</span>
-                </button>
-                <button
-                  type="button"
-                  className="ghost icon-btn"
-                  disabled={primaryLocked || busy || (!prompt.trim() && !session.goal)}
-                  onClick={runSession}
-                  title={
-                    primaryLocked
-                      ? primaryLockReason
-                      : `Ask Freya to run a session (${AUTOMATION_LABELS[automationMode]})`
-                  }
-                  aria-label="Run session"
-                >
-                  <IconLayers />
-                  <span className="sr-only">Run session</span>
+                  {busy ? <IconSpinner /> : <IconPlay />}
+                  <span className="sr-only">{busy ? "Working…" : "Generate"}</span>
                 </button>
               </div>
             </div>
           </div>
         </section>
 
-        <button
-          type="button"
-          role="separator"
-          className="workspace-split"
-          aria-orientation="vertical"
-          aria-label="Resize chat and gallery panes"
-          aria-valuemin={15}
-          aria-valuemax={85}
-          aria-valuenow={Math.round(workspaceSplit)}
-          title="Drag to resize"
-          onPointerDown={onWorkspaceSplitPointerDown}
-          onKeyDown={onWorkspaceSplitKeyDown}
-        />
-
         <section className="pane pane-right" aria-label="Gallery and results">
           {suggestedLoras.length > 0 && (
-            <aside className="lora-strip" aria-label="Civitai asset suggestions">
+            <aside className="lora-strip" aria-label="LoRA selection preview">
               <div className="lora-strip-head">
                 <div>
-                  <span className="t-kind">Civitai assets</span>
+                  <span className="t-kind">LoRA selection</span>
                   {civitaiQuery ? (
                     <p className="lora-strip-q">
                       Civitai · <strong>{civitaiQuery}</strong>
@@ -5355,8 +1762,8 @@ export default function App() {
                 </button>
               </div>
               <p className="hint">
-                LoRAs ranked first; checkpoints and other weights included. Pin anytime (no worker
-                needed). Install needs a worker — otherwise Freya generates via OpenRouter.
+                Pin anytime (no worker needed). Install needs a worker — otherwise Freya generates
+                via OpenRouter.
               </p>
               <div className="lora-row lora-row-strip">
                 {suggestedLoras.map((l) => renderLoraCard(l, { compact: true }))}
@@ -5364,16 +1771,43 @@ export default function App() {
             </aside>
           )}
 
-      {tab === "gallery" && !previewResult && gallery.length === 0 && batchResults.length === 0 && (
-        <div className="gallery-empty">
-          <div className="gallery-empty-art">
-            <img
-              src="/empty-gallery.png"
-              alt="no images yet"
-              className="gallery-empty-img"
-              draggable={false}
-            />
+      {tab === "gallery" && !result && gallery.length > 0 && (
+        <section className="salon salon-single">
+          <div className="salon-head">
+            <span className="t-kind">Latest in gallery</span>
           </div>
+          <figure className="salon-feature">
+            <img src={gallerySrc(gallery[0])} alt={gallery[0].prompt || "Latest gallery image"} />
+            <figcaption>
+              <span className="salon-caption">{gallery[0].prompt}</span>
+              <span className="salon-meta">
+                {gallery[0].backend}
+                {gallery[0].model ? ` · ${gallery[0].model}` : ""}
+                {mock ? " · mock" : ""}
+              </span>
+              <button
+                type="button"
+                className="ghost remix-btn"
+                onClick={async () => {
+                  const remix = await api(`/v1/gallery/${gallery[0].id}/remix`, {
+                    method: "POST",
+                  });
+                  setPrompt(remix.prompt || "");
+                }}
+              >
+                Remix this prompt
+              </button>
+            </figcaption>
+          </figure>
+        </section>
+      )}
+
+      {tab === "gallery" && !result && gallery.length === 0 && batchResults.length === 0 && (
+        <div className="gallery-empty">
+          <div className="gallery-empty-art" aria-hidden="true">
+            <HeroCanvas />
+          </div>
+          <p>No images yet — Generate or Run session and results will hang here.</p>
         </div>
       )}
 
@@ -5387,29 +1821,15 @@ export default function App() {
             {batchResults.map((r, i) => (
               <article
                 key={r.artifactId || r.url}
-                className={`salon-work${previewResult?.artifactId === r.artifactId ? " selected" : ""} salon-work-${(i % 3) + 1}`}
+                className={`salon-work${result?.artifactId === r.artifactId ? " selected" : ""} salon-work-${(i % 3) + 1}`}
                 onClick={() => {
                   setResult(r);
                   setModelBrief(r.enhancedPrompt || "");
                   if (r.prompt) setPrompt(r.prompt);
                 }}
               >
-                {r.artifactId ? (
-                  <button
-                    type="button"
-                    className="ghost salon-work-del"
-                    title="Delete from gallery"
-                    aria-label="Delete variation"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      deleteGalleryItem(r.artifactId);
-                    }}
-                  >
-                    <IconTrash />
-                  </button>
-                ) : null}
                 <figure>
-                  <MediaFigure item={r} src={r.url} alt={r.prompt || "variation"} />
+                  <img src={r.url} alt={r.prompt || "variation"} />
                   <figcaption>
                     <span className="salon-caption">
                       {(r.prompt || "").slice(0, 100)}
@@ -5428,74 +1848,19 @@ export default function App() {
         </section>
       )}
 
-      {tab === "gallery" && previewResult && (
+      {tab === "gallery" && result && (
         <section className="salon salon-single">
           <div className="salon-head">
-            <span className="t-kind">
-              {batchResults.length > 1
-                ? "Selected variation"
-                : previewIsLatest
-                  ? "Latest image"
-                  : "Selected image"}
-            </span>
-            {previewResult.artifactId ? (
-              <button
-                type="button"
-                className="ghost salon-head-del"
-                title="Delete from gallery"
-                aria-label="Delete from gallery"
-                onClick={() => deleteGalleryItem(previewResult.artifactId)}
-              >
-                <IconTrash />
-                <span>Delete</span>
-              </button>
-            ) : null}
+            <span className="t-kind">{batchResults.length > 1 ? "Selected variation" : "Latest image"}</span>
           </div>
           <figure className="salon-feature">
-            <MediaFigure
-              item={previewResult}
-              src={previewResult.url}
-              alt={previewResult.enhancedPrompt || previewResult.prompt || prompt}
-            />
+            <img src={result.url} alt={result.enhancedPrompt || prompt} />
             <figcaption>
-              {previewResult.prompt ? (
-                <span className="salon-caption">{previewResult.prompt}</span>
-              ) : null}
               <span className="salon-meta">
-                {previewResult.backend}
-                {previewResult.model ? ` · ${previewResult.model}` : ""}
-                {previewResult.modality ? ` · ${previewResult.modality}` : ""}
-                {previewResult.mime || previewResult.meta?.mime
-                  ? ` · ${previewResult.mime || previewResult.meta?.mime}`
-                  : ""}
+                {result.backend}
+                {result.model ? ` · ${result.model}` : ""}
                 {mock ? " · mock" : ""}
               </span>
-              {previewResult.artifactId && (
-                <div className="salon-actions">
-                  <button
-                    type="button"
-                    className="ghost remix-btn"
-                    onClick={async () => {
-                      const remix = await api(
-                        `/v1/gallery/${previewResult.artifactId}/remix`,
-                        { method: "POST" },
-                      );
-                      setPrompt(remix.prompt || "");
-                    }}
-                  >
-                    Remix this prompt
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost remix-btn salon-del-btn"
-                    title="Delete from gallery"
-                    onClick={() => deleteGalleryItem(previewResult.artifactId)}
-                  >
-                    <IconTrash />
-                    Delete
-                  </button>
-                </div>
-              )}
             </figcaption>
           </figure>
           {modelBrief && (
@@ -5508,7 +1873,7 @@ export default function App() {
       )}
 
       <nav className="tabs" aria-label="Studio sections">
-        {STUDIO_TABS.map((t) => (
+        {["gallery", "styles", "civitai", "settings"].map((t) => (
           <button
             key={t}
             className={tab === t ? "active" : "ghost"}
@@ -5544,260 +1909,70 @@ export default function App() {
 
       {tab === "civitai" && (
         <section className="panel">
-          <div className="row civitai-subnav" style={{ marginBottom: "0.75rem" }}>
-            {CIVITAI_SUBNAV.filter((s) => !s.end).map(({ id, label }) => {
-              const count =
-                id === "favorites"
-                  ? favorites.length
-                  : id === "installed"
-                    ? installedAssets.length
-                    : 0;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  className={civitaiSubview === id ? "primary" : "ghost"}
-                  aria-pressed={civitaiSubview === id}
-                  onClick={() => setCivitaiSubview(id)}
-                >
-                  {count ? `${label} (${count})` : label}
-                </button>
-              );
-            })}
-            <HelpQ topic="help-civitai" label="Civitai" onOpen={openHelp} />
-            {CIVITAI_SUBNAV.filter((s) => s.end).map(({ id, label }) => {
-              const activeDl = downloadJobs.some((j) =>
-                ["queued", "downloading"].includes(j.status),
-              );
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  className={`civitai-subnav-end${activeDl ? " dl-busy" : ""} ${
-                    civitaiSubview === id ? "primary" : "ghost"
-                  }`}
-                  aria-pressed={civitaiSubview === id}
-                  aria-busy={activeDl || undefined}
-                  title={activeDl ? "Downloads in progress" : label}
-                  onClick={() => setCivitaiSubview(id)}
-                >
-                  {label}
-                </button>
-              );
-            })}
+          {!settings?.civitaiConfigured && (
+            <p className="hint">
+              Add your Civitai API key in Settings to search LoRAs
+              {mock ? " (any non-empty value works in mock)" : ""}. Install onto a worker is
+              optional — Pin works without one; cloud Generate uses OpenRouter.
+            </p>
+          )}
+          {settings?.civitaiConfigured && !hasWorker() && (
+            <p className="hint">
+              Worker not set — you can search and pin LoRAs now. Install needs a diffusion worker
+              URL; Generate still works via OpenRouter without one.
+            </p>
+          )}
+          <p className="hint civitai-demo-hint">
+            Featured example: describe something like “{examplePrompt}” — Freya searches for “
+            {exampleCivitaiQuery}”. Manual Search/Pin here always works; Install needs a worker.
+          </p>
+          <div className="row" style={{ marginBottom: "1rem" }}>
+            <input
+              style={{ flex: 1, minWidth: "12rem" }}
+              value={civitaiQ}
+              onChange={(e) => setCivitaiQ(e.target.value)}
+              placeholder="Search Civitai…"
+            />
+            <button className="primary" disabled={busy} onClick={searchCivitai}>
+              Search
+            </button>
           </div>
-          {civitaiSubview === "search" && (
-            <>
-              {!settings?.civitaiConfigured && (
-                <p className="hint">
-                  Add a Civitai key in Settings
-                  {mock ? " (any value works in mock)" : ""}.
-                </p>
-              )}
-              {settings?.civitaiConfigured && !hasWorker() && (
-                <p className="hint">Worker needed to Install — search / favorite / pin work now.</p>
-              )}
-              <div className="row civitai-search-row" style={{ marginBottom: "1rem" }}>
-                <input
-                  style={{ flex: 1, minWidth: "12rem" }}
-                  value={civitaiQ}
-                  onChange={(e) => setCivitaiQ(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      searchCivitai({ immediate: true });
-                    }
-                  }}
-                  placeholder="Search Civitai…"
-                  aria-label="Search Civitai"
-                />
-                <button
-                  type="button"
-                  className="primary icon-btn icon-btn-primary"
-                  disabled={busy}
-                  title="Search"
-                  aria-label="Search"
-                  onClick={() => searchCivitai({ immediate: true })}
-                >
-                  <IconSearch />
-                </button>
-              </div>
-              <div className="lora-row">
-                {civitaiItems.map((item) =>
-                  renderLoraCard(item, {
-                    pinLabel: "Pin to session",
-                    onAfterPin: () => setTab("gallery"),
-                  }),
+          {savedMsg && <p className="hint">{savedMsg}</p>}
+          <div className="lora-row">
+            {civitaiItems.map((item) => (
+              <article key={item.id} className="lora-card">
+                <h4>{item.name}</h4>
+                <p>{item.modelType}</p>
+                {item.triggerWord && (
+                  <p className="hint">Trigger (optional): {item.triggerWord}</p>
                 )}
-              </div>
-            </>
-          )}
-          {civitaiSubview === "favorites" && (
-            <>
-              {favorites.length === 0 ? (
-                <div className="gallery-empty">
-                  <div className="gallery-empty-art">
-                    <img
-                      src="/empty-favorites.png"
-                      alt="No favorites yet."
-                      className="gallery-empty-img"
-                      draggable={false}
-                    />
-                  </div>
-                </div>
-              ) : (
-                <div className="lora-row">
-                  {favorites.map((item) =>
-                    renderLoraCard(item, {
-                      pinLabel: "Pin to session",
-                      onAfterPin: () => setTab("gallery"),
-                    }),
-                  )}
-                </div>
-              )}
-            </>
-          )}
-          {civitaiSubview === "downloads" && (
-            <>
-              <div className="row" style={{ justifyContent: "space-between", marginBottom: "0.5rem" }}>
-                <span className="label-with-help" style={{ flex: 1 }}>
-                  <strong>Queue</strong>
-                  <HelpQ topic="help-civitai-downloads" label="Downloads" onOpen={openHelp} />
-                </span>
-                {hasWorker() &&
-                downloadJobs.some((j) =>
-                  ["succeeded", "failed", "cancelled"].includes(
-                    String(j?.status || "").toLowerCase(),
-                  ),
-                ) ? (
+                <div className="row lora-card-actions">
                   <button
-                    type="button"
-                    className="ghost icon-btn"
-                    title="Clear finished jobs from the list"
-                    aria-label="Clear finished jobs"
-                    onClick={clearFinishedDownloadJobs}
+                    className={isPinned(item) ? "primary" : "ghost"}
+                    onClick={() => {
+                      if (isPinned(item)) unpinLora(item);
+                      else pinLora(item);
+                      setTab("gallery");
+                    }}
                   >
-                    <IconClear />
+                    {isPinned(item) ? "Unpin" : "Pin to session"}
                   </button>
-                ) : null}
-              </div>
-              {!hasWorker() ? (
-                <p className="hint">Connect a worker to see the download queue.</p>
-              ) : downloadJobs.length === 0 ? (
-                <div className="gallery-empty">
-                  <div className="gallery-empty-art">
-                    <img
-                      src="/empty-downloads.png"
-                      alt="No recent jobs."
-                      className="gallery-empty-img"
-                      draggable={false}
-                    />
-                  </div>
+                  <button
+                    className="primary"
+                    disabled={busy}
+                    title={
+                      hasWorker()
+                        ? "Install this LoRA onto your diffusion worker"
+                        : "Needs a worker URL — pin for later, or add a worker in Settings"
+                    }
+                    onClick={() => installCivitai(item)}
+                  >
+                    {hasWorker() ? "Install to worker" : "Install (needs worker)"}
+                  </button>
                 </div>
-              ) : (
-                <div className="install-job-list">
-                  {downloadJobs.map((job) => {
-                    const pct =
-                      job.percent != null
-                        ? Math.min(100, Math.max(0, Number(job.percent)))
-                        : job.bytesTotal
-                          ? Math.min(
-                              100,
-                              (Number(job.bytesDone || 0) / Number(job.bytesTotal)) * 100,
-                            )
-                          : null;
-                    const canCancel = ["queued", "downloading"].includes(job.status);
-                    return (
-                      <article key={job.id} className="install-job-row">
-                        <div className="install-job-head">
-                          <strong>{job.name || job.destPath || job.id}</strong>
-                          <span className={`install-job-status status-${job.status}`}>
-                            {job.status}
-                          </span>
-                        </div>
-                        <p className="hint" style={{ margin: "0.25rem 0" }}>
-                          {job.destPath}
-                          {job.baseModel ? ` · ${job.baseModel}` : ""}
-                          {job.modelType ? ` · ${job.modelType}` : ""}
-                        </p>
-                        <div className="install-job-progress">
-                          <div
-                            className="install-job-bar"
-                            style={{ width: `${pct != null ? pct : job.status === "succeeded" ? 100 : 0}%` }}
-                          />
-                        </div>
-                        <div className="row install-job-meta">
-                          <span className="hint">
-                            {formatBytes(job.bytesDone)}
-                            {job.bytesTotal ? ` / ${formatBytes(job.bytesTotal)}` : ""}
-                            {pct != null ? ` (${pct.toFixed(0)}%)` : ""}
-                            {job.error ? ` — ${job.error}` : ""}
-                          </span>
-                          {canCancel ? (
-                            <button
-                              type="button"
-                              className="ghost"
-                              onClick={() => cancelDownloadJob(job.id)}
-                            >
-                              Cancel
-                            </button>
-                          ) : null}
-                        </div>
-                      </article>
-                    );
-                  })}
-                </div>
-              )}
-            </>
-          )}
-          {civitaiSubview === "installed" && (
-            <>
-              {!hasWorker() ? (
-                <p className="hint">Connect a worker to manage installed assets.</p>
-              ) : installedBusy && installedAssets.length === 0 ? (
-                <p className="hint">Loading…</p>
-              ) : installedAssets.length === 0 ? (
-                <div className="gallery-empty">
-                  <div className="gallery-empty-art">
-                    <img
-                      src="/empty-installed.png"
-                      alt="Nothing installed yet."
-                      className="gallery-empty-img"
-                      draggable={false}
-                    />
-                  </div>
-                </div>
-              ) : (
-                <div className="installed-sections">
-                  {groupInstalledAssets(installedAssets).map((section) => (
-                    <section key={section.id} className="installed-section" aria-label={section.title}>
-                      <h3 className="installed-section-title">
-                        {section.title}
-                        <span className="hint"> ({section.items.length})</span>
-                      </h3>
-                      <div className="lora-row">
-                        {section.items.map((asset) => {
-                          const card = {
-                            ...asset,
-                            modelType: asset.modelType || asset.kind || "Asset",
-                            modelId: asset.modelId ?? null,
-                            versionId: asset.versionId ?? null,
-                            name: asset.name || asset.id,
-                            thumbnailUrl: pickCivitaiThumb(asset, favorites),
-                          };
-                          return renderLoraCard(card, {
-                            onAfterPin: isPinnableAsset(card)
-                              ? () => setTab("gallery")
-                              : undefined,
-                          });
-                        })}
-                      </div>
-                    </section>
-                  ))}
-                </div>
-              )}
-            </>
-          )}
+              </article>
+            ))}
+          </div>
         </section>
       )}
 
@@ -5807,29 +1982,18 @@ export default function App() {
             {gallery.map((g) => (
               <article
                 key={g.id}
-                className={`salon-work${previewResult?.artifactId === g.id ? " selected" : ""}`}
-                onClick={() => selectGalleryPreview(g)}
+                className="salon-work"
+                onClick={async () => {
+                  const remix = await api(`/v1/gallery/${g.id}/remix`, { method: "POST" });
+                  setPrompt(remix.prompt || "");
+                  setTab("gallery");
+                }}
               >
-                <button
-                  type="button"
-                  className="ghost salon-work-del"
-                  title="Delete from gallery"
-                  aria-label={`Delete ${(g.prompt || "generation").slice(0, 40)}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    deleteGalleryItem(g.id);
-                  }}
-                >
-                  <IconTrash />
-                </button>
                 <figure>
-                  <MediaFigure item={g} src={gallerySrc(g)} alt={g.prompt} />
+                  <img src={gallerySrc(g)} alt={g.prompt} />
                   <figcaption>
                     <span className="salon-caption">{(g.prompt || "").slice(0, 90)}…</span>
-                    <span className="salon-meta">
-                      {g.backend}
-                      {isVideoArtifact(g) ? " · video" : isGifArtifact(g) ? " · gif" : ""}
-                    </span>
+                    <span className="salon-meta">{g.backend}</span>
                   </figcaption>
                 </figure>
               </article>
@@ -5838,1672 +2002,82 @@ export default function App() {
         </section>
       )}
 
-      {tab === "worker" && (
-        <section className="panel settings worker-tab" aria-label="Diffusion worker">
-          <div className="worker-layout">
-            <aside className="worker-setup-panel" aria-label="Setup and connect">
-              <div className="settings-block-head">
-                <span className="label-with-help">
-                  <strong>Setup</strong>
-                  <HelpQ topic="help-worker" label="Worker setup" onOpen={openHelp} />
-                </span>
-              </div>
-              <p className="hint">
-                Local LoRAs / Local generate need a GPU worker on a host (
-                <code>freya-local-worker</code>, default <code>0.0.0.0:{DEFAULT_WORKER_PORT}</code>
-                ). Cloud Generate uses OpenRouter. Models dir: <code>FREYA_MODELS_DIR</code>{" "}
-                (default <code>~/freya/models</code>).
-              </p>
-
-              <div className="worker-setup" aria-label="One-line host setup">
-                <strong className="worker-connect-title">One-line host setup</strong>
-                <p className="hint">
-                  Copy a command onto the GPU machine. It installs/uses Docker, writes{" "}
-                  <code>FREYA_WORKER_TOKEN</code> from your machine token, and starts{" "}
-                  <code>freya-local-worker</code>. Generate a token first if the field below shows
-                  a placeholder.
-                </p>
-                {!effectiveMachineToken() ? (
-                  <p className="hint">
-                    No machine token in this browser — use{" "}
-                    <strong>Generate machine token</strong> (right), then copy again.
-                  </p>
-                ) : null}
-                <label>
-                  Linux / macOS
-                  <textarea
-                    className="worker-setup-cmd"
-                    readOnly
-                    rows={3}
-                    value={linuxWorkerSetupCmd()}
-                    spellCheck={false}
-                  />
-                </label>
-                <div className="row settings-token-actions">
-                  <button
-                    type="button"
-                    className="ghost"
-                    disabled={busy || mock}
-                    onClick={() => copyWorkerSetupCmd("linux")}
-                    title="Copy Linux setup one-liner"
-                  >
-                    Copy Linux
-                  </button>
-                </div>
-                <label>
-                  Windows (PowerShell)
-                  <textarea
-                    className="worker-setup-cmd"
-                    readOnly
-                    rows={3}
-                    value={windowsWorkerSetupCmd()}
-                    spellCheck={false}
-                  />
-                </label>
-                <div className="row settings-token-actions">
-                  <button
-                    type="button"
-                    className="ghost"
-                    disabled={busy || mock}
-                    onClick={() => copyWorkerSetupCmd("windows")}
-                    title="Copy Windows setup one-liner"
-                  >
-                    Copy Windows
-                  </button>
-                  {setupCmdCopyMsg ? <span className="hint">{setupCmdCopyMsg}</span> : null}
-                </div>
-              </div>
-
-              <div className="worker-connect" aria-label="Connect options">
-                <strong className="worker-connect-title">Connect</strong>
-                <p className="hint">
-                  After the worker is running, put its address in Host / Port (or Advanced full
-                  URL), then <strong>Save worker</strong>:
-                </p>
-                <ul className="worker-setup-steps">
-                  <li>
-                    <strong>Host IP + port</strong> — usual from in-cluster Studio: this machine&apos;s
-                    LAN IP, port <code>{DEFAULT_WORKER_PORT}</code>.
-                  </li>
-                  <li>
-                    <strong>Localhost</strong> — API and worker on the same host →{" "}
-                    <em>Use local defaults</em> (
-                    <code>
-                      {DEFAULT_WORKER_HOST}:{DEFAULT_WORKER_PORT}
-                    </code>
-                    ).
-                  </li>
-                  <li>
-                    <strong>Full URL</strong> — Advanced → https / remote FQDN (e.g.{" "}
-                    <code>https://vllm.dataknife.net</code>).
-                  </li>
-                </ul>
-                <p className="hint">
-                  SD / SDXL / Pony / Flux bases belong on the GPU worker — not on a remote text LLM
-                  endpoint.
-                </p>
-              </div>
-            </aside>
-
-            <div className="worker-controls-panel" aria-label="Worker controls">
-              <div className="settings-block-head">
-                <span className="label-with-help">
-                  <strong>Controls</strong>
-                  <HelpQ topic="help-worker-token" label="Machine token" onOpen={openHelp} />
-                </span>
-              </div>
-
-              <div className="settings-block worker-auth-block" aria-label="Machine API token">
-                <div className="settings-block-head">
-                  <strong>Machine API token</strong>
-                  <span className={`key-on-file ${settings?.apiTokenConfigured ? "is-on" : ""}`}>
-                    {settings?.apiTokenConfigured
-                      ? studioToken
-                        ? "Configured · in browser"
-                        : "Configured"
-                      : "Not required (local/dev)"}
-                  </span>
-                </div>
-                <div className="row settings-token-actions">
-                  <button
-                    type="button"
-                    className={`primary btn-save${saveFlash === "token" ? " is-saved" : ""}`}
-                    disabled={busy || tokenBusy || mock}
-                    onClick={generateApiToken}
-                    title="Rotate machine token for MCP / workers"
-                  >
-                    {tokenBusy
-                      ? "Generating…"
-                      : saveFlash === "token"
-                        ? "Saved ✓"
-                        : "Generate machine token"}
-                  </button>
-                </div>
-                {saveFlash === "token" && savedMsg ? (
-                  <p className="save-toast" role="status">
-                    {savedMsg}
-                  </p>
-                ) : null}
-                {generatedToken && (
-                  <div className="token-once">
-                    <label>
-                      New token (copy now — shown once)
-                      <input type="text" readOnly value={generatedToken} autoComplete="off" />
-                    </label>
-                    <div className="row settings-token-actions">
-                      <button type="button" className="ghost" onClick={copyGeneratedToken}>
-                        Copy
-                      </button>
-                      {tokenCopyMsg && <span className="hint">{tokenCopyMsg}</span>}
-                    </div>
-                  </div>
-                )}
-              </div>
-
-              <div className="worker-panel" aria-label="Diffusion worker status">
-                <div className="worker-panel-head">
-                  <span
-                    className={`status-dot ${
-                      workerStats?.reachable
-                        ? "on"
-                        : workerStats?.configured || composedWorkerUrl()
-                          ? "warn"
-                          : ""
-                    }`}
-                  />
-                  <strong>Status</strong>
-                  <span className="hint">
-                    {mock
-                      ? "mock stats"
-                      : workerStats
-                        ? [
-                            workerStats.reachable
-                              ? "reachable"
-                              : workerStats.configured || composedWorkerUrl()
-                                ? "unreachable"
-                                : "not configured",
-                            workerStats.runtime?.kind && workerStats.runtime.kind !== "none"
-                              ? workerStats.runtime.kind
-                              : null,
-                          ]
-                            .filter(Boolean)
-                            .join(" · ")
-                        : "—"}
-                  </span>
-                </div>
-
-                <div className="row settings-token-actions">
-                  <button
-                    type="button"
-                    className="ghost"
-                    disabled={busy}
-                    onClick={applyLocalWorkerDefaults}
-                  >
-                    Use local defaults
-                  </button>
-                </div>
-
-                {!useWorkerUrlOverride && (
-                  <div className="worker-endpoint-row" aria-label="Worker host and port">
-                    <label>
-                      Host
-                      <input
-                        autoComplete="off"
-                        placeholder={DEFAULT_WORKER_HOST}
-                        value={workerHost}
-                        onChange={(e) => setWorkerHost(e.target.value)}
-                      />
-                    </label>
-                    <label className="worker-port-field">
-                      Port
-                      <input
-                        autoComplete="off"
-                        inputMode="numeric"
-                        placeholder={DEFAULT_WORKER_PORT}
-                        value={workerPort}
-                        onChange={(e) => setWorkerPort(e.target.value)}
-                      />
-                    </label>
-                  </div>
-                )}
-                <p className="hint">
-                  <code>{composedWorkerUrl() || "(empty)"}</code>
-                </p>
-
-                <button
-                  type="button"
-                  className={`primary btn-save${saveFlash === "worker" ? " is-saved" : ""}`}
-                  disabled={busy}
-                  onClick={saveWorkerEndpoint}
-                >
-                  {saveFlash === "worker" ? "Saved ✓" : "Save worker"}
-                </button>
-                {saveFlash === "worker" && savedMsg ? (
-                  <p className="save-toast" role="status">
-                    {savedMsg}
-                  </p>
-                ) : savedMsg ? (
-                  <p className="hint">{savedMsg}</p>
-                ) : null}
-
-                {(() => {
-                  const vram = workerStats?.vram;
-                  const used = vram?.usedMiB;
-                  const total = vram?.totalMiB;
-                  const pct =
-                    typeof used === "number" && typeof total === "number" && total > 0
-                      ? Math.min(100, Math.round((used / total) * 100))
-                      : null;
-                  const util = vram?.utilPercent;
-                  const storage = workerStats?.storage;
-                  return (
-                    <div className="worker-meters">
-                      <div className="worker-vram">
-                        <div className="worker-vram-meta">
-                          <span>VRAM</span>
-                          <span>
-                            {pct != null
-                              ? `${used} / ${total} MiB (${pct}%)`
-                              : mock
-                                ? "— (mock)"
-                                : "n/a"}
-                            {typeof util === "number" ? ` · GPU ${util}%` : ""}
-                          </span>
-                        </div>
-                        <div
-                          className="worker-vram-bar"
-                          role="progressbar"
-                          aria-valuenow={pct ?? 0}
-                          aria-valuemin={0}
-                          aria-valuemax={100}
-                        >
-                          <div className="worker-vram-fill" style={{ width: `${pct ?? 0}%` }} />
-                        </div>
-                      </div>
-                      <StorageMeter
-                        label="Gallery PVC"
-                        disk={storage?.gallery}
-                        fallbackHint={mock ? "— (mock)" : "n/a"}
-                      />
-                      <StorageMeter
-                        label="Models dir"
-                        disk={storage?.models}
-                        fallbackHint={
-                          mock
-                            ? "— (mock)"
-                            : workerStats?.reachable
-                              ? "n/a"
-                              : "worker unreachable"
-                        }
-                      />
-                      {(workerStats?.loras != null || workerStats?.checkpoints != null) && (
-                        <p className="hint">
-                          LoRAs {workerStats.loras ?? "—"} · checkpoints{" "}
-                          {workerStats.checkpoints ?? "—"}
-                          {workerStats.uptimeSec != null
-                            ? ` · up ${workerStats.uptimeSec}s`
-                            : ""}
-                        </p>
-                      )}
-                      {workerStats?.modelLoaded?.model && (
-                        <p className="hint">
-                          Active base: {workerStats.modelLoaded.model}
-                          {workerStats.modelLoaded.baseModel
-                            ? ` (${workerStats.modelLoaded.baseModel})`
-                            : ""}
-                          {activeBaseEngineHint(workerStats.modelLoaded, workerStats)}
-                        </p>
-                      )}
-                      {(() => {
-                        const dirHint = modelsDirHint(workerStats);
-                        return dirHint ? <p className="hint">{dirHint}</p> : null;
-                      })()}
-                    </div>
-                  );
-                })()}
-                <WorkerBaseModelPanel
-                  busy={busy || workerCtlBusy || mock}
-                  hasWorker={hasWorker()}
-                  api={api}
-                  onSaved={(msg) => setSavedMsg(msg)}
-                  onError={(msg) => setError(msg)}
-                />
-                <div className="worker-controls">
-                  <button
-                    type="button"
-                    className="ghost"
-                    disabled={busy || workerCtlBusy || mock}
-                    onClick={() => workerControl("start")}
-                    title="Start local docker/systemd worker"
-                  >
-                    ▶ Start
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost"
-                    disabled={busy || workerCtlBusy || mock}
-                    onClick={() => workerControl("stop")}
-                    title="Stop local docker/systemd worker"
-                  >
-                    ■ Stop
-                  </button>
-                </div>
-              </div>
-
-              <details className="settings-advanced">
-                <summary>Advanced</summary>
-                <label>
-                  <span className="settings-label-row">
-                    Machine API token
-                    {studioToken ? (
-                      <span className="key-on-file is-on">In browser</span>
-                    ) : null}
-                  </span>
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    placeholder="Paste machine token"
-                    value={studioToken}
-                    onChange={(e) => setStudioToken(e.target.value)}
-                  />
-                </label>
-                <div className="row settings-token-actions">
-                  <button
-                    type="button"
-                    className={`ghost${saveFlash === "token" ? " is-saved" : ""}`}
-                    disabled={busy || tokenBusy || mock}
-                    onClick={applyStudioToken}
-                    title="Save machine token in this browser"
-                  >
-                    Save token
-                  </button>
-                </div>
-                <label className="settings-check">
-                  <input
-                    type="checkbox"
-                    checked={useWorkerUrlOverride}
-                    onChange={(e) => setUseWorkerUrlOverride(e.target.checked)}
-                  />
-                  Full worker URL
-                </label>
-                {useWorkerUrlOverride && (
-                  <label>
-                    Worker URL
-                    <input
-                      placeholder="https://vllm.dataknife.net"
-                      value={workerUrlOverride}
-                      onChange={(e) => setWorkerUrlOverride(e.target.value)}
-                    />
-                  </label>
-                )}
-              </details>
-            </div>
-          </div>
-        </section>
-      )}
-
-      {tab === "metrics" && (
-        <section className="panel settings metrics-panel" aria-label="OpenRouter metrics">
-          <div className="settings-block-head">
-            <span className="label-with-help">
-              <strong>OpenRouter usage</strong>
-              <HelpQ topic="help-metrics" label="Metrics" onOpen={openHelp} />
-            </span>
-            <button
-              type="button"
-              className="ghost"
-              disabled={orMetricsBusy || busy}
-              onClick={refreshOpenRouterMetrics}
-            >
-              {orMetricsBusy ? "Refreshing…" : "Refresh"}
-            </button>
-          </div>
-          {!settings?.openRouterConfigured ? (
-            <p className="hint">
-              Add an OpenRouter key in{" "}
-              <button type="button" className="linkish" onClick={() => setTab("settings")}>
-                Settings
-              </button>
-              .
-            </p>
-          ) : orMetricsBusy && !orMetrics ? (
-            <p className="hint">Loading…</p>
-          ) : orMetrics ? (
-            <>
-              {orMetrics.key ? (
-                <div className="metrics-grid" aria-label="Per-key usage">
-                  <div className="metric-card">
-                    <span className="metric-label">Spend today</span>
-                    <span className="metric-value">
-                      {fmtUsd(orMetrics.key.usageDaily)}
-                    </span>
-                  </div>
-                  <div className="metric-card">
-                    <span className="metric-label">This week</span>
-                    <span className="metric-value">
-                      {fmtUsd(orMetrics.key.usageWeekly)}
-                    </span>
-                  </div>
-                  <div className="metric-card">
-                    <span className="metric-label">This month</span>
-                    <span className="metric-value">
-                      {fmtUsd(orMetrics.key.usageMonthly)}
-                    </span>
-                  </div>
-                  <div className="metric-card">
-                    <span className="metric-label">All-time (this key)</span>
-                    <span className="metric-value">{fmtUsd(orMetrics.key.usage)}</span>
-                  </div>
-                  <div className="metric-card">
-                    <span className="metric-label">Key limit remaining</span>
-                    <span className="metric-value">
-                      {orMetrics.key.limitRemaining == null
-                        ? "Unlimited"
-                        : fmtUsd(orMetrics.key.limitRemaining)}
-                    </span>
-                    {orMetrics.key.limit != null ? (
-                      <span className="hint">
-                        Cap {fmtUsd(orMetrics.key.limit)}
-                        {orMetrics.key.limitReset ? ` · resets ${orMetrics.key.limitReset}` : ""}
-                      </span>
-                    ) : null}
-                  </div>
-                  {orMetrics.key.label ? (
-                    <p className="hint metric-key-label">Key: {orMetrics.key.label}</p>
-                  ) : null}
-                </div>
-              ) : (
-                <p className="err">{orMetrics.keyError || "Could not load key usage."}</p>
-              )}
-
-              <div className="settings-block" aria-label="Account credits">
-                <div className="settings-block-head">
-                  <strong>Account credits</strong>
-                </div>
-                {orMetrics.credits ? (
-                  <div className="metrics-grid">
-                    <div className="metric-card">
-                      <span className="metric-label">Remaining</span>
-                      <span className="metric-value">
-                        {fmtUsd(orMetrics.credits.remaining)}
-                      </span>
-                    </div>
-                    <div className="metric-card">
-                      <span className="metric-label">Purchased</span>
-                      <span className="metric-value">
-                        {fmtUsd(orMetrics.credits.totalCredits)}
-                      </span>
-                    </div>
-                    <div className="metric-card">
-                      <span className="metric-label">Used (lifetime)</span>
-                      <span className="metric-value">
-                        {fmtUsd(orMetrics.credits.totalUsage)}
-                      </span>
-                    </div>
-                  </div>
-                ) : (
-                  <p className="hint">
-                    {orMetrics.creditsError || "Needs an OpenRouter Management API key."}
-                  </p>
-                )}
-              </div>
-
-              {Array.isArray(orMetrics.notes) && orMetrics.notes.length > 0 ? (
-                <ul className="metrics-notes hint">
-                  {orMetrics.notes.map((n) => (
-                    <li key={n}>{n}</li>
-                  ))}
-                </ul>
-              ) : null}
-            </>
-          ) : (
-            <p className="hint">No metrics yet — hit Refresh.</p>
-          )}
-        </section>
-      )}
-
       {tab === "settings" && (
         <section className="panel settings">
-          <aside className="settings-disclaimer" role="note">
-            You are liable for what you generate.{" "}
-            <button type="button" className="linkish" onClick={() => setTab("guidelines")}>
-              Guidelines
-            </button>
-          </aside>
-
+          <p className="hint">
+            {mock
+              ? "Mock mode: keys are fake flags in memory. Paste anything non-empty to “configure” Civitai/OpenRouter. Agent/image models live in the compose chrome (Mode · Agent · Image)."
+              : "Keys stay on the Freya API (or in your Kubernetes Secrets). They are never shown back in full after save."}{" "}
+            OpenRouter alone is enough for cloud Generate — a worker is only for LoRAs and custom
+            local looks.
+          </p>
           <label>
-            <span className="settings-label-row">
-              <span className="label-with-help">
-                OpenRouter API key
-                <HelpQ topic="help-keys" label="API keys" onOpen={openHelp} />
-              </span>
-              {settings?.openRouterConfigured ? (
-                <span className="key-on-file is-on">Saved · configured</span>
-              ) : (
-                <span className="key-on-file">Not configured</span>
-              )}
-            </span>
-            <span className="settings-key-row">
-              <input
-                type="password"
-                autoComplete="off"
-                placeholder={
-                  settings?.openRouterConfigured
-                    ? "••••••••••••  (on file — paste to replace)"
-                    : "sk-or-…"
-                }
-                value={openrouterKey}
-                onChange={(e) => setOpenrouterKey(e.target.value)}
-              />
-              {settings?.openRouterConfigured ? (
-                <button
-                  type="button"
-                  className="ghost danger-ghost"
-                  disabled={busy}
-                  onClick={() => clearApiKey("openrouter")}
-                >
-                  Clear
-                </button>
-              ) : null}
-            </span>
-          </label>
-          <label>
-            <span className="settings-label-row">
-              Civitai API key
-              {settings?.civitaiConfigured ? (
-                <span className="key-on-file is-on">Saved · configured</span>
-              ) : (
-                <span className="key-on-file">Not configured</span>
-              )}
-            </span>
-            <span className="settings-key-row">
-              <input
-                type="password"
-                autoComplete="off"
-                placeholder={
-                  settings?.civitaiConfigured
-                    ? "••••••••••••  (on file — paste to replace)"
-                    : "From civitai.com/user/account"
-                }
-                value={civitaiKey}
-                onChange={(e) => setCivitaiKey(e.target.value)}
-              />
-              {settings?.civitaiConfigured ? (
-                <button
-                  type="button"
-                  className="ghost danger-ghost"
-                  disabled={busy}
-                  onClick={() => clearApiKey("civitai")}
-                >
-                  Clear
-                </button>
-              ) : null}
-            </span>
-          </label>
-          <label className="settings-check" style={{ marginTop: "-0.35rem" }}>
+            Studio API token
             <input
-              type="checkbox"
-              checked={allowNsfwLocal}
-              onChange={(e) => setAllowNsfwLocal(e.target.checked)}
+              type="password"
+              autoComplete="off"
+              placeholder="Bearer for /v1 when Freya API auth is enabled"
+              value={studioToken}
+              onChange={(e) => setStudioToken(e.target.value)}
             />
-            <span className="label-with-help">
-              Show NSFW
-              <HelpQ topic="help-nsfw" label="NSFW" onOpen={openHelp} />
+            <span className="hint">
+              Stored only in this browser (localStorage). Required when the API has{" "}
+              <code>FREYA_API_TOKEN</code> / <code>apiTokenSecretRef</code> set. Leave blank for open
+              local/dev.
             </span>
           </label>
-
-          <div className="settings-block" aria-label="OpenRouter privacy">
-            <div className="settings-block-head">
-              <span className="label-with-help">
-                <strong>Privacy</strong>
-                <HelpQ topic="help-zdr" label="Privacy / ZDR" onOpen={openHelp} />
-              </span>
-            </div>
-            <label>
-              Data collection
-              <select
-                value={privacyDataCollection}
-                onChange={(e) => setPrivacyDataCollection(e.target.value)}
-              >
-                <option value="allow">Allow</option>
-                <option value="deny">Deny</option>
-              </select>
-            </label>
-            <label className="settings-check">
-              <input
-                type="checkbox"
-                checked={privacyZdr}
-                onChange={(e) => setPrivacyZdr(e.target.checked)}
-              />
-              ZDR
-            </label>
-          </div>
-
-          <div className="settings-block" aria-label="Instruction tone">
-            <div className="settings-block-head">
-              <span className="label-with-help">
-                <strong>Tone</strong>
-                <HelpQ topic="help-tone" label="Instruction tone" onOpen={openHelp} />
-              </span>
-            </div>
-            <select
-              aria-label="Tone"
-              value={instructionTone}
-              onChange={(e) => setInstructionTone(e.target.value)}
-            >
-              <option value="warm">Warm</option>
-              <option value="direct">Direct</option>
-              <option value="steerable">Steerable</option>
-            </select>
-          </div>
-
-          <div className="settings-block" aria-label="System prompts">
-            <div className="settings-block-head">
-              <span className="label-with-help">
-                <strong>System prompts</strong>
-                <HelpQ topic="help-prompts" label="System prompts" onOpen={openHelp} />
-              </span>
-            </div>
-            <select
-              aria-label="System prompts"
-              value={instructionMode}
-              onChange={(e) => {
-                const id = e.target.value;
-                setInstructionMode(id);
-                const row = instructions.find((i) => i.id === id);
-                setInstructionDraft(row?.text || "");
-              }}
-            >
-              {(instructions.length
-                ? instructions
-                : [
-                    { id: "converse", label: "Converse (chat agent)" },
-                    { id: "route", label: "Route (intent classifier)" },
-                    { id: "chat", label: "Chat (assist)" },
-                    { id: "plan", label: "Plan" },
-                    { id: "suggest", label: "Suggest" },
-                    { id: "session", label: "Session" },
-                    { id: "prompt-prose", label: "Enhance — prose brief" },
-                    { id: "prompt-sd", label: "Enhance — SD keywords" },
-                  ]
-              ).map((i) => (
-                <option key={i.id} value={i.id}>
-                  {i.label || i.id}
-                  {i.overridden ? " · overridden" : ""}
-                </option>
-              ))}
-            </select>
-            <label>
-              System instruction
-              <textarea
-                className="settings-prompt-textarea"
-                rows={10}
-                value={instructionDraft}
-                onChange={(e) => setInstructionDraft(e.target.value)}
-                spellCheck={false}
-              />
-            </label>
-            <div className="settings-key-actions">
-              <button
-                type="button"
-                className={`primary${saveFlash === "settings" ? " is-saved" : ""}`}
-                disabled={instructionBusy || busy}
-                onClick={saveInstructionPrompt}
-              >
-                {instructionBusy
-                  ? "Saving…"
-                  : saveFlash === "settings"
-                    ? "Saved ✓"
-                    : "Save prompt"}
-              </button>
-              <button
-                type="button"
-                disabled={instructionBusy || busy}
-                onClick={resetInstructionPrompt}
-              >
-                Reset to default
-              </button>
-              {instructions.find((i) => i.id === instructionMode)?.overridden ? (
-                <span className="hint">Custom</span>
-              ) : (
-                <span className="hint">Default</span>
-              )}
-            </div>
-          </div>
-
-          {saveFlash === "settings" && savedMsg ? (
-            <p className="save-toast" role="status">
-              {savedMsg}
-            </p>
-          ) : savedMsg && tab === "settings" ? (
-            <p className="hint">{savedMsg}</p>
-          ) : null}
-        </section>
-      )}
-
-      {tab === "models" && (
-        <section className="panel settings" aria-label="Models">
-          <div className="settings-block" aria-label="Composer defaults">
-            <div className="settings-block-head">
-              <span className="label-with-help">
-                <strong>Composer defaults</strong>
-                <HelpQ topic="help-composer" label="Composer defaults" onOpen={openHelp} />
-              </span>
-            </div>
-            <label>
-              Agent
-              <select
-                value={agentMenuValue}
-                onChange={(e) => changeAgentModel(e.target.value)}
-              >
-                {agentOptions.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label || m.id}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Image
-              <select
-                value={imageMenuValue}
-                onChange={(e) => changeImageModel(e.target.value)}
-              >
-                {imageOptions.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label || m.id}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Video
-              <select
-                value={videoMenuValue}
-                onChange={(e) => changeVideoModel(e.target.value)}
-              >
-                {(videoOptions.length
-                  ? videoOptions
-                  : [{ id: AUTO_VIDEO.id, label: AUTO_VIDEO.label || "Auto" }]
-                ).map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label || m.id}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Router
-              <select
-                value={routerMenuValue}
-                onChange={(e) => changeRouterModel(e.target.value)}
-              >
-                {routerOptions.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label || m.id}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span className="label-with-help">
-                Backend
-                <HelpQ topic="help-backend" label="Cloud | Local" onOpen={openHelp} />
-              </span>
-              <select
-                value={generateBackend}
-                onChange={(e) => changeGenerateBackend(e.target.value)}
-              >
-                <option value="cloud">Cloud</option>
-                <option value="local" disabled={!localBackendOk}>
-                  Local
-                </option>
-              </select>
-            </label>
-          </div>
-
-          <div className="settings-block" aria-label="Cost">
-            <div className="settings-block-head">
-              <span className="label-with-help">
-                <strong>Cost</strong>
-                <HelpQ topic="help-cost" label="Cost tier" onOpen={openHelp} />
-              </span>
-            </div>
-            <label>
-              Tier
-              <select
-                value={autoFallbacks.costTier || "medium"}
-                onChange={(e) =>
-                  setAutoFallbacks((prev) =>
-                    normalizeAutoFallbacks({ ...prev, costTier: e.target.value }),
-                  )
-                }
-              >
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-                <option value="max">Max</option>
-              </select>
-            </label>
-          </div>
-
-          <div className="settings-block" aria-label="Auto fallbacks">
-            <div className="settings-block-head">
-              <span className="label-with-help">
-                <strong>Auto fallbacks</strong>
-                <HelpQ topic="help-auto" label="Auto fallbacks" onOpen={openHelp} />
-              </span>
-              <button
-                type="button"
-                className="ghost"
-                disabled={busy}
-                onClick={() =>
-                  setAutoFallbacks((prev) =>
-                    normalizeAutoFallbacks({
-                      ...EMPTY_AUTO_FALLBACKS,
-                      costTier: prev.costTier || "medium",
-                    }),
-                  )
-                }
-              >
-                Reset
-              </button>
-            </div>
-            {[
-              ["agent", "Agent"],
-              ["agentZdr", "Agent (ZDR)"],
-              ["image", "Image"],
-              ["imageZdr", "Image (ZDR)"],
-              ["video", "Video"],
-              ["videoZdr", "Video (ZDR)"],
-              ["router", "Router"],
-            ].map(([key, label]) => (
-              <label key={key}>
-                {label}
-                <input
-                  type="text"
-                  list={`auto-fb-${key}`}
-                  placeholder="Built-in (blank)"
-                  value={autoFallbacks[key] || ""}
-                  onChange={(e) =>
-                    setAutoFallbacks((prev) =>
-                      normalizeAutoFallbacks({ ...prev, [key]: e.target.value }),
-                    )
-                  }
-                  spellCheck={false}
-                />
-                <datalist id={`auto-fb-${key}`}>
-                  {(key.startsWith("image")
-                    ? imageOptions
-                    : key.startsWith("video")
-                      ? videoOptions
-                      : agentOptions
-                  )
-                    .filter((m) => m.id && m.id !== AUTO_AGENT.id && m.id !== AUTO_IMAGE.id && m.id !== AUTO_VIDEO.id && m.id !== AUTO_ROUTER.id)
-                    .slice(0, 40)
-                    .map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.label || m.id}
-                      </option>
-                    ))}
-                </datalist>
-              </label>
-            ))}
-          </div>
-
-          <div className="settings-block" aria-label="Catalog alignment">
-            <div className="settings-block-head">
-              <span className="label-with-help">
-                <strong>Alignment</strong>
-                <HelpQ topic="help-alignment" label="Catalog alignment" onOpen={openHelp} />
-              </span>
-            </div>
-            <label>
-              Preference
-              <select
-                value={modelAlignment}
-                onChange={(e) => setModelAlignment(e.target.value)}
-              >
-                <option value="balanced">Balanced</option>
-                <option value="safety">Safety</option>
-                <option value="uncensored">Uncensored</option>
-              </select>
-            </label>
-          </div>
-
-          <div className="settings-block" aria-label="Chat providers">
-            <div className="settings-block-head">
-              <span className="label-with-help">
-                <strong>Chat providers</strong>
-                <HelpQ topic="help-providers" label="Chat providers" onOpen={openHelp} />
-              </span>
-              {(() => {
-                const total = chatProviderAvailable.length;
-                const on = chatProviderAvailable.filter((s) =>
-                  chatProviderIsChecked(s, chatProviders),
-                ).length;
-                return (
-                  <span className="hint">
-                    {total ? `${on} / ${total}` : "—"}
-                  </span>
-                );
-              })()}
-            </div>
-            <div className="chat-provider-toolbar">
-              <input
-                type="search"
-                placeholder="Search vendors…"
-                value={chatProviderSearch}
-                onChange={(e) => setChatProviderSearch(e.target.value)}
-                aria-label="Search chat providers"
-              />
-              <span className="settings-token-actions">
-                <button
-                  type="button"
-                  className="ghost"
-                  disabled={!chatProviderAvailable.length || busy}
-                  onClick={() => setChatProviders(chatProvidersSelectAll(chatProviderAvailable, true))}
-                >
-                  Select all
-                </button>
-                <button
-                  type="button"
-                  className="ghost"
-                  disabled={!chatProviderAvailable.length || busy}
-                  onClick={() => setChatProviders(chatProvidersSelectAll(chatProviderAvailable, false))}
-                >
-                  Select none
-                </button>
-              </span>
-            </div>
-            <div className="chat-provider-list" role="group" aria-label="Vendor checkboxes">
-              {chatProviderAvailable.length === 0 ? (
-                <span className="hint">No vendors yet.</span>
-              ) : (
-                chatProviderAvailable
-                  .filter((slug) => {
-                    const q = chatProviderSearch.trim().toLowerCase();
-                    if (!q) return true;
-                    return slug.includes(q);
-                  })
-                  .map((slug) => {
-                    const checked = chatProviderIsChecked(slug, chatProviders);
-                    return (
-                      <label key={slug} className="settings-check chat-provider-row">
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={(e) =>
-                            setChatProviders(
-                              chatProvidersAfterToggle(
-                                chatProviderAvailable,
-                                chatProviders,
-                                slug,
-                                e.target.checked,
-                              ),
-                            )
-                          }
-                        />
-                        <span>{slug}</span>
-                      </label>
-                    );
-                  })
-              )}
-            </div>
-            {chatProviders.legacyOnly?.length ? (
-              <span className="hint warn-hint">
-                Legacy allowlist: {chatProviders.legacyOnly.join(", ")}
-              </span>
-            ) : null}
-          </div>
-
-          {modelsCatalogReady ? (
-            <p className="hint">
-              Agent {Math.max(0, agentModels.length - 1)} · Image{" "}
-              {Math.max(0, imageModels.length - 1)} · Router{" "}
-              {Math.max(0, routerModels.length - 1)} · Video{" "}
-              {videoModels.length > 0 ? videoModels.length : "—"}
-            </p>
-          ) : (
-            <p className="hint">{MODELS_API_HINT}</p>
-          )}
-          <button
-            type="button"
-            className={`primary btn-save${saveFlash === "models" ? " is-saved" : ""}`}
-            disabled={busy}
-            onClick={saveSettings}
-          >
-            {saveFlash === "models" || saveFlash === "settings" ? "Saved ✓" : "Save models"}
+          <label>
+            OpenRouter API key
+            <input
+              type="password"
+              autoComplete="off"
+              placeholder={
+                settings?.openRouterConfigured ? "Configured — paste to replace" : "sk-or-…"
+              }
+              value={openrouterKey}
+              onChange={(e) => setOpenrouterKey(e.target.value)}
+            />
+            <span className="hint">Required for cloud image generation (no worker needed).</span>
+          </label>
+          <label>
+            Civitai API key
+            <input
+              type="password"
+              autoComplete="off"
+              placeholder={
+                settings?.civitaiConfigured
+                  ? "Configured — paste to replace"
+                  : "From civitai.com/user/account"
+              }
+              value={civitaiKey}
+              onChange={(e) => setCivitaiKey(e.target.value)}
+            />
+            <span className="hint">
+              Search Civitai and (with a worker) install LoRAs/checkpoints. Pin works without a
+              worker.
+            </span>
+          </label>
+          <label>
+            Diffusion worker URL (optional — LoRAs / local custom look)
+            <input
+              placeholder="http://gpu-box.lan:8091"
+              value={workerUrl}
+              onChange={(e) => setWorkerUrl(e.target.value)}
+            />
+            <span className="hint">
+              Optional. Needed to install LoRAs and run local/custom models. Leave blank to generate
+              only via OpenRouter.
+            </span>
+          </label>
+          <button className="primary" disabled={busy} onClick={saveSettings}>
+            Save settings
           </button>
-          {(saveFlash === "models" || saveFlash === "settings") && savedMsg ? (
-            <p className="save-toast" role="status">
-              {savedMsg}
-            </p>
-          ) : null}
-        </section>
-      )}
-
-      {tab === "help" && (
-        <section className="panel settings help-panel" aria-label="Help">
-          <h2 className="help-heading">Help</h2>
-          <p className="help-lead">
-            Short notes for Studio controls. Open a section from any <span className="help-q-inline">?</span>{" "}
-            button, or jump below.
-          </p>
-          <nav className="help-toc" aria-label="Help sections">
-            {[
-              ["help-overview", "Overview"],
-              ["help-civitai", "Civitai"],
-              ["help-civitai-downloads", "Downloads"],
-              ["help-worker", "Worker"],
-              ["help-worker-token", "Machine token"],
-              ["help-keys", "API keys"],
-              ["help-nsfw", "NSFW"],
-              ["help-zdr", "Privacy / ZDR"],
-              ["help-tone", "Tone"],
-              ["help-prompts", "System prompts"],
-              ["help-composer", "Composer"],
-              ["help-backend", "Cloud | Local"],
-              ["help-cost", "Cost"],
-              ["help-auto", "Auto fallbacks"],
-              ["help-alignment", "Alignment"],
-              ["help-providers", "Chat providers"],
-              ["help-metrics", "Metrics"],
-              ["help-modes", "Plan / Auto / YOLO"],
-            ].map(([id, label]) => (
-              <button
-                key={id}
-                type="button"
-                className="linkish"
-                onClick={() => openHelp(id)}
-              >
-                {label}
-              </button>
-            ))}
-          </nav>
-
-          <HelpSection id="help-overview" title="Overview" active={helpFocus === "help-overview"}>
-            <p>
-              Chat on the left; Gallery / Styles / Civitai / Worker on the tabs. Cloud Generate needs
-              an OpenRouter key. Local LoRAs and Local generate need a diffusion worker.
-            </p>
-            <p>
-              Keys and Privacy live under Settings. Model pickers, Auto fallbacks, and chat vendors
-              live under Models.
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-civitai" title="Civitai" active={helpFocus === "help-civitai"}>
-            <p>
-              <strong>Search</strong> finds LoRAs / checkpoints (needs a Civitai API key).{" "}
-              <strong>★ Favorite</strong> is a persistent library in this browser.{" "}
-              <strong>Pin</strong> is session-only for LoRAs / adapters / embeddings — not
-              checkpoints (use Worker → Set as base). <strong>Install</strong> queues a download
-              and does not auto-pin.
-            </p>
-            <p>
-              <strong>Installed</strong> shows assets already on the worker disk as clickable cards
-              (same style as Favorites) — open a card for details, pin (adapters only), delete, or
-              set base.
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-civitai-downloads" title="Downloads" active={helpFocus === "help-civitai-downloads"}>
-            <p>
-              Background install queue on the worker (up to a few downloads in parallel). Progress
-              shows bytes / %. Cancel applies to queued or in-flight jobs. <strong>Clear</strong>{" "}
-              removes finished jobs (succeeded / failed / cancelled) from the list only — it does
-              not delete files or cancel active downloads.
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-worker" title="Worker" active={helpFocus === "help-worker"}>
-            <p>
-              Primary setup lives on the <strong>Worker</strong> tab: one-line Linux/Windows host
-              scripts (machine token included), then Host/Port → Save worker. Short reminder: GPU
-              process is <code>freya-local-worker</code> (default port {DEFAULT_WORKER_PORT}); Studio
-              is usually in-cluster and reaches it by URL (
-              <code>FreyaDiffusionWorker</code> <code>externalEndpoint</code>).
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-worker-token" title="Machine API token" active={helpFocus === "help-worker-token"}>
-            <p>
-              Service token for MCP / workers (not human sign-in). Generate rotates the token; copy
-              it once. Advanced → paste / Save token stores it in this browser for recovery.
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-keys" title="API keys" active={helpFocus === "help-keys"}>
-            <p>
-              Keys stay on the Freya API (or Kubernetes Secrets). After save they are never shown
-              back in full — empty field + “configured” badge means still on file. OpenRouter alone
-              is enough for cloud Generate. Civitai is for search / install.
-            </p>
-            {mock ? (
-              <p>Mock mode: any non-empty value counts as configured.</p>
-            ) : null}
-          </HelpSection>
-
-          <HelpSection id="help-nsfw" title="Show NSFW local assets" active={helpFocus === "help-nsfw"}>
-            <p>
-              When off, Freya hides NSFW-looking local and Civitai results by name / API flag. Turn
-              on to show them in Studio lists.
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-zdr" title="Privacy / ZDR" active={helpFocus === "help-zdr"}>
-            <p>
-              <strong>ZDR</strong> asks OpenRouter for zero-data-retention routes on Freya requests
-              (<code>provider.zdr</code>). Account-wide ZDR at{" "}
-              <a href="https://openrouter.ai/settings/privacy" target="_blank" rel="noreferrer">
-                openrouter.ai/settings/privacy
-              </a>{" "}
-              still applies — Freya can only tighten routing, not loosen it.
-            </p>
-            <p>
-              With ZDR on, Image / Video pickers filter to ZDR-capable models and Auto prefers
-              Google media models. Many Flux / Seedream endpoints have no ZDR route and fail with a
-              clear error instead of a silent dead-end.
-            </p>
-            <p>
-              <strong>Data collection</strong> — Allow (providers may store/train) or Deny (only
-              no-collection endpoints).
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-tone" title="Instruction tone" active={helpFocus === "help-tone"}>
-            <p>
-              Appends a tone hint after pack / custom system prompts: Warm (default), Direct
-              (concise), or Steerable (low-refusal creative).
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-prompts" title="System prompts" active={helpFocus === "help-prompts"}>
-            <p>
-              Override Freya pack instructions (<code>packs/instructions/*.txt</code>).{" "}
-              <strong>Route</strong> classifies chat/picture/gif/video and Auto models;{" "}
-              <strong>Converse</strong> is the chat agent (tools, Installed-first LoRAs,
-              Plan/Auto/YOLO). Empty override uses the shipped default. Tone still appends after
-              the text. Reset clears the override.
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-composer" title="Composer defaults" active={helpFocus === "help-composer"}>
-            <p>
-              Pins for Agent / Image / Video / Router. <strong>Auto</strong> is Freya’s internal
-              router: it picks a concrete model for that job. If it fails, the cost / privacy /
-              alignment fallback is used. <strong>OpenRouter router (upstream)</strong> is{" "}
-              <code>openrouter/auto</code> — only when you select that row, not when you pick Auto.
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-cost" title="Cost" active={helpFocus === "help-cost"}>
-            <p>
-              Low, Medium, High, or Max chooses which built-in model the internal router and Auto
-              fallbacks use. Medium is the default. Privacy (ZDR / data collection) and Alignment
-              still change the set. A filled Auto fallback box overrides that one cell.
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-backend" title="Cloud | Local" active={helpFocus === "help-backend"}>
-            <p>
-              Same switch as the composer bar (stored in this browser). Cloud = OpenRouter. Local =
-              GPU worker (needs a reachable worker URL).
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-auto" title="Auto fallbacks" active={helpFocus === "help-auto"}>
-            <p>
-              Concrete models when Agent / Image / Video / Router are Auto and the internal router
-              does not suggest one. Leave blank to use the built-in set for the current cost tier,
-              privacy, and alignment. ZDR rows apply when ZDR or deny-collection is on. Do not put
-              openrouter/auto here — that id is only the explicit upstream picker option.
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-alignment" title="Catalog alignment" active={helpFocus === "help-alignment"}>
-            <p>
-              Freya-side filter on <code>/v1/models</code> (OpenRouter moderation flags + name
-              heuristics): Balanced (full list), Safety (moderated / major vendors), or Uncensored
-              (prefer low-moderation). Also steers blank Auto fallbacks.
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-providers" title="Chat providers" active={helpFocus === "help-providers"}>
-            <p>
-              Checked vendors appear in the Agent / Router picker. Unchecked are hidden. New vendors
-              from OpenRouter default to checked (opt-out).
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-metrics" title="OpenRouter metrics" active={helpFocus === "help-metrics"}>
-            <p>
-              Per-key spend from Freya’s completion key. Account credits need an OpenRouter
-              Management API key — see{" "}
-              <a
-                href="https://openrouter.ai/docs/guides/overview/auth/management-api-keys"
-                target="_blank"
-                rel="noreferrer"
-              >
-                Management keys
-              </a>
-              .
-            </p>
-          </HelpSection>
-
-          <HelpSection id="help-modes" title="Plan / Auto / YOLO" active={helpFocus === "help-modes"}>
-            <p>
-              <strong>Plan</strong> — Freya proposes tool calls; confirm before they run.{" "}
-              <strong>Auto</strong> — runs tools, asks when installs or character/LoRA choice are
-              ambiguous. <strong>YOLO</strong> — picks and runs (generate, search, install when a
-              worker is set). For character likeness, Freya prefers Installed base+LoRA combos
-              before Civitai.
-            </p>
-          </HelpSection>
-        </section>
-      )}
-
-      {tab === "guidelines" && (
-        <section className="panel settings guidelines-panel" aria-label="User guidelines">
-          <h2 className="guidelines-heading">Guidelines</h2>
-          <p className="guidelines-lead">
-            Freya is yours to run — with that comes responsibility for prompts, downloads, and
-            anything you publish.
-          </p>
-          <GuidelinesBody />
-          {!guidelinesAcked ? (
-            <div className="login-actions">
-              <button type="button" className="primary" onClick={acceptGuidelines}>
-                Accept &amp; acknowledge
-              </button>
-            </div>
-          ) : (
-            <p className="hint">Acknowledged in this browser.</p>
-          )}
+          {savedMsg && <p className="hint">{savedMsg}</p>}
         </section>
       )}
         </section>
       </div>
       </div>
-
-      {civitaiDetail && detailModel && (
-        <div
-          className="civitai-modal-backdrop"
-          role="presentation"
-          onClick={closeCivitaiDetail}
-        >
-          <div
-            className="civitai-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-label={detailModel.name || "Civitai asset"}
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="civitai-modal-head">
-              <div>
-                <span className="lora-type-badge">{detailModel.modelType || "Asset"}</span>
-                <h3>{detailModel.name}</h3>
-                <p className="hint">
-                  {[detailModel.creator && `by ${detailModel.creator}`, detailModel.baseModel, detailModel.versionName]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </p>
-              </div>
-              <button type="button" className="ghost" onClick={closeCivitaiDetail}>
-                Close
-              </button>
-            </div>
-            <div className="civitai-modal-gallery">
-              {detailImages.length > 0 ? (
-                <>
-                  <img
-                    src={detailImages[Math.min(detailImageIdx, detailImages.length - 1)]}
-                    alt=""
-                    onError={(e) => e.currentTarget.classList.add("is-broken")}
-                  />
-                  {detailImages.length > 1 && (
-                    <div className="row civitai-modal-thumbs">
-                      {detailImages.map((url, i) => (
-                        <button
-                          key={url}
-                          type="button"
-                          className={i === detailImageIdx ? "primary" : "ghost"}
-                          onClick={() => setDetailImageIdx(i)}
-                        >
-                          <img src={url} alt="" />
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </>
-              ) : (
-                <div className="lora-card-thumb-fallback">No preview</div>
-              )}
-            </div>
-            <div className="civitai-modal-body">
-              {(civitaiDetailBusy || civitaiDetail.loading) && (
-                <p className="hint">Loading details…</p>
-              )}
-              {civitaiDetail.error && <p className="hint">{civitaiDetail.error}</p>}
-              {detailModel.needsBase && (
-                <p className="civitai-needs-base">{detailModel.needsBase}</p>
-              )}
-              {detailModel.description && <p>{detailModel.description}</p>}
-              {(detailModel.trainedWords?.length || detailModel.triggerWord) && (
-                <p className="hint">
-                  Triggers:{" "}
-                  {(detailModel.trainedWords?.length
-                    ? detailModel.trainedWords
-                    : [detailModel.triggerWord]
-                  ).filter(Boolean).join(" · ")}
-                </p>
-              )}
-              {(detailModel.stats || detailModel.downloadCount != null) && (
-                <p className="hint">
-                  {[
-                    formatStat(detailModel.stats?.downloadCount ?? detailModel.downloadCount) &&
-                      `${formatStat(detailModel.stats?.downloadCount ?? detailModel.downloadCount)} downloads`,
-                    formatStat(detailModel.stats?.thumbsUpCount ?? detailModel.thumbsUp) &&
-                      `${formatStat(detailModel.stats?.thumbsUpCount ?? detailModel.thumbsUp)} likes`,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </p>
-              )}
-              {detailVersions.length > 0 && (
-                <div className="civitai-variant-picks" aria-label="Version and file">
-                  <label>
-                    Version
-                    <select
-                      value={detailSelectedVersion?.id ?? detailModel.versionId ?? ""}
-                      onChange={(e) => {
-                        const vid = Number(e.target.value);
-                        const ver =
-                          detailVersions.find((v) => String(v.id) === String(vid)) ||
-                          detailVersions[0];
-                        const primary = pickPrimaryCivitaiFile(ver?.files || []);
-                        selectCivitaiVariant(vid, primary?.id);
-                      }}
-                    >
-                      {detailVersions.map((v) => (
-                        <option key={v.id} value={v.id}>
-                          {v.name}
-                          {v.baseModel ? ` · ${v.baseModel}` : ""}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  {detailFiles.length > 0 && (
-                    <label>
-                      File
-                      <select
-                        value={detailModel.fileId ?? pickPrimaryCivitaiFile(detailFiles)?.id ?? ""}
-                        onChange={(e) => {
-                          const fid = Number(e.target.value);
-                          selectCivitaiVariant(
-                            detailSelectedVersion?.id ?? detailModel.versionId,
-                            fid,
-                          );
-                        }}
-                      >
-                        {detailFiles.map((f) => {
-                          const size = formatCivitaiFileSize(f);
-                          const fmt = f.format || f.type || "";
-                          return (
-                            <option key={f.id ?? f.name} value={f.id}>
-                              {[f.name || "file", fmt, f.primary ? "primary" : "", size]
-                                .filter(Boolean)
-                                .join(" · ")}
-                            </option>
-                          );
-                        })}
-                      </select>
-                    </label>
-                  )}
-                  {(detailModel.fileName || detailModel.fileFormat) && (
-                    <p className="hint">
-                      Installs as{" "}
-                      <code>{destPathForAsset(detailModel)}</code>
-                    </p>
-                  )}
-                </div>
-              )}
-              {(civitaiDetail.localOnly || detailModel.localAsset || detailModel.path) && (
-                <p className="hint">
-                  {[
-                    detailModel.path && `Path: ${detailModel.path}`,
-                    detailModel.baseModel && `Base: ${detailModel.baseModel}`,
-                    detailModel.sizeBytes != null && `Size: ${formatBytes(detailModel.sizeBytes)}`,
-                    detailModel.kind && `Kind: ${detailModel.kind}`,
-                    detailModel.modelId != null && `Civitai model: ${detailModel.modelId}`,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </p>
-              )}
-              <div className="row lora-card-actions">
-                <button
-                  type="button"
-                  className={`${isFavorite(detailModel) ? "primary" : "ghost"} icon-btn`}
-                  title={
-                    isFavorite(detailModel)
-                      ? "Remove from favorites"
-                      : "Save to favorites library"
-                  }
-                  aria-label={isFavorite(detailModel) ? "Unfavorite" : "Favorite"}
-                  onClick={() => toggleFavorite(detailModel)}
-                >
-                  <IconStar filled={isFavorite(detailModel)} />
-                </button>
-                {isPinnableAsset(detailModel) ? (
-                  <button
-                    type="button"
-                    className={`${isPinned(detailModel) ? "primary" : "ghost"} icon-btn`}
-                    title={
-                      isPinned(detailModel) ? "Unpin from this session" : "Pin to session"
-                    }
-                    aria-label={
-                      isPinned(detailModel) ? "Unpin from session" : "Pin to session"
-                    }
-                    onClick={() =>
-                      isPinned(detailModel)
-                        ? unpinLora(detailModel)
-                        : pinLora(
-                            detailModel,
-                            detailModel.path ? { path: detailModel.path } : undefined,
-                          )
-                    }
-                  >
-                    <IconPin />
-                  </button>
-                ) : null}
-                {renderInstallAction(detailModel)}
-                {(() => {
-                  const installed =
-                    findInstalledForItem(detailModel) ||
-                    (detailModel.path
-                      ? installedAssets.find((a) => a.path === detailModel.path)
-                      : null);
-                  const isCkpt =
-                    installed &&
-                    (installed.kind === "checkpoint" ||
-                      (installed.path || "").startsWith("checkpoints/"));
-                  const isActive = installed && activeBasePath && activeBasePath === installed.path;
-                  if (!isCkpt) return null;
-                  return (
-                    <button
-                      type="button"
-                      className={isActive ? "primary" : "ghost"}
-                      disabled={isActive}
-                      onClick={() => setInstalledAsBase(installed)}
-                    >
-                      {isActive ? "Active base" : "Set as base"}
-                    </button>
-                  );
-                })()}
-                {detailModel.civitaiUrl && (
-                  <a
-                    className="ghost"
-                    href={detailModel.civitaiUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    Open on Civitai
-                  </a>
-                )}
-              </div>
-              {(detailModel.needsBase || detailModel.baseModel) && (
-                <p className="hint">
-                  {detailModel.needsBase ||
-                    `LoRA base family: ${detailModel.baseModel}. Install a matching checkpoint to checkpoints/ on the local worker, then set it as active base on the Worker tab.`}
-                </p>
-              )}
-              {detailRelated.length > 0 && (
-                <div className="civitai-related">
-                  <h4>Needs checkpoint / related</h4>
-                  <p className="hint">
-                    Civitai does not expose a hard dependency graph — Freya suggests popular
-                    checkpoints for this base family so you can install and set one as active base.
-                    Install puts weights under FREYA_MODELS_DIR (game drive / PVC); set active base
-                    after.
-                  </p>
-                  <div className="lora-row">
-                    {detailRelated.map((rel) => {
-                      const card = rel?.model || rel;
-                      return renderLoraCard(
-                        {
-                          ...card,
-                          _relationNote: rel?.note || rel?.relation,
-                        },
-                        { compact: true },
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** Settings panel: list worker checkpoints + set active base for LoRA-compatible gens. */
-function WorkerBaseModelPanel({ busy, hasWorker, api, onSaved, onError }) {
-  const [checkpoints, setCheckpoints] = useState([]);
-  const [catalog, setCatalog] = useState([]);
-  const [active, setActive] = useState(null);
-  const [selected, setSelected] = useState("");
-  const [loading, setLoading] = useState(false);
-
-  const refresh = async () => {
-    if (!hasWorker) {
-      setCheckpoints([]);
-      setActive(null);
-      return;
-    }
-    setLoading(true);
-    try {
-      const [cps, base, models] = await Promise.all([
-        api("/v1/worker/checkpoints").catch(() => ({ data: [] })),
-        api("/v1/worker/base-model").catch(() => null),
-        api("/v1/base-models").catch(() => ({ items: [] })),
-      ]);
-      const list = Array.isArray(cps?.data) ? cps.data : [];
-      setCheckpoints(list);
-      setCatalog(Array.isArray(models?.items) ? models.items : []);
-      setActive(base);
-      if (base?.model) setSelected(base.model);
-      else if (list[0]?.path) setSelected(list[0].path);
-    } catch (e) {
-      onError?.(e.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasWorker]);
-
-  const setBase = async () => {
-    if (!selected.trim()) return;
-    setLoading(true);
-    try {
-      const match = checkpoints.find((c) => c.path === selected);
-      const catalogHit = catalog.find((c) => c.suggestedModel === selected);
-      const body = {
-        model: selected.trim(),
-        baseModel: match?.baseModel || catalogHit?.baseModel || undefined,
-      };
-      const res = await api("/v1/worker/base-model", {
-        method: "PUT",
-        body: JSON.stringify(body),
-      });
-      setActive(res);
-      onSaved?.(`Active base set to ${res.model || selected}`);
-      await refresh();
-    } catch (e) {
-      onError?.(e.message);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  if (!hasWorker) {
-    return <p className="hint">Connect a worker to set a base checkpoint.</p>;
-  }
-
-  const options = [
-    ...checkpoints.map((c) => ({
-      value: c.path,
-      label: `${c.name || c.id}${c.baseModel ? ` (${c.baseModel})` : ""}`,
-    })),
-    ...catalog
-      .filter((c) => !checkpoints.some((x) => x.path === c.suggestedModel))
-      .map((c) => ({
-        value: c.suggestedModel,
-        label: `${c.baseModel} hint → ${c.suggestedModel}`,
-      })),
-  ];
-
-  return (
-    <div className="worker-base-panel">
-      <div className="worker-vram-meta">
-        <span>Base checkpoint</span>
-        <button type="button" className="ghost" disabled={busy || loading} onClick={refresh}>
-          Refresh
-        </button>
-      </div>
-      <div className="worker-base-row">
-        <select
-          value={selected}
-          disabled={busy || loading || options.length === 0}
-          onChange={(e) => setSelected(e.target.value)}
-        >
-          {options.length === 0 ? (
-            <option value="">No checkpoints yet — install from Civitai</option>
-          ) : (
-            options.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))
-          )}
-        </select>
-        <button type="button" className="ghost" disabled={busy || loading || !selected} onClick={setBase}>
-          Set active
-        </button>
-      </div>
-      {active?.model && (
-        <p className="hint">
-          Current: {active.model}
-          {active.baseModel ? ` · ${active.baseModel}` : ""}
-        </p>
-      )}
     </div>
   );
 }

@@ -41,29 +41,22 @@ pub fn default_civitai_key() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct OpenRouterSpec {
     pub secret_ref: SecretKeyRef,
-    /// Default chat / plan model id. `auto` = Freya internal Auto (not `openrouter/auto`).
+    /// Default chat / plan model id (OpenRouter).
     #[serde(default = "default_chat_model")]
     pub chat_model: String,
-    /// Default cloud image model id. `auto` = Freya router / Flux NL default.
+    /// Default cloud image model id (OpenRouter).
     #[serde(default = "default_image_model")]
     pub image_model: String,
-    /// Freya-owned light intent router model. `auto` = Llama 3.1 8B-class (dolphin3 spirit).
-    #[serde(default = "default_router_model")]
-    pub router_model: String,
     #[serde(default = "default_openrouter_base")]
     pub base_url: String,
 }
 
 fn default_chat_model() -> String {
-    "auto".into()
+    "openrouter/auto".into()
 }
 
 fn default_image_model() -> String {
-    "auto".into()
-}
-
-fn default_router_model() -> String {
-    "auto".into()
+    "black-forest-labs/flux.2-klein-4b".into()
 }
 
 fn default_openrouter_base() -> String {
@@ -79,7 +72,6 @@ impl Default for OpenRouterSpec {
             },
             chat_model: default_chat_model(),
             image_model: default_image_model(),
-            router_model: default_router_model(),
             base_url: default_openrouter_base(),
         }
     }
@@ -112,12 +104,6 @@ pub struct IngressSpec {
     pub class_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
-    /// TLS Secret in the Studio namespace (e.g. `wildcard-dataknife-net-tls`).
-    /// Fleet pattern: same Let's Encrypt `*.dataknife.net` secret synced to
-    /// `kube-system` as the ingress default cert; copy into this namespace when
-    /// setting `tlsSecretName`. Omit to rely on the controller default cert only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_secret_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -159,7 +145,7 @@ pub struct HuggingFaceSpec {
     pub secret_ref: Option<SecretKeyRef>,
 }
 
-/// Namespaced Freya studio: API + UI + gallery + optional MCP.
+/// Namespaced Freya studio: API + UI + gallery.
 #[derive(CustomResource, Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "freya.dataknife.ai",
@@ -187,12 +173,6 @@ pub struct FreyaStudioSpec {
     pub api_image: Option<ImageRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_image: Option<ImageRef>,
-    /// MCP Streamable HTTP server image (defaults to harbor freya-mcp).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_image: Option<ImageRef>,
-    /// Deploy Freya MCP (`{name}-mcp`) and Ingress path `/mcp`. Default true.
-    #[serde(default = "default_mcp_enabled")]
-    pub mcp_enabled: bool,
     #[serde(default)]
     pub storage: StorageSpec,
     #[serde(default)]
@@ -200,42 +180,11 @@ pub struct FreyaStudioSpec {
     /// Optional FreyaDiffusionWorker name in the same namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diffusion_worker_ref: Option<String>,
-    /// Secret holding `FREYA_API_TOKEN` for the API (machine bearer for MCP/worker/UI after login).
-    /// When unset and `generateAdminSecrets` is true, the operator creates `{name}-api-token`.
+    /// Secret holding `FREYA_API_TOKEN` for the API. Set for non-dev / Ingress; UI sends the bearer from Settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_token_secret_ref: Option<SecretKeyRef>,
-    /// Game-operator style: ensure an admin login Secret (`username` + `admin-password`)
-    /// and, when `apiTokenSecretRef` is unset, an API bearer Secret. Default true.
-    #[serde(default = "default_generate_admin_secrets")]
-    pub generate_admin_secrets: bool,
-    /// BYO admin credentials Secret (keys: `admin-password` required, `username` optional → `admin`).
-    /// Used when `generateAdminSecrets` is false, or as the target name when generating.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub admin_credentials_secret_ref: Option<LocalObjectRef>,
     #[serde(default = "default_replicas")]
     pub replicas: i32,
-}
-
-/// Namespaced Secret reference (name only) — mirrors game-operator `credentialsSecretRef`.
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct LocalObjectRef {
-    pub name: String,
-}
-
-/// Secret key for the Studio admin password (game-operator convention).
-pub const SECRET_KEY_ADMIN_PASSWORD: &str = "admin-password";
-/// Secret key for the Studio admin username (default `admin` when absent).
-pub const SECRET_KEY_ADMIN_USERNAME: &str = "username";
-/// Secret key for the machine API bearer.
-pub const SECRET_KEY_API_TOKEN: &str = "token";
-
-fn default_generate_admin_secrets() -> bool {
-    true
-}
-
-fn default_mcp_enabled() -> bool {
-    true
 }
 
 fn default_replicas() -> i32 {
@@ -251,18 +200,6 @@ pub struct FreyaStudioStatus {
     pub api_endpoint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_endpoint: Option<String>,
-    /// In-cluster MCP Streamable HTTP base, e.g. `http://freya-mcp.freya.svc:8090/mcp`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mcp_endpoint: Option<String>,
-    /// Secret holding admin login (`username` + `admin-password`). Never includes the password.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub admin_credentials_secret_name: Option<String>,
-    /// True when the operator generated (or filled) the admin credentials Secret.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub admin_credentials_generated: Option<bool>,
-    /// Secret holding the machine API bearer (`token` key).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_token_secret_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
 }
@@ -415,10 +352,10 @@ pub enum WorkerPlacement {
 /// Optional GPU worker for local SD / LoRA (vLLM-Omni by default).
 ///
 /// Placement:
-/// - `external` (**recommended**) — point `externalEndpoint` at the GPU host running
-///   `freya-local-worker` / vLLM-Omni (or compatible `/v1/images/generations` + LoRA install).
-///   Studio stays in-cluster; the worker stays out-of-cluster via URL.
-/// - `incluster` (optional) — operator deploys the engine only when the cluster has GPUs.
+/// - `incluster` — operator deploys the engine on a GPU node when the cluster has GPUs.
+/// - `external` — point `externalEndpoint` at a remote physical system running vLLM-Omni
+///   (or compatible `/v1/images/generations` + LoRA install API). Freya UI/API use that
+///   endpoint; `FreyaModelAsset` installs LoRAs onto the remote worker for the UI catalog.
 #[derive(CustomResource, Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "freya.dataknife.ai",

@@ -1,5 +1,4 @@
 pub mod asset;
-pub mod credentials;
 pub mod generation;
 pub mod studio;
 pub mod worker;
@@ -20,13 +19,6 @@ pub fn default_api_image() -> (String, String) {
 pub fn default_ui_image() -> (String, String) {
     (
         "harbor.dataknife.net/library/freya-web".into(),
-        "0.1.0".into(),
-    )
-}
-
-pub fn default_mcp_image() -> (String, String) {
-    (
-        "harbor.dataknife.net/library/freya-mcp".into(),
         "0.1.0".into(),
     )
 }
