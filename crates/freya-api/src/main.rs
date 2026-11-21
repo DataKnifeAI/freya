@@ -1,11 +1,13 @@
 mod civitai;
 mod config;
 mod gallery;
+mod gpu;
 mod openrouter;
 mod routes;
 mod state;
 mod styles;
 mod worker;
+mod worker_ctl;
 
 use axum::extract::Request;
 use axum::http::{header, HeaderValue, Method, StatusCode};
@@ -62,6 +64,11 @@ async fn main() -> anyhow::Result<()> {
             "/v1/settings",
             get(routes::settings_get).put(routes::settings_put),
         )
+        .route("/v1/worker/stats", get(routes::worker_stats))
+        .route("/v1/worker/start", post(routes::worker_start))
+        .route("/v1/worker/stop", post(routes::worker_stop))
+        .route("/v1/worker/enable", post(routes::worker_enable))
+        .route("/v1/worker/disable", post(routes::worker_disable))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_token,

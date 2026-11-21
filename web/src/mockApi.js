@@ -359,9 +359,11 @@ const state = {
     civitaiConfigured: true,
     hfConfigured: false,
     diffusionWorkerUrl: "",
+    workerEnabled: true,
     chatModel: "openrouter/auto",
     imageModel: "black-forest-labs/flux.2-klein-4b",
   },
+  workerRuntime: { kind: "none", name: "mock", running: false, detail: "mock" },
   styles: STYLE_PACKS,
   gallery: [
     {
@@ -742,6 +744,44 @@ export async function mockApi(path, opts = {}) {
     return { ...state.settings };
   }
 
+  if (p === "/v1/worker/stats" && method === "GET") {
+    const configured = Boolean(state.settings.diffusionWorkerUrl);
+    const enabled = state.settings.workerEnabled !== false;
+    return {
+      ok: true,
+      enabled,
+      configured,
+      url: state.settings.diffusionWorkerUrl || null,
+      reachable: configured && enabled,
+      runtime: state.workerRuntime,
+      vram: null,
+      host: null,
+      loras: configured ? 2 : null,
+      checkpoints: configured ? 0 : null,
+      uptimeSec: configured ? 42 : null,
+      modelLoaded: null,
+      modelsDir: null,
+      worker: {},
+    };
+  }
+
+  if (p === "/v1/worker/start" && method === "POST") {
+    state.workerRuntime = { kind: "mock", name: "mock", running: true, detail: "mock start" };
+    return { ok: true, runtime: state.workerRuntime };
+  }
+  if (p === "/v1/worker/stop" && method === "POST") {
+    state.workerRuntime = { kind: "mock", name: "mock", running: false, detail: "mock stop" };
+    return { ok: true, runtime: state.workerRuntime };
+  }
+  if (p === "/v1/worker/enable" && method === "POST") {
+    state.settings.workerEnabled = true;
+    return { ok: true, enabled: true };
+  }
+  if (p === "/v1/worker/disable" && method === "POST") {
+    state.settings.workerEnabled = false;
+    return { ok: true, enabled: false };
+  }
+
   if (p === "/v1/gallery" && method === "GET") {
     return { items: state.gallery };
   }
@@ -1001,11 +1041,14 @@ export async function mockApi(path, opts = {}) {
   }
 
   if (p === "/v1/health" || p === "/healthz") {
+    const enabled = state.settings.workerEnabled !== false;
     return {
       ok: true,
       openRouter: state.settings.openRouterConfigured,
       civitai: state.settings.civitaiConfigured,
-      diffusionWorker: Boolean(state.settings.diffusionWorkerUrl),
+      diffusionWorker: Boolean(state.settings.diffusionWorkerUrl) && enabled,
+      workerEnabled: enabled,
+      workerConfigured: Boolean(state.settings.diffusionWorkerUrl),
       mock: true,
     };
   }

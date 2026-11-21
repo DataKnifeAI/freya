@@ -65,6 +65,23 @@ pub struct Config {
     #[arg(long, env = "FREYA_WORKER_TOKEN", default_value = "")]
     pub worker_token: String,
 
+    /// Accept invalid/self-signed TLS when calling the diffusion worker (local/dev Ingress).
+    #[arg(long, env = "FREYA_WORKER_TLS_INSECURE", default_value_t = false)]
+    pub worker_tls_insecure: bool,
+
+    /// Docker container name for local start/stop (`docker start|stop`).
+    #[arg(long, env = "FREYA_WORKER_CONTAINER", default_value = "freya-local-worker")]
+    pub worker_container: String,
+
+    /// Optional systemd unit name if the worker is not a docker container.
+    #[arg(long, env = "FREYA_WORKER_SYSTEMD_UNIT", default_value = "freya-worker.service")]
+    pub worker_systemd_unit: String,
+
+    /// When false, API treats the worker as unavailable (OpenRouter still works).
+    /// Persisted via secrets file / Settings enable|disable.
+    #[arg(long, env = "FREYA_WORKER_ENABLED", default_value_t = true)]
+    pub worker_enabled: bool,
+
     /// Comma-separated allowed CORS origins. Empty + no token → permissive (dev warning).
     /// Empty + token set → same-origin only (no `*`).
     #[arg(long, env = "FREYA_CORS_ORIGINS", default_value = "")]

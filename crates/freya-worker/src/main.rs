@@ -13,7 +13,9 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::fs;
+use tokio::process::Command;
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
@@ -32,6 +34,7 @@ struct Config {
 struct App {
     models_dir: PathBuf,
     token: String,
+    started: Instant,
 }
 
 #[tokio::main]
@@ -56,9 +59,11 @@ async fn main() -> anyhow::Result<()> {
     let state = Arc::new(App {
         models_dir: cfg.models_dir.clone(),
         token: cfg.token.trim().to_string(),
+        started: Instant::now(),
     });
     let protected = Router::new()
         .route("/v1/loras", get(list_loras))
+        .route("/v1/stats", get(stats))
         .route("/v1/images/generations", post(generate))
         .route("/v1/assets/install", post(install))
         .route_layer(middleware::from_fn_with_state(
@@ -66,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
             require_worker_token,
         ));
     let app = Router::new()
-        .route("/health", get(|| async { Json(json!({"ok": true})) }))
+        .route("/health", get(health))
         .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -75,6 +80,113 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Health for local ops. Includes GPU/VRAM when `nvidia-smi` is available
+/// (null inside GPU-less containers — freya-api may enrich from the host).
+async fn health(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    Json(build_stats(&app).await)
+}
+
+/// Same payload as `/health` behind optional worker auth.
+async fn stats(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+    Json(build_stats(&app).await)
+}
+
+async fn build_stats(app: &App) -> serde_json::Value {
+    let loras = count_entries(&app.models_dir.join("loras")).await;
+    let checkpoints = count_entries(&app.models_dir.join("checkpoints")).await;
+    let (vram, host) = collect_gpu_stats().await;
+    json!({
+        "ok": true,
+        "modelsDir": app.models_dir.display().to_string(),
+        "loras": loras,
+        "checkpoints": checkpoints,
+        "uptimeSec": app.started.elapsed().as_secs(),
+        "modelLoaded": serde_json::Value::Null,
+        "vram": vram,
+        "host": host,
+    })
+}
+
+/// Query NVIDIA GPUs via `nvidia-smi`. Returns `(vram, host)` JSON values (null if unavailable).
+async fn collect_gpu_stats() -> (serde_json::Value, serde_json::Value) {
+    let out = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=index,name,memory.used,memory.total,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .await;
+    let Ok(out) = out else {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    };
+    if !out.status.success() {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut gpus = Vec::new();
+    let mut used_total = 0u64;
+    let mut mem_total = 0u64;
+    let mut util_sum = 0u64;
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        let index: u64 = parts[0].parse().unwrap_or(0);
+        let name = parts[1].to_string();
+        let used: u64 = parts[2].parse().unwrap_or(0);
+        let total: u64 = parts[3].parse().unwrap_or(0);
+        let util: u64 = parts[4].parse().unwrap_or(0);
+        used_total += used;
+        mem_total += total;
+        util_sum += util;
+        gpus.push(json!({
+            "index": index,
+            "name": name,
+            "usedMiB": used,
+            "totalMiB": total,
+            "utilPercent": util,
+        }));
+    }
+    if gpus.is_empty() {
+        return (serde_json::Value::Null, serde_json::Value::Null);
+    }
+    let n = gpus.len() as u64;
+    let hostname = hostname_string();
+    (
+        json!({
+            "usedMiB": used_total,
+            "totalMiB": mem_total,
+            "utilPercent": util_sum / n.max(1),
+            "gpus": gpus,
+        }),
+        json!({
+            "hostname": hostname,
+            "source": "nvidia-smi",
+        }),
+    )
+}
+
+fn hostname_string() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+async fn count_entries(dir: &Path) -> usize {
+    let Ok(mut rd) = fs::read_dir(dir).await else {
+        return 0;
+    };
+    let mut n = 0usize;
+    while let Ok(Some(_)) = rd.next_entry().await {
+        n += 1;
+    }
+    n
 }
 
 async fn require_worker_token(

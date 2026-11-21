@@ -446,6 +446,8 @@ export default function App() {
       (typeof localStorage !== "undefined" && localStorage.getItem("freya.apiToken")) || "",
   );
   const [workerUrl, setWorkerUrl] = useState("");
+  const [workerStats, setWorkerStats] = useState(null);
+  const [workerCtlBusy, setWorkerCtlBusy] = useState(false);
   const [civitaiQ, setCivitaiQ] = useState(BEGINNER_CIVITAI_QUERY);
   const [civitaiItems, setCivitaiItems] = useState([]);
   const [civitaiSubview, setCivitaiSubview] = useState("search");
@@ -749,6 +751,48 @@ export default function App() {
   useEffect(() => {
     refresh();
   }, []);
+
+  const refreshWorkerStats = async () => {
+    try {
+      const st = await api("/v1/worker/stats");
+      setWorkerStats(st);
+    } catch {
+      setWorkerStats(null);
+    }
+  };
+
+  useEffect(() => {
+    if (tab !== "settings" || mock) return undefined;
+    refreshWorkerStats();
+    const id = setInterval(refreshWorkerStats, 5000);
+    return () => clearInterval(id);
+  }, [tab, mock]);
+
+  const workerControl = async (action) => {
+    setWorkerCtlBusy(true);
+    setError("");
+    setSavedMsg("");
+    try {
+      await api(`/v1/worker/${action}`, { method: "POST", body: "{}" });
+      const st = await api("/v1/settings");
+      setSettings(st);
+      await refreshWorkerStats();
+      const health = await api("/v1/health").catch(() => null);
+      setSavedMsg(
+        action === "stop"
+          ? `Worker stop requested${health ? ` · health diffusionWorker=${health.diffusionWorker}` : ""}`
+          : action === "start"
+            ? `Worker start requested${health ? ` · health diffusionWorker=${health.diffusionWorker}` : ""}`
+            : action === "disable"
+              ? "Worker disabled — local gens skipped; OpenRouter still works"
+              : "Worker enabled",
+      );
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setWorkerCtlBusy(false);
+    }
+  };
 
   const persistModels = (nextAgent, nextImage) => {
     try {
@@ -1595,7 +1639,15 @@ export default function App() {
               OpenRouter
               <span className={`status-dot ${settings.civitaiConfigured ? "on" : ""}`} />
               Civitai
-              <span className={`status-dot ${settings.diffusionWorkerUrl ? "on" : ""}`} />
+              <span
+                className={`status-dot ${
+                  workerStats?.reachable && settings.workerEnabled !== false
+                    ? "on"
+                    : settings.diffusionWorkerUrl
+                      ? "warn"
+                      : ""
+                }`}
+              />
               Worker
             </span>
           )}
@@ -2397,9 +2449,111 @@ export default function App() {
             />
             <span className="hint">
               Optional. Needed to install LoRAs and run local/custom models. Leave blank to generate
-              only via OpenRouter.
+              only via OpenRouter. Enable/Disable detaches the URL without clearing it; Start/Stop
+              controls the local docker/systemd worker when present.
             </span>
           </label>
+          <div className="worker-panel" aria-label="Diffusion worker status">
+            <div className="worker-panel-head">
+              <span
+                className={`status-dot ${
+                  workerStats?.reachable && (workerStats?.enabled ?? settings?.workerEnabled) !== false
+                    ? "on"
+                    : workerStats?.configured || workerUrl
+                      ? "warn"
+                      : ""
+                }`}
+              />
+              <strong>Worker</strong>
+              <span className="hint">
+                {mock
+                  ? "mock stats"
+                  : workerStats
+                    ? [
+                        workerStats.enabled === false ? "disabled" : "enabled",
+                        workerStats.reachable ? "up" : "down",
+                        workerStats.runtime?.kind && workerStats.runtime.kind !== "none"
+                          ? workerStats.runtime.kind
+                          : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")
+                    : "—"}
+              </span>
+            </div>
+            {(() => {
+              const vram = workerStats?.vram;
+              const used = vram?.usedMiB;
+              const total = vram?.totalMiB;
+              const pct =
+                typeof used === "number" && typeof total === "number" && total > 0
+                  ? Math.min(100, Math.round((used / total) * 100))
+                  : null;
+              const util = vram?.utilPercent;
+              return (
+                <div className="worker-vram">
+                  <div className="worker-vram-meta">
+                    <span>VRAM</span>
+                    <span>
+                      {pct != null
+                        ? `${used} / ${total} MiB (${pct}%)`
+                        : mock
+                          ? "— (mock)"
+                          : "n/a"}
+                      {typeof util === "number" ? ` · GPU ${util}%` : ""}
+                    </span>
+                  </div>
+                  <div className="worker-vram-bar" role="progressbar" aria-valuenow={pct ?? 0} aria-valuemin={0} aria-valuemax={100}>
+                    <div className="worker-vram-fill" style={{ width: `${pct ?? 0}%` }} />
+                  </div>
+                  {(workerStats?.loras != null || workerStats?.checkpoints != null) && (
+                    <p className="hint">
+                      LoRAs {workerStats.loras ?? "—"} · checkpoints {workerStats.checkpoints ?? "—"}
+                      {workerStats.uptimeSec != null ? ` · up ${workerStats.uptimeSec}s` : ""}
+                    </p>
+                  )}
+                </div>
+              );
+            })()}
+            <div className="worker-controls">
+              <button
+                type="button"
+                className="ghost"
+                disabled={busy || workerCtlBusy || mock}
+                onClick={() => workerControl("start")}
+                title="Start local docker/systemd worker"
+              >
+                ▶ Start
+              </button>
+              <button
+                type="button"
+                className="ghost"
+                disabled={busy || workerCtlBusy || mock}
+                onClick={() => workerControl("stop")}
+                title="Stop local docker/systemd worker"
+              >
+                ■ Stop
+              </button>
+              <button
+                type="button"
+                className="ghost"
+                disabled={busy || workerCtlBusy || mock}
+                onClick={() => workerControl("enable")}
+                title="Use configured worker for local gens"
+              >
+                Enable
+              </button>
+              <button
+                type="button"
+                className="ghost"
+                disabled={busy || workerCtlBusy || mock}
+                onClick={() => workerControl("disable")}
+                title="Detach worker — OpenRouter cloud path still works"
+              >
+                Disable
+              </button>
+            </div>
+          </div>
           <p className="hint">
             Video (OpenRouter):{" "}
             {videoModels.length > 0

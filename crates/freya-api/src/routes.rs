@@ -13,20 +13,150 @@ use serde_json::{json, Value};
 type ApiResult<T> = Result<T, ApiError>;
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let cfg = state.config.read().await;
-    let worker_ok = {
+    let (open_router, civitai, worker_enabled, worker_url) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.openrouter_configured(),
+            cfg.civitai_configured(),
+            cfg.worker_enabled,
+            cfg.diffusion_worker_url.clone(),
+        )
+    };
+    let worker_ok = if worker_enabled {
         let w = state.worker.read().await;
         match w.as_ref() {
             Some(c) => c.health().await,
             None => false,
         }
+    } else {
+        false
     };
     Json(json!({
         "ok": true,
-        "openRouter": cfg.openrouter_configured(),
-        "civitai": cfg.civitai_configured(),
+        "openRouter": open_router,
+        "civitai": civitai,
         "diffusionWorker": worker_ok,
+        "workerEnabled": worker_enabled,
+        "workerConfigured": worker_url.is_some(),
     }))
+}
+
+/// Proxy worker GPU/runtime stats; enrich VRAM from host `nvidia-smi` when worker returns null.
+pub async fn worker_stats(State(state): State<AppState>) -> impl IntoResponse {
+    let (enabled, url, container, unit) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.worker_enabled,
+            cfg.diffusion_worker_url.clone(),
+            cfg.worker_container.clone(),
+            cfg.worker_systemd_unit.clone(),
+        )
+    };
+    let runtime = crate::worker_ctl::detect(&container, &unit).await;
+    let mut worker_payload = Value::Null;
+    let mut reachable = false;
+    if enabled {
+        let w = state.worker.read().await;
+        if let Some(c) = w.as_ref() {
+            if let Some(detail) = c.stats_detail().await {
+                reachable = true;
+                worker_payload = detail;
+            }
+        }
+    } else if let Some(url) = url.as_ref() {
+        // Still probe reachability for the panel when disabled (URL kept, client detached).
+        let probe = crate::worker::DiffusionWorkerClient::new_with_tls(
+            url.clone(),
+            state.config.read().await.worker_tls_insecure,
+        )
+        .with_token(state.config.read().await.worker_token.clone());
+        if let Some(detail) = probe.stats_detail().await {
+            reachable = true;
+            worker_payload = detail;
+        }
+    }
+
+    let mut vram = worker_payload
+        .get("vram")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut host = worker_payload
+        .get("host")
+        .cloned()
+        .unwrap_or(Value::Null);
+    if vram.is_null() {
+        let host_vram = crate::gpu::collect_host_vram().await;
+        if !host_vram.is_null() {
+            vram = host_vram;
+            if host.is_null() {
+                host = json!({
+                    "hostname": crate::gpu::hostname_string(),
+                    "source": "host-nvidia-smi",
+                });
+            }
+        }
+    }
+
+    Json(json!({
+        "ok": true,
+        "enabled": enabled,
+        "configured": url.is_some(),
+        "url": url,
+        "reachable": reachable,
+        "runtime": runtime.to_json(),
+        "vram": vram,
+        "host": host,
+        "loras": worker_payload.get("loras").cloned().unwrap_or(Value::Null),
+        "checkpoints": worker_payload.get("checkpoints").cloned().unwrap_or(Value::Null),
+        "uptimeSec": worker_payload.get("uptimeSec").cloned().unwrap_or(Value::Null),
+        "modelLoaded": worker_payload.get("modelLoaded").cloned().unwrap_or(Value::Null),
+        "modelsDir": worker_payload.get("modelsDir").cloned().unwrap_or(Value::Null),
+        "worker": worker_payload,
+    }))
+}
+
+pub async fn worker_start(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let (container, unit) = {
+        let cfg = state.config.read().await;
+        (cfg.worker_container.clone(), cfg.worker_systemd_unit.clone())
+    };
+    let runtime = crate::worker_ctl::start(&container, &unit)
+        .await
+        .map_err(ApiError::Msg)?;
+    // Brief wait so /health can come up before the UI polls.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    Ok(Json(json!({ "ok": true, "runtime": runtime.to_json() })))
+}
+
+pub async fn worker_stop(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let (container, unit) = {
+        let cfg = state.config.read().await;
+        (cfg.worker_container.clone(), cfg.worker_systemd_unit.clone())
+    };
+    let runtime = crate::worker_ctl::stop(&container, &unit)
+        .await
+        .map_err(ApiError::Msg)?;
+    Ok(Json(json!({ "ok": true, "runtime": runtime.to_json() })))
+}
+
+pub async fn worker_enable(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    {
+        let mut cfg = state.config.write().await;
+        cfg.worker_enabled = true;
+    }
+    state.rebuild_worker_client().await;
+    let _ = state.persist_secrets().await;
+    Ok(Json(json!({ "ok": true, "enabled": true })))
+}
+
+pub async fn worker_disable(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    {
+        let mut cfg = state.config.write().await;
+        cfg.worker_enabled = false;
+    }
+    state.rebuild_worker_client().await;
+    let _ = state.persist_secrets().await;
+    Ok(Json(json!({ "ok": true, "enabled": false })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1283,6 +1413,7 @@ pub struct SettingsPublic {
     pub civitai_configured: bool,
     pub hf_configured: bool,
     pub diffusion_worker_url: Option<String>,
+    pub worker_enabled: bool,
     pub chat_model: String,
     pub image_model: String,
 }
@@ -1294,6 +1425,7 @@ pub async fn settings_get(State(state): State<AppState>) -> Json<SettingsPublic>
         civitai_configured: cfg.civitai_configured(),
         hf_configured: !cfg.hf_token.is_empty(),
         diffusion_worker_url: cfg.diffusion_worker_url.clone(),
+        worker_enabled: cfg.worker_enabled,
         chat_model: cfg.chat_model.clone(),
         image_model: cfg.image_model.clone(),
     })
@@ -1327,13 +1459,8 @@ pub async fn settings_put(
         if let Some(url) = upd.diffusion_worker_url {
             if url.is_empty() {
                 cfg.diffusion_worker_url = None;
-                *state.worker.write().await = None;
             } else {
-                cfg.diffusion_worker_url = Some(url.clone());
-                *state.worker.write().await = Some(
-                    crate::worker::DiffusionWorkerClient::new(url)
-                        .with_token(cfg.worker_token.clone()),
-                );
+                cfg.diffusion_worker_url = Some(url);
             }
         }
         if let Some(m) = upd.chat_model {
@@ -1348,8 +1475,11 @@ pub async fn settings_put(
         openrouter_api_key: upd.openrouter_api_key,
         civitai_api_key: upd.civitai_api_key,
         hf_token: upd.hf_token,
+        diffusion_worker_url: None, // URL already applied above; persist_secrets writes full snapshot
+        worker_enabled: None,
     };
     state.apply_secrets(secrets).await;
+    state.rebuild_worker_client().await;
     let _ = state.persist_secrets().await;
 
     // OpenRouterClient captures chat/image model at construction — rebuild after changes.

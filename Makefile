@@ -4,7 +4,7 @@ VERSION ?= 0.1.0
 CARGO ?= cargo
 
 .PHONY: all help build release test fmt fmt-check lint vet ci run-api run-worker run-operator \
-	manifests install deploy up-local clean docker-build
+	manifests install deploy up-local kind-hosts clean docker-build
 
 all: build
 
@@ -100,6 +100,9 @@ up-local: ## API + notes for UI (copy .env.example → .env first)
 .PHONY: mock-ui
 mock-ui: ## Interactive Freya UI mock (no API / keys required)
 	cd web && npm install && npm run dev:mock
+
+kind-hosts: ## Map freya.dataknife.net → 127.0.0.1 for kind Ingress
+	./scripts/kind-hosts.sh
 
 clean:
 	$(CARGO) clean
