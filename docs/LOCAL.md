@@ -39,6 +39,17 @@ In the UI, session automation modes:
 
 Worker is optional: cloud generate uses OpenRouter; LoRA install needs `FREYA_DIFFUSION_WORKER_URL` + Civitai.
 
+### Civitai in the UI
+
+- Search/Suggest returns installable types (LoRA, LoCon, DoRA, Checkpoint, TextualInversion, VAE) with thumbnails and type badges — not LoRA-only.
+- **Pin** = session-scoped (current generate). **★ Favorite** = persistent library in `localStorage` (`freya.civitaiFavorites`); Civitai tab → Favorites.
+- Click a card for details (previews, triggers, base model, related checkpoints). Related assets are Freya-derived from `baseModel` (Civitai has no hard dependency graph).
+- API: `GET /v1/civitai/search`, `GET /v1/civitai/models/{id}`, `POST /v1/civitai/install`.
+
+### Video generation (OpenRouter — discovery only)
+
+OpenRouter supports async video via `POST /api/v1/videos` + poll, and catalogs at `GET /api/v1/videos/models` or `GET /api/v1/models?output_modalities=video`. Freya’s `GET /v1/models` now includes a `video` array for discovery; Settings shows a short note. Freya does **not** generate video in the UI yet (image path stays sync `/images`).
+
 ### API / worker auth (non-dev)
 
 By default `FREYA_API_TOKEN` / `FREYA_WORKER_TOKEN` are empty and `/v1` routes are open — both binaries log a warning (local/dev). For anything exposed beyond localhost:

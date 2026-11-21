@@ -99,23 +99,15 @@ pub async fn assist(
                 out["civitaiQuery"] = json!(q);
                 let civ = state.civitai.read().await;
                 if civ.configured() {
-                    match civ.search(q, 8).await {
+                    match civ.search(q, 12).await {
                         Ok(items) => {
-                            let loras: Vec<_> = items
+                            let mut assets: Vec<_> = items
                                 .into_iter()
-                                .filter(|c| {
-                                    c.model_type.eq_ignore_ascii_case("LORA")
-                                        || c.model_type.eq_ignore_ascii_case("LoCon")
-                                        || c.model_type.to_lowercase().contains("lora")
-                                })
-                                .take(6)
+                                .filter(|c| crate::civitai::is_freya_asset_type(&c.model_type))
                                 .collect();
-                            out["loras"] = json!(if loras.is_empty() {
-                                // fall back to whatever matched the vibe
-                                civ.search(q, 6).await.unwrap_or_default()
-                            } else {
-                                loras
-                            });
+                            assets.sort_by_key(|c| crate::civitai::asset_type_rank(&c.model_type));
+                            assets.truncate(6);
+                            out["loras"] = json!(assets);
                         }
                         Err(e) => {
                             out["civitaiError"] = json!(e.to_string());
@@ -426,6 +418,7 @@ pub async fn gallery_remix(
 pub async fn models(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let or = state.openrouter.read().await;
     let mut cloud = or.list_image_models().await.unwrap_or_default();
+    let video = or.list_video_models().await.unwrap_or_default();
     let mut local = Vec::new();
     if let Some(w) = state.worker.read().await.as_ref() {
         if let Ok(loras) = w.list_loras().await {
@@ -442,7 +435,18 @@ pub async fn models(State(state): State<AppState>) -> ApiResult<Json<serde_json:
     }
     Ok(Json(json!({
         "openrouter": cloud.drain(..).map(|m| json!({
-            "id": m.id, "name": m.name, "backend": m.backend
+            "id": m.id, "name": m.name, "backend": m.backend, "modality": "image"
+        })).collect::<Vec<_>>(),
+        // Video is async on OpenRouter (POST /videos + poll) — listed for discovery; Freya UI
+        // does not generate video yet.
+        "video": video.into_iter().map(|m| json!({
+            "id": m.id,
+            "name": m.name,
+            "backend": "openrouter",
+            "modality": "video",
+            "supportedDurations": m.supported_durations,
+            "supportedResolutions": m.supported_resolutions,
+            "supportedAspectRatios": m.supported_aspect_ratios,
         })).collect::<Vec<_>>(),
         "local": local,
     })))
@@ -460,10 +464,32 @@ pub struct CivitaiSearchQuery {
     pub q: String,
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// Optional comma-separated Civitai ModelTypes (e.g. `LORA,Checkpoint,VAE`).
+    /// Empty / omitted → Freya defaults (adapters, checkpoints, embeddings, VAE).
+    #[serde(default)]
+    pub types: Option<String>,
 }
 
 fn default_limit() -> u32 {
     20
+}
+
+fn parse_civitai_types(raw: Option<&str>) -> Vec<String> {
+    let owned: Vec<String> = raw
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if owned.is_empty() {
+        crate::civitai::DEFAULT_SEARCH_TYPES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    } else {
+        owned
+    }
 }
 
 pub async fn civitai_search(
@@ -471,8 +497,59 @@ pub async fn civitai_search(
     Query(q): Query<CivitaiSearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let civ = state.civitai.read().await;
-    let items = civ.search(&q.q, q.limit).await.map_err(ApiError::from)?;
+    let types = parse_civitai_types(q.types.as_deref());
+    let type_refs: Vec<&str> = types.iter().map(String::as_str).collect();
+    let items = civ
+        .search_types(&q.q, q.limit, &type_refs)
+        .await
+        .map_err(ApiError::from)?;
     Ok(Json(json!({ "items": items })))
+}
+
+/// Full Civitai model detail + related compatible checkpoints (when applicable).
+pub async fn civitai_model(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let civ = state.civitai.read().await;
+    let detail = civ.get_model(id).await.map_err(ApiError::from)?;
+    // Nested shape for the UI modal: { model, related: [{ model, note }] }.
+    let related: Vec<_> = detail
+        .related
+        .iter()
+        .map(|r| {
+            json!({
+                "relation": "compatible_checkpoint",
+                "note": detail.base_model.as_ref().map(|b| format!("Popular checkpoint for {b}")),
+                "model": r,
+            })
+        })
+        .collect();
+    let model = json!({
+        "id": detail.id,
+        "name": detail.name,
+        "modelType": detail.model_type,
+        "versionId": detail.version_id,
+        "versionName": detail.version_name,
+        "downloadUrl": detail.download_url,
+        "thumbnailUrl": detail.thumbnail_url,
+        "examplePrompt": detail.example_prompt,
+        "baseModel": detail.base_model,
+        "trainedWords": detail.trained_words,
+        "triggerWord": detail.trigger_word,
+        "description": detail.description,
+        "creator": detail.creator,
+        "imageUrls": detail.image_urls,
+        "civitaiUrl": detail.civitai_url,
+        "needsBase": detail.needs_base,
+        "downloadCount": detail.download_count,
+        "thumbsUp": detail.thumbs_up,
+        "stats": {
+            "downloadCount": detail.download_count,
+            "thumbsUpCount": detail.thumbs_up,
+        },
+    });
+    Ok(Json(json!({ "model": model, "related": related })))
 }
 
 #[derive(Debug, Deserialize)]
