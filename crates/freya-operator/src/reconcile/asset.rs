@@ -120,6 +120,36 @@ async fn read_secret_key(ctx: &Ctx, ns: &str, name: &str, key: &str) -> Result<S
         .map_err(|e| Error::Http(format!("secret {name}/{key} not utf8: {e}")))
 }
 
+/// Same download hosts as freya-worker install — required before attaching `secretRef`.
+fn asset_download_host_ok(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    h == "civitai.com"
+        || h.ends_with(".civitai.com")
+        || h == "huggingface.co"
+        || h.ends_with(".huggingface.co")
+        || h == "hf.co"
+        || h.ends_with(".hf.co")
+}
+
+fn asset_download_url_ok(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "https" | "http") {
+        return false;
+    }
+    parsed.host_str().is_some_and(asset_download_host_ok)
+}
+
+fn sanitize_asset_url(url: &str) -> Result<(), Error> {
+    if !asset_download_url_ok(url) {
+        return Err(Error::BadUrl(
+            "url must be http(s) on civitai.com, huggingface.co, or hf.co".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Reject absolute / `..` / shell-metachar dest paths; must stay under `/models`.
 fn sanitize_dest_path(dest: &str) -> Result<(), Error> {
     if dest.is_empty() {
@@ -178,6 +208,8 @@ async fn ensure_download_job(
     owner: &OwnerReference,
 ) -> Result<(), Error> {
     sanitize_dest_path(&asset.spec.dest_path)?;
+    // Allowlist before mounting secretRef — prevents sending namespace secrets to attacker URLs.
+    sanitize_asset_url(&asset.spec.url)?;
     let job_name = format!("freya-asset-{name}");
     let pvc = format!("{}-models", asset.spec.worker_ref);
     let mut env = vec![
@@ -198,6 +230,7 @@ async fn ensure_download_job(
         },
     ];
 
+    // Only mount secretRef after allowlist — never present namespace secrets to arbitrary hosts.
     if let Some(secret) = &asset.spec.secret_ref {
         env.push(EnvVar {
             name: "ASSET_TOKEN".into(),
@@ -260,11 +293,21 @@ case "$DEST" in
     exit 1
     ;;
 esac
+# Defense in depth: refuse token attach / download outside allowlisted hosts.
+case "$ASSET_URL" in
+  https://civitai.com/*|http://civitai.com/*|https://*.civitai.com/*|http://*.civitai.com/*) ;;
+  https://huggingface.co/*|http://huggingface.co/*|https://*.huggingface.co/*|http://*.huggingface.co/*) ;;
+  https://hf.co/*|http://hf.co/*|https://*.hf.co/*|http://*.hf.co/*) ;;
+  *)
+    echo "refusing non-allowlisted ASSET_URL" >&2
+    exit 1
+    ;;
+esac
 mkdir -p "$(dirname "$DEST")"
 if [ -n "${ASSET_TOKEN:-}" ]; then
-  curl -fL -H "Authorization: Bearer ${ASSET_TOKEN}" -o "$DEST" -- "$ASSET_URL"
+  curl -fL --max-redirs 5 -H "Authorization: Bearer ${ASSET_TOKEN}" -o "$DEST" -- "$ASSET_URL"
 else
-  curl -fL -o "$DEST" -- "$ASSET_URL"
+  curl -fL --max-redirs 5 -o "$DEST" -- "$ASSET_URL"
 fi
 echo "installed $DEST_PATH"
 "#
@@ -364,6 +407,24 @@ pub fn error_policy(asset: Arc<FreyaModelAsset>, err: &Error, _ctx: Arc<Ctx>) ->
     Action::requeue(Duration::from_secs(30))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allowlist_asset_download_hosts() {
+        assert!(asset_download_url_ok(
+            "https://civitai.com/api/download/models/1?token=x"
+        ));
+        assert!(asset_download_url_ok(
+            "https://huggingface.co/org/model/resolve/main/file.safetensors"
+        ));
+        assert!(sanitize_asset_url("https://hf.co/org/model").is_ok());
+        assert!(sanitize_asset_url("https://evil.example/steal").is_err());
+        assert!(sanitize_asset_url("file:///etc/passwd").is_err());
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("missing namespace")]
@@ -374,6 +435,8 @@ pub enum Error {
     MissingEndpoint,
     #[error("bad destPath: {0}")]
     BadDest(String),
+    #[error("bad url: {0}")]
+    BadUrl(String),
     #[error("kube: {0}")]
     Kube(#[from] kube::Error),
     #[error("http: {0}")]

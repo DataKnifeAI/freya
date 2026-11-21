@@ -16,7 +16,7 @@ User → Freya UI → Freya API
 | OpenRouter | `spec.openRouter.secretRef` | `OPENROUTER_API_KEY` | Also editable in UI Settings |
 | Civitai | `spec.civitai.secretRef` | `CIVITAI_API_KEY` | UI Settings |
 | Hugging Face | `spec.huggingFace.secretRef` | `HF_TOKEN` | optional |
-| API bearer | `FreyaStudio.spec.apiTokenSecretRef` | `FREYA_API_TOKEN` | UI nginx injects `Authorization`; required for Ingress |
+| API bearer | `FreyaStudio.spec.apiTokenSecretRef` | `FREYA_API_TOKEN` | UI sends bearer from Settings (not injected by nginx); required for Ingress |
 | Worker bearer | `FreyaDiffusionWorker.spec.authSecretRef` | `FREYA_WORKER_TOKEN` | Injected on worker + API |
 
 Never put API keys in CRD string fields — only Secret references.

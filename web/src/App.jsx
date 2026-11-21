@@ -378,6 +378,10 @@ export default function App() {
   const [settings, setSettings] = useState(null);
   const [civitaiKey, setCivitaiKey] = useState("");
   const [openrouterKey, setOpenrouterKey] = useState("");
+  const [studioToken, setStudioToken] = useState(
+    () =>
+      (typeof localStorage !== "undefined" && localStorage.getItem("freya.apiToken")) || "",
+  );
   const [workerUrl, setWorkerUrl] = useState("");
   const [civitaiQ, setCivitaiQ] = useState(BEGINNER_CIVITAI_QUERY);
   const [civitaiItems, setCivitaiItems] = useState([]);
@@ -1095,6 +1099,12 @@ export default function App() {
     setError("");
     setSavedMsg("");
     try {
+      // Persist studio bearer first so the PUT below authenticates when FREYA_API_TOKEN is set.
+      if (studioToken.trim()) {
+        localStorage.setItem("freya.apiToken", studioToken.trim());
+      } else {
+        localStorage.removeItem("freya.apiToken");
+      }
       const body = { diffusionWorkerUrl: workerUrl };
       if (civitaiKey.trim()) body.civitaiApiKey = civitaiKey.trim();
       if (openrouterKey.trim()) body.openrouterApiKey = openrouterKey.trim();
@@ -1108,7 +1118,7 @@ export default function App() {
       setSavedMsg(
         mock
           ? "Mock settings saved in-memory (reload resets unless you keep this tab open)."
-          : "Settings saved. Keys are stored for this Freya API instance.",
+          : "Settings saved. Provider keys stay on the API; studio bearer stays in this browser.",
       );
     } catch (e) {
       setError(e.message);
@@ -2001,6 +2011,21 @@ export default function App() {
             OpenRouter alone is enough for cloud Generate — a worker is only for LoRAs and custom
             local looks.
           </p>
+          <label>
+            Studio API token
+            <input
+              type="password"
+              autoComplete="off"
+              placeholder="Bearer for /v1 when Freya API auth is enabled"
+              value={studioToken}
+              onChange={(e) => setStudioToken(e.target.value)}
+            />
+            <span className="hint">
+              Stored only in this browser (localStorage). Required when the API has{" "}
+              <code>FREYA_API_TOKEN</code> / <code>apiTokenSecretRef</code> set. Leave blank for open
+              local/dev.
+            </span>
+          </label>
           <label>
             OpenRouter API key
             <input

@@ -8,7 +8,6 @@ RUN npm run build
 FROM nginx:1.27-alpine
 # Official image runs envsubst on /etc/nginx/templates/*.template → conf.d/
 ENV FREYA_API_UPSTREAM=http://freya-api:8080
-ENV FREYA_API_TOKEN=
 COPY web/nginx.conf /etc/nginx/templates/default.conf.template
 COPY --from=build /web/dist /usr/share/nginx/html
 EXPOSE 80

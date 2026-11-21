@@ -67,9 +67,30 @@ pub async fn load_styles(packs_dir: &Path) -> Result<Vec<StylePack>> {
     Ok(out)
 }
 
+/// Assist `mode` must be a single path segment (no `/`, `..`, or absolute paths).
+fn is_safe_instruction_mode(mode: &str) -> bool {
+    !mode.is_empty()
+        && mode.len() <= 64
+        && mode
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 pub async fn load_instruction(packs_dir: &Path, mode: &str) -> String {
-    let path = packs_dir.join("instructions").join(format!("{mode}.txt"));
-    if let Ok(s) = fs::read_to_string(path).await {
+    if !is_safe_instruction_mode(mode) {
+        return builtin_instruction("chat").to_string();
+    }
+    let dir = packs_dir.join("instructions");
+    let path = dir.join(format!("{mode}.txt"));
+    // Containment: refuse anything that resolves outside the instructions dir.
+    if let (Ok(dir_c), Ok(path_c)) = (fs::canonicalize(&dir).await, fs::canonicalize(&path).await) {
+        if path_c.starts_with(&dir_c) {
+            if let Ok(s) = fs::read_to_string(path_c).await {
+                return s;
+            }
+        }
+    } else if let Ok(s) = fs::read_to_string(&path).await {
+        // Dir may not exist yet — safe basename already enforced above.
         return s;
     }
     builtin_instruction(mode).to_string()
@@ -133,5 +154,28 @@ pub fn builtin_instruction(mode: &str) -> &'static str {
             "You are Freya running an agentic image session (like agentic coding, for images). Given the user's goal and optional session history, reply with JSON only: {\"goal\":\"restated goal\",\"steps\":[{\"kind\":\"search_loras\"|\"generate\"|\"iterate\",\"prompt\":\"natural language\",\"note\":\"why\"}],\"civitaiQuery\":\"short search or empty\",\"batchPrompts\":[\"nl 1\",\"nl 2\",\"nl 3\"],\"sessionNote\":\"friendly next step\"}. batchPrompts are 2–4 natural-language variations to generate as a set. Never use SD keyword soup."
         }
         _ => "You are Freya, a helpful image studio agent.",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn instruction_mode_rejects_path_traversal() {
+        assert!(is_safe_instruction_mode("chat"));
+        assert!(is_safe_instruction_mode("prompt-prose"));
+        assert!(!is_safe_instruction_mode("../etc/passwd"));
+        assert!(!is_safe_instruction_mode("/etc/passwd"));
+        assert!(!is_safe_instruction_mode("foo/bar"));
+        assert!(!is_safe_instruction_mode(""));
+    }
+
+    #[tokio::test]
+    async fn load_instruction_ignores_unsafe_mode() {
+        let packs = PathBuf::from("/nonexistent-packs-dir");
+        let text = load_instruction(&packs, "../../etc/passwd").await;
+        assert_eq!(text, builtin_instruction("chat"));
     }
 }
