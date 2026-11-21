@@ -504,8 +504,195 @@ function modelBriefFor(prompt, loraBrief) {
   return `A carefully composed scene: ${trimmed}. Natural light and atmosphere, clear focal subject, cohesive color and mood throughout.${loraBrief}`;
 }
 
+function wantsImageIntent(message) {
+  const m = String(message || "").toLowerCase();
+  return [
+    "generate",
+    "make an image",
+    "make me an image",
+    "create an image",
+    "draw ",
+    "draw me",
+    "render ",
+    "paint ",
+    "produce an image",
+    "run session",
+    "run a session",
+    "make a picture",
+    "create a picture",
+  ].some((k) => m.includes(k));
+}
+
+function mockGenerateArtifact(prompt, body = {}) {
+  const loras = Array.isArray(body.loras) ? body.loras : [];
+  const loraBrief =
+    loras.length > 0
+      ? ` LoRAs: ${loras.map((l) => `${l.name}@${l.scale ?? 0.8}`).join(", ")}.`
+      : "";
+  const enhanced = modelBriefFor(prompt, loraBrief);
+  const id = `mock-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const wantLocal =
+    body.backend === "local" ||
+    (body.backend !== "openrouter" &&
+      loras.length > 0 &&
+      Boolean(state.settings.diffusionWorkerUrl));
+  const backend = wantLocal ? "local" : "openrouter";
+  const specificImage = body.model && body.model !== "auto" ? body.model : null;
+  const item = {
+    id,
+    prompt,
+    enhancedPrompt: enhanced,
+    backend,
+    model:
+      backend === "local"
+        ? "local-worker-stub"
+        : specificImage || state.settings.imageModel || "black-forest-labs/flux.2-klein-4b",
+    createdAt: new Date().toISOString(),
+    url: svgDataUrl(
+      prompt.slice(0, 40) || "Freya",
+      backend,
+      backend === "local" ? 140 : 28 + (id.length % 40),
+    ),
+    loras,
+  };
+  state.gallery.unshift(item);
+  return {
+    artifactId: id,
+    backend: item.backend,
+    model: item.model,
+    enhancedPrompt: enhanced,
+    url: item.url,
+    meta: item,
+    loras,
+  };
+}
+
+function planChatActions(message, body) {
+  const m = String(message || "").toLowerCase();
+  const actions = [];
+  if (m.includes("suggest") || m.includes("idea") || m.includes("brainstorm")) {
+    actions.push({ type: "suggest_ideas", args: { topic: message } });
+  }
+  if (
+    m.includes("civitai") ||
+    m.includes("search for lora") ||
+    m.includes("find a lora") ||
+    m.includes("find loras") ||
+    m.includes("search civitai")
+  ) {
+    const q =
+      (message.split(/\bfor\b/i)[1] || message).trim().slice(0, 80) || BEGINNER_CIVITAI_QUERY;
+    actions.push({ type: "search_civitai", args: { query: q } });
+  }
+  if (wantsImageIntent(message)) {
+    if (m.includes("run session") || m.includes("variations") || m.includes("batch")) {
+      actions.push({ type: "run_session", args: { goal: message } });
+    } else {
+      actions.push({ type: "generate_image", args: { prompt: message, batch: false } });
+    }
+  }
+  let reply;
+  if (!actions.length) {
+    reply =
+      "Happy to talk through style, mood, and framing. Say the word when you want me to generate, search Civitai, or suggest ideas.";
+  } else if (actions.some((a) => a.type === "generate_image" || a.type === "run_session")) {
+    reply = "On it — generating that image for you.";
+  } else if (actions.some((a) => a.type === "search_civitai")) {
+    reply = "I’ll search Civitai for matching assets.";
+  } else {
+    reply = "Here are a few directions we could take.";
+  }
+  if (body?.confirm && Array.isArray(body.actions) && body.actions.length) {
+    return {
+      reply: "Running the confirmed actions.",
+      actions: body.actions.map((a) => ({
+        type: a.type,
+        args: a.args || {},
+      })),
+    };
+  }
+  return { reply, actions };
+}
+
+async function executeMockChatAction(action, body) {
+  const ty = action.type;
+  const args = action.args || {};
+  if (ty === "suggest_ideas") {
+    const topic = args.topic || body.message || BEGINNER_EXAMPLE;
+    const ideas = suggestIdeas(topic);
+    return {
+      type: ty,
+      status: "executed",
+      args,
+      result: {
+        ideas,
+        sessionNote: "Pick an idea and send it, or ask me to generate one.",
+      },
+    };
+  }
+  if (ty === "search_civitai") {
+    const q = (args.query || "").trim() || BEGINNER_CIVITAI_QUERY;
+    const { loras } = lorasForAssist(q);
+    return {
+      type: ty,
+      status: "executed",
+      args: { ...args, query: q },
+      result: { query: q, loras },
+    };
+  }
+  if (ty === "generate_image") {
+    const prompt = (args.prompt || body.message || BEGINNER_EXAMPLE).trim();
+    const result = mockGenerateArtifact(prompt, {
+      ...body,
+      prompt,
+      model: body.imageModel || body.model,
+      loras: body.loras || [],
+    });
+    return { type: ty, status: "executed", args, result };
+  }
+  if (ty === "run_session") {
+    const goal = (args.goal || body.message || BEGINNER_EXAMPLE).trim();
+    const { batchPrompts } = sessionBatch(goal, body.session || {});
+    const results = batchPrompts.map((p) =>
+      mockGenerateArtifact(p, { ...body, prompt: p, loras: body.loras || [] }),
+    );
+    return {
+      type: ty,
+      status: "executed",
+      args,
+      result: { goal, batchPrompts, results },
+    };
+  }
+  if (ty === "install_asset") {
+    if (!state.settings.civitaiConfigured) {
+      return { type: ty, status: "error", args, error: "Civitai API key required" };
+    }
+    if (!state.settings.diffusionWorkerUrl) {
+      return {
+        type: ty,
+        status: "error",
+        args,
+        error: "LoRA install needs a diffusion worker",
+      };
+    }
+    return {
+      type: ty,
+      status: "executed",
+      args,
+      result: { ok: true, destPath: args.destPath || "loras/asset.safetensors", name: args.name },
+    };
+  }
+  return { type: ty, status: "error", args, error: `unknown action: ${ty}` };
+}
+
+function isSideEffectAction(ty) {
+  return ty === "generate_image" || ty === "install_asset" || ty === "run_session";
+}
+
 export async function mockApi(path, opts = {}) {
-  await delay(path.includes("/run") || path.includes("/generate") ? 900 : 280);
+  await delay(
+    path.includes("/run") || path.includes("/generate") || path.includes("/chat") ? 900 : 280,
+  );
   const method = (opts.method || "GET").toUpperCase();
   const url = new URL(path, "http://mock.local");
   const p = url.pathname;
@@ -582,6 +769,81 @@ export async function mockApi(path, opts = {}) {
       enhancedPrompt: item.enhancedPrompt,
       backend: item.backend,
       model: item.model,
+    };
+  }
+
+  if (p === "/v1/chat" && method === "POST") {
+    const body = parseBody(opts);
+    const message = (body.message || "").trim() || BEGINNER_EXAMPLE;
+    const mode = String(body.automationMode || "auto").toLowerCase();
+    const { reply: plannedReply, actions: planned } = planChatActions(message, body);
+    let reply = plannedReply;
+    const actionResults = [];
+    let pendingConfirmation = false;
+    let question = null;
+
+    const sideEffects = planned.filter((a) => isSideEffectAction(a.type));
+    if (mode === "plan" && !body.confirm && sideEffects.length) {
+      pendingConfirmation = true;
+      for (const a of planned) {
+        if (isSideEffectAction(a.type)) {
+          actionResults.push({ type: a.type, status: "proposed", args: a.args || {} });
+        } else {
+          actionResults.push(await executeMockChatAction(a, body));
+        }
+      }
+      reply =
+        reply ||
+        "Here’s what I’d do — confirm to run generate/install, or keep chatting.";
+    } else if (mode === "auto" && !body.confirm) {
+      const installs = planned.filter((a) => a.type === "install_asset");
+      if (installs.length > 1) {
+        pendingConfirmation = true;
+        question = {
+          kind: "lora",
+          text: "Several LoRA installs are queued — which should Freya install?",
+        };
+        for (const a of planned) {
+          if (isSideEffectAction(a.type)) {
+            actionResults.push({ type: a.type, status: "proposed", args: a.args || {} });
+          } else {
+            actionResults.push(await executeMockChatAction(a, body));
+          }
+        }
+      } else {
+        for (const a of planned) {
+          actionResults.push(await executeMockChatAction(a, body));
+        }
+      }
+    } else {
+      for (const a of planned) {
+        actionResults.push(await executeMockChatAction(a, body));
+      }
+    }
+
+    const ideas = [];
+    const loras = [];
+    const artifacts = [];
+    let civitaiQuery = "";
+    for (const ar of actionResults) {
+      const res = ar.result || {};
+      if (Array.isArray(res.ideas)) ideas.push(...res.ideas);
+      if (Array.isArray(res.loras)) loras.push(...res.loras);
+      if (res.query) civitaiQuery = res.query;
+      if (ar.type === "generate_image" && res.artifactId) artifacts.push(res);
+      if (Array.isArray(res.results)) artifacts.push(...res.results);
+    }
+
+    return {
+      reply,
+      actions: actionResults,
+      pendingConfirmation,
+      question,
+      ideas,
+      loras,
+      civitaiQuery: civitaiQuery || null,
+      artifacts,
+      automationMode: mode,
     };
   }
 
@@ -670,51 +932,7 @@ export async function mockApi(path, opts = {}) {
 
   if ((p === "/v1/run" || p === "/v1/generate") && method === "POST") {
     const body = parseBody(opts);
-    const prompt = body.prompt || "untitled";
-    const loras = Array.isArray(body.loras) ? body.loras : [];
-    const loraBrief =
-      loras.length > 0
-        ? ` LoRAs: ${loras.map((l) => `${l.name}@${l.scale ?? 0.8}`).join(", ")}.`
-        : "";
-    const enhanced = modelBriefFor(prompt, loraBrief);
-    const id = `mock-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    // Worker optional: OpenRouter when no worker (or backend auto/openrouter). Local only when
-    // explicitly requested or LoRAs are applied on a configured worker.
-    const wantLocal =
-      body.backend === "local" ||
-      (body.backend !== "openrouter" &&
-        loras.length > 0 &&
-        Boolean(state.settings.diffusionWorkerUrl));
-    const backend = wantLocal ? "local" : "openrouter";
-    const specificImage =
-      body.model && body.model !== "auto" ? body.model : null;
-    const item = {
-      id,
-      prompt,
-      enhancedPrompt: enhanced,
-      backend,
-      model:
-        backend === "local"
-          ? "local-worker-stub"
-          : specificImage || state.settings.imageModel || "black-forest-labs/flux.2-klein-4b",
-      createdAt: new Date().toISOString(),
-      url: svgDataUrl(
-        prompt.slice(0, 40) || "Freya",
-        backend,
-        backend === "local" ? 140 : 28 + (id.length % 40),
-      ),
-      loras,
-    };
-    state.gallery.unshift(item);
-    return {
-      artifactId: id,
-      backend: item.backend,
-      model: item.model,
-      enhancedPrompt: enhanced,
-      url: item.url,
-      meta: item,
-      loras,
-    };
+    return mockGenerateArtifact(body.prompt || "untitled", body);
   }
 
   if (p === "/v1/civitai/search" && method === "GET") {
