@@ -28,7 +28,9 @@ spec:
   storage:
     gallerySize: 20Gi
   ingress:
-    enabled: false
+    enabled: true
+    className: nginx
+    host: freya.dataknife.net
 ---
 # Create Secrets first (see README Cluster section). Env equivalents for local:
 #   OPENROUTER_API_KEY, CIVITAI_API_KEY, HF_TOKEN, FREYA_API_TOKEN, FREYA_WORKER_TOKEN
@@ -39,3 +41,4 @@ spec:
 #   freya-api-token   key=token   (openssl rand -hex 32)
 #   freya-worker-token key=apiKey (openssl rand -hex 32)
 # Optional style pack sample: freya_v1alpha1_freyastyle.yaml (freya.png NL example)
+# Public UI: http://freya.dataknife.net (point DNS at the Ingress LB / this host)
