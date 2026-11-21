@@ -51,6 +51,8 @@ kubectl apply -k config/default
 kubectl create ns freya
 kubectl -n freya create secret generic freya-openrouter --from-literal=apiKey="$OPENROUTER_API_KEY"
 kubectl -n freya create secret generic freya-civitai --from-literal=apiKey="$CIVITAI_API_KEY"
+kubectl -n freya create secret generic freya-api-token --from-literal=token="$(openssl rand -hex 32)"
+kubectl -n freya create secret generic freya-worker-token --from-literal=apiKey="$(openssl rand -hex 32)"
 
 # remote GPU box
 kubectl apply -f config/samples/freya_v1alpha1_freyadiffusionworker_external.yaml

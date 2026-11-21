@@ -11,3 +11,7 @@ spec:
   gpuCount: 1
   modelsPvcSize: 100Gi
   port: 8091
+  # Same secret as FreyaStudio → FREYA_WORKER_TOKEN on API + worker
+  authSecretRef:
+    name: freya-worker-token
+    key: apiKey

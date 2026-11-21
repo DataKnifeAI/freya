@@ -38,6 +38,12 @@ pub async fn reconcile(studio: Arc<FreyaStudio>, ctx: Arc<Ctx>) -> Result<Action
     ensure_service(&ctx, &ns, &name, "api", 8080, &owner).await?;
     ensure_service(&ctx, &ns, &name, "ui", 80, &owner).await?;
     if studio.spec.ingress.enabled {
+        if studio.spec.api_token_secret_ref.is_none() {
+            warn!(
+                studio = %name,
+                "ingress enabled without apiTokenSecretRef — API stays open to the cluster/Internet"
+            );
+        }
         ensure_ingress(&ctx, &ns, &name, &studio, &owner).await?;
     }
 
@@ -48,21 +54,26 @@ pub async fn reconcile(studio: Arc<FreyaStudio>, ctx: Arc<Ctx>) -> Result<Action
     Ok(Action::requeue(Duration::from_secs(120)))
 }
 
-async fn resolve_worker_url(ctx: &Ctx, ns: &str, worker_name: &str) -> Result<String, Error> {
+async fn resolve_worker(
+    ctx: &Ctx,
+    ns: &str,
+    worker_name: &str,
+) -> Result<(String, Option<freya_crd::SecretKeyRef>), Error> {
     let workers: Api<FreyaDiffusionWorker> = Api::namespaced(ctx.client.clone(), ns);
     let worker = workers.get(worker_name).await.map_err(Error::Kube)?;
-    match worker.spec.placement {
+    let url = match worker.spec.placement {
         WorkerPlacement::External => worker
             .spec
             .external_endpoint
             .clone()
             .or_else(|| worker.status.as_ref().and_then(|s| s.endpoint.clone()))
-            .ok_or(Error::MissingWorkerEndpoint),
-        WorkerPlacement::InCluster => Ok(format!(
+            .ok_or(Error::MissingWorkerEndpoint)?,
+        WorkerPlacement::InCluster => format!(
             "http://{worker_name}.{ns}.svc.cluster.local:{}",
             worker.spec.port
-        )),
-    }
+        ),
+    };
+    Ok((url, worker.spec.auth_secret_ref.clone()))
 }
 
 fn labels(instance: &str, component: &str) -> BTreeMap<String, String> {
@@ -201,12 +212,19 @@ async fn ensure_api_deployment(
             value: Some(worker_name.clone()),
             ..Default::default()
         });
-        let worker_url = resolve_worker_url(ctx, ns, worker_name).await?;
+        let (worker_url, worker_auth) = resolve_worker(ctx, ns, worker_name).await?;
         env.push(EnvVar {
             name: "FREYA_DIFFUSION_WORKER_URL".into(),
             value: Some(worker_url),
             ..Default::default()
         });
+        if let Some(ref auth) = worker_auth {
+            env.push(secret_env("FREYA_WORKER_TOKEN", auth, true));
+        }
+    }
+
+    if let Some(ref api_tok) = studio.spec.api_token_secret_ref {
+        env.push(secret_env("FREYA_API_TOKEN", api_tok, false));
     }
 
     if let Some(ref civ) = studio.spec.civitai.secret_ref {
@@ -339,12 +357,19 @@ async fn ensure_ui_deployment(
                             name: Some("http".into()),
                             ..Default::default()
                         }]),
-                        env: Some(vec![EnvVar {
-                            // Consumed by nginx envsubst template → upstream for /v1/.
-                            name: "FREYA_API_UPSTREAM".into(),
-                            value: Some(format!("http://{name}-api:8080")),
-                            ..Default::default()
-                        }]),
+                        env: Some({
+                            let mut ui_env = vec![EnvVar {
+                                // Consumed by nginx envsubst template → upstream for /v1/.
+                                name: "FREYA_API_UPSTREAM".into(),
+                                value: Some(format!("http://{name}-api:8080")),
+                                ..Default::default()
+                            }];
+                            // Same token as API so nginx can inject Authorization on /v1/.
+                            if let Some(ref api_tok) = studio.spec.api_token_secret_ref {
+                                ui_env.push(secret_env("FREYA_API_TOKEN", api_tok, false));
+                            }
+                            ui_env
+                        }),
                         ..Default::default()
                     }],
                     ..Default::default()

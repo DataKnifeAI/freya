@@ -47,7 +47,7 @@ pub async fn reconcile(asset: Arc<FreyaModelAsset>, ctx: Arc<Ctx>) -> Result<Act
                 .ok_or(Error::MissingEndpoint)?;
 
             info!(%ns, asset = %name, %endpoint, "installing LoRA/asset on remote worker");
-            install_remote(&asset, &endpoint).await?;
+            install_remote(&ctx, &ns, &asset, &worker, &endpoint).await?;
             patch_phase(
                 &ctx,
                 &ns,
@@ -66,7 +66,13 @@ pub async fn reconcile(asset: Arc<FreyaModelAsset>, ctx: Arc<Ctx>) -> Result<Act
     }
 }
 
-async fn install_remote(asset: &FreyaModelAsset, endpoint: &str) -> Result<(), Error> {
+async fn install_remote(
+    ctx: &Ctx,
+    ns: &str,
+    asset: &FreyaModelAsset,
+    worker: &FreyaDiffusionWorker,
+    endpoint: &str,
+) -> Result<(), Error> {
     sanitize_dest_path(&asset.spec.dest_path)?;
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
@@ -79,21 +85,39 @@ async fn install_remote(asset: &FreyaModelAsset, endpoint: &str) -> Result<(), E
         "destPath": asset.spec.dest_path,
     });
 
-    let resp = client
+    let mut req = client
         .post(format!(
             "{}/v1/assets/install",
             endpoint.trim_end_matches('/')
         ))
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| Error::Http(e.to_string()))?;
+        .json(&body);
+
+    if let Some(auth) = &worker.spec.auth_secret_ref {
+        let token = read_secret_key(ctx, ns, &auth.name, &auth.key).await?;
+        req = req.bearer_auth(token);
+    }
+
+    let resp = req.send().await.map_err(|e| Error::Http(e.to_string()))?;
 
     if !resp.status().is_success() {
         let msg = resp.text().await.unwrap_or_default();
         return Err(Error::Http(format!("remote install failed: {msg}")));
     }
     Ok(())
+}
+
+async fn read_secret_key(ctx: &Ctx, ns: &str, name: &str, key: &str) -> Result<String, Error> {
+    use k8s_openapi::api::core::v1::Secret;
+    let api: Api<Secret> = Api::namespaced(ctx.client.clone(), ns);
+    let secret = api.get(name).await.map_err(Error::Kube)?;
+    let data = secret
+        .data
+        .ok_or_else(|| Error::Http(format!("secret {name} has no data")))?;
+    let bytes = data
+        .get(key)
+        .ok_or_else(|| Error::Http(format!("secret {name} missing key {key}")))?;
+    String::from_utf8(bytes.0.clone())
+        .map_err(|e| Error::Http(format!("secret {name}/{key} not utf8: {e}")))
 }
 
 /// Reject absolute / `..` / shell-metachar dest paths; must stay under `/models`.

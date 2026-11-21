@@ -575,7 +575,10 @@ pub async fn settings_put(
                 *state.worker.write().await = None;
             } else {
                 cfg.diffusion_worker_url = Some(url.clone());
-                *state.worker.write().await = Some(crate::worker::DiffusionWorkerClient::new(url));
+                *state.worker.write().await = Some(
+                    crate::worker::DiffusionWorkerClient::new(url)
+                        .with_token(cfg.worker_token.clone()),
+                );
             }
         }
         if let Some(m) = upd.chat_model {

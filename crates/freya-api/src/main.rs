@@ -35,11 +35,11 @@ async fn main() -> anyhow::Result<()> {
     let require_auth = !cfg.api_token.trim().is_empty();
     if !require_auth {
         warn!(
-            "FREYA_API_TOKEN unset — mutating /v1 routes are open (local/dev only). \
-             Set FREYA_API_TOKEN and optionally FREYA_CORS_ORIGINS for non-dev."
+            "FREYA_API_TOKEN unset — /v1 routes are open (local/dev only). \
+             Set FREYA_API_TOKEN (and FreyaStudio apiTokenSecretRef in-cluster) for non-dev."
         );
     } else {
-        info!("FREYA_API_TOKEN set — bearer auth required on mutating /v1 routes");
+        info!("FREYA_API_TOKEN set — bearer auth required on /v1 routes (except gallery images)");
     }
 
     let state = AppState::from_config(cfg).await?;
@@ -103,15 +103,19 @@ fn build_cors(cfg: &Config) -> CorsLayer {
     }
 }
 
-/// When `FREYA_API_TOKEN` is set, require `Authorization: Bearer <token>` on mutating methods.
-/// GET/HEAD/OPTIONS stay open so health + static UI reads work without a token on every image.
+/// When `FREYA_API_TOKEN` is set, require `Authorization: Bearer <token>` on all `/v1` methods
+/// except OPTIONS (CORS) and gallery image GETs (`<img src>` cannot send Authorization).
 async fn require_api_token(
     axum::extract::State(state): axum::extract::State<AppState>,
     req: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     let method = req.method().clone();
-    if matches!(method, Method::GET | Method::HEAD | Method::OPTIONS) {
+    if method == Method::OPTIONS {
+        return Ok(next.run(req).await);
+    }
+    // UUID gallery ids are unguessable; list/detail/search still require the bearer.
+    if matches!(method, Method::GET | Method::HEAD) && is_gallery_image_path(req.uri().path()) {
         return Ok(next.run(req).await);
     }
 
@@ -136,4 +140,26 @@ async fn require_api_token(
         return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)
+}
+
+fn is_gallery_image_path(path: &str) -> bool {
+    let parts: Vec<&str> = path.trim_end_matches('/').split('/').collect();
+    matches!(
+        parts.as_slice(),
+        ["", "v1", "gallery", id, "image"] if !id.is_empty()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gallery_image_path_match() {
+        assert!(is_gallery_image_path("/v1/gallery/abc-123/image"));
+        assert!(is_gallery_image_path("/v1/gallery/abc-123/image/"));
+        assert!(!is_gallery_image_path("/v1/gallery"));
+        assert!(!is_gallery_image_path("/v1/gallery/abc-123"));
+        assert!(!is_gallery_image_path("/v1/civitai/search"));
+    }
 }
