@@ -721,7 +721,13 @@ export default function App() {
         setCivitaiDetail({ model: item, related: item.related || [], loading: false });
       }
     } catch (e) {
-      setCivitaiDetail({ model: item, related: [], loading: false, error: e.message });
+      // Keep the list/suggest card usable if detail fetch misses (e.g. mock catalog vs live id).
+      setCivitaiDetail({
+        model: item,
+        related: [],
+        loading: false,
+        error: item?.name ? null : e.message,
+      });
     } finally {
       setCivitaiDetailBusy(false);
     }
