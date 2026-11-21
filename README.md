@@ -24,9 +24,10 @@ make mock-ui          # or: cd web && npm i && npm run dev:mock
 **Full stack:**
 
 ```bash
-export OPENROUTER_API_KEY=sk-or-...
-# optional — search/install Civitai LoRAs onto a worker
-export CIVITAI_API_KEY=...
+cp .env.example .env
+# edit .env — set OPENROUTER_API_KEY=sk-or-... (required)
+# optional: CIVITAI_API_KEY, FREYA_API_TOKEN, FREYA_WORKER_TOKEN, FREYA_CORS_ORIGINS
+set -a && source .env && set +a
 
 make run-api          # :8080
 cd web && npm install && npm run dev   # :5173
@@ -41,6 +42,8 @@ In the UI **Settings** tab you can paste:
 - **OpenRouter API key** — chat + cloud images  
 - **Civitai API key** — search Civitai and **Install to worker** (LoRAs/checkpoints for the UI)  
 - **Diffusion worker URL** — in-cluster Service or a remote physical GPU host  
+
+Sessions use **Plan / Auto / YOLO** automation (see [docs/LOCAL.md](docs/LOCAL.md)). Featured example prompt matches `freya.png` brand art.
 
 ## Cluster
 

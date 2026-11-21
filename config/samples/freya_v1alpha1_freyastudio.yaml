@@ -30,9 +30,12 @@ spec:
   ingress:
     enabled: false
 ---
-# Create Secrets first (see README Cluster section). Example:
+# Create Secrets first (see README Cluster section). Env equivalents for local:
+#   OPENROUTER_API_KEY, CIVITAI_API_KEY, HF_TOKEN, FREYA_API_TOKEN, FREYA_WORKER_TOKEN
+# Cluster Secret names:
 #   freya-openrouter  key=apiKey
 #   freya-civitai     key=apiKey
 #   freya-hf          key=token
 #   freya-api-token   key=token   (openssl rand -hex 32)
 #   freya-worker-token key=apiKey (openssl rand -hex 32)
+# Optional style pack sample: freya_v1alpha1_freyastyle.yaml (freya.png NL example)
