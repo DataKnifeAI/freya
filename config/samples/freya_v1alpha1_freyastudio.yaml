@@ -41,4 +41,5 @@ spec:
 #   freya-api-token   key=token   (openssl rand -hex 32)
 #   freya-worker-token key=apiKey (openssl rand -hex 32)
 # Optional style pack sample: freya_v1alpha1_freyastyle.yaml (freya.png NL example)
-# Public UI: http://freya.dataknife.net (point DNS at the Ingress LB / this host)
+# Public UI: https://freya.dataknife.net — for kind, run ./scripts/kind-hosts.sh
+# (public DNS still points at prd-apps Traefik → plain-text "404 page not found")

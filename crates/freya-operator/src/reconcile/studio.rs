@@ -54,11 +54,13 @@ pub async fn reconcile(studio: Arc<FreyaStudio>, ctx: Arc<Ctx>) -> Result<Action
     Ok(Action::requeue(Duration::from_secs(120)))
 }
 
+const TLS_INSECURE_ANNOTATION: &str = "freya.dataknife.ai/tls-insecure";
+
 async fn resolve_worker(
     ctx: &Ctx,
     ns: &str,
     worker_name: &str,
-) -> Result<(String, Option<freya_crd::SecretKeyRef>), Error> {
+) -> Result<(String, Option<freya_crd::SecretKeyRef>, bool), Error> {
     let workers: Api<FreyaDiffusionWorker> = Api::namespaced(ctx.client.clone(), ns);
     let worker = workers.get(worker_name).await.map_err(Error::Kube)?;
     let url = match worker.spec.placement {
@@ -73,7 +75,12 @@ async fn resolve_worker(
             worker.spec.port
         ),
     };
-    Ok((url, worker.spec.auth_secret_ref.clone()))
+    let tls_insecure = worker
+        .annotations()
+        .get(TLS_INSECURE_ANNOTATION)
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    Ok((url, worker.spec.auth_secret_ref.clone(), tls_insecure))
 }
 
 fn labels(instance: &str, component: &str) -> BTreeMap<String, String> {
@@ -212,12 +219,20 @@ async fn ensure_api_deployment(
             value: Some(worker_name.clone()),
             ..Default::default()
         });
-        let (worker_url, worker_auth) = resolve_worker(ctx, ns, worker_name).await?;
+        let (worker_url, worker_auth, tls_insecure) =
+            resolve_worker(ctx, ns, worker_name).await?;
         env.push(EnvVar {
             name: "FREYA_DIFFUSION_WORKER_URL".into(),
             value: Some(worker_url),
             ..Default::default()
         });
+        if tls_insecure {
+            env.push(EnvVar {
+                name: "FREYA_WORKER_TLS_INSECURE".into(),
+                value: Some("true".into()),
+                ..Default::default()
+            });
+        }
         if let Some(ref auth) = worker_auth {
             env.push(secret_env("FREYA_WORKER_TOKEN", auth, true));
         }

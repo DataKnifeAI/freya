@@ -12,9 +12,18 @@ pub struct DiffusionWorkerClient {
 }
 
 impl DiffusionWorkerClient {
+    #[allow(dead_code)]
     pub fn new(base: impl Into<String>) -> Self {
+        Self::new_with_tls(base, false)
+    }
+
+    pub fn new_with_tls(base: impl Into<String>, tls_insecure: bool) -> Self {
+        let http = reqwest::Client::builder()
+            .danger_accept_invalid_certs(tls_insecure)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             base: base.into().trim_end_matches('/').to_string(),
             token: None,
         }
@@ -34,12 +43,38 @@ impl DiffusionWorkerClient {
     }
 
     pub async fn health(&self) -> bool {
-        self.http
+        self.health_detail().await.is_some()
+    }
+
+    /// Fetch worker `/health` JSON when reachable.
+    pub async fn health_detail(&self) -> Option<Value> {
+        let resp = self
+            .http
             .get(format!("{}/health", self.base))
             .send()
             .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<Value>().await.ok()
+    }
+
+    /// Prefer authenticated `/v1/stats`, fall back to public `/health`.
+    pub async fn stats_detail(&self) -> Option<Value> {
+        let resp = self
+            .apply_auth(self.http.get(format!("{}/v1/stats", self.base)))
+            .send()
+            .await
+            .ok();
+        if let Some(resp) = resp {
+            if resp.status().is_success() {
+                if let Ok(v) = resp.json::<Value>().await {
+                    return Some(v);
+                }
+            }
+        }
+        self.health_detail().await
     }
 
     pub async fn list_loras(&self) -> Result<Vec<LocalAsset>> {

@@ -1,5 +1,47 @@
 # Local development
 
+## Kind cluster UI (`freya.dataknife.net`)
+
+Local kind maps host ports **80/443** to ingress-nginx (`kind-freya.yaml`). The FreyaStudio Ingress host is `freya.dataknife.net`.
+
+**404 page not found** (plain text, `content-type: text/plain`) is **Traefik on prd-apps**, not Freya. Public DNS still CNAMEs `freya.dataknife.net` → `prd-apps-wk.dataknife.net` (192.168.14.x). Override on this machine:
+
+```bash
+make kind-hosts   # or ./scripts/kind-hosts.sh (rewrites /etc/hosts + resolvectl flush-caches)
+```
+
+This host’s `nsswitch` prefers `resolve` over `files`; systemd-resolved still honors `/etc/hosts` after a cache flush. Without the override you hit Traefik on prd-apps.
+
+### Brave (and other browsers) still 404 after hosts
+
+**Cause:** Brave **Secure DNS** (DNS-over-HTTPS) ignores `/etc/hosts` and resolves via Cloudflare/Google → prd-apps Traefik → `404 page not found`.
+
+**Fix (this machine):**
+
+1. Brave → **Settings** → **Privacy and security** → **Use secure DNS** → **turn Off**  
+   (or use “OS default” / a resolver that does **not** bypass system hosts).
+2. Hard-reload `https://freya.dataknife.net/` (or open a new private window after the change).
+
+`curl` and browsers that use system DNS already work once hosts is set.
+
+**Other device on the LAN:** kind publishes **80/443** on this host’s LAN IP (`192.168.3.125`). On that device, either:
+
+- Add hosts: `192.168.3.125 freya.dataknife.net` (and disable Secure DNS if the browser uses DoH), or  
+- Temporarily: `curl -H 'Host: freya.dataknife.net' http://192.168.3.125/`
+
+NodePort (`31026`/`30556`) is only inside the kind node network; use host **80/443**, not NodePort from outside.
+
+Working URLs after the hosts override (and Secure DNS off in Brave):
+
+| URL | Expected |
+|-----|----------|
+| https://freya.dataknife.net/ | Freya UI (200) |
+| http://freya.dataknife.net/ | Freya UI (200) |
+| https://freya.dataknife.net/v1/health | API health JSON |
+| https://vllm.dataknife.net/health | Local diffusion worker (DNS already → this host) |
+
+Without hosts: `curl -H 'Host: freya.dataknife.net' http://127.0.0.1/` also serves the UI. Vite mock/dev remains at http://127.0.0.1:5173/.
+
 ## Interactive UI mock (no API)
 
 Iterate on Freya UI without OpenRouter, Civitai, or a worker:
@@ -38,6 +80,24 @@ In the UI, session automation modes:
 | **YOLO** | Full auto — search, install when a worker is set, else generate via OpenRouter |
 
 Worker is optional: cloud generate uses OpenRouter; LoRA install needs `FREYA_DIFFUSION_WORKER_URL` + Civitai.
+
+### Local worker on game drive vs cluster vLLM
+
+| Path | URL / endpoint | Models |
+|------|----------------|--------|
+| **This machine (local)** | `FREYA_DIFFUSION_WORKER_URL=http://127.0.0.1:8091` (binds `0.0.0.0:8091`) | `FREYA_MODELS_DIR=/mnt/game2/freya/models` (repo `data/models` → symlink) |
+| **Cluster Studio** | `FreyaDiffusionWorker` `externalEndpoint` (e.g. `https://vllm.dataknife.net`) | Remote GPU / vLLM — do not overwrite that CR when only setting up the local worker |
+
+Worker health/stats:
+
+| Endpoint | Notes |
+|----------|--------|
+| Worker `GET /health` / `GET /v1/stats` | `{ ok, modelsDir, loras, checkpoints, uptimeSec, vram, host }` — VRAM from `nvidia-smi` when present (null in GPU-less containers) |
+| API `GET /v1/worker/stats` | Proxies worker stats; fills host `nvidia-smi` when worker VRAM is null; includes docker/systemd runtime |
+| API `POST /v1/worker/start\|stop` | Local docker (`FREYA_WORKER_CONTAINER`, default `freya-local-worker`) or systemd unit |
+| API `POST /v1/worker/enable\|disable` | Persist flag in secrets — disabled skips local gens; OpenRouter still works |
+
+Settings shows a compact VRAM bar + Start / Stop / Enable / Disable.
 
 ### Civitai in the UI
 

@@ -4,12 +4,15 @@ kind: FreyaDiffusionWorker
 metadata:
   name: freya-gpu
   namespace: freya
+  annotations:
+    # Set when Ingress/worker uses a self-signed cert (local kind). Omit in prod with real TLS.
+    freya.dataknife.ai/tls-insecure: "true"
 spec:
   placement: external
-  # kind→host: Service/Endpoints to a worker on the kind Docker network, or
-  # host gateway (often firewalled on Linux). Example for kind-local worker:
+  # Public vLLM / diffusion worker (not Freya UI — that is freya.dataknife.net).
+  # Prefer https. kind-local alternative example:
   #   http://freya-gpu-host.freya.svc.cluster.local:8091
-  externalEndpoint: http://freya-gpu-host.freya.svc.cluster.local:8091
+  externalEndpoint: https://vllm.dataknife.net
   engine: vllm-omni
   # Must match FREYA_WORKER_TOKEN on the remote worker process
   authSecretRef:
