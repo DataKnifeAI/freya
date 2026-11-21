@@ -116,6 +116,42 @@ impl OpenRouterClient {
         Ok(out)
     }
 
+    /// Discover OpenRouter video models via `GET /videos/models` (async gen API; not wired to Freya generate yet).
+    pub async fn list_video_models(&self) -> Result<Vec<VideoModel>> {
+        if self.api_key.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Prefer dedicated video catalog; fall back to modality filter on /models.
+        let url = format!("{}/videos/models", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("list video models")?;
+        if resp.status().is_success() {
+            let v: Value = resp.json().await.unwrap_or(Value::Null);
+            let out = parse_video_models(&v);
+            if !out.is_empty() {
+                return Ok(out);
+            }
+        }
+        let url = format!("{}/models?output_modalities=video", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("list video models (modality)")?;
+        if !resp.status().is_success() {
+            return Ok(Vec::new());
+        }
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        Ok(parse_video_models(&v))
+    }
+
     pub async fn generate_image(
         &self,
         prompt: &str,
@@ -353,6 +389,72 @@ pub struct ImageModel {
     pub id: String,
     pub name: String,
     pub backend: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoModel {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_durations: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_resolutions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_aspect_ratios: Vec<String>,
+}
+
+fn parse_video_models(v: &Value) -> Vec<VideoModel> {
+    let mut out = Vec::new();
+    let Some(arr) = v.get("data").and_then(|d| d.as_array()) else {
+        return out;
+    };
+    for m in arr {
+        let id = m
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let name = m
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        let supported_durations = m
+            .get("supported_durations")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+            .unwrap_or_default();
+        let supported_resolutions = m
+            .get("supported_resolutions")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let supported_aspect_ratios = m
+            .get("supported_aspect_ratios")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(VideoModel {
+            id,
+            name,
+            supported_durations,
+            supported_resolutions,
+            supported_aspect_ratios,
+        });
+    }
+    out
 }
 
 #[derive(Debug, Clone)]

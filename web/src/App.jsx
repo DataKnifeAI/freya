@@ -14,6 +14,35 @@ const MODELS_STORAGE_KEY = "freya.models";
 const SESSIONS_STORAGE_KEY = "freya.sessions";
 const SIDEBAR_STORAGE_KEY = "freya.sidebarOpen";
 const THEME_STORAGE_KEY = "freya.theme";
+/** Persistent Civitai library (survives sessions). Distinct from session Pin. */
+const FAVORITES_STORAGE_KEY = "freya.civitaiFavorites";
+
+function readFavorites() {
+  try {
+    const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x) => x && (x.id != null || x.name)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeFavorites(list) {
+  try {
+    localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(list.slice(0, 200)));
+  } catch {
+    /* ignore quota */
+  }
+}
+
+function formatStat(n) {
+  if (n == null || Number.isNaN(Number(n))) return null;
+  const v = Number(n);
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `${(v / 1_000).toFixed(1)}K`;
+  return String(v);
+}
 
 function readStoredTheme() {
   try {
@@ -385,6 +414,12 @@ export default function App() {
   const [workerUrl, setWorkerUrl] = useState("");
   const [civitaiQ, setCivitaiQ] = useState(BEGINNER_CIVITAI_QUERY);
   const [civitaiItems, setCivitaiItems] = useState([]);
+  const [civitaiSubview, setCivitaiSubview] = useState("search");
+  const [favorites, setFavorites] = useState(readFavorites);
+  const [civitaiDetail, setCivitaiDetail] = useState(null);
+  const [civitaiDetailBusy, setCivitaiDetailBusy] = useState(false);
+  const [detailImageIdx, setDetailImageIdx] = useState(0);
+  const [videoModels, setVideoModels] = useState([]);
   const [savedMsg, setSavedMsg] = useState("");
   const [ideas, setIdeas] = useState(() =>
     Array.isArray(bootSession.ideas) ? bootSession.ideas : [],
@@ -606,16 +641,18 @@ export default function App() {
 
   const refresh = async () => {
     try {
-      const [s, st, g] = await Promise.all([
+      const [s, st, g, models] = await Promise.all([
         api("/v1/styles"),
         api("/v1/settings"),
         api("/v1/gallery"),
+        api("/v1/models").catch(() => ({})),
       ]);
       const items = s.items || [];
       setStyles(items);
       setSettings(st);
       setWorkerUrl(st.diffusionWorkerUrl || "");
       setGallery(g.items || []);
+      setVideoModels(Array.isArray(models?.video) ? models.video : []);
       const featured = items[0]?.examplePrompt;
       if (featured) {
         setCivitaiQ((prev) =>
@@ -624,6 +661,69 @@ export default function App() {
       }
     } catch (e) {
       setError(e.message);
+    }
+  };
+
+  const isFavorite = (item) =>
+    favorites.some((f) => loraKey(f) === loraKey(item));
+
+  const toggleFavorite = (item) => {
+    setFavorites((prev) => {
+      const key = loraKey(item);
+      const exists = prev.some((f) => loraKey(f) === key);
+      const next = exists
+        ? prev.filter((f) => loraKey(f) !== key)
+        : [
+            {
+              id: item.id,
+              name: item.name,
+              modelType: item.modelType,
+              downloadUrl: item.downloadUrl,
+              thumbnailUrl: item.thumbnailUrl,
+              triggerWord: item.triggerWord || item.trainedWords?.[0],
+              baseModel: item.baseModel,
+              civitaiUrl: item.civitaiUrl || (item.id ? `https://civitai.com/models/${item.id}` : null),
+              trainedWords: item.trainedWords,
+            },
+            ...prev,
+          ].slice(0, 200);
+      writeFavorites(next);
+      return next;
+    });
+  };
+
+  const closeCivitaiDetail = () => {
+    setCivitaiDetail(null);
+    setDetailImageIdx(0);
+  };
+
+  const openCivitaiDetail = async (item) => {
+    if (!item?.id && !item?.name) return;
+    setCivitaiDetailBusy(true);
+    setDetailImageIdx(0);
+    setCivitaiDetail({ model: item, related: [], loading: true });
+    try {
+      if (item.id != null && settings?.civitaiConfigured) {
+        const data = await api(`/v1/civitai/models/${item.id}`);
+        // Accept nested { model, related } or a flat detail payload.
+        const model = data.model || data;
+        const related = Array.isArray(data.related)
+          ? data.related
+          : Array.isArray(model.related)
+            ? model.related
+            : [];
+        setCivitaiDetail({
+          model: { ...item, ...model },
+          related,
+          loading: false,
+        });
+      } else {
+        setCivitaiDetail({ model: item, related: item.related || [], loading: false });
+      }
+    } catch (e) {
+      setCivitaiDetail({ model: item, related: [], loading: false, error: e.message });
+    } finally {
+      setCivitaiDetailBusy(false);
     }
   };
 
@@ -752,12 +852,19 @@ export default function App() {
     return data;
   };
 
-  const installOne = async (item) => {
+  const destPathForAsset = (item) => {
     const safe = (item.name || "model").replace(/[^a-zA-Z0-9._-]+/g, "_");
-    const dest =
-      item.modelType === "LORA" || item.modelType === "LoCon"
-        ? `loras/${safe}.safetensors`
-        : `checkpoints/${safe}.safetensors`;
+    const t = (item.modelType || "").toLowerCase();
+    if (t === "lora" || t === "locon" || t === "dora" || t === "lycoris" || t.includes("lora")) {
+      return `loras/${safe}.safetensors`;
+    }
+    if (t === "textualinversion") return `embeddings/${safe}.safetensors`;
+    if (t === "vae") return `vae/${safe}.safetensors`;
+    return `checkpoints/${safe}.safetensors`;
+  };
+
+  const installOne = async (item) => {
+    const dest = destPathForAsset(item);
     await api("/v1/civitai/install", {
       method: "POST",
       body: JSON.stringify({
@@ -1131,7 +1238,11 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const data = await api(`/v1/civitai/search?q=${encodeURIComponent(civitaiQ)}&limit=12`);
+      // Default Freya types on the API; pass explicitly so mock + live stay aligned.
+      const types = "LORA,LoCon,DoRA,Checkpoint,TextualInversion,VAE";
+      const data = await api(
+        `/v1/civitai/search?q=${encodeURIComponent(civitaiQ)}&limit=12&types=${encodeURIComponent(types)}`,
+      );
       setCivitaiItems(data.items || []);
     } catch (e) {
       setError(e.message);
@@ -1214,24 +1325,64 @@ export default function App() {
     (session.pinnedLoras || []).length > 0 ||
     Boolean(session.sessionNote);
 
-  const renderLoraCard = (item, { compact = false } = {}) => {
+  const renderLoraCard = (item, { compact = false, pinLabel, onAfterPin } = {}) => {
     const pinned = isPinned(item);
+    const favorited = isFavorite(item);
+    const typeLabel = item.modelType || "LORA";
+    const downloads = formatStat(item.stats?.downloadCount);
     return (
       <article key={loraKey(item)} className={`lora-card${compact ? " compact" : ""}`}>
+        <button
+          type="button"
+          className="lora-card-thumb lora-card-thumb-btn"
+          onClick={() => openCivitaiDetail(item)}
+          title="View details"
+        >
+          {item.thumbnailUrl ? (
+            <img
+              src={item.thumbnailUrl}
+              alt=""
+              loading="lazy"
+              onError={(e) => {
+                e.currentTarget.classList.add("is-broken");
+              }}
+            />
+          ) : null}
+          <div className="lora-card-thumb-fallback" aria-hidden="true">
+            {typeLabel.slice(0, 4)}
+          </div>
+          <span className="lora-type-badge">{typeLabel}</span>
+          {downloads ? <span className="lora-stat-badge">{downloads}</span> : null}
+        </button>
         <div className="lora-card-body">
-          <h4>{item.name}</h4>
-          <p>
-            {item.modelType || "LORA"}
-            {item.triggerWord ? ` · trigger: ${item.triggerWord}` : ""}
-          </p>
+          <button type="button" className="lora-card-title" onClick={() => openCivitaiDetail(item)}>
+            <h4>{item.name}</h4>
+          </button>
+          {item.baseModel ? <p className="lora-card-meta">{item.baseModel}</p> : null}
+          {item.triggerWord ? <p>trigger: {item.triggerWord}</p> : null}
         </div>
         <div className="row lora-card-actions">
           <button
             type="button"
-            className={pinned ? "primary" : "ghost"}
-            onClick={() => (pinned ? unpinLora(item) : pinLora(item))}
+            className={favorited ? "primary" : "ghost"}
+            title={favorited ? "Remove from favorites" : "Save to favorites library"}
+            onClick={() => toggleFavorite(item)}
           >
-            {pinned ? "Unpin" : "Pin"}
+            {favorited ? "★" : "☆"}
+          </button>
+          <button
+            type="button"
+            className={pinned ? "primary" : "ghost"}
+            title={pinned ? "Unpin from this session" : "Pin for this session only"}
+            onClick={() => {
+              if (pinned) unpinLora(item);
+              else {
+                pinLora(item);
+                onAfterPin?.(item);
+              }
+            }}
+          >
+            {pinned ? "Unpin" : pinLabel || "Pin"}
           </button>
           <button
             type="button"
@@ -1250,6 +1401,15 @@ export default function App() {
       </article>
     );
   };
+
+  const detailModel = civitaiDetail?.model;
+  const detailImages =
+    (detailModel?.imageUrls?.length
+      ? detailModel.imageUrls
+      : detailModel?.thumbnailUrl
+        ? [detailModel.thumbnailUrl]
+        : []) || [];
+  const detailRelated = civitaiDetail?.related || [];
 
   const showAssistPanel =
     ideas.length > 0 || suggestedLoras.length > 0 || suggestNote || civitaiQuery;
@@ -1607,8 +1767,9 @@ export default function App() {
                 )}
                 {suggestedLoras.length > 0 && (
                   <p className="hint">
-                    {suggestedLoras.length} LoRA candidate{suggestedLoras.length === 1 ? "" : "s"}{" "}
-                    in the gallery pane → pin or install there.
+                    {suggestedLoras.length} Civitai{" "}
+                    {suggestedLoras.length === 1 ? "asset" : "assets"} in the gallery pane → pin or
+                    install there.
                   </p>
                 )}
               </aside>
@@ -1745,10 +1906,10 @@ export default function App() {
 
         <section className="pane pane-right" aria-label="Gallery and results">
           {suggestedLoras.length > 0 && (
-            <aside className="lora-strip" aria-label="LoRA selection preview">
+            <aside className="lora-strip" aria-label="Civitai asset suggestions">
               <div className="lora-strip-head">
                 <div>
-                  <span className="t-kind">LoRA selection</span>
+                  <span className="t-kind">Civitai assets</span>
                   {civitaiQuery ? (
                     <p className="lora-strip-q">
                       Civitai · <strong>{civitaiQuery}</strong>
@@ -1762,8 +1923,8 @@ export default function App() {
                 </button>
               </div>
               <p className="hint">
-                Pin anytime (no worker needed). Install needs a worker — otherwise Freya generates
-                via OpenRouter.
+                LoRAs ranked first; checkpoints and other weights included. Pin anytime (no worker
+                needed). Install needs a worker — otherwise Freya generates via OpenRouter.
               </p>
               <div className="lora-row lora-row-strip">
                 {suggestedLoras.map((l) => renderLoraCard(l, { compact: true }))}
@@ -1909,70 +2070,84 @@ export default function App() {
 
       {tab === "civitai" && (
         <section className="panel">
-          {!settings?.civitaiConfigured && (
-            <p className="hint">
-              Add your Civitai API key in Settings to search LoRAs
-              {mock ? " (any non-empty value works in mock)" : ""}. Install onto a worker is
-              optional — Pin works without one; cloud Generate uses OpenRouter.
-            </p>
-          )}
-          {settings?.civitaiConfigured && !hasWorker() && (
-            <p className="hint">
-              Worker not set — you can search and pin LoRAs now. Install needs a diffusion worker
-              URL; Generate still works via OpenRouter without one.
-            </p>
-          )}
-          <p className="hint civitai-demo-hint">
-            Featured example: describe something like “{examplePrompt}” — Freya searches for “
-            {exampleCivitaiQuery}”. Manual Search/Pin here always works; Install needs a worker.
-          </p>
-          <div className="row" style={{ marginBottom: "1rem" }}>
-            <input
-              style={{ flex: 1, minWidth: "12rem" }}
-              value={civitaiQ}
-              onChange={(e) => setCivitaiQ(e.target.value)}
-              placeholder="Search Civitai…"
-            />
-            <button className="primary" disabled={busy} onClick={searchCivitai}>
+          <div className="row civitai-subnav" style={{ marginBottom: "0.75rem" }}>
+            <button
+              type="button"
+              className={civitaiSubview === "search" ? "primary" : "ghost"}
+              onClick={() => setCivitaiSubview("search")}
+            >
               Search
             </button>
+            <button
+              type="button"
+              className={civitaiSubview === "favorites" ? "primary" : "ghost"}
+              onClick={() => setCivitaiSubview("favorites")}
+            >
+              Favorites ({favorites.length})
+            </button>
           </div>
-          {savedMsg && <p className="hint">{savedMsg}</p>}
-          <div className="lora-row">
-            {civitaiItems.map((item) => (
-              <article key={item.id} className="lora-card">
-                <h4>{item.name}</h4>
-                <p>{item.modelType}</p>
-                {item.triggerWord && (
-                  <p className="hint">Trigger (optional): {item.triggerWord}</p>
+          {civitaiSubview === "search" && (
+            <>
+              {!settings?.civitaiConfigured && (
+                <p className="hint">
+                  Add your Civitai API key in Settings to search assets (LoRA, Checkpoint, and
+                  related weights)
+                  {mock ? " — any non-empty value works in mock" : ""}. ★ Favorite is a persistent
+                  library; Pin is session-only. Install needs a worker.
+                </p>
+              )}
+              {settings?.civitaiConfigured && !hasWorker() && (
+                <p className="hint">
+                  Worker not set — search, favorite, and pin work now. Install needs a diffusion
+                  worker URL; Generate still works via OpenRouter without one.
+                </p>
+              )}
+              <p className="hint civitai-demo-hint">
+                Featured example: describe something like “{examplePrompt}” — Freya searches for “
+                {exampleCivitaiQuery}”. Click a card for details, triggers, and related checkpoints.
+              </p>
+              <div className="row" style={{ marginBottom: "1rem" }}>
+                <input
+                  style={{ flex: 1, minWidth: "12rem" }}
+                  value={civitaiQ}
+                  onChange={(e) => setCivitaiQ(e.target.value)}
+                  placeholder="Search Civitai…"
+                />
+                <button className="primary" disabled={busy} onClick={searchCivitai}>
+                  Search
+                </button>
+              </div>
+              {savedMsg && <p className="hint">{savedMsg}</p>}
+              <div className="lora-row">
+                {civitaiItems.map((item) =>
+                  renderLoraCard(item, {
+                    pinLabel: "Pin to session",
+                    onAfterPin: () => setTab("gallery"),
+                  }),
                 )}
-                <div className="row lora-card-actions">
-                  <button
-                    className={isPinned(item) ? "primary" : "ghost"}
-                    onClick={() => {
-                      if (isPinned(item)) unpinLora(item);
-                      else pinLora(item);
-                      setTab("gallery");
-                    }}
-                  >
-                    {isPinned(item) ? "Unpin" : "Pin to session"}
-                  </button>
-                  <button
-                    className="primary"
-                    disabled={busy}
-                    title={
-                      hasWorker()
-                        ? "Install this LoRA onto your diffusion worker"
-                        : "Needs a worker URL — pin for later, or add a worker in Settings"
-                    }
-                    onClick={() => installCivitai(item)}
-                  >
-                    {hasWorker() ? "Install to worker" : "Install (needs worker)"}
-                  </button>
+              </div>
+            </>
+          )}
+          {civitaiSubview === "favorites" && (
+            <>
+              <p className="hint">
+                Persistent library in this browser (localStorage). ★ Favorite survives sessions; Pin
+                only applies to the current session generate. Install/Pin still available here.
+              </p>
+              {favorites.length === 0 ? (
+                <p className="hint">No favorites yet — star assets from Search or Suggest.</p>
+              ) : (
+                <div className="lora-row">
+                  {favorites.map((item) =>
+                    renderLoraCard(item, {
+                      pinLabel: "Pin to session",
+                      onAfterPin: () => setTab("gallery"),
+                    }),
+                  )}
                 </div>
-              </article>
-            ))}
-          </div>
+              )}
+            </>
+          )}
         </section>
       )}
 
@@ -2069,6 +2244,15 @@ export default function App() {
               only via OpenRouter.
             </span>
           </label>
+          <p className="hint">
+            Video (OpenRouter):{" "}
+            {videoModels.length > 0
+              ? `${videoModels.length} model(s) discovered via /v1/models → video (e.g. ${videoModels
+                  .slice(0, 3)
+                  .map((m) => m.id)
+                  .join(", ")}). Generation is async (POST /videos + poll) and not wired in Freya UI yet.`
+              : "No video models listed yet (needs OpenRouter key). Freya discovers them on /v1/models but does not generate video yet."}
+          </p>
           <button className="primary" disabled={busy} onClick={saveSettings}>
             Save settings
           </button>
@@ -2078,6 +2262,152 @@ export default function App() {
         </section>
       </div>
       </div>
+
+      {civitaiDetail && detailModel && (
+        <div
+          className="civitai-modal-backdrop"
+          role="presentation"
+          onClick={closeCivitaiDetail}
+        >
+          <div
+            className="civitai-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={detailModel.name || "Civitai asset"}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="civitai-modal-head">
+              <div>
+                <span className="lora-type-badge">{detailModel.modelType || "Asset"}</span>
+                <h3>{detailModel.name}</h3>
+                <p className="hint">
+                  {[detailModel.creator && `by ${detailModel.creator}`, detailModel.baseModel, detailModel.versionName]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </p>
+              </div>
+              <button type="button" className="ghost" onClick={closeCivitaiDetail}>
+                Close
+              </button>
+            </div>
+            <div className="civitai-modal-gallery">
+              {detailImages.length > 0 ? (
+                <>
+                  <img
+                    src={detailImages[Math.min(detailImageIdx, detailImages.length - 1)]}
+                    alt=""
+                    onError={(e) => e.currentTarget.classList.add("is-broken")}
+                  />
+                  {detailImages.length > 1 && (
+                    <div className="row civitai-modal-thumbs">
+                      {detailImages.map((url, i) => (
+                        <button
+                          key={url}
+                          type="button"
+                          className={i === detailImageIdx ? "primary" : "ghost"}
+                          onClick={() => setDetailImageIdx(i)}
+                        >
+                          <img src={url} alt="" />
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="lora-card-thumb-fallback">No preview</div>
+              )}
+            </div>
+            <div className="civitai-modal-body">
+              {(civitaiDetailBusy || civitaiDetail.loading) && (
+                <p className="hint">Loading details…</p>
+              )}
+              {civitaiDetail.error && <p className="hint">{civitaiDetail.error}</p>}
+              {detailModel.needsBase && (
+                <p className="civitai-needs-base">{detailModel.needsBase}</p>
+              )}
+              {detailModel.description && <p>{detailModel.description}</p>}
+              {(detailModel.trainedWords?.length || detailModel.triggerWord) && (
+                <p className="hint">
+                  Triggers:{" "}
+                  {(detailModel.trainedWords?.length
+                    ? detailModel.trainedWords
+                    : [detailModel.triggerWord]
+                  ).filter(Boolean).join(" · ")}
+                </p>
+              )}
+              {(detailModel.stats || detailModel.downloadCount != null) && (
+                <p className="hint">
+                  {[
+                    formatStat(detailModel.stats?.downloadCount ?? detailModel.downloadCount) &&
+                      `${formatStat(detailModel.stats?.downloadCount ?? detailModel.downloadCount)} downloads`,
+                    formatStat(detailModel.stats?.thumbsUpCount ?? detailModel.thumbsUp) &&
+                      `${formatStat(detailModel.stats?.thumbsUpCount ?? detailModel.thumbsUp)} likes`,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </p>
+              )}
+              <div className="row lora-card-actions">
+                <button
+                  type="button"
+                  className={isFavorite(detailModel) ? "primary" : "ghost"}
+                  onClick={() => toggleFavorite(detailModel)}
+                >
+                  {isFavorite(detailModel) ? "★ Favorited" : "☆ Favorite"}
+                </button>
+                <button
+                  type="button"
+                  className={isPinned(detailModel) ? "primary" : "ghost"}
+                  onClick={() =>
+                    isPinned(detailModel) ? unpinLora(detailModel) : pinLora(detailModel)
+                  }
+                >
+                  {isPinned(detailModel) ? "Unpin" : "Pin to session"}
+                </button>
+                <button
+                  type="button"
+                  className="ghost"
+                  disabled={busy}
+                  onClick={() => installCivitai(detailModel)}
+                >
+                  {hasWorker() ? "Install" : "Install (needs worker)"}
+                </button>
+                {detailModel.civitaiUrl && (
+                  <a
+                    className="ghost"
+                    href={detailModel.civitaiUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Open on Civitai
+                  </a>
+                )}
+              </div>
+              {detailRelated.length > 0 && (
+                <div className="civitai-related">
+                  <h4>Needs checkpoint / related</h4>
+                  <p className="hint">
+                    Civitai does not expose a hard dependency graph — Freya suggests popular
+                    checkpoints for this base family so you can pin or install them too.
+                  </p>
+                  <div className="lora-row">
+                    {detailRelated.map((rel) => {
+                      const card = rel?.model || rel;
+                      return renderLoraCard(
+                        {
+                          ...card,
+                          _relationNote: rel?.note || rel?.relation,
+                        },
+                        { compact: true },
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
