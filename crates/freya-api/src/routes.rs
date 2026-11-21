@@ -191,7 +191,20 @@ pub async fn run(
                     req.backend = Some(b.into());
                 }
                 if let Some(m) = plan.get("model").and_then(|x| x.as_str()) {
-                    req.model = Some(m.into());
+                    // Planners sometimes emit chat routers (openrouter/auto) — keep default image model.
+                    let default_image = {
+                        let cfg = state.config.read().await;
+                        cfg.image_model.clone()
+                    };
+                    let resolved = crate::openrouter::resolve_image_model(m, &default_image);
+                    if resolved != m {
+                        tracing::debug!(
+                            planner_model = %m,
+                            resolved = %resolved,
+                            "ignored non-image planner model"
+                        );
+                    }
+                    req.model = Some(resolved);
                 }
                 if let Some(s) = plan.get("styleId").and_then(|x| x.as_str()) {
                     req.style_ref = Some(s.into());
@@ -302,8 +315,13 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
         )
     } else {
         let or = state.openrouter.read().await;
+        let default_image = or.default_image_model().to_string();
+        let model = req
+            .model
+            .as_deref()
+            .map(|m| crate::openrouter::resolve_image_model(m, &default_image));
         let img = or
-            .generate_image(&final_prompt, req.model.as_deref(), req.size.as_deref())
+            .generate_image(&final_prompt, model.as_deref(), req.size.as_deref())
             .await
             .map_err(ApiError::from)?;
         let bytes = base64::engine::general_purpose::STANDARD
@@ -312,9 +330,7 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
         (
             bytes,
             img.mime,
-            req.model
-                .clone()
-                .unwrap_or_else(|| or.default_image_model().to_string()),
+            model.unwrap_or(default_image),
             "openrouter".to_string(),
         )
     };

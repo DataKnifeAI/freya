@@ -164,7 +164,7 @@ pub fn builtin_instruction(mode: &str) -> &'static str {
             "You are Freya. Expand the user's natural-language description into a rich image brief for modern models: one continuous paragraph of vivid prose. Do NOT output comma-separated Stable Diffusion keyword lists. Output ONLY the prose brief."
         }
         "plan" => {
-            "You are Freya's planner for agentic image sessions. Reply with JSON only: {\"backend\":\"openrouter\"|\"local\",\"model\":\"...\",\"styleId\":null|\"...\",\"enhanceMode\":\"prompt-prose\"|\"prompt-sd\",\"civitaiQuery\":null|\"short search\",\"rationale\":\"short\"}. Prefer openrouter + prompt-prose. Use local + prompt-sd only for pinned LoRAs."
+            "You are Freya's planner for agentic image sessions. Reply with JSON only: {\"backend\":\"openrouter\"|\"local\",\"model\":\"...\",\"styleId\":null|\"...\",\"enhanceMode\":\"prompt-prose\"|\"prompt-sd\",\"civitaiQuery\":null|\"short search\",\"rationale\":\"short\"}. Prefer openrouter + prompt-prose. For model use an OpenRouter *image* model id such as black-forest-labs/flux.2-klein-4b or google/gemini-2.5-flash-image — never openrouter/auto or chat-only models. Use local + prompt-sd only for pinned LoRAs."
         }
         "suggest" => {
             "You are Freya. Reply with JSON only: {\"ideas\":[\"nl alt 1\",\"nl alt 2\"],\"civitaiQuery\":\"short LoRA search\",\"sessionNote\":\"what to try next\"}. Ideas are everyday prose, never SD tags. civitaiQuery is 2–6 words for Civitai."

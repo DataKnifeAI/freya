@@ -56,8 +56,8 @@ const AGENT_MODELS = [
 const IMAGE_MODELS = [
   { id: "auto", label: "Auto", short: "Auto" },
   { id: "black-forest-labs/flux.2-klein-4b", label: "FLUX.2 Klein 4B", short: "FLUX Klein" },
-  { id: "black-forest-labs/flux.1-schnell", label: "FLUX.1 Schnell", short: "FLUX Schnell" },
-  { id: "stabilityai/sdxl-turbo", label: "SDXL Turbo", short: "SDXL Turbo" },
+  { id: "google/gemini-2.5-flash-image", label: "Gemini 2.5 Flash Image", short: "Gemini Image" },
+  { id: "openai/gpt-image-1-mini", label: "GPT Image 1 Mini", short: "GPT Image Mini" },
 ];
 
 const emptySession = () => ({
