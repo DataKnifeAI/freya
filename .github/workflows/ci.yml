@@ -21,11 +21,11 @@ jobs:
 
       - name: Validate Docker Compose
         run: |
-          # Create a minimal .env file if it doesn't exist (for CI validation)
-          if [ ! -f .env ]; then
-            touch .env
+          # Compose stack lives under legacy/ after the OpenRouter operator cutover
+          if [ ! -f legacy/.env ]; then
+            touch legacy/.env
           fi
-          docker compose config > /dev/null
+          docker compose -f legacy/docker-compose.yml --project-directory legacy config > /dev/null
           echo "✅ Docker Compose configuration is valid"
 
       - name: Install kube-score
@@ -104,17 +104,27 @@ jobs:
           wget -O /usr/local/bin/hadolint https://github.com/hadolint/hadolint/releases/latest/download/hadolint-Linux-x86_64
           chmod +x /usr/local/bin/hadolint
 
-      - name: Validate ComfyUI Dockerfile
+      - name: Validate legacy ComfyUI Dockerfile
         run: |
-          echo "Validating Dockerfile.comfyui..."
-          hadolint Dockerfile.comfyui || echo "⚠️  ComfyUI Dockerfile had linting warnings (non-blocking)"
+          echo "Validating legacy/Dockerfile.comfyui..."
+          hadolint legacy/Dockerfile.comfyui || echo "⚠️  ComfyUI Dockerfile had linting warnings (non-blocking)"
           echo "✅ ComfyUI Dockerfile validation complete"
 
-      - name: Validate SwarmUI Dockerfile
+      - name: Validate legacy SwarmUI Dockerfile
         run: |
-          echo "Validating Dockerfile.swarmui..."
-          hadolint Dockerfile.swarmui || echo "⚠️  SwarmUI Dockerfile had linting warnings (non-blocking)"
+          echo "Validating legacy/Dockerfile.swarmui..."
+          hadolint legacy/Dockerfile.swarmui || echo "⚠️  SwarmUI Dockerfile had linting warnings (non-blocking)"
           echo "✅ SwarmUI Dockerfile validation complete"
+
+      - name: Validate Freya Dockerfiles
+        run: |
+          for f in Dockerfile Dockerfile.web; do
+            if [ -f "$f" ]; then
+              echo "Validating $f..."
+              hadolint "$f" || echo "⚠️  $f had linting warnings (non-blocking)"
+            fi
+          done
+          echo "✅ Freya Dockerfile validation complete"
 
   test-scripts:
     name: Test Scripts
