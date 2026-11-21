@@ -289,7 +289,7 @@ textarea::placeholder { color: var(--chrome-faint); font-style: italic; }
 textarea:focus { background: var(--chrome-field); border-bottom-color: var(--apricot); }
 .compose-status { font-size: 0.72rem; line-height: 1.35; }
 
-/* Single-line control row: Sessions · Run | Mode · Agent · Image …… [ Suggest · Generate ] */
+/* Single-line control row: Sessions · Run | Mode · Agent · Image …… [ Suggest · Send ] */
 .composer-bar { display: flex; flex-wrap: nowrap; align-items: center; gap: 0.35rem; min-width: 0; }
 .compose-actions { flex: none; display: flex; flex-wrap: nowrap; gap: 0.25rem; align-items: center; }
 .icon-btn {
@@ -298,13 +298,13 @@ textarea:focus { background: var(--chrome-field); border-bottom-color: var(--apr
 }
 .icon-btn svg { display: block; }
 .icon-btn-primary { box-shadow: none; }
-/* Primary action cluster: Suggest + Generate grouped on the right */
+/* Primary action cluster: Suggest + Send grouped on the right */
 .composer-primary-cluster {
   margin-left: auto; flex: none; display: flex; flex-wrap: nowrap; align-items: center; gap: 0.25rem;
   padding: 0.2rem; background: var(--celadon-tint);
   border: 1px solid var(--chrome-line); border-radius: 4px;
 }
-.composer-generate { margin-left: 0; }
+.composer-send { margin-left: 0; }
 .icon-spin { display: inline-flex; animation: spin 0.9s linear infinite; }
 .composer-divider { flex: none; width: 1px; height: 20px; background: var(--chrome-line); }
 
@@ -342,7 +342,7 @@ button.ghost { background: transparent; border: 1px solid var(--line); color: va
 button.ghost:hover { border-color: var(--ember); color: var(--ember-deep); }
 .compose button.ghost, .pane-right button.ghost { border-color: var(--chrome-line); color: var(--chrome-text); }
 .compose button.ghost:hover, .pane-right button.ghost:hover { border-color: var(--apricot); color: var(--apricot); }
-/* Suggest sits inside the primary cluster but stays quiet next to Generate */
+/* Suggest sits inside the primary cluster but stays quiet next to Send */
 .composer-primary-cluster button.ghost:hover { border-color: var(--apricot-line); color: var(--mist-light); }
 :root[data-theme="light"] .composer-primary-cluster button.ghost:hover { color: var(--mist-deep); }
 button:disabled { opacity: 0.45; cursor: wait; }
@@ -380,6 +380,27 @@ button.linkish:hover { text-decoration-color: var(--ember); }
 .t-meta time { font-variant-numeric: tabular-nums; }
 .t-prompt { padding: 0; border: none; background: transparent; text-align: left; font-weight: 500; font-size: 0.9rem; line-height: 1.45; color: var(--paper-text); }
 .t-prompt:hover { color: var(--ember-deep); }
+.t-msg.t-user { border-left-color: var(--ember); }
+.t-msg.t-assistant { border-left-color: var(--apricot-deep); }
+.t-bubble { margin: 0; font-size: 0.9rem; line-height: 1.45; white-space: pre-wrap; }
+.t-tools { list-style: none; margin: 0.35rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.t-tool {
+  font-size: 0.68rem; font-weight: 600; letter-spacing: 0.02em;
+  padding: 0.15rem 0.45rem; border: 1px solid var(--line); border-radius: 2px;
+  display: inline-flex; gap: 0.35rem; align-items: baseline;
+}
+.t-tool-type { text-transform: none; }
+.t-tool-status { opacity: 0.65; text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.6rem; }
+.t-tool-proposed { border-color: var(--apricot-deep); color: var(--apricot-deep); }
+.t-tool-executed { border-color: var(--ember); }
+.t-tool-error { border-color: var(--err-on-paper); color: var(--err-on-paper); }
+.t-thumbs { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.4rem; }
+.t-thumb {
+  padding: 0; border: 1px solid var(--line); border-radius: 2px; background: transparent;
+  width: 72px; height: 72px; overflow: hidden; cursor: pointer;
+}
+.t-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.t-thumb:hover { border-color: var(--ember); }
 .pin-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; }
 .pin-list li { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; font-size: 0.82rem; }
 .pin-list li button { padding: 0.15rem 0.45rem; font-size: 0.66rem; }

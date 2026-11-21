@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
 
     let protected = Router::new()
         .route("/v1/assist", post(routes::assist))
+        .route("/v1/chat", post(routes::chat))
         .route("/v1/generate", post(routes::generate))
         .route("/v1/run", post(routes::run))
         .route("/v1/gallery", get(routes::gallery_list))

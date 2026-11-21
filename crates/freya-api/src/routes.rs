@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 
 type ApiResult<T> = Result<T, ApiError>;
 
@@ -119,6 +119,696 @@ pub async fn assist(
     }
 
     Ok(Json(out))
+}
+
+// ——— Conversational chat with tool actions (Plan / Auto / YOLO) ———
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatMessageIn {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatActionIn {
+    #[serde(rename = "type")]
+    pub action_type: String,
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatRequest {
+    pub message: String,
+    #[serde(default)]
+    pub messages: Vec<ChatMessageIn>,
+    #[serde(default)]
+    pub session: Option<serde_json::Value>,
+    #[serde(default)]
+    pub automation_mode: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub image_model: Option<String>,
+    /// When true, skip LLM planning and execute `actions` (Plan confirmation).
+    #[serde(default)]
+    pub confirm: bool,
+    #[serde(default)]
+    pub actions: Vec<ChatActionIn>,
+    #[serde(default)]
+    pub loras: Vec<LoraIn>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedAction {
+    action_type: String,
+    args: serde_json::Value,
+}
+
+fn wants_image_intent(message: &str) -> bool {
+    let m = message.to_lowercase();
+    const KEYS: &[&str] = &[
+        "generate",
+        "make an image",
+        "make me an image",
+        "create an image",
+        "draw ",
+        "draw me",
+        "render ",
+        "paint ",
+        "produce an image",
+        "run session",
+        "run a session",
+        "make a picture",
+        "create a picture",
+    ];
+    KEYS.iter().any(|k| m.contains(k))
+}
+
+fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
+    let m = message.to_lowercase();
+    let mut actions = Vec::new();
+
+    if m.contains("suggest") || m.contains("idea") || m.contains("brainstorm") {
+        actions.push(PlannedAction {
+            action_type: "suggest_ideas".into(),
+            args: json!({ "topic": message }),
+        });
+    }
+    if m.contains("civitai")
+        || m.contains("search for lora")
+        || m.contains("find a lora")
+        || m.contains("find loras")
+        || m.contains("search civitai")
+    {
+        let query = message
+            .split_once("for ")
+            .map(|(_, rest)| rest.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(message);
+        actions.push(PlannedAction {
+            action_type: "search_civitai".into(),
+            args: json!({ "query": query.chars().take(80).collect::<String>() }),
+        });
+    }
+    if wants_image_intent(message) {
+        if m.contains("run session") || m.contains("variations") || m.contains("batch") {
+            actions.push(PlannedAction {
+                action_type: "run_session".into(),
+                args: json!({ "goal": message }),
+            });
+        } else {
+            actions.push(PlannedAction {
+                action_type: "generate_image".into(),
+                args: json!({ "prompt": message, "batch": false }),
+            });
+        }
+    }
+
+    let reply = if actions.is_empty() {
+        format!(
+            "Happy to talk through it. Tell me when you want me to generate, search Civitai, or suggest ideas — I’ll wait until you ask."
+        )
+    } else if actions.iter().any(|a| a.action_type == "generate_image" || a.action_type == "run_session") {
+        "On it — I’ll make that image for you.".into()
+    } else if actions.iter().any(|a| a.action_type == "search_civitai") {
+        "I’ll search Civitai for matching assets.".into()
+    } else {
+        "Here are some directions we could take.".into()
+    };
+    (reply, actions)
+}
+
+fn parse_chat_plan(text: &str, fallback_message: &str) -> (String, Vec<PlannedAction>) {
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(strip_json_fence(text)) {
+        let reply = parsed
+            .get("reply")
+            .and_then(|r| r.as_str())
+            .unwrap_or(text)
+            .to_string();
+        let mut actions = Vec::new();
+        if let Some(arr) = parsed.get("actions").and_then(|a| a.as_array()) {
+            for a in arr {
+                let ty = a
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if ty.is_empty() {
+                    continue;
+                }
+                let args = a.get("args").cloned().unwrap_or(json!({}));
+                actions.push(PlannedAction {
+                    action_type: ty,
+                    args,
+                });
+            }
+        }
+        return (reply, actions);
+    }
+    // Model returned prose — keep it, infer tools from user intent.
+    let (fallback_reply, inferred) = infer_chat_plan(fallback_message);
+    if inferred.is_empty() {
+        (text.trim().to_string(), vec![])
+    } else if text.trim().is_empty() {
+        (fallback_reply, inferred)
+    } else {
+        (text.trim().to_string(), inferred)
+    }
+}
+
+fn is_side_effect_action(ty: &str) -> bool {
+    matches!(ty, "generate_image" | "install_asset" | "run_session")
+}
+
+async fn execute_chat_action(
+    state: &AppState,
+    action: &PlannedAction,
+    pinned: &[LoraIn],
+    image_model: Option<&str>,
+) -> serde_json::Value {
+    let ty = action.action_type.as_str();
+    match ty {
+        "suggest_ideas" => {
+            let topic = action
+                .args
+                .get("topic")
+                .and_then(|t| t.as_str())
+                .unwrap_or("a memorable scene");
+            let system = styles::load_instruction(&state.packs_dir, "suggest").await;
+            let or = state.openrouter.read().await;
+            match or.chat(&system, topic, None).await {
+                Ok(text) => {
+                    let mut ideas = Vec::new();
+                    let mut note = String::new();
+                    if let Ok(parsed) =
+                        serde_json::from_str::<serde_json::Value>(strip_json_fence(&text))
+                    {
+                        if let Some(arr) = parsed.get("ideas").and_then(|i| i.as_array()) {
+                            ideas = arr
+                                .iter()
+                                .filter_map(|x| x.as_str().map(str::to_string))
+                                .collect();
+                        }
+                        if let Some(n) = parsed.get("sessionNote").and_then(|n| n.as_str()) {
+                            note = n.to_string();
+                        }
+                    }
+                    if ideas.is_empty() {
+                        ideas = text
+                            .lines()
+                            .map(|l| l.trim().trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')').trim())
+                            .filter(|l| !l.is_empty())
+                            .take(5)
+                            .map(str::to_string)
+                            .collect();
+                    }
+                    json!({
+                        "type": ty,
+                        "status": "executed",
+                        "args": action.args,
+                        "result": { "ideas": ideas, "sessionNote": note }
+                    })
+                }
+                Err(e) => json!({
+                    "type": ty,
+                    "status": "error",
+                    "args": action.args,
+                    "error": e.to_string()
+                }),
+            }
+        }
+        "search_civitai" => {
+            let q = action
+                .args
+                .get("query")
+                .and_then(|q| q.as_str())
+                .unwrap_or("")
+                .trim();
+            if q.is_empty() {
+                return json!({
+                    "type": ty,
+                    "status": "error",
+                    "args": action.args,
+                    "error": "missing query"
+                });
+            }
+            let civ = state.civitai.read().await;
+            if !civ.configured() {
+                return json!({
+                    "type": ty,
+                    "status": "error",
+                    "args": action.args,
+                    "error": "Civitai API key not configured"
+                });
+            }
+            match civ.search(q, 12).await {
+                Ok(items) => {
+                    let mut assets: Vec<_> = items
+                        .into_iter()
+                        .filter(|c| crate::civitai::is_freya_asset_type(&c.model_type))
+                        .collect();
+                    assets.sort_by_key(|c| crate::civitai::asset_type_rank(&c.model_type));
+                    assets.truncate(6);
+                    json!({
+                        "type": ty,
+                        "status": "executed",
+                        "args": action.args,
+                        "result": { "query": q, "loras": assets }
+                    })
+                }
+                Err(e) => json!({
+                    "type": ty,
+                    "status": "error",
+                    "args": action.args,
+                    "error": e.to_string()
+                }),
+            }
+        }
+        "generate_image" => {
+            let prompt = action
+                .args
+                .get("prompt")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .trim();
+            if prompt.is_empty() {
+                return json!({
+                    "type": ty,
+                    "status": "error",
+                    "args": action.args,
+                    "error": "missing prompt"
+                });
+            }
+            let mut req = GenerateRequest {
+                prompt: prompt.to_string(),
+                negative_prompt: None,
+                enhance: Some("auto".into()),
+                backend: Some(if pinned.is_empty() {
+                    "auto".into()
+                } else if state.worker.read().await.is_some() {
+                    "local".into()
+                } else {
+                    "auto".into()
+                }),
+                model: image_model.map(str::to_string),
+                style_ref: None,
+                loras: pinned.to_vec(),
+                size: None,
+                seed: None,
+            };
+            if req.model.as_deref() == Some("auto") {
+                req.model = None;
+            }
+            match run_generate(state, req).await {
+                Ok(result) => json!({
+                    "type": ty,
+                    "status": "executed",
+                    "args": action.args,
+                    "result": result
+                }),
+                Err(e) => {
+                    let msg = match e {
+                        ApiError::Msg(m) => m,
+                        ApiError::NoWorker => "No diffusion worker configured".into(),
+                        ApiError::NotFound => "not found".into(),
+                    };
+                    json!({
+                        "type": ty,
+                        "status": "error",
+                        "args": action.args,
+                        "error": msg
+                    })
+                }
+            }
+        }
+        "run_session" => {
+            let goal = action
+                .args
+                .get("goal")
+                .and_then(|g| g.as_str())
+                .unwrap_or("explore the scene")
+                .trim();
+            let system = styles::load_instruction(&state.packs_dir, "session").await;
+            let or = state.openrouter.read().await;
+            let batch: Vec<String> = match or.chat(&system, goal, None).await {
+                Ok(text) => {
+                    if let Ok(parsed) =
+                        serde_json::from_str::<serde_json::Value>(strip_json_fence(&text))
+                    {
+                        parsed
+                            .get("batchPrompts")
+                            .and_then(|b| b.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|x| x.as_str().map(str::to_string))
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        vec![]
+                    }
+                }
+                Err(_) => vec![],
+            };
+            let prompts = if batch.is_empty() {
+                vec![
+                    format!("{goal} — wide establishing shot."),
+                    format!("{goal} — closer framing."),
+                    format!("{goal} — quieter mood."),
+                ]
+            } else {
+                batch
+            };
+            let mut results = Vec::new();
+            for p in &prompts {
+                let mut req = GenerateRequest {
+                    prompt: p.clone(),
+                    negative_prompt: None,
+                    enhance: Some("auto".into()),
+                    backend: Some("auto".into()),
+                    model: image_model.map(str::to_string),
+                    style_ref: None,
+                    loras: pinned.to_vec(),
+                    size: None,
+                    seed: None,
+                };
+                if req.model.as_deref() == Some("auto") {
+                    req.model = None;
+                }
+                match run_generate(state, req).await {
+                    Ok(r) => results.push(r),
+                    Err(e) => {
+                        let msg = match e {
+                            ApiError::Msg(m) => m,
+                            ApiError::NoWorker => "No diffusion worker configured".into(),
+                            ApiError::NotFound => "not found".into(),
+                        };
+                        results.push(json!({ "error": msg, "prompt": p }));
+                    }
+                }
+            }
+            json!({
+                "type": ty,
+                "status": "executed",
+                "args": action.args,
+                "result": { "goal": goal, "batchPrompts": prompts, "results": results }
+            })
+        }
+        "install_asset" => {
+            let download_url = action
+                .args
+                .get("downloadUrl")
+                .and_then(|u| u.as_str())
+                .unwrap_or("");
+            let dest_path = action
+                .args
+                .get("destPath")
+                .and_then(|d| d.as_str())
+                .unwrap_or("loras/asset.safetensors");
+            let name = action
+                .args
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(str::to_string);
+            if download_url.is_empty() {
+                return json!({
+                    "type": ty,
+                    "status": "error",
+                    "args": action.args,
+                    "error": "missing downloadUrl"
+                });
+            }
+            let install_req = InstallCivitaiRequest {
+                download_url: download_url.to_string(),
+                dest_path: dest_path.to_string(),
+                name,
+            };
+            match civitai_install_inner(state, install_req).await {
+                Ok(v) => json!({
+                    "type": ty,
+                    "status": "executed",
+                    "args": action.args,
+                    "result": v
+                }),
+                Err(e) => {
+                    let msg = match e {
+                        ApiError::Msg(m) => m,
+                        ApiError::NoWorker => {
+                            "LoRA install needs a diffusion worker — set the worker URL in Settings"
+                                .into()
+                        }
+                        ApiError::NotFound => "not found".into(),
+                    };
+                    json!({
+                        "type": ty,
+                        "status": "error",
+                        "args": action.args,
+                        "error": msg
+                    })
+                }
+            }
+        }
+        other => json!({
+            "type": other,
+            "status": "error",
+            "args": action.args,
+            "error": format!("unknown action type: {other}")
+        }),
+    }
+}
+
+async fn civitai_install_inner(
+    state: &AppState,
+    req: InstallCivitaiRequest,
+) -> ApiResult<serde_json::Value> {
+    let cfg = state.config.read().await;
+    if !cfg.civitai_configured() {
+        return Err(ApiError::Msg(
+            "Civitai API key required — set it in Settings".into(),
+        ));
+    }
+    if !civitai_download_url_ok(&req.download_url) {
+        return Err(ApiError::Msg(
+            "downloadUrl must be an http(s) civitai.com URL".into(),
+        ));
+    }
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let auth = cfg.civitai_api_key.clone();
+    let url = req.download_url.clone();
+    drop(cfg);
+    client
+        .install_asset("civitai", &url, &req.dest_path, Some(&auth))
+        .await
+        .map_err(ApiError::from)?;
+    Ok(json!({
+        "ok": true,
+        "destPath": req.dest_path,
+        "name": req.name,
+    }))
+}
+
+pub async fn chat(
+    State(state): State<AppState>,
+    Json(req): Json<ChatRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let mode = req
+        .automation_mode
+        .as_deref()
+        .unwrap_or("auto")
+        .to_lowercase();
+    let mode = match mode.as_str() {
+        "plan" | "auto" | "yolo" => mode,
+        _ => "auto".into(),
+    };
+
+    let (mut reply, planned) = if req.confirm && !req.actions.is_empty() {
+        (
+            "Running the confirmed actions.".to_string(),
+            req.actions
+                .iter()
+                .map(|a| PlannedAction {
+                    action_type: a.action_type.clone(),
+                    args: a.args.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        let system = styles::load_instruction(&state.packs_dir, "converse").await;
+        let mut user_blob = req.message.clone();
+        if !req.messages.is_empty() {
+            let hist: Vec<_> = req
+                .messages
+                .iter()
+                .rev()
+                .take(8)
+                .rev()
+                .map(|m| format!("{}: {}", m.role, m.content))
+                .collect();
+            user_blob = format!(
+                "{}\n\n--- recent conversation ---\n{}",
+                req.message,
+                hist.join("\n")
+            );
+        }
+        if let Some(sess) = &req.session {
+            user_blob = format!(
+                "{}\n\n--- session context ---\n{}",
+                user_blob,
+                serde_json::to_string_pretty(sess).unwrap_or_default()
+            );
+        }
+        let or = state.openrouter.read().await;
+        match or.chat(&system, &user_blob, req.model.as_deref()).await {
+            Ok(text) => parse_chat_plan(&text, &req.message),
+            Err(_) => infer_chat_plan(&req.message),
+        }
+    };
+
+    // Safety net: never invent generate when the user did not ask, unless they confirmed.
+    let planned: Vec<PlannedAction> = if req.confirm {
+        planned
+    } else {
+        planned
+            .into_iter()
+            .filter(|a| {
+                if matches!(a.action_type.as_str(), "generate_image" | "run_session") {
+                    wants_image_intent(&req.message)
+                        || a.args
+                            .get("prompt")
+                            .and_then(|p| p.as_str())
+                            .map(|p| wants_image_intent(p))
+                            .unwrap_or(false)
+                } else {
+                    true
+                }
+            })
+            .collect()
+    };
+
+    let side_effects: Vec<_> = planned
+        .iter()
+        .filter(|a| is_side_effect_action(&a.action_type))
+        .collect();
+
+    // Plan mode: propose side effects; still run discovery tools.
+    let mut pending_confirmation = false;
+    let mut question: Option<serde_json::Value> = None;
+    let mut action_results = Vec::new();
+
+    if mode == "plan" && !req.confirm && !side_effects.is_empty() {
+        pending_confirmation = true;
+        for a in &planned {
+            if is_side_effect_action(&a.action_type) {
+                action_results.push(json!({
+                    "type": a.action_type,
+                    "status": "proposed",
+                    "args": a.args,
+                }));
+            } else {
+                action_results.push(execute_chat_action(&state, a, &req.loras, req.image_model.as_deref()).await);
+            }
+        }
+        if reply.is_empty() {
+            reply = "Here’s what I’d do — confirm to run generate/install, or keep chatting.".into();
+        }
+    } else if mode == "auto" && !req.confirm {
+        let install_count = planned
+            .iter()
+            .filter(|a| a.action_type == "install_asset")
+            .count();
+        if install_count > 1 {
+            pending_confirmation = true;
+            question = Some(json!({
+                "kind": "lora",
+                "text": "Several LoRA installs are queued — which should Freya install?",
+            }));
+            for a in &planned {
+                let status = if a.action_type == "install_asset" {
+                    "proposed"
+                } else if is_side_effect_action(&a.action_type) {
+                    // Hold generate until installs decided? Prefer propose generate too when installs ambiguous.
+                    "proposed"
+                } else {
+                    // execute discovery
+                    action_results.push(
+                        execute_chat_action(&state, a, &req.loras, req.image_model.as_deref()).await,
+                    );
+                    continue;
+                };
+                action_results.push(json!({
+                    "type": a.action_type,
+                    "status": status,
+                    "args": a.args,
+                }));
+            }
+        } else {
+            for a in &planned {
+                action_results
+                    .push(execute_chat_action(&state, a, &req.loras, req.image_model.as_deref()).await);
+            }
+        }
+    } else {
+        // YOLO, or confirm, or no side effects in plan with only discovery
+        for a in &planned {
+            if mode == "plan" && !req.confirm && is_side_effect_action(&a.action_type) {
+                action_results.push(json!({
+                    "type": a.action_type,
+                    "status": "proposed",
+                    "args": a.args,
+                }));
+                pending_confirmation = true;
+            } else {
+                action_results
+                    .push(execute_chat_action(&state, a, &req.loras, req.image_model.as_deref()).await);
+            }
+        }
+    }
+
+    // Aggregate convenience fields for the UI
+    let mut ideas = Vec::new();
+    let mut loras = Vec::new();
+    let mut artifacts = Vec::new();
+    let mut civitai_query = String::new();
+    for ar in &action_results {
+        if let Some(res) = ar.get("result") {
+            if let Some(arr) = res.get("ideas").and_then(|i| i.as_array()) {
+                for x in arr {
+                    if let Some(s) = x.as_str() {
+                        ideas.push(json!(s));
+                    }
+                }
+            }
+            if let Some(arr) = res.get("loras").and_then(|i| i.as_array()) {
+                loras.extend(arr.iter().cloned());
+            }
+            if let Some(q) = res.get("query").and_then(|q| q.as_str()) {
+                civitai_query = q.to_string();
+            }
+            if ar.get("type").and_then(|t| t.as_str()) == Some("generate_image") {
+                artifacts.push(res.clone());
+            }
+            if let Some(batch) = res.get("results").and_then(|r| r.as_array()) {
+                artifacts.extend(batch.iter().cloned());
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "reply": reply,
+        "actions": action_results,
+        "pendingConfirmation": pending_confirmation,
+        "question": question,
+        "ideas": ideas,
+        "loras": loras,
+        "civitaiQuery": if civitai_query.is_empty() { Value::Null } else { json!(civitai_query) },
+        "artifacts": artifacts,
+        "automationMode": mode,
+    })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -583,33 +1273,7 @@ pub async fn civitai_install(
     State(state): State<AppState>,
     Json(req): Json<InstallCivitaiRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let cfg = state.config.read().await;
-    if !cfg.civitai_configured() {
-        return Err(ApiError::Msg(
-            "Civitai API key required — set it in Settings".into(),
-        ));
-    }
-    if !civitai_download_url_ok(&req.download_url) {
-        return Err(ApiError::Msg(
-            "downloadUrl must be an http(s) civitai.com URL".into(),
-        ));
-    }
-    let worker = state.worker.read().await;
-    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
-    // Pass the key as authToken (Bearer on download) — never append to the URL
-    // (reqwest errors include the full URL and would leak the secret).
-    let auth = cfg.civitai_api_key.clone();
-    let url = req.download_url.clone();
-    drop(cfg);
-    client
-        .install_asset("civitai", &url, &req.dest_path, Some(&auth))
-        .await
-        .map_err(ApiError::from)?;
-    Ok(Json(json!({
-        "ok": true,
-        "destPath": req.dest_path,
-        "name": req.name,
-    })))
+    civitai_install_inner(&state, req).await.map(Json)
 }
 
 #[derive(Debug, Serialize)]

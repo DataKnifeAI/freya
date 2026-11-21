@@ -70,9 +70,9 @@ function resolveInitialTheme() {
 }
 
 const MODE_HINTS = {
-  plan: "Plan only — steps, Civitai query, LoRAs, batch prompts. No generate or install.",
-  auto: "Run & ask when unsure — pauses on ambiguous LoRAs. Installs only if a worker is set; otherwise generates via OpenRouter.",
-  yolo: "Full auto — search, install only when a worker is set, otherwise generate via OpenRouter. No questions.",
+  plan: "Plan — Freya proposes tool calls (generate/install). Confirm before they run.",
+  auto: "Auto — Freya runs tools, but asks when installs are ambiguous.",
+  yolo: "YOLO — Freya runs tools freely (generate, search, install when a worker is set).",
 };
 
 const AGENT_MODELS = [
@@ -93,8 +93,42 @@ const emptySession = () => ({
   goal: "",
   pinnedLoras: [],
   turns: [],
+  messages: [],
   sessionNote: "",
 });
+
+/** Normalize persisted session: promote legacy turns into chat messages. */
+function normalizeSession(raw) {
+  if (!raw || typeof raw !== "object") return emptySession();
+  const pinnedLoras = Array.isArray(raw.pinnedLoras) ? raw.pinnedLoras : [];
+  const turns = Array.isArray(raw.turns) ? raw.turns : [];
+  let messages = Array.isArray(raw.messages) ? raw.messages : [];
+  if (!messages.length && turns.length) {
+    messages = turns
+      .slice()
+      .reverse()
+      .flatMap((t) => {
+        const at = t.at || new Date().toISOString();
+        const out = [{ role: "user", content: t.prompt || "", at }];
+        if (t.artifactIds?.length) {
+          out.push({
+            role: "assistant",
+            content: `Generated ${t.artifactIds.length} image${t.artifactIds.length === 1 ? "" : "s"}.`,
+            at,
+            artifactIds: t.artifactIds,
+          });
+        }
+        return out;
+      });
+  }
+  return {
+    goal: raw.goal || "",
+    pinnedLoras,
+    turns,
+    messages,
+    sessionNote: raw.sessionNote || "",
+  };
+}
 
 function makeSessionId() {
   return `s_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
@@ -257,9 +291,9 @@ const Svg = ({ children, filled = false }) => (
     {children}
   </svg>
 );
-const IconPlay = () => (
-  <Svg filled>
-    <path d="M8 5.5v13l11-6.5z" stroke="none" />
+const IconSend = () => (
+  <Svg>
+    <path d="M5 12h14M13 6l6 6-6 6" />
   </Svg>
 );
 const IconSpinner = () => (
@@ -430,18 +464,7 @@ export default function App() {
   const [suggestNote, setSuggestNote] = useState(() => bootSession.suggestNote || "");
   const [civitaiQuery, setCivitaiQuery] = useState(() => bootSession.civitaiQuery || "");
   const [modelBrief, setModelBrief] = useState(() => bootSession.modelBrief || "");
-  const [session, setSession] = useState(() =>
-    bootSession.session
-      ? {
-          goal: bootSession.session.goal || "",
-          pinnedLoras: Array.isArray(bootSession.session.pinnedLoras)
-            ? bootSession.session.pinnedLoras
-            : [],
-          turns: Array.isArray(bootSession.session.turns) ? bootSession.session.turns : [],
-          sessionNote: bootSession.session.sessionNote || "",
-        }
-      : emptySession(),
-  );
+  const [session, setSession] = useState(() => normalizeSession(bootSession.session));
   const [automationMode, setAutomationMode] = useState(readStoredMode);
   const storedModels = readStoredModels();
   const [agentModel, setAgentModel] = useState(storedModels.agentModel);
@@ -524,6 +547,7 @@ export default function App() {
         goal: session.goal || "",
         pinnedLoras: session.pinnedLoras || [],
         turns: session.turns || [],
+        messages: session.messages || [],
         sessionNote: session.sessionNote || "",
       },
       ideas,
@@ -541,18 +565,7 @@ export default function App() {
 
   const applySessionEntry = (entry) => {
     setPrompt(entry.prompt || "");
-    setSession(
-      entry.session
-        ? {
-            goal: entry.session.goal || "",
-            pinnedLoras: Array.isArray(entry.session.pinnedLoras)
-              ? entry.session.pinnedLoras
-              : [],
-            turns: Array.isArray(entry.session.turns) ? entry.session.turns : [],
-            sessionNote: entry.session.sessionNote || "",
-          }
-        : emptySession(),
-    );
+    setSession(normalizeSession(entry.session));
     setIdeas(Array.isArray(entry.ideas) ? entry.ideas : []);
     setSuggestedLoras(Array.isArray(entry.suggestedLoras) ? entry.suggestedLoras : []);
     setSuggestNote(entry.suggestNote || "");
@@ -811,14 +824,192 @@ export default function App() {
   };
 
   const pushTurn = (text, artifactIds = []) => {
+    const at = new Date().toISOString();
     setSession((prev) => ({
       ...prev,
       goal: prev.goal || text,
-      turns: [{ prompt: text, at: new Date().toISOString(), artifactIds }, ...(prev.turns || [])].slice(
-        0,
-        12,
-      ),
+      turns: [{ prompt: text, at, artifactIds }, ...(prev.turns || [])].slice(0, 12),
+      messages: [
+        ...(prev.messages || []),
+        { role: "user", content: text, at },
+        ...(artifactIds?.length
+          ? [
+              {
+                role: "assistant",
+                content: `Generated ${artifactIds.length} image${artifactIds.length === 1 ? "" : "s"}.`,
+                at,
+                artifactIds,
+              },
+            ]
+          : []),
+      ].slice(-40),
     }));
+  };
+
+  const appendMessages = (...msgs) => {
+    setSession((prev) => ({
+      ...prev,
+      messages: [...(prev.messages || []), ...msgs].slice(-40),
+    }));
+  };
+
+  const applyChatResponse = (data, userText) => {
+    const actions = Array.isArray(data.actions) ? data.actions : [];
+    const artifacts = Array.isArray(data.artifacts)
+      ? data.artifacts.filter((a) => a && (a.artifactId || a.url))
+      : [];
+    const artifactIds = artifacts.map((a) => a.artifactId).filter(Boolean);
+    const ideasNext = Array.isArray(data.ideas) ? data.ideas : [];
+    const lorasNext = Array.isArray(data.loras) ? data.loras : [];
+    const query = data.civitaiQuery || "";
+
+    if (ideasNext.length) setIdeas(ideasNext);
+    if (lorasNext.length) setSuggestedLoras(lorasNext);
+    if (query) {
+      setCivitaiQuery(query);
+      setCivitaiQ(query);
+    }
+
+    if (artifacts.length) {
+      setBatchResults(artifacts.length > 1 ? artifacts : []);
+      setResult(artifacts[0]);
+      setModelBrief(artifacts[0]?.enhancedPrompt || "");
+    }
+
+    const proposed = actions.filter((a) => a.status === "proposed");
+    if (data.pendingConfirmation && proposed.length) {
+      setPendingPlan({
+        status: automationMode === "plan" ? "plan" : "auto",
+        goal: userText,
+        actions: proposed,
+        batchPrompts: proposed
+          .filter((a) => a.type === "generate_image" || a.type === "run_session")
+          .map((a) => a.args?.prompt || a.args?.goal)
+          .filter(Boolean),
+        pendingInstalls: proposed
+          .filter((a) => a.type === "install_asset")
+          .map((a) => ({
+            name: a.args?.name,
+            downloadUrl: a.args?.downloadUrl,
+            destPath: a.args?.destPath,
+          })),
+        steps: proposed.map((a) => ({
+          kind: a.type,
+          note: a.args?.prompt || a.args?.query || a.args?.goal || a.type,
+        })),
+        civitaiQuery: query,
+        sessionNote: data.reply || "",
+      });
+    } else {
+      setPendingPlan(null);
+    }
+
+    if (data.question) {
+      setPendingQuestion({
+        kind: data.question.kind || "tool",
+        text: data.question.text || "Freya needs a decision before continuing.",
+        choices: data.question.choices || [
+          { id: "confirm", label: "Confirm & run", value: "confirm" },
+          { id: "skip", label: "Skip tools", value: "skip" },
+        ],
+      });
+    } else if (!data.pendingConfirmation) {
+      setPendingQuestion(null);
+    }
+
+    const toolLines = actions
+      .filter((a) => a.status === "executed" || a.status === "error" || a.status === "proposed")
+      .map((a) => {
+        if (a.status === "proposed") return `Proposed: ${a.type}`;
+        if (a.status === "error") return `${a.type} failed: ${a.error || "error"}`;
+        if (a.type === "generate_image") return `Generated image`;
+        if (a.type === "run_session")
+          return `Generated ${(a.result?.results || []).length || "a"} variation(s)`;
+        if (a.type === "search_civitai")
+          return `Searched Civitai for “${a.result?.query || a.args?.query || "…"}”`;
+        if (a.type === "suggest_ideas")
+          return `Suggested ${(a.result?.ideas || []).length || "some"} ideas`;
+        if (a.type === "install_asset") return `Installed “${a.args?.name || "asset"}”`;
+        return `${a.type}: ${a.status}`;
+      });
+    if (toolLines.length) setSessionLog(toolLines);
+
+    const at = new Date().toISOString();
+    appendMessages({
+      role: "assistant",
+      content: data.reply || (artifacts.length ? "Done." : "…"),
+      at,
+      actions,
+      artifactIds,
+      ideas: ideasNext,
+      loras: lorasNext,
+    });
+
+    if (artifactIds.length) {
+      setSession((prev) => ({
+        ...prev,
+        goal: prev.goal || userText,
+        turns: [
+          { prompt: userText, at, artifactIds },
+          ...(prev.turns || []),
+        ].slice(0, 12),
+      }));
+    }
+
+    return artifacts;
+  };
+
+  const chatBody = (message, extra = {}) => {
+    const body = {
+      message,
+      automationMode,
+      messages: (session.messages || []).slice(-8).map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
+      session: {
+        goal: session.goal || message,
+        pinnedLoras: session.pinnedLoras,
+        recentPrompts: (session.turns || []).slice(0, 5).map((t) => t.prompt),
+      },
+      loras: pinnedPayload(),
+      ...extra,
+    };
+    if (agentModel && agentModel !== "openrouter/auto") body.model = agentModel;
+    if (imageModel && imageModel !== "auto") body.imageModel = imageModel;
+    return body;
+  };
+
+  /** Primary composer action — send a chat message; tools run per Plan/Auto/YOLO. */
+  const submitChat = async (overrideText, extra = {}) => {
+    const text = (overrideText ?? prompt).trim();
+    if (!text && !extra.confirm) return;
+    const sessionId = activeIdRef.current;
+    const userText = text || session.goal || examplePrompt;
+    setBusy(true);
+    setError("");
+    setSavedMsg("");
+    try {
+      if (!extra.confirm) {
+        const at = new Date().toISOString();
+        appendMessages({ role: "user", content: userText, at });
+        setSession((prev) => ({ ...prev, goal: prev.goal || userText }));
+        setPrompt("");
+      }
+      const data = await api("/v1/chat", {
+        method: "POST",
+        body: JSON.stringify(chatBody(userText, extra)),
+      });
+      if (activeIdRef.current !== sessionId) return;
+      applyChatResponse(data, userText);
+      const g = await api("/v1/gallery");
+      if (activeIdRef.current !== sessionId) return;
+      setGallery(g.items || []);
+    } catch (e) {
+      if (activeIdRef.current === sessionId) setError(e.message);
+    } finally {
+      if (activeIdRef.current === sessionId) setBusy(false);
+    }
   };
 
   const runBody = (nlPrompt) => {
@@ -967,64 +1158,12 @@ export default function App() {
     };
   };
 
-  const run = async () => {
-    const sessionId = activeIdRef.current;
-    setBusy(true);
-    setError("");
-    setBatchResults([]);
-    try {
-      const data = await runOne(prompt);
-      if (activeIdRef.current !== sessionId) return;
-      setResult(data);
-      setModelBrief(data.enhancedPrompt || "");
-      pushTurn(prompt, data.artifactId ? [data.artifactId] : []);
-      const g = await api("/v1/gallery");
-      if (activeIdRef.current !== sessionId) return;
-      setGallery(g.items || []);
-    } catch (e) {
-      if (activeIdRef.current === sessionId) setError(e.message);
-    } finally {
-      if (activeIdRef.current === sessionId) setBusy(false);
-    }
-  };
-
-  /** Ask Freya for NL alternatives + LoRA recommendations (never auto-installs). */
+  /** Shortcut: inject a suggest request into chat (tool: suggest_ideas). */
   const suggestIdeas = async () => {
-    setBusy(true);
-    setError("");
-    try {
-      const message = prompt.trim() || examplePrompt;
-      if (!prompt.trim()) setPrompt(examplePrompt);
-      const data = await api("/v1/assist", {
-        method: "POST",
-        body: JSON.stringify(assistBody("suggest", message)),
-      });
-      const nextIdeas = Array.isArray(data.ideas)
-        ? data.ideas
-        : typeof data.text === "string"
-          ? data.text
-              .split("\n")
-              .map((l) => l.replace(/^\d+\.\s*/, "").trim())
-              .filter(Boolean)
-          : [];
-      setIdeas(nextIdeas);
-      setSuggestedLoras(Array.isArray(data.loras) ? data.loras : []);
-      setSuggestNote(data.sessionNote || "");
-      setCivitaiQuery(data.civitaiQuery || "");
-      if (data.civitaiQuery) setCivitaiQ(data.civitaiQuery);
-      if (data.sessionNote) {
-        setSession((prev) => ({ ...prev, sessionNote: data.sessionNote }));
-      }
-      if (!settings?.civitaiConfigured && (!data.loras || data.loras.length === 0)) {
-        setSavedMsg(
-          "LoRA suggestions need a Civitai key — add any non-empty value in Settings (mock).",
-        );
-      }
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
-    }
+    const topic = prompt.trim() || session.goal || examplePrompt;
+    const msg = `Suggest ideas for: ${topic}`;
+    setPrompt(msg);
+    await submitChat(msg);
   };
 
   const fetchSessionPlan = async () => {
@@ -1114,53 +1253,26 @@ export default function App() {
     );
   };
 
-  /** Agentic session — gated by Plan / Auto / YOLO. */
+  /** Shortcut: inject a run-session request into chat. */
   const runSession = async () => {
-    const sessionId = activeIdRef.current;
-    setBusy(true);
-    setError("");
-    setBatchResults([]);
-    setSessionLog([]);
+    const goal = prompt.trim() || session.goal || examplePrompt;
+    const msg = `Run session for: ${goal}`;
+    setPrompt(msg);
+    await submitChat(msg);
+  };
+
+  const confirmPendingActions = async () => {
+    if (!pendingPlan?.actions?.length) return;
+    await submitChat(pendingPlan.goal || prompt || examplePrompt, {
+      confirm: true,
+      actions: pendingPlan.actions.map((a) => ({
+        type: a.type,
+        args: a.args || {},
+      })),
+    });
+    setPendingPlan(null);
     setPendingQuestion(null);
-    try {
-      const plan = await fetchSessionPlan();
-      if (activeIdRef.current !== sessionId) return;
-
-      if (automationMode === "plan") {
-        setPendingPlan({ ...plan, status: "plan" });
-        setSuggestNote(
-          plan.sessionNote ||
-            "Plan ready — no generate or install. Run pieces manually, or switch to Auto/YOLO and Run session again.",
-        );
-        setSavedMsg("Plan mode — nothing executed yet.");
-        return;
-      }
-
-      if (automationMode === "auto") {
-        const q = detectAutoQuestion(plan);
-        if (q) {
-          setPendingPlan({ ...plan, status: "auto" });
-          setPendingQuestion(q);
-          setSuggestNote(plan.sessionNote || "Freya paused — answer below to continue.");
-          setSavedMsg("Auto mode — waiting on your answer.");
-          return;
-        }
-        setPendingPlan(null);
-        await executePlan(plan, {
-          installs: (plan.pendingInstalls || []).length === 1 ? plan.pendingInstalls : [],
-          yolo: false,
-        });
-        return;
-      }
-
-      // YOLO
-      setPendingPlan(null);
-      await executePlan(plan, { installs: "all", yolo: true });
-    } catch (e) {
-      if (activeIdRef.current === sessionId) setError(e.message);
-    } finally {
-      if (activeIdRef.current === sessionId) setBusy(false);
-    }
+    setSavedMsg("Confirmed — Freya ran the proposed tools.");
   };
 
   const answerQuestion = async (choice) => {
@@ -1168,37 +1280,41 @@ export default function App() {
 
     if (choice.value === "settings") {
       setTab("settings");
-      setSavedMsg("Add a worker URL (and Civitai key) for LoRA installs — OpenRouter still generates without one.");
+      setSavedMsg(
+        "Add a worker URL (and Civitai key) for LoRA installs — OpenRouter still generates without one.",
+      );
       return;
     }
 
-    setBusy(true);
-    setError("");
-    try {
-      let plan = pendingPlan;
-      if (pendingQuestion.kind === "goal" && choice.id === "example") {
-        setPrompt(examplePrompt);
-        plan = { ...plan, goal: examplePrompt };
-      }
-
-      let installs = [];
-      if (pendingQuestion.kind === "lora") {
-        if (choice.value === "all") installs = "all";
-        else if (choice.value == null) installs = [];
-        else installs = [choice.value];
-      } else if (pendingQuestion.kind === "config") {
-        installs = [];
-      } else if ((plan.pendingInstalls || []).length === 1 && canAutoInstall()) {
-        installs = plan.pendingInstalls;
-      }
-
-      await executePlan(plan, { installs, yolo: false });
-      setSavedMsg("Continued after your answer.");
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
+    if (choice.value === "skip" || choice.id === "skip") {
+      dismissPending();
+      appendMessages({
+        role: "assistant",
+        content: "Skipped proposed tools — keep chatting whenever you’re ready.",
+        at: new Date().toISOString(),
+      });
+      return;
     }
+
+    if (choice.value === "confirm" || choice.id === "confirm" || choice.id === "all") {
+      await confirmPendingActions();
+      return;
+    }
+
+    // Single LoRA choice — confirm only that install (+ any generate)
+    const actions = (pendingPlan.actions || []).filter((a) => {
+      if (a.type !== "install_asset") return true;
+      if (choice.value && typeof choice.value === "object") {
+        return a.args?.name === choice.value.name || a.args?.downloadUrl === choice.value.downloadUrl;
+      }
+      return false;
+    });
+    await submitChat(pendingPlan.goal || prompt || examplePrompt, {
+      confirm: true,
+      actions: actions.map((a) => ({ type: a.type, args: a.args || {} })),
+    });
+    setPendingPlan(null);
+    setPendingQuestion(null);
   };
 
   const dismissPending = () => {
@@ -1310,7 +1426,7 @@ export default function App() {
     setTab("gallery");
   };
 
-  const chronologicalTurns = [...(session.turns || [])].reverse();
+  const conversation = session.messages || [];
 
   // Keep the newest history in view above the pinned composer.
   useEffect(() => {
@@ -1318,7 +1434,7 @@ export default function App() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [
     activeSessionId,
-    chronologicalTurns.length,
+    conversation.length,
     sessionLog.length,
     ideas.length,
     pendingPlan,
@@ -1326,8 +1442,8 @@ export default function App() {
   ]);
 
   const hasTimeline =
+    conversation.length > 0 ||
     Boolean(session.goal) ||
-    chronologicalTurns.length > 0 ||
     (session.pinnedLoras || []).length > 0 ||
     Boolean(session.sessionNote);
 
@@ -1535,13 +1651,13 @@ export default function App() {
 
       <div className="workspace">
         <section className="pane pane-left" aria-label="Prompt and session">
-          <div className="timeline" aria-label="Session timeline" ref={timelineRef}>
+          <div className="timeline" aria-label="Conversation" ref={timelineRef}>
             <div className="timeline-head">
-              <h2>Session</h2>
+              <h2>Conversation</h2>
               <span className="timeline-count">
-                {chronologicalTurns.length
-                  ? `${chronologicalTurns.length} turn${chronologicalTurns.length === 1 ? "" : "s"}`
-                  : "no turns yet"}
+                {conversation.length
+                  ? `${conversation.length} message${conversation.length === 1 ? "" : "s"}`
+                  : "no messages yet"}
               </span>
               <button
                 type="button"
@@ -1560,16 +1676,9 @@ export default function App() {
 
             {!hasTimeline && !pendingPlan && !pendingQuestion && sessionLog.length === 0 && (
               <p className="timeline-empty">
-                Your goals, plans, questions and turns will collect here. Try the featured example,
-                then Suggest ideas or Run session.
+                Chat with Freya here. Ask about style, or say “make an image of …” when you want a
+                generate. Suggest and Session shortcuts just send a message.
               </p>
-            )}
-
-            {session.goal && (
-              <article className="t-entry t-goal">
-                <span className="t-kind">Goal</span>
-                <p>{session.goal}</p>
-              </article>
             )}
 
             {(session.pinnedLoras || []).length > 0 && (
@@ -1591,52 +1700,89 @@ export default function App() {
               </article>
             )}
 
-            {chronologicalTurns.map((t, i) => (
-              <article key={`${t.at}-${i}`} className="t-entry t-turn">
+            {conversation.map((m, i) => (
+              <article
+                key={`${m.at || i}-${m.role}-${i}`}
+                className={`t-entry t-msg t-${m.role === "user" ? "user" : "assistant"}`}
+              >
                 <div className="t-meta">
-                  <span className="t-kind">Turn {i + 1}</span>
-                  {t.at && (
+                  <span className="t-kind">{m.role === "user" ? "You" : "Freya"}</span>
+                  {m.at && (
                     <time>
-                      {new Date(t.at).toLocaleTimeString([], {
+                      {new Date(m.at).toLocaleTimeString([], {
                         hour: "numeric",
                         minute: "2-digit",
                       })}
                     </time>
                   )}
-                  {t.artifactIds?.length > 0 && (
-                    <span>
-                      {t.artifactIds.length} image{t.artifactIds.length === 1 ? "" : "s"} →
-                    </span>
-                  )}
                 </div>
-                <button type="button" className="t-prompt" onClick={() => setPrompt(t.prompt)}>
-                  {t.prompt}
-                </button>
+                <p className="t-bubble">{m.content}</p>
+                {Array.isArray(m.actions) && m.actions.length > 0 && (
+                  <ul className="t-tools">
+                    {m.actions.map((a, ai) => (
+                      <li key={`${a.type}-${ai}`} className={`t-tool t-tool-${a.status || "done"}`}>
+                        <span className="t-tool-type">{a.type}</span>
+                        <span className="t-tool-status">{a.status || "done"}</span>
+                        {a.status === "error" && a.error ? ` — ${a.error}` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {m.artifactIds?.length > 0 && (
+                  <div className="t-thumbs">
+                    {m.artifactIds.map((id) => {
+                      const art =
+                        batchResults.find((r) => r.artifactId === id) ||
+                        (result?.artifactId === id ? result : null) ||
+                        gallery.find((g) => g.id === id);
+                      const src = art?.url || (art ? gallerySrc(art) : `/v1/gallery/${id}/image`);
+                      return (
+                        <button
+                          key={id}
+                          type="button"
+                          className="t-thumb"
+                          onClick={() => {
+                            if (art) {
+                              setResult(art.artifactId ? art : { ...art, artifactId: art.id, url: gallerySrc(art) });
+                              setTab("gallery");
+                            }
+                          }}
+                        >
+                          <img src={src} alt="" />
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+                {Array.isArray(m.ideas) && m.ideas.length > 0 && (
+                  <div className="idea-chips">
+                    {m.ideas.map((idea) => (
+                      <button
+                        key={idea}
+                        type="button"
+                        className="idea-chip"
+                        onClick={() => setPrompt(idea)}
+                      >
+                        {idea}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </article>
             ))}
 
-            {session.sessionNote && (
-              <article className="t-entry t-note">
-                <span className="t-kind">Session note</span>
-                <p>{session.sessionNote}</p>
-              </article>
-            )}
-
-            {pendingPlan && pendingPlan.status === "plan" && (
-              <aside className="pending-plan" aria-label="Session plan">
+            {pendingPlan && (pendingPlan.status === "plan" || pendingPlan.actions?.length) && (
+              <aside className="pending-plan" aria-label="Proposed tools">
                 <div className="pending-plan-head">
-                  <h3>Session plan</h3>
+                  <h3>Proposed tools</h3>
                   <button type="button" className="ghost" onClick={dismissPending}>
                     Dismiss
                   </button>
                 </div>
-                <p className="pending-goal">
-                  <span className="session-label">Goal</span>
-                  {pendingPlan.goal}
-                </p>
-                {pendingPlan.civitaiQuery && (
-                  <p className="civitai-search-line" role="status">
-                    Proposed Civitai search: <strong>{pendingPlan.civitaiQuery}</strong>
+                {pendingPlan.goal && (
+                  <p className="pending-goal">
+                    <span className="session-label">For</span>
+                    {pendingPlan.goal}
                   </p>
                 )}
                 {pendingPlan.steps?.length > 0 && (
@@ -1664,25 +1810,24 @@ export default function App() {
                         </li>
                       ))}
                     </ul>
-                    <p className="hint">
-                      Plan mode has no side effects until you Install or Generate yourself — or
-                      switch to Auto/YOLO. Install needs a worker; Generate via OpenRouter does not.
-                    </p>
                   </div>
                 )}
-                {pendingPlan.batchPrompts?.length > 0 && (
-                  <div className="pending-batch">
-                    <span className="session-label">Batch prompts</span>
-                    <ul>
-                      {pendingPlan.batchPrompts.map((bp) => (
-                        <li key={bp}>
-                          <button type="button" className="linkish" onClick={() => setPrompt(bp)}>
-                            {bp.slice(0, 100)}
-                            {bp.length > 100 ? "…" : ""}
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
+                <p className="hint">
+                  Plan mode proposes generate/install — confirm to run, or switch to Auto/YOLO.
+                </p>
+                {pendingPlan.actions?.length > 0 && (
+                  <div className="pending-ask-choices">
+                    <button
+                      type="button"
+                      className="primary"
+                      disabled={busy}
+                      onClick={confirmPendingActions}
+                    >
+                      Confirm & run
+                    </button>
+                    <button type="button" className="ghost" disabled={busy} onClick={dismissPending}>
+                      Not now
+                    </button>
                   </div>
                 )}
               </aside>
@@ -1785,7 +1930,7 @@ export default function App() {
           <div className="compose">
             <div className="compose-head">
               <label className="compose-label" htmlFor="freya-prompt">
-                What are you going for?
+                Message Freya
               </label>
               {!prompt.trim() && (
                 <button
@@ -1802,15 +1947,20 @@ export default function App() {
               id="freya-prompt"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  if (!busy && prompt.trim()) submitChat();
+                }
+              }}
               placeholder={examplePrompt}
               rows={3}
-              title="Everyday language or classic SD prompts (tags, weights, triggers) — one box, Freya handles either"
+              title="Chat with Freya — Enter to send, Shift+Enter for a new line"
               aria-describedby="freya-prompt-hint"
             />
             <p id="freya-prompt-hint" className="sr-only">
-              Everyday language or classic SD prompts (tags, weights, triggers) — one box, Freya
-              handles either. Cloud Generate works with OpenRouter alone; add a worker for LoRAs and
-              custom local looks. {MODE_HINTS[automationMode]}
+              Chat with Freya. Ask to generate only when you want an image. Mode gates tool
+              autonomy. {MODE_HINTS[automationMode]}
             </p>
             {error && <p className="err compose-status">{error}</p>}
             {savedMsg && (
@@ -1818,7 +1968,7 @@ export default function App() {
                 {savedMsg}
               </p>
             )}
-            <div className="composer-bar" aria-label="Session controls">
+            <div className="composer-bar" aria-label="Chat controls">
               <div className="compose-actions">
                 <button
                   type="button"
@@ -1839,7 +1989,7 @@ export default function App() {
                   className="ghost icon-btn"
                   disabled={busy || (!prompt.trim() && !session.goal)}
                   onClick={runSession}
-                  title={`Run session (${AUTOMATION_LABELS[automationMode]})`}
+                  title={`Ask Freya to run a session (${AUTOMATION_LABELS[automationMode]})`}
                   aria-label="Run session"
                 >
                   <IconLayers />
@@ -1882,13 +2032,13 @@ export default function App() {
                   onOpen={(v) => setMenuOpen(v ? "image" : null)}
                 />
               </div>
-              <div className="composer-primary-cluster" role="group" aria-label="Suggest and generate">
+              <div className="composer-primary-cluster" role="group" aria-label="Suggest and send">
                 <button
                   type="button"
                   className="ghost icon-btn"
                   disabled={busy}
                   onClick={suggestIdeas}
-                  title="Suggest ideas"
+                  title="Suggest ideas (sends a chat message)"
                   aria-label="Suggest ideas"
                 >
                   <IconBulb />
@@ -1896,14 +2046,14 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  className="primary icon-btn icon-btn-primary composer-generate"
+                  className="primary icon-btn icon-btn-primary composer-send"
                   disabled={busy || !prompt.trim()}
-                  onClick={run}
-                  title={busy ? "Working…" : "Generate"}
-                  aria-label={busy ? "Working" : "Generate"}
+                  onClick={() => submitChat()}
+                  title={busy ? "Working…" : "Send message"}
+                  aria-label={busy ? "Working" : "Send message"}
                 >
-                  {busy ? <IconSpinner /> : <IconPlay />}
-                  <span className="sr-only">{busy ? "Working…" : "Generate"}</span>
+                  {busy ? <IconSpinner /> : <IconSend />}
+                  <span className="sr-only">{busy ? "Working…" : "Send"}</span>
                 </button>
               </div>
             </div>
@@ -1974,7 +2124,7 @@ export default function App() {
           <div className="gallery-empty-art" aria-hidden="true">
             <HeroCanvas />
           </div>
-          <p>No images yet — Generate or Run session and results will hang here.</p>
+          <p>No images yet — ask Freya to make an image and results will hang here.</p>
         </div>
       )}
 
