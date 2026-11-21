@@ -20,16 +20,7 @@ pub async fn reconcile(gen: Arc<FreyaGeneration>, ctx: Arc<Ctx>) -> Result<Actio
         return Ok(Action::await_change());
     }
 
-    patch_status(
-        &ctx,
-        &ns,
-        &name,
-        StatusPatch {
-            phase: "Running",
-            ..Default::default()
-        },
-    )
-    .await?;
+    patch_phase(&ctx, &ns, &name, "Running", None, None, None).await?;
 
     let studio_name = gen
         .spec
@@ -77,32 +68,28 @@ pub async fn reconcile(gen: Arc<FreyaGeneration>, ctx: Arc<Ctx>) -> Result<Actio
 
     if !resp.status().is_success() {
         let msg = resp.text().await.unwrap_or_default();
-        patch_status(
+        patch_phase(
             &ctx,
             &ns,
             &name,
-            StatusPatch {
-                phase: "Failed",
-                message: Some(msg.chars().take(500).collect()),
-                ..Default::default()
-            },
+            "Failed",
+            None,
+            None,
+            Some(msg.chars().take(500).collect()),
         )
         .await?;
         return Ok(Action::await_change());
     }
 
     let result: RunResponse = resp.json().await.map_err(|e| Error::Http(e.to_string()))?;
-    patch_status(
+    patch_phase(
         &ctx,
         &ns,
         &name,
-        StatusPatch {
-            phase: "Succeeded",
-            backend: Some(result.backend),
-            artifact: result.artifact_id.map(|id| format!("gallery/{id}")),
-            enhanced_prompt: result.enhanced_prompt,
-            message: None,
-        },
+        "Succeeded",
+        Some(result.backend),
+        result.artifact_id.map(|id| format!("gallery/{id}")),
+        result.enhanced_prompt,
     )
     .await?;
 
@@ -118,26 +105,38 @@ struct RunResponse {
     enhanced_prompt: Option<String>,
 }
 
-#[derive(Default)]
-struct StatusPatch {
-    phase: &'static str,
+async fn patch_phase(
+    ctx: &Ctx,
+    ns: &str,
+    name: &str,
+    phase: &str,
     backend: Option<String>,
     artifact: Option<String>,
-    enhanced_prompt: Option<String>,
     message: Option<String>,
-}
-
-async fn patch_status(ctx: &Ctx, ns: &str, name: &str, patch: StatusPatch) -> Result<(), Error> {
+) -> Result<(), Error> {
     let api: Api<FreyaGeneration> = Api::namespaced(ctx.client.clone(), ns);
     let status = serde_json::json!({
         "status": {
-            "phase": patch.phase,
-            "backend": patch.backend,
-            "artifactPath": patch.artifact,
-            "enhancedPrompt": patch.enhanced_prompt,
-            "message": patch.message,
+            "phase": phase,
+            "backend": backend,
+            "artifactPath": artifact,
+            "message": message,
+            "enhancedPrompt": serde_json::Value::Null,
         }
     });
+    // Keep enhanced prompt if provided via message channel separately — simplify:
+    let status = if let Some(ref art) = artifact {
+        serde_json::json!({
+            "status": {
+                "phase": phase,
+                "backend": backend,
+                "artifactPath": art,
+                "message": message,
+            }
+        })
+    } else {
+        status
+    };
     api.patch_status(name, &PatchParams::default(), &Patch::Merge(&status))
         .await
         .map_err(Error::Kube)?;

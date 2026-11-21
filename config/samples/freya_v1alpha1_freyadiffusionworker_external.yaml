@@ -1,29 +1,10 @@
-# Recommended: GPU worker stays on the physical host; Studio reaches it by URL.
-# (Shared k8s for operator/Studio/MCP/Ingress is fine — Freya does not need in-cluster GPU.)
-#
-# Run on the GPU host: make run-worker  OR  Docker freya-local-worker (0.0.0.0:8091)
-# Then pick an externalEndpoint the in-cluster API can dial:
-#   - FQDN / Ingress:  https://vllm.dataknife.net          (this lab; DNS → GPU host)
-#   - LAN IP + port:   http://192.168.3.125:8091           (Worker tab Host/Port)
-#   - localhost:       http://127.0.0.1:8091               (API hostNetwork / make run-api on same host)
-#   - k8s DNS bridge:  http://freya-gpu-host.freya.svc.cluster.local:8091
-#                      (optional ExternalName / Endpoints Service → host)
-#
-# Worker tab Setup copy matches these forms. Optional alternate: *_incluster.yaml
+# Remote physical GPU box (or any host running vLLM-Omni / freya-worker)
 apiVersion: freya.dataknife.ai/v1alpha1
 kind: FreyaDiffusionWorker
 metadata:
   name: freya-gpu
   namespace: freya
-  # Do not set freya.dataknife.ai/tls-insecure on a public HTTPS endpoint.
-  # Studio verifies that certificate. The annotation only skips verify for
-  # loopback, private, link-local, and cluster DNS hosts.
 spec:
   placement: external
-  # Public / LAN URL of freya-local-worker (or vLLM-Omni-compatible) — not the Freya UI host.
-  externalEndpoint: https://vllm.dataknife.net
+  externalEndpoint: http://gpu-box.lan:8091
   engine: vllm-omni
-  # Must match FREYA_WORKER_TOKEN on the remote worker process
-  authSecretRef:
-    name: freya-worker-token
-    key: apiKey

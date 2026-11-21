@@ -41,7 +41,11 @@ impl Gallery {
         meta: &mut ArtifactMeta,
     ) -> Result<ArtifactMeta> {
         let id = Uuid::new_v4().to_string();
-        let ext = mime_to_ext(mime);
+        let ext = if mime.contains("jpeg") || mime.contains("jpg") {
+            "jpg"
+        } else {
+            "png"
+        };
         let filename = format!("{id}.{ext}");
         meta.id = id.clone();
         meta.filename = filename.clone();
@@ -74,9 +78,6 @@ impl Gallery {
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<ArtifactMeta>> {
-        let Some(id) = sanitize_gallery_id(id) else {
-            return Ok(None);
-        };
         let path = self.root.join(format!("{id}.json"));
         if !path.exists() {
             return Ok(None);
@@ -85,89 +86,7 @@ impl Gallery {
         Ok(Some(serde_json::from_slice(&raw)?))
     }
 
-    /// Remove artifact bytes + metadata. Returns `false` if id is invalid or missing.
-    pub async fn delete(&self, id: &str) -> Result<bool> {
-        let Some(id) = sanitize_gallery_id(id) else {
-            return Ok(false);
-        };
-        let Some(meta) = self.get(id).await? else {
-            return Ok(false);
-        };
-        let img = self.image_path(&meta);
-        let meta_path = self.root.join(format!("{id}.json"));
-        if img.exists() {
-            fs::remove_file(&img)
-                .await
-                .with_context(|| format!("remove gallery image {}", img.display()))?;
-        }
-        fs::remove_file(&meta_path)
-            .await
-            .with_context(|| format!("remove gallery meta {}", meta_path.display()))?;
-        Ok(true)
-    }
-
     pub fn image_path(&self, meta: &ArtifactMeta) -> PathBuf {
         self.root.join(&meta.filename)
     }
-}
-
-/// Gallery ids are UUIDs written by [`Gallery::save`]. Reject path traversal.
-fn sanitize_gallery_id(id: &str) -> Option<&str> {
-    if Uuid::parse_str(id).is_ok() {
-        Some(id)
-    } else {
-        None
-    }
-}
-
-fn mime_to_ext(mime: &str) -> &'static str {
-    let m = mime.to_ascii_lowercase();
-    if m.contains("jpeg") || m.contains("jpg") {
-        "jpg"
-    } else if m.contains("webp") {
-        "webp"
-    } else if m.contains("gif") {
-        "gif"
-    } else if m.contains("webm") {
-        "webm"
-    } else if m.contains("mp4") || m.contains("mpeg") || m.contains("quicktime") {
-        "mp4"
-    } else if m.contains("png") {
-        "png"
-    } else {
-        "bin"
-    }
-}
-
-/// Content-Type for serving a gallery artifact.
-pub fn content_type_for_mime(mime: &str) -> &'static str {
-    let m = mime.to_ascii_lowercase();
-    if m.contains("jpeg") || m.contains("jpg") {
-        "image/jpeg"
-    } else if m.contains("webp") {
-        "image/webp"
-    } else if m.contains("gif") {
-        "image/gif"
-    } else if m.contains("webm") {
-        "video/webm"
-    } else if m.contains("mp4") || m.contains("mpeg") || m.contains("quicktime") {
-        "video/mp4"
-    } else if m.contains("png") {
-        "image/png"
-    } else if !mime.is_empty() {
-        // Pass through unknown but non-empty mime when possible — fall back to octet-stream.
-        "application/octet-stream"
-    } else {
-        "application/octet-stream"
-    }
-}
-
-pub fn is_video_mime(mime: &str) -> bool {
-    let m = mime.to_ascii_lowercase();
-    m.contains("mp4") || m.contains("webm") || m.contains("quicktime") || m.starts_with("video/")
-}
-
-pub fn is_animated_image_mime(mime: &str) -> bool {
-    let m = mime.to_ascii_lowercase();
-    m.contains("gif") || m.contains("webp")
 }
