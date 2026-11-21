@@ -43,7 +43,7 @@ spec:
                     type: string
                 type: object
               apiTokenSecretRef:
-                description: Secret holding `FREYA_API_TOKEN` for the API (and UI nginx proxy). Set for non-dev / Ingress.
+                description: Secret holding `FREYA_API_TOKEN` for the API. Set for non-dev / Ingress; UI sends the bearer from Settings.
                 nullable: true
                 properties:
                   key:

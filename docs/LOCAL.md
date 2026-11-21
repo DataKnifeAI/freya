@@ -39,9 +39,10 @@ export FREYA_WORKER_TOKEN='long-random-secret'   # same value on API + worker
 # optional: restrict browser origins (comma-separated)
 export FREYA_CORS_ORIGINS='https://freya.example.com,http://127.0.0.1:5173'
 # optional for Vite UI: VITE_FREYA_API_TOKEN=$FREYA_API_TOKEN
+# or paste the same value in UI Settings → Studio API token
 ```
 
-Send `Authorization: Bearer $FREYA_API_TOKEN` on `/v1` calls (UI nginx injects this in-cluster). Gallery image GETs stay open so `<img src>` works; list/search/settings require the bearer when the token is set.
+Send `Authorization: Bearer $FREYA_API_TOKEN` on `/v1` calls. The UI forwards a token from Settings / `VITE_FREYA_API_TOKEN` / `localStorage.freya.apiToken` (nginx does not inject one). Gallery image GETs stay open so `<img src>` works; list/search/settings require the bearer when the token is set.
 
 In-cluster: set `FreyaStudio.spec.apiTokenSecretRef` and `FreyaDiffusionWorker.spec.authSecretRef`.
 

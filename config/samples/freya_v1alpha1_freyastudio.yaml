@@ -11,7 +11,7 @@ spec:
       key: apiKey
     chatModel: openrouter/auto
     imageModel: black-forest-labs/flux.2-klein-4b
-  # Required for non-dev / Ingress — bearer on /v1 (UI nginx injects it).
+  # Required for non-dev / Ingress — bearer on /v1 (paste into UI Settings).
   apiTokenSecretRef:
     name: freya-api-token
     key: token
@@ -30,8 +30,9 @@ spec:
   ingress:
     enabled: false
 ---
-# kubectl -n freya create secret generic freya-openrouter --from-literal=apiKey=sk-or-...
-# kubectl -n freya create secret generic freya-civitai --from-literal=apiKey=YOUR_CIVITAI_KEY
-# kubectl -n freya create secret generic freya-hf --from-literal=token=hf_...
-# kubectl -n freya create secret generic freya-api-token --from-literal=token="$(openssl rand -hex 32)"
-# kubectl -n freya create secret generic freya-worker-token --from-literal=apiKey="$(openssl rand -hex 32)"
+# Create Secrets first (see README Cluster section). Example:
+#   freya-openrouter  key=apiKey
+#   freya-civitai     key=apiKey
+#   freya-hf          key=token
+#   freya-api-token   key=token   (openssl rand -hex 32)
+#   freya-worker-token key=apiKey (openssl rand -hex 32)

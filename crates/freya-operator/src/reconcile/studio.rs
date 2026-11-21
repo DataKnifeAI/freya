@@ -357,19 +357,12 @@ async fn ensure_ui_deployment(
                             name: Some("http".into()),
                             ..Default::default()
                         }]),
-                        env: Some({
-                            let mut ui_env = vec![EnvVar {
-                                // Consumed by nginx envsubst template → upstream for /v1/.
-                                name: "FREYA_API_UPSTREAM".into(),
-                                value: Some(format!("http://{name}-api:8080")),
-                                ..Default::default()
-                            }];
-                            // Same token as API so nginx can inject Authorization on /v1/.
-                            if let Some(ref api_tok) = studio.spec.api_token_secret_ref {
-                                ui_env.push(secret_env("FREYA_API_TOKEN", api_tok, false));
-                            }
-                            ui_env
-                        }),
+                        env: Some(vec![EnvVar {
+                            // Consumed by nginx envsubst template → upstream for /v1/.
+                            name: "FREYA_API_UPSTREAM".into(),
+                            value: Some(format!("http://{name}-api:8080")),
+                            ..Default::default()
+                        }]),
                         ..Default::default()
                     }],
                     ..Default::default()

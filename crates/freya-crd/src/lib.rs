@@ -180,7 +180,7 @@ pub struct FreyaStudioSpec {
     /// Optional FreyaDiffusionWorker name in the same namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diffusion_worker_ref: Option<String>,
-    /// Secret holding `FREYA_API_TOKEN` for the API (and UI nginx proxy). Set for non-dev / Ingress.
+    /// Secret holding `FREYA_API_TOKEN` for the API. Set for non-dev / Ingress; UI sends the bearer from Settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_token_secret_ref: Option<SecretKeyRef>,
     #[serde(default = "default_replicas")]
