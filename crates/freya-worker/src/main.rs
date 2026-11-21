@@ -141,6 +141,9 @@ async fn generate(Json(req): Json<GenReq>) -> Json<serde_json::Value> {
 struct InstallReq {
     url: String,
     dest_path: String,
+    /// Optional download credential (Civitai/HF). Never embed secrets in `url` — reqwest errors echo URLs.
+    #[serde(default)]
+    auth_token: Option<String>,
 }
 
 /// Resolve `dest_path` under `models_dir`, rejecting absolute paths and `..` escape.
@@ -220,10 +223,24 @@ async fn install(
         ));
     }
     if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).await.map_err(internal)?;
+        fs::create_dir_all(parent)
+            .await
+            .map_err(|e| internal("create dest dir", e))?;
     }
-    let client = download_client().map_err(internal)?;
-    let resp = client.get(&req.url).send().await.map_err(internal)?;
+    let client = download_client().map_err(|e| internal("download client", e))?;
+    let mut req_builder = client.get(&req.url);
+    if let Some(token) = req
+        .auth_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        req_builder = req_builder.bearer_auth(token);
+    }
+    let resp = req_builder
+        .send()
+        .await
+        .map_err(|e| internal("download request", e))?;
     if !resp.status().is_success() {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
@@ -232,16 +249,26 @@ async fn install(
             })),
         ));
     }
-    let bytes = resp.bytes().await.map_err(internal)?;
-    fs::write(&dest, &bytes).await.map_err(internal)?;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| internal("download body", e))?;
+    fs::write(&dest, &bytes)
+        .await
+        .map_err(|e| internal("write asset", e))?;
     info!(path = %dest.display(), bytes = bytes.len(), "installed asset");
     Ok(Json(json!({ "ok": true, "path": req.dest_path })))
 }
 
-fn internal(e: impl std::fmt::Display) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+/// Never return raw transport errors — reqwest Display includes the full URL (and query secrets).
+fn internal(
+    context: &str,
+    e: impl std::fmt::Display,
+) -> (axum::http::StatusCode, Json<serde_json::Value>) {
+    warn!(%context, error = %e, "asset install failed");
     (
         axum::http::StatusCode::BAD_REQUEST,
-        Json(json!({ "error": e.to_string() })),
+        Json(json!({ "error": format!("{context} failed") })),
     )
 }
 

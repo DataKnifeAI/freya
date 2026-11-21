@@ -133,12 +133,21 @@ impl DiffusionWorkerClient {
             .context("decode worker image")
     }
 
-    pub async fn install_asset(&self, source: &str, url: &str, dest_path: &str) -> Result<()> {
-        let body = serde_json::json!({
+    pub async fn install_asset(
+        &self,
+        source: &str,
+        url: &str,
+        dest_path: &str,
+        auth_token: Option<&str>,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({
             "source": source,
             "url": url,
             "destPath": dest_path,
         });
+        if let Some(t) = auth_token.map(str::trim).filter(|t| !t.is_empty()) {
+            body["authToken"] = Value::String(t.into());
+        }
         let resp = self
             .apply_auth(
                 self.http
