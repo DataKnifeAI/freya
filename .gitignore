@@ -1,4 +1,13 @@
-# Python
+# Rust
+/target
+/data
+**/*.rs.bk
+
+# Web
+web/node_modules
+web/dist
+
+# Python (legacy)
 __pycache__/
 *.py[cod]
 *$py.class
@@ -8,10 +17,8 @@ env/
 venv/
 ENV/
 .venv
-pip-log.txt
-pip-delete-this-directory.txt
 
-# Models and outputs
+# Models and outputs (legacy Compose volumes)
 comfyui/models/
 comfyui/output/
 comfyui/input/
@@ -28,34 +35,27 @@ openwebui/
 *.pt
 *.pth
 
-# IDE
+# IDE / OS
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Docker
-.dockerignore
 
 # Logs
 *.log
 logs/
 
-# Environment
+# Environment / secrets
 .env
-.env.local
+.env.*
+!.env.example
+*.pem
 
-# .NET
+# .NET (legacy SwarmUI)
 bin/
 obj/
 *.dll
 *.exe
-
-# Jupyter
-.ipynb_checkpoints/
-*.ipynb

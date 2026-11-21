@@ -1,0 +1,29 @@
+[package]
+name = "freya-operator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Freya Kubernetes operator"
+
+[[bin]]
+name = "freya-operator"
+path = "src/main.rs"
+
+[[bin]]
+name = "freya-crdgen"
+path = "src/crdgen.rs"
+
+[dependencies]
+freya-crd = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }

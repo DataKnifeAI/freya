@@ -1,0 +1,31 @@
+apiVersion: freya.dataknife.ai/v1alpha1
+kind: FreyaStudio
+metadata:
+  name: freya
+  namespace: freya
+spec:
+  replicas: 1
+  openRouter:
+    secretRef:
+      name: freya-openrouter
+      key: apiKey
+    chatModel: openrouter/auto
+    imageModel: black-forest-labs/flux.2-klein-4b
+  # Optional — search Civitai + install LoRAs onto the worker for the UI
+  civitai:
+    secretRef:
+      name: freya-civitai
+      key: apiKey
+  huggingFace:
+    secretRef:
+      name: freya-hf
+      key: token
+  diffusionWorkerRef: freya-gpu
+  storage:
+    gallerySize: 20Gi
+  ingress:
+    enabled: false
+---
+# kubectl -n freya create secret generic freya-openrouter --from-literal=apiKey=sk-or-...
+# kubectl -n freya create secret generic freya-civitai --from-literal=apiKey=YOUR_CIVITAI_KEY
+# kubectl -n freya create secret generic freya-hf --from-literal=token=hf_...

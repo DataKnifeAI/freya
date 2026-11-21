@@ -1,0 +1,13 @@
+# In-cluster GPU Deployment (requires nvidia.com/gpu)
+apiVersion: freya.dataknife.ai/v1alpha1
+kind: FreyaDiffusionWorker
+metadata:
+  name: freya-gpu
+  namespace: freya
+spec:
+  placement: inCluster
+  engine: vllm-omni
+  model: stabilityai/stable-diffusion-xl-base-1.0
+  gpuCount: 1
+  modelsPvcSize: 100Gi
+  port: 8091

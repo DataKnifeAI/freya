@@ -1,0 +1,10 @@
+# Remote physical GPU box (or any host running vLLM-Omni / freya-worker)
+apiVersion: freya.dataknife.ai/v1alpha1
+kind: FreyaDiffusionWorker
+metadata:
+  name: freya-gpu
+  namespace: freya
+spec:
+  placement: external
+  externalEndpoint: http://gpu-box.lan:8091
+  engine: vllm-omni

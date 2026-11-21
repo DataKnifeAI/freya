@@ -1,0 +1,263 @@
+:root {
+  --ink: #1a1410;
+  --paper: #f3ebe1;
+  --ember: #c45c26;
+  --moss: #2f4f3e;
+  --mist: rgba(255, 248, 240, 0.72);
+  --line: rgba(26, 20, 16, 0.12);
+  --shadow: 0 24px 60px rgba(26, 20, 16, 0.18);
+  font-family: "Outfit", system-ui, sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(1200px 600px at 10% -10%, rgba(196, 92, 38, 0.28), transparent 55%),
+    radial-gradient(900px 500px at 90% 0%, rgba(47, 79, 62, 0.22), transparent 50%),
+    linear-gradient(160deg, #efe4d6 0%, #f7f1ea 45%, #e7ddd0 100%);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.shell {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 4rem;
+}
+
+.hero {
+  min-height: 72vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 1.25rem;
+  padding: 2rem 0 1rem;
+  animation: rise 700ms ease-out both;
+}
+
+.brand {
+  font-family: "Fraunces", Georgia, serif;
+  font-size: clamp(3.2rem, 9vw, 5.5rem);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 0.95;
+  margin: 0;
+}
+
+.tagline {
+  max-width: 36rem;
+  font-size: 1.1rem;
+  line-height: 1.5;
+  opacity: 0.85;
+  margin: 0;
+}
+
+.compose {
+  display: grid;
+  gap: 0.85rem;
+  background: var(--mist);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 1rem;
+  box-shadow: var(--shadow);
+  animation: rise 900ms ease-out both;
+}
+
+textarea {
+  width: 100%;
+  min-height: 110px;
+  resize: vertical;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 1.05rem;
+  line-height: 1.45;
+  outline: none;
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  align-items: center;
+}
+
+button,
+.btn {
+  appearance: none;
+  border: none;
+  border-radius: 999px;
+  padding: 0.7rem 1.2rem;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 160ms ease, background 160ms ease, opacity 160ms ease;
+}
+
+button:hover,
+.btn:hover {
+  transform: translateY(-1px);
+}
+
+button.primary {
+  background: var(--ink);
+  color: #fff8f0;
+}
+
+button.ghost {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+
+.tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin: 2rem 0 1rem;
+}
+
+.tabs button.active {
+  background: var(--moss);
+  color: #f4faf6;
+}
+
+.panel {
+  animation: fade 400ms ease both;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.card {
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 1rem;
+  background: rgba(255, 250, 244, 0.65);
+  cursor: pointer;
+  transition: transform 180ms ease;
+}
+
+.card:hover {
+  transform: translateY(-3px);
+}
+
+.card h3 {
+  font-family: "Fraunces", Georgia, serif;
+  margin: 0 0 0.4rem;
+  font-size: 1.15rem;
+}
+
+.card p {
+  margin: 0;
+  font-size: 0.92rem;
+  opacity: 0.8;
+}
+
+.badge {
+  display: inline-block;
+  margin-top: 0.6rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+
+.result {
+  margin-top: 1.5rem;
+}
+
+.result img {
+  width: 100%;
+  max-width: 640px;
+  border-radius: 16px;
+  display: block;
+  box-shadow: var(--shadow);
+  animation: fade 500ms ease both;
+}
+
+.settings {
+  display: grid;
+  gap: 1rem;
+  max-width: 520px;
+}
+
+label {
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.92rem;
+}
+
+input {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 0.7rem 0.85rem;
+  font: inherit;
+  background: rgba(255, 250, 244, 0.9);
+}
+
+.hint {
+  font-size: 0.85rem;
+  opacity: 0.7;
+}
+
+.status-dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  display: inline-block;
+  margin-right: 0.35rem;
+  background: #8a8a8a;
+}
+
+.status-dot.on {
+  background: var(--moss);
+}
+
+.err {
+  color: #8b1e1e;
+  font-size: 0.92rem;
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@media (max-width: 640px) {
+  .shell {
+    padding: 1.5rem 1rem 3rem;
+  }
+}

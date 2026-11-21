@@ -1,0 +1,14 @@
+# Exclude model/data dirs from build context (reduce context size, avoid permission issues)
+ollama/
+comfyui/models/
+comfyui/output/
+comfyui/input/
+swarmui/data/
+swarmui/output/
+swarmui/dlbackend/
+swarmui/models/
+swarmui/extensions/
+swarmui/bin/
+.git/
+.env
+.env.*
