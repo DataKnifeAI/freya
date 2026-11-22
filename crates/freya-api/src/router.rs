@@ -90,24 +90,34 @@ pub fn resolve_auto_fallback(
     };
     let user = user.trim();
     if !user.is_empty() {
+        let user_id = if kind == AutoFallbackKind::Image {
+            match crate::openrouter::canonical_image_model(user) {
+                Some(id) => id,
+                None => {
+                    return builtin_auto_fallback(kind, privacy, alignment, &fallbacks.cost_tier);
+                }
+            }
+        } else {
+            user.to_string()
+        };
         // When strict privacy is on, ignore non-Google Flux-ish image/video overrides.
         if strict {
             match kind {
                 AutoFallbackKind::Image
-                    if !user.starts_with("google/")
-                        && (user.contains("flux")
-                            || user.contains("seedream")
-                            || user.contains("black-forest")) =>
+                    if !user_id.starts_with("google/")
+                        && (user_id.contains("flux")
+                            || user_id.contains("seedream")
+                            || user_id.contains("black-forest")) =>
                 {
                     return builtin_auto_fallback(kind, privacy, alignment, &fallbacks.cost_tier)
                         .to_string();
                 }
                 AutoFallbackKind::Video
-                    if !user.starts_with("google/")
-                        && (user.contains("seedance")
-                            || user.contains("kling")
-                            || user.contains("hailuo")
-                            || user.contains("flux")) =>
+                    if !user_id.starts_with("google/")
+                        && (user_id.contains("seedance")
+                            || user_id.contains("kling")
+                            || user_id.contains("hailuo")
+                            || user_id.contains("flux")) =>
                 {
                     return builtin_auto_fallback(kind, privacy, alignment, &fallbacks.cost_tier)
                         .to_string();
@@ -115,7 +125,7 @@ pub fn resolve_auto_fallback(
                 _ => {}
             }
         }
-        return user.to_string();
+        return user_id;
     }
     builtin_auto_fallback(kind, privacy, alignment, &fallbacks.cost_tier).to_string()
 }
@@ -261,7 +271,8 @@ pub fn resolve_video_model_choice_prefs(
     alignment: &AlignmentPrefs,
     fallbacks: &AutoFallbacksPrefs,
 ) -> String {
-    let auto_default = resolve_auto_fallback(AutoFallbackKind::Video, privacy, alignment, fallbacks);
+    let auto_default =
+        resolve_auto_fallback(AutoFallbackKind::Video, privacy, alignment, fallbacks);
     if let Some(p) = pinned.map(str::trim).filter(|s| !s.is_empty()) {
         if !is_auto_video(p) {
             return crate::openrouter::resolve_video_model(p, &auto_default);
@@ -437,7 +448,8 @@ pub fn resolve_image_model_choice_prefs(
     alignment: &AlignmentPrefs,
     fallbacks: &AutoFallbacksPrefs,
 ) -> String {
-    let auto_default = resolve_auto_fallback(AutoFallbackKind::Image, privacy, alignment, fallbacks);
+    let auto_default =
+        resolve_auto_fallback(AutoFallbackKind::Image, privacy, alignment, fallbacks);
     if let Some(p) = pinned.map(str::trim).filter(|s| !s.is_empty()) {
         if !is_auto_image(p) {
             return crate::openrouter::resolve_image_model(p, &auto_default);
@@ -617,8 +629,16 @@ pub fn message_is_chat_not_media(message: &str) -> bool {
         let imperative = contains_any(
             &lower,
             &[
-                "draw", "generat", "illustrat", "render", "paint", "video", "gif", "animat",
-                "picture", "image",
+                "draw",
+                "generat",
+                "illustrat",
+                "render",
+                "paint",
+                "video",
+                "gif",
+                "animat",
+                "picture",
+                "image",
             ],
         );
         if !imperative {
@@ -629,9 +649,9 @@ pub fn message_is_chat_not_media(message: &str) -> bool {
 }
 
 fn looks_like_prose_scene(lower: &str) -> bool {
-    let stripped = lower.trim().trim_matches(|c: char| {
-        matches!(c, '"' | '\'' | '“' | '”' | '«' | '»')
-    });
+    let stripped = lower
+        .trim()
+        .trim_matches(|c: char| matches!(c, '"' | '\'' | '“' | '”' | '«' | '»'));
     if stripped.contains('?') {
         return false;
     }
@@ -776,7 +796,8 @@ pub fn coerce_route_to_media_ask(
                     fallbacks,
                 ));
             }
-            decision.reason = "Chat: question, how-it-works, or LoRA/character clarification.".into();
+            decision.reason =
+                "Chat: question, how-it-works, or LoRA/character clarification.".into();
             if !decision.source.contains("chat-guard") {
                 decision.source = format!("{}+chat-guard", decision.source);
             }
@@ -927,15 +948,24 @@ fn sanitize_router_model_suggestion(raw: &str) -> Option<String> {
     if s.contains(char::is_whitespace) {
         return None;
     }
-    // OpenRouter ids are `org/name`. Bare tokens (`light`, `ldm-xxl-256`, `chat-0.4.0`)
+    // Drop a mistaken `openrouter/` prefix. Invented slugs
+    // (`openrouter/google-gemini-pro-image-1`) become empty and fall through to Auto.
+    let s = crate::openrouter::canonicalize_catalog_id(s);
+    if s.is_empty() {
+        return None;
+    }
+    // OpenRouter ids are `provider/model`. Bare tokens (`light`, `ldm-xxl-256`)
     // are router prose, not models — drop them so Auto fallbacks are used.
     if !s.contains('/') {
         return None;
     }
-    if is_auto_image(s) || is_auto_agent(s) || is_upstream_router(s) {
+    if is_auto_image(&s) || is_auto_agent(&s) || is_upstream_router(&s) {
         return None;
     }
-    Some(s.to_string())
+    if s.to_ascii_lowercase().starts_with("openrouter/") {
+        return None;
+    }
+    Some(s)
 }
 
 fn parse_route_json(text: &str) -> Option<RouteDecision> {
@@ -975,7 +1005,7 @@ fn parse_route_json(text: &str) -> Option<RouteDecision> {
 /// Context injected into the router user blob so Auto picks respect Privacy/Alignment.
 pub fn router_prefs_context(privacy: &PrivacyPrefs, alignment: &AlignmentPrefs) -> String {
     format!(
-        "Privacy: ZDR={} data_collection={}. Alignment: {}. Prefer concrete OpenRouter model ids that satisfy these. Safety: moderated high-refusal models (GPT, Claude, Cohere; GPT Image or Google image; Veo for video). Balanced: a capable default, not an uncensored specialist and not the strictest safety model. Uncensored: models whose name or description is uncensored (Dolphin, Venice, Cydonia) or, for image and video, the least-moderated catalog option (Flux, Krea, Grok). Do not suggest Llama-instruct, Claude, or GPT as uncensored. When ZDR or deny-collection is on, stay on ids from the ZDR catalog. No video model is on that catalog.",
+        "Privacy: ZDR={} data_collection={}. Alignment: {}. Prefer concrete provider/model ids that satisfy these (image examples: google/gemini-2.5-flash-image, google/gemini-3-pro-image). Never prefix openrouter/ onto a provider/model id and never invent openrouter/google-gemini-pro-image-1. Safety: moderated high-refusal models (GPT, Claude, Cohere; GPT Image or Google image; Veo for video). Balanced: a capable default, not an uncensored specialist and not the strictest safety model. Uncensored: models whose name or description is uncensored (Dolphin, Venice, Cydonia) or, for image and video, the least-moderated catalog option (Flux, Krea, Grok). Do not suggest Llama-instruct, Claude, or GPT as uncensored. When ZDR or deny-collection is on, stay on ids from the ZDR catalog. No video model is on that catalog.",
         if privacy.zero_data_retention {
             "on"
         } else {
@@ -1029,13 +1059,7 @@ pub async fn classify_prefs(
                 if d.reason.is_empty() {
                     d.reason = format!("Routed as {} via {model}", d.modality.as_str());
                 }
-                return coerce_route_to_media_ask(
-                    d,
-                    user_message,
-                    privacy,
-                    alignment,
-                    fallbacks,
-                );
+                return coerce_route_to_media_ask(d, user_message, privacy, alignment, fallbacks);
             }
             tracing::debug!(raw = %text, "router returned non-JSON; using heuristic");
             let mut h = infer_modality_prefs(user_message, privacy, alignment, fallbacks);
@@ -1166,12 +1190,10 @@ mod tests {
             resolve_agent_model(Some("anthropic/claude-sonnet-5.5"), &route).as_deref(),
             Some("anthropic/claude-sonnet-5.5")
         );
-        assert!(resolve_image_model_choice(
-            Some("openai/gpt-image-1-mini"),
-            &route,
-            AUTO_IMAGE
-        )
-        .contains("gpt-image"));
+        assert!(
+            resolve_image_model_choice(Some("openai/gpt-image-1-mini"), &route, AUTO_IMAGE)
+                .contains("gpt-image")
+        );
     }
 
     #[test]
@@ -1221,13 +1243,16 @@ mod tests {
             sanitize_router_model_suggestion("black-forest-labs/flux.2-klein-4b").as_deref(),
             Some("black-forest-labs/flux.2-klein-4b")
         );
+        assert!(sanitize_router_model_suggestion("openrouter/google-gemini-pro-image-1").is_none());
+        assert_eq!(
+            sanitize_router_model_suggestion("openrouter/google/gemini-3-pro-image").as_deref(),
+            Some("google/gemini-3-pro-image")
+        );
         let route = RouteDecision {
             modality: Modality::Picture,
             reason: "t".into(),
             agent_model: None,
-            image_model: Some(
-                "None, letting Freya use Auto default (ZDR-aware).".into(),
-            ),
+            image_model: Some("None, letting Freya use Auto default (ZDR-aware).".into()),
             source: "t".into(),
         };
         // Prose suggestion ignored → Auto default.
@@ -1318,6 +1343,56 @@ mod tests {
             resolve_auto_fallback(AutoFallbackKind::Image, &privacy, &alignment, &fb),
             "openai/gpt-image-1"
         );
+    }
+
+    #[test]
+    fn invented_openrouter_image_id_uses_real_catalog_id() {
+        let route = RouteDecision {
+            modality: Modality::Picture,
+            reason: "t".into(),
+            agent_model: None,
+            image_model: Some("openrouter/google-gemini-pro-image-1".into()),
+            source: "t".into(),
+        };
+        assert_eq!(
+            resolve_image_model_choice(Some(AUTO_IMAGE), &route, AUTO_IMAGE),
+            DEFAULT_AUTO_IMAGE_MODEL
+        );
+        assert_eq!(
+            resolve_image_model_choice(
+                Some("openrouter/google-gemini-pro-image-1"),
+                &route,
+                AUTO_IMAGE
+            ),
+            DEFAULT_AUTO_IMAGE_MODEL
+        );
+        assert_eq!(
+            resolve_image_model_choice(Some("google/gemini-3-pro-image"), &route, AUTO_IMAGE),
+            "google/gemini-3-pro-image"
+        );
+        assert_eq!(
+            resolve_image_model_choice(
+                Some("openrouter/google/gemini-3-pro-image"),
+                &route,
+                AUTO_IMAGE
+            ),
+            "google/gemini-3-pro-image"
+        );
+        let privacy = PrivacyPrefs::default();
+        let alignment = AlignmentPrefs::default();
+        let fb = AutoFallbacksPrefs {
+            image: "openrouter/google-gemini-pro-image-1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_auto_fallback(AutoFallbackKind::Image, &privacy, &alignment, &fb),
+            DEFAULT_AUTO_IMAGE_MODEL
+        );
+        let d = parse_route_json(
+            r#"{"modality":"picture","reason":"gen","agentModel":null,"imageModel":"openrouter/google-gemini-pro-image-1"}"#,
+        )
+        .expect("parse");
+        assert!(d.image_model.is_none());
     }
 
     #[test]

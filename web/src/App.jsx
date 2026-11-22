@@ -14,6 +14,424 @@ const MODELS_STORAGE_KEY = "freya.models";
 const SESSIONS_STORAGE_KEY = "freya.sessions";
 const SIDEBAR_STORAGE_KEY = "freya.sidebarOpen";
 const THEME_STORAGE_KEY = "freya.theme";
+const TAB_STORAGE_KEY = "freya.tab";
+/** Top-level Studio tabs (nav + restore must stay in sync). */
+const STUDIO_TABS = [
+  "gallery",
+  "styles",
+  "civitai",
+  "worker",
+  "metrics",
+  "models",
+  "settings",
+  "help",
+  "guidelines",
+];
+
+/** Empty Auto fallbacks → API uses Privacy/Alignment built-in matrix. */
+const EMPTY_AUTO_FALLBACKS = {
+  agent: "",
+  agentZdr: "",
+  image: "",
+  imageZdr: "",
+  video: "",
+  videoZdr: "",
+  router: "",
+  costTier: "medium",
+};
+
+function normalizeAutoFallbacks(raw) {
+  const r = raw && typeof raw === "object" ? raw : {};
+  const pick = (k) => {
+    const v = typeof r[k] === "string" ? r[k].trim() : "";
+    return v.toLowerCase() === "auto" ? "" : v;
+  };
+  const cost = String(r.costTier || "medium").trim().toLowerCase();
+  return {
+    agent: pick("agent"),
+    agentZdr: pick("agentZdr"),
+    image: pick("image"),
+    imageZdr: pick("imageZdr"),
+    video: pick("video"),
+    videoZdr: pick("videoZdr"),
+    router: pick("router"),
+    costTier: ["low", "high", "max"].includes(cost) ? cost : "medium",
+  };
+}
+
+const COST_TIERS = [
+  { id: "low", label: "Low", title: "Low" },
+  { id: "medium", label: "Med", title: "Medium" },
+  { id: "high", label: "High", title: "High" },
+  { id: "max", label: "Max", title: "Max" },
+];
+
+function CostTierSwitch({ value, onChange }) {
+  const current = COST_TIERS.some((t) => t.id === value) ? value : "medium";
+  return (
+    <div className="cost-tier-switch" role="radiogroup" aria-label="Cost tier">
+      {COST_TIERS.map((t) => (
+        <button
+          key={t.id}
+          type="button"
+          role="radio"
+          aria-checked={current === t.id}
+          className={current === t.id ? "is-active" : ""}
+          title={`Auto cost: ${t.title}`}
+          onClick={() => onChange(t.id)}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** First-login / first-use acknowledgment of user liability guidelines. */
+const GUIDELINES_ACK_STORAGE_KEY = "freya.guidelinesAck";
+/** Persistent Civitai library (survives sessions). Distinct from session Pin. */
+const FAVORITES_STORAGE_KEY = "freya.civitaiFavorites";
+
+/** Third-party policy links (README + Settings + Guidelines tab stay in sync). */
+const POLICY_LINKS = {
+  openrouter: [
+    { label: "Terms", href: "https://openrouter.ai/terms" },
+    { label: "Privacy", href: "https://openrouter.ai/privacy" },
+    {
+      label: "Data collection",
+      href: "https://openrouter.ai/docs/guides/privacy/data-collection",
+    },
+    { label: "ZDR", href: "https://openrouter.ai/docs/guides/features/zdr" },
+  ],
+  civitai: [
+    { label: "Terms", href: "https://civitai.com/content/tos" },
+    { label: "Privacy", href: "https://civitai.com/content/privacy" },
+    { label: "Content moderation", href: "https://civitai.com/content/moderation" },
+    { label: "Real-people rules", href: "https://civitai.com/content/rules/real-people" },
+  ],
+  huggingface: [
+    { label: "Terms", href: "https://huggingface.co/terms-of-service" },
+    { label: "Privacy", href: "https://huggingface.co/privacy" },
+    { label: "Content policy", href: "https://huggingface.co/content-policy" },
+  ],
+};
+
+function readGuidelinesAck() {
+  try {
+    return localStorage.getItem(GUIDELINES_ACK_STORAGE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function persistGuidelinesAck() {
+  try {
+    localStorage.setItem(GUIDELINES_ACK_STORAGE_KEY, "1");
+  } catch {
+    /* private mode / quota */
+  }
+}
+
+function PolicyLinkRow({ links }) {
+  return links.map((l, i) => (
+    <span key={l.href}>
+      {i > 0 ? " · " : null}
+      <a href={l.href} target="_blank" rel="noreferrer">
+        {l.label}
+      </a>
+    </span>
+  ));
+}
+
+/** Compact “?” control — opens Help tab at a section id (`help-zdr`, …). */
+function HelpQ({ topic, onOpen, label }) {
+  const title = label ? `Help: ${label}` : "Help";
+  return (
+    <button
+      type="button"
+      className="help-q"
+      title={title}
+      aria-label={title}
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onOpen?.(topic);
+      }}
+    >
+      ?
+    </button>
+  );
+}
+
+function HelpSection({ id, title, children, active }) {
+  return (
+    <article id={id} className={`help-section${active ? " is-active" : ""}`}>
+      <h3 className="help-section-title">{title}</h3>
+      <div className="help-section-body">{children}</div>
+    </article>
+  );
+}
+
+function GuidelinesBody({ compact = false }) {
+  return (
+    <div className={compact ? "guidelines-body is-compact" : "guidelines-body"}>
+      <p>
+        <strong>Freya is a tool.</strong> It helps you plan prompts and call image/chat APIs you
+        configure. It does not decide what is legal where you live, and it does not police your
+        prompts or outputs beyond what third-party providers already enforce.
+      </p>
+      <p>
+        <strong>You are responsible.</strong> Generated or downloaded content may be illegal or
+        restricted under your country or state law. You alone are liable for how you use Freya,
+        what you generate, and what you publish or share — not Freya, DataKnifeAI, or the
+        operators of this instance.
+      </p>
+      <p>
+        <strong>Bring your own keys and hardware.</strong> You supply OpenRouter / Civitai / HF
+        credentials and any local GPU worker. Those accounts and machines are yours; Freya only
+        relays requests you initiate.
+      </p>
+      <p>
+        <strong>Follow third-party policies.</strong> Using Freya means you agree to comply with
+        each provider’s terms, privacy, and content rules for any keys you configure and any
+        prompts or assets you send or download:
+      </p>
+      <ul className="guidelines-policy-list">
+        <li>
+          <strong>OpenRouter</strong> — <PolicyLinkRow links={POLICY_LINKS.openrouter} />
+        </li>
+        <li>
+          <strong>Civitai</strong> — <PolicyLinkRow links={POLICY_LINKS.civitai} />
+        </li>
+        <li>
+          <strong>Hugging Face</strong> — <PolicyLinkRow links={POLICY_LINKS.huggingface} />
+        </li>
+      </ul>
+      {!compact && (
+        <p className="hint">
+          Acknowledgment is stored in this browser as{" "}
+          <code>{GUIDELINES_ACK_STORAGE_KEY}</code>. Clear site data to see the prompt again.
+        </p>
+      )}
+    </div>
+  );
+}
+const CIVITAI_SUBVIEW_STORAGE_KEY = "freya.civitaiSubview";
+/** Left cluster then Downloads (rightmost in subnav). */
+const CIVITAI_SUBVIEWS = ["search", "favorites", "installed", "downloads"];
+/** Debounce for Civitai search-as-you-type (ms). */
+const CIVITAI_SEARCH_DEBOUNCE_MS = 350;
+const CIVITAI_SEARCH_TYPES = "LORA,LoCon,DoRA,Checkpoint,TextualInversion,VAE";
+/** Local freya-worker / freya-local-worker defaults (see .env.example, docs/LOCAL.md). */
+const DEFAULT_WORKER_HOST = "localhost";
+const DEFAULT_WORKER_PORT = "8091";
+
+/** Status suffix for active base — reflects Diffusers engine, not stub-era copy. */
+function activeBaseEngineHint(modelLoaded, workerStats) {
+  if (!modelLoaded?.model) return "";
+  const engineName =
+    modelLoaded.engine ||
+    workerStats?.engine?.engine ||
+    workerStats?.worker?.engine?.engine ||
+    "";
+  const enginePayload = workerStats?.engine || workerStats?.worker?.engine || null;
+  const engineOk = enginePayload?.ok === true;
+  if (modelLoaded.loadedInVram === true) {
+    return engineName ? ` — loaded in VRAM (${engineName})` : " — loaded in VRAM";
+  }
+  if (engineName === "diffusers-unreachable") {
+    return " — selected; Diffusers engine unavailable";
+  }
+  if (engineName === "diffusers" || (engineOk && engineName)) {
+    return " — selected; Diffusers loads on demand";
+  }
+  if (!engineName || engineName === "stub") {
+    return " — selected on disk; no Diffusers engine configured";
+  }
+  return ` — selected (${engineName})`;
+}
+
+/** Label container vs host models path when both are known. */
+function modelsDirHint(workerStats) {
+  const dir = workerStats?.modelsDir;
+  if (!dir) return null;
+  const host = workerStats?.modelsDirHost || workerStats?.worker?.modelsDirHost || null;
+  const containerish =
+    dir === "/models" || dir === "/data/models" || dir.startsWith("/models/");
+  if (host) {
+    return `Models dir: ${host} (container: ${dir})`;
+  }
+  if (containerish) {
+    return `Models dir (container path): ${dir}`;
+  }
+  return `Models dir: ${dir}`;
+}
+
+function parseWorkerEndpoint(url) {
+  // No saved URL → show local defaults in the fields (hasWorker still uses persisted settings).
+  const empty = {
+    host: DEFAULT_WORKER_HOST,
+    port: DEFAULT_WORKER_PORT,
+    advancedUrl: "",
+    useAdvanced: false,
+  };
+  if (!url || !String(url).trim()) return empty;
+  try {
+    const u = new URL(String(url).trim());
+    const path = (u.pathname || "/").replace(/\/$/, "") || "";
+    const simpleHttp =
+      u.protocol === "http:" && !path && !u.search && !u.hash && Boolean(u.hostname);
+    if (simpleHttp) {
+      return {
+        host: u.hostname,
+        port: u.port || DEFAULT_WORKER_PORT,
+        advancedUrl: "",
+        useAdvanced: false,
+      };
+    }
+    return {
+      host: "",
+      port: "",
+      advancedUrl: String(url).trim(),
+      useAdvanced: true,
+    };
+  } catch {
+    return {
+      host: "",
+      port: "",
+      advancedUrl: String(url).trim(),
+      useAdvanced: true,
+    };
+  }
+}
+
+function composeWorkerUrl(host, port) {
+  const h = String(host || "").trim();
+  if (!h) return "";
+  const p = String(port || DEFAULT_WORKER_PORT).trim() || DEFAULT_WORKER_PORT;
+  return `http://${h}:${p}`;
+}
+
+/** Studio origin for setup script URLs (same host that serves /scripts/…). */
+function studioOrigin() {
+  try {
+    if (typeof window !== "undefined" && window.location?.origin) {
+      return window.location.origin;
+    }
+  } catch {
+    /* ignore */
+  }
+  return "";
+}
+
+function shellSingleQuote(s) {
+  return `'${String(s ?? "").replace(/'/g, `'\\''`)}'`;
+}
+
+/** Linux one-liner with machine token substituted (Worker tab Setup). */
+function buildLinuxWorkerSetupCmd({ origin, token, apiUrl }) {
+  const base = (origin || "").replace(/\/$/, "") || "<studio-origin>";
+  const tok = token?.trim() || "<machine-token>";
+  const api = (apiUrl || base).replace(/\/$/, "");
+  return `curl -fsSL ${base}/scripts/setup-local-worker.sh | bash -s -- --token ${shellSingleQuote(tok)} --api-url ${shellSingleQuote(api)}`;
+}
+
+/** Windows PowerShell one-liner with machine token substituted. */
+function buildWindowsWorkerSetupCmd({ origin, token, apiUrl }) {
+  const base = (origin || "").replace(/\/$/, "") || "<studio-origin>";
+  const tok = (token?.trim() || "<machine-token>").replace(/'/g, "''");
+  const api = ((apiUrl || base).replace(/\/$/, "") || base).replace(/'/g, "''");
+  // PowerShell subexpression $(irm …) — escape $ so JS template literals leave it alone.
+  return `iex "& { \$(irm '${base}/scripts/setup-local-worker.ps1') } -Token '${tok}' -ApiUrl '${api}'"`;
+}
+
+function readFavorites() {
+  try {
+    const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x) => x && (x.id != null || x.name)) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeFavorites(list) {
+  try {
+    localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(list.slice(0, 200)));
+  } catch {
+    /* ignore quota */
+  }
+}
+
+/** Human-readable byte size for storage meters (Worker tab). */
+function formatBytes(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v < 0) return "—";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let x = v;
+  let i = 0;
+  while (x >= 1024 && i < units.length - 1) {
+    x /= 1024;
+    i += 1;
+  }
+  const digits = i === 0 ? 0 : x >= 10 ? 1 : 2;
+  return `${x.toFixed(digits)} ${units[i]}`;
+}
+
+/** Compact used/total progress bar (gallery PVC + worker models). */
+function StorageMeter({ label, disk, fallbackHint }) {
+  const used = disk?.usedBytes;
+  const total = disk?.totalBytes;
+  const free = disk?.freeBytes;
+  const pct =
+    typeof disk?.usedPercent === "number"
+      ? Math.min(100, Math.max(0, Math.round(disk.usedPercent)))
+      : typeof used === "number" && typeof total === "number" && total > 0
+        ? Math.min(100, Math.round((used / total) * 100))
+        : null;
+  const meta =
+    pct != null && typeof used === "number" && typeof total === "number"
+      ? `${formatBytes(used)} / ${formatBytes(total)} (${pct}%)${
+          typeof free === "number" ? ` · ${formatBytes(free)} free` : ""
+        }`
+      : fallbackHint || "n/a";
+  return (
+    <div className="worker-vram worker-disk" title={disk?.path || undefined}>
+      <div className="worker-vram-meta">
+        <span>{label}</span>
+        <span>{meta}</span>
+      </div>
+      <div
+        className="worker-vram-bar"
+        role="progressbar"
+        aria-label={label}
+        aria-valuenow={pct ?? 0}
+        aria-valuemin={0}
+        aria-valuemax={100}
+      >
+        <div className="worker-vram-fill" style={{ width: `${pct ?? 0}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function formatStat(n) {
+  if (n == null || Number.isNaN(Number(n))) return null;
+  const v = Number(n);
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
+  if (v >= 1_000) return `${(v / 1_000).toFixed(1)}K`;
+  return String(v);
+}
+
+/** Format OpenRouter USD credit amounts for the Metrics tab. */
+function fmtUsd(n) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  const v = Number(n);
+  const abs = Math.abs(v);
+  const digits = abs >= 100 ? 2 : abs >= 1 ? 3 : 4;
+  return `$${v.toFixed(digits)}`;
+}
 
 function readStoredTheme() {
   try {
@@ -1667,6 +2085,195 @@ export default function App() {
                     {sidebarOpen ? "Hide sessions" : "Show sessions"}
                   </span>
                 </button>
+              </div>
+              <div className="chrome-strip" role="toolbar" aria-label="Generation backend">
+                <div
+                  className="backend-switch"
+                  role="group"
+                  aria-label="Generation backend"
+                >
+                  <button
+                    type="button"
+                    className={`backend-switch-btn${generateBackend === "cloud" ? " is-active" : ""}`}
+                    aria-pressed={generateBackend === "cloud"}
+                    onClick={() => changeGenerateBackend("cloud")}
+                    title="OpenRouter cloud generate"
+                  >
+                    Cloud
+                  </button>
+                  <button
+                    type="button"
+                    className={`backend-switch-btn${generateBackend === "local" ? " is-active" : ""}`}
+                    aria-pressed={generateBackend === "local"}
+                    disabled={!localBackendOk}
+                    onClick={() => changeGenerateBackend("local")}
+                    title={
+                      localBackendOk
+                        ? "Local GPU worker generate"
+                        : localBackendReason || "Local worker unavailable"
+                    }
+                  >
+                    Local
+                  </button>
+                </div>
+              </div>
+              <div
+                className="composer-primary-cluster"
+                role="group"
+                aria-label="Models, suggest, send, and run session"
+              >
+                <GroupedChromeMenu
+                  className="composer-model-menu"
+                  label="Agent, router & mode"
+                  icon={<ModeIcon />}
+                  align="end"
+                  valueLabel={`${modelShortLabel(agentOptions, agentMenuValue)} · ${AUTOMATION_LABELS[automationMode]}`}
+                  title={[
+                    modelsCatalogReady
+                      ? `Agent: ${modelLabel(agentOptions, agentModel)}`
+                      : `Agent: Auto — ${MODELS_API_HINT}`,
+                    modelsCatalogReady
+                      ? `Router: ${modelLabel(routerOptions, routerModel)}`
+                      : `Router: Auto — ${MODELS_API_HINT}`,
+                    `Mode: ${AUTOMATION_LABELS[automationMode]} — ${MODE_HINTS[automationMode]}`,
+                  ].join(" · ")}
+                  open={menuOpen === "agent-bundle"}
+                  onOpen={(v) => setMenuOpen(v ? "agent-bundle" : null)}
+                  sections={[
+                    {
+                      id: "agent",
+                      label: "Agent",
+                      icon: <IconAgent />,
+                      valueLabel: modelShortLabel(agentOptions, agentMenuValue),
+                      options: agentOptions,
+                      value: agentMenuValue,
+                      onChange: changeAgentModel,
+                      menuNote: modelsMenuNote,
+                    },
+                    {
+                      id: "router",
+                      label: "Router",
+                      icon: <IconRouter />,
+                      valueLabel: modelShortLabel(routerOptions, routerMenuValue),
+                      options: routerOptions,
+                      value: routerMenuValue,
+                      onChange: changeRouterModel,
+                      menuNote: modelsMenuNote,
+                    },
+                    {
+                      id: "mode",
+                      label: "Mode",
+                      icon: <ModeIcon />,
+                      valueLabel: AUTOMATION_LABELS[automationMode],
+                      options: modeOptions,
+                      value: automationMode,
+                      onChange: setMode,
+                    },
+                  ]}
+                />
+                {generateBackend === "cloud" ? (
+                  <GroupedChromeMenu
+                    className="composer-model-menu"
+                    label="Generation models"
+                    icon={<IconImage />}
+                    align="end"
+                    valueLabel={`${modelShortLabel(imageOptions, imageMenuValue)} · ${modelShortLabel(videoOptions, videoMenuValue)}`}
+                    title={[
+                      modelsCatalogReady
+                        ? `Image: ${modelLabel(imageOptions, imageModel)}`
+                        : `Image: Auto — ${MODELS_API_HINT}`,
+                      modelsCatalogReady
+                        ? `Video: ${modelLabel(videoOptions, videoModel)}`
+                        : `Video: Auto — ${MODELS_API_HINT}`,
+                    ].join(" · ")}
+                    open={menuOpen === "gen-bundle"}
+                    onOpen={(v) => setMenuOpen(v ? "gen-bundle" : null)}
+                    sections={[
+                      {
+                        id: "image",
+                        label: "Image",
+                        icon: <IconImage />,
+                        valueLabel: modelShortLabel(imageOptions, imageMenuValue),
+                        options: imageOptions,
+                        value: imageMenuValue,
+                        onChange: changeImageModel,
+                        menuNote: modelsMenuNote,
+                      },
+                      {
+                        id: "video",
+                        label: "Video",
+                        icon: <IconVideo />,
+                        valueLabel: modelShortLabel(videoOptions, videoMenuValue),
+                        options: videoOptions,
+                        value: videoMenuValue,
+                        onChange: changeVideoModel,
+                        menuNote:
+                          modelsCatalogReady && videoOptions.length <= 1
+                            ? "No T2V models in catalog — OpenRouter video key/plan may be required"
+                            : modelsMenuNote,
+                      },
+                    ]}
+                  />
+                ) : (
+                  <GroupedChromeMenu
+                    className="composer-model-menu"
+                    label="Local base"
+                    icon={<IconImage />}
+                    align="end"
+                    valueLabel={
+                      localBaseModel
+                        ? localBaseModel.split("/").pop() || localBaseModel
+                        : "Base"
+                    }
+                    title={
+                      localBaseModel
+                        ? `Active base: ${localBaseModel}`
+                        : "Select worker checkpoint / active base"
+                    }
+                    open={menuOpen === "gen-bundle"}
+                    onOpen={(v) => setMenuOpen(v ? "gen-bundle" : null)}
+                    sections={[
+                      {
+                        id: "base",
+                        label: "Base",
+                        icon: <IconImage />,
+                        valueLabel: localBaseModel
+                          ? localBaseModel.split("/").pop() || localBaseModel
+                          : "Base",
+                        options: localCheckpoints.length
+                          ? localCheckpoints.map((c) => ({
+                              id: c.path,
+                              label: `${c.name || c.id}${c.baseModel ? ` (${c.baseModel})` : ""}`,
+                            }))
+                          : [
+                              {
+                                id: "",
+                                label: "No checkpoints — install from Civitai",
+                                disabled: true,
+                              },
+                            ],
+                        value: localBaseModel,
+                        onChange: (id) => {
+                          if (id) setComposerBaseModel(id);
+                        },
+                        menuNote: localBaseBusy
+                          ? "Setting active base…"
+                          : localBackendReason ||
+                            (localCheckpoints.length
+                              ? "Worker checkpoint for local generate"
+                              : "Install a checkpoint on the worker first"),
+                      },
+                    ]}
+                  />
+                )}
+                <CostTierSwitch
+                  value={autoFallbacks.costTier || "medium"}
+                  onChange={(costTier) =>
+                    setAutoFallbacks((prev) =>
+                      normalizeAutoFallbacks({ ...prev, costTier }),
+                    )
+                  }
+                />
                 <button
                   type="button"
                   className="ghost icon-btn"
@@ -2026,53 +2633,653 @@ export default function App() {
               local/dev.
             </span>
           </label>
-          <label>
-            OpenRouter API key
-            <input
-              type="password"
-              autoComplete="off"
-              placeholder={
-                settings?.openRouterConfigured ? "Configured — paste to replace" : "sk-or-…"
-              }
-              value={openrouterKey}
-              onChange={(e) => setOpenrouterKey(e.target.value)}
-            />
-            <span className="hint">Required for cloud image generation (no worker needed).</span>
-          </label>
-          <label>
-            Civitai API key
-            <input
-              type="password"
-              autoComplete="off"
-              placeholder={
-                settings?.civitaiConfigured
-                  ? "Configured — paste to replace"
-                  : "From civitai.com/user/account"
-              }
-              value={civitaiKey}
-              onChange={(e) => setCivitaiKey(e.target.value)}
-            />
-            <span className="hint">
-              Search Civitai and (with a worker) install LoRAs/checkpoints. Pin works without a
-              worker.
-            </span>
-          </label>
-          <label>
-            Diffusion worker URL (optional — LoRAs / local custom look)
-            <input
-              placeholder="http://gpu-box.lan:8091"
-              value={workerUrl}
-              onChange={(e) => setWorkerUrl(e.target.value)}
-            />
-            <span className="hint">
-              Optional. Needed to install LoRAs and run local/custom models. Leave blank to generate
-              only via OpenRouter.
-            </span>
-          </label>
-          <button className="primary" disabled={busy} onClick={saveSettings}>
-            Save settings
+
+          <div className="settings-block" aria-label="OpenRouter privacy">
+            <div className="settings-block-head">
+              <span className="label-with-help">
+                <strong>Privacy</strong>
+                <HelpQ topic="help-zdr" label="Privacy / ZDR" onOpen={openHelp} />
+              </span>
+            </div>
+            <label>
+              Data collection
+              <select
+                value={privacyDataCollection}
+                onChange={(e) => setPrivacyDataCollection(e.target.value)}
+              >
+                <option value="allow">Allow</option>
+                <option value="deny">Deny</option>
+              </select>
+            </label>
+            <label className="settings-check">
+              <input
+                type="checkbox"
+                checked={privacyZdr}
+                onChange={(e) => setPrivacyZdr(e.target.checked)}
+              />
+              ZDR
+            </label>
+          </div>
+
+          <div className="settings-block" aria-label="Instruction tone">
+            <div className="settings-block-head">
+              <span className="label-with-help">
+                <strong>Tone</strong>
+                <HelpQ topic="help-tone" label="Instruction tone" onOpen={openHelp} />
+              </span>
+            </div>
+            <select
+              aria-label="Tone"
+              value={instructionTone}
+              onChange={(e) => setInstructionTone(e.target.value)}
+            >
+              <option value="warm">Warm</option>
+              <option value="direct">Direct</option>
+              <option value="steerable">Steerable</option>
+            </select>
+          </div>
+
+          <div className="settings-block" aria-label="System prompts">
+            <div className="settings-block-head">
+              <span className="label-with-help">
+                <strong>System prompts</strong>
+                <HelpQ topic="help-prompts" label="System prompts" onOpen={openHelp} />
+              </span>
+            </div>
+            <select
+              aria-label="System prompts"
+              value={instructionMode}
+              onChange={(e) => {
+                const id = e.target.value;
+                setInstructionMode(id);
+                const row = instructions.find((i) => i.id === id);
+                setInstructionDraft(row?.text || "");
+              }}
+            >
+              {(instructions.length
+                ? instructions
+                : [
+                    { id: "converse", label: "Converse (chat agent)" },
+                    { id: "route", label: "Route (intent classifier)" },
+                    { id: "chat", label: "Chat (assist)" },
+                    { id: "plan", label: "Plan" },
+                    { id: "suggest", label: "Suggest" },
+                    { id: "session", label: "Session" },
+                    { id: "prompt-prose", label: "Enhance — prose brief" },
+                    { id: "prompt-sd", label: "Enhance — SD keywords" },
+                  ]
+              ).map((i) => (
+                <option key={i.id} value={i.id}>
+                  {i.label || i.id}
+                  {i.overridden ? " · overridden" : ""}
+                </option>
+              ))}
+            </select>
+            <label>
+              System instruction
+              <textarea
+                className="settings-prompt-textarea"
+                rows={10}
+                value={instructionDraft}
+                onChange={(e) => setInstructionDraft(e.target.value)}
+                spellCheck={false}
+              />
+            </label>
+            <div className="settings-key-actions">
+              <button
+                type="button"
+                className={`primary${saveFlash === "settings" ? " is-saved" : ""}`}
+                disabled={instructionBusy || busy}
+                onClick={saveInstructionPrompt}
+              >
+                {instructionBusy
+                  ? "Saving…"
+                  : saveFlash === "settings"
+                    ? "Saved ✓"
+                    : "Save prompt"}
+              </button>
+              <button
+                type="button"
+                disabled={instructionBusy || busy}
+                onClick={resetInstructionPrompt}
+              >
+                Reset to default
+              </button>
+              {instructions.find((i) => i.id === instructionMode)?.overridden ? (
+                <span className="hint">Custom</span>
+              ) : (
+                <span className="hint">Default</span>
+              )}
+            </div>
+          </div>
+
+          {saveFlash === "settings" && savedMsg ? (
+            <p className="save-toast" role="status">
+              {savedMsg}
+            </p>
+          ) : savedMsg && tab === "settings" ? (
+            <p className="hint">{savedMsg}</p>
+          ) : null}
+        </section>
+      )}
+
+      {tab === "models" && (
+        <section className="panel settings" aria-label="Models">
+          <div className="settings-block" aria-label="Composer defaults">
+            <div className="settings-block-head">
+              <span className="label-with-help">
+                <strong>Composer defaults</strong>
+                <HelpQ topic="help-composer" label="Composer defaults" onOpen={openHelp} />
+              </span>
+            </div>
+            <label>
+              Agent
+              <select
+                value={agentMenuValue}
+                onChange={(e) => changeAgentModel(e.target.value)}
+              >
+                {agentOptions.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label || m.id}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Image
+              <select
+                value={imageMenuValue}
+                onChange={(e) => changeImageModel(e.target.value)}
+              >
+                {imageOptions.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label || m.id}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Video
+              <select
+                value={videoMenuValue}
+                onChange={(e) => changeVideoModel(e.target.value)}
+              >
+                {(videoOptions.length
+                  ? videoOptions
+                  : [{ id: AUTO_VIDEO.id, label: AUTO_VIDEO.label || "Auto" }]
+                ).map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label || m.id}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Router
+              <select
+                value={routerMenuValue}
+                onChange={(e) => changeRouterModel(e.target.value)}
+              >
+                {routerOptions.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label || m.id}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              <span className="label-with-help">
+                Backend
+                <HelpQ topic="help-backend" label="Cloud | Local" onOpen={openHelp} />
+              </span>
+              <select
+                value={generateBackend}
+                onChange={(e) => changeGenerateBackend(e.target.value)}
+              >
+                <option value="cloud">Cloud</option>
+                <option value="local" disabled={!localBackendOk}>
+                  Local
+                </option>
+              </select>
+            </label>
+          </div>
+
+          <div className="settings-block" aria-label="Auto fallbacks">
+            <div className="settings-block-head">
+              <span className="label-with-help">
+                <strong>Auto fallbacks</strong>
+                <HelpQ topic="help-auto" label="Auto fallbacks" onOpen={openHelp} />
+              </span>
+              <button
+                type="button"
+                className="ghost"
+                disabled={busy}
+                onClick={() =>
+                  setAutoFallbacks((prev) =>
+                    normalizeAutoFallbacks({
+                      ...EMPTY_AUTO_FALLBACKS,
+                      costTier: prev.costTier || "medium",
+                    }),
+                  )
+                }
+              >
+                Reset
+              </button>
+            </div>
+            {[
+              ["agent", "Agent"],
+              ["agentZdr", "Agent (ZDR)"],
+              ["image", "Image"],
+              ["imageZdr", "Image (ZDR)"],
+              ["video", "Video"],
+              ["videoZdr", "Video (ZDR)"],
+              ["router", "Router"],
+            ].map(([key, label]) => (
+              <label key={key}>
+                {label}
+                <input
+                  type="text"
+                  list={`auto-fb-${key}`}
+                  placeholder="Built-in (blank)"
+                  value={autoFallbacks[key] || ""}
+                  onChange={(e) =>
+                    setAutoFallbacks((prev) =>
+                      normalizeAutoFallbacks({ ...prev, [key]: e.target.value }),
+                    )
+                  }
+                  spellCheck={false}
+                />
+                <datalist id={`auto-fb-${key}`}>
+                  {(key.startsWith("image")
+                    ? imageOptions
+                    : key.startsWith("video")
+                      ? videoOptions
+                      : agentOptions
+                  )
+                    .filter((m) => m.id && m.id !== AUTO_AGENT.id && m.id !== AUTO_IMAGE.id && m.id !== AUTO_VIDEO.id && m.id !== AUTO_ROUTER.id)
+                    .slice(0, 40)
+                    .map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.label || m.id}
+                      </option>
+                    ))}
+                </datalist>
+              </label>
+            ))}
+          </div>
+
+          <div className="settings-block" aria-label="Catalog alignment">
+            <div className="settings-block-head">
+              <span className="label-with-help">
+                <strong>Alignment</strong>
+                <HelpQ topic="help-alignment" label="Catalog alignment" onOpen={openHelp} />
+              </span>
+            </div>
+            <label>
+              Preference
+              <select
+                value={modelAlignment}
+                onChange={(e) => setModelAlignment(e.target.value)}
+              >
+                <option value="balanced">Balanced</option>
+                <option value="safety">Safety</option>
+                <option value="uncensored">Uncensored</option>
+              </select>
+            </label>
+          </div>
+
+          <div className="settings-block" aria-label="Chat providers">
+            <div className="settings-block-head">
+              <span className="label-with-help">
+                <strong>Chat providers</strong>
+                <HelpQ topic="help-providers" label="Chat providers" onOpen={openHelp} />
+              </span>
+              {(() => {
+                const total = chatProviderAvailable.length;
+                const on = chatProviderAvailable.filter((s) =>
+                  chatProviderIsChecked(s, chatProviders),
+                ).length;
+                return (
+                  <span className="hint">
+                    {total ? `${on} / ${total}` : "—"}
+                  </span>
+                );
+              })()}
+            </div>
+            <div className="chat-provider-toolbar">
+              <input
+                type="search"
+                placeholder="Search vendors…"
+                value={chatProviderSearch}
+                onChange={(e) => setChatProviderSearch(e.target.value)}
+                aria-label="Search chat providers"
+              />
+              <span className="settings-token-actions">
+                <button
+                  type="button"
+                  className="ghost"
+                  disabled={!chatProviderAvailable.length || busy}
+                  onClick={() => setChatProviders(chatProvidersSelectAll(chatProviderAvailable, true))}
+                >
+                  Select all
+                </button>
+                <button
+                  type="button"
+                  className="ghost"
+                  disabled={!chatProviderAvailable.length || busy}
+                  onClick={() => setChatProviders(chatProvidersSelectAll(chatProviderAvailable, false))}
+                >
+                  Select none
+                </button>
+              </span>
+            </div>
+            <div className="chat-provider-list" role="group" aria-label="Vendor checkboxes">
+              {chatProviderAvailable.length === 0 ? (
+                <span className="hint">No vendors yet.</span>
+              ) : (
+                chatProviderAvailable
+                  .filter((slug) => {
+                    const q = chatProviderSearch.trim().toLowerCase();
+                    if (!q) return true;
+                    return slug.includes(q);
+                  })
+                  .map((slug) => {
+                    const checked = chatProviderIsChecked(slug, chatProviders);
+                    return (
+                      <label key={slug} className="settings-check chat-provider-row">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={(e) =>
+                            setChatProviders(
+                              chatProvidersAfterToggle(
+                                chatProviderAvailable,
+                                chatProviders,
+                                slug,
+                                e.target.checked,
+                              ),
+                            )
+                          }
+                        />
+                        <span>{slug}</span>
+                      </label>
+                    );
+                  })
+              )}
+            </div>
+            {chatProviders.legacyOnly?.length ? (
+              <span className="hint warn-hint">
+                Legacy allowlist: {chatProviders.legacyOnly.join(", ")}
+              </span>
+            ) : null}
+          </div>
+
+          {modelsCatalogReady ? (
+            <p className="hint">
+              Agent {Math.max(0, agentModels.length - 1)} · Image{" "}
+              {Math.max(0, imageModels.length - 1)} · Router{" "}
+              {Math.max(0, routerModels.length - 1)} · Video{" "}
+              {videoModels.length > 0 ? videoModels.length : "—"}
+            </p>
+          ) : (
+            <p className="hint">{MODELS_API_HINT}</p>
+          )}
+          <button
+            type="button"
+            className={`primary btn-save${saveFlash === "models" ? " is-saved" : ""}`}
+            disabled={busy}
+            onClick={saveSettings}
+          >
+            {saveFlash === "models" || saveFlash === "settings" ? "Saved ✓" : "Save models"}
           </button>
-          {savedMsg && <p className="hint">{savedMsg}</p>}
+          {(saveFlash === "models" || saveFlash === "settings") && savedMsg ? (
+            <p className="save-toast" role="status">
+              {savedMsg}
+            </p>
+          ) : null}
+        </section>
+      )}
+
+      {tab === "help" && (
+        <section className="panel settings help-panel" aria-label="Help">
+          <h2 className="help-heading">Help</h2>
+          <p className="help-lead">
+            Short notes for Studio controls. Open a section from any <span className="help-q-inline">?</span>{" "}
+            button, or jump below.
+          </p>
+          <nav className="help-toc" aria-label="Help sections">
+            {[
+              ["help-overview", "Overview"],
+              ["help-civitai", "Civitai"],
+              ["help-civitai-downloads", "Downloads"],
+              ["help-worker", "Worker"],
+              ["help-worker-token", "Machine token"],
+              ["help-keys", "API keys"],
+              ["help-nsfw", "NSFW"],
+              ["help-zdr", "Privacy / ZDR"],
+              ["help-tone", "Tone"],
+              ["help-prompts", "System prompts"],
+              ["help-composer", "Composer"],
+              ["help-backend", "Cloud | Local"],
+              ["help-cost", "Cost"],
+              ["help-auto", "Auto fallbacks"],
+              ["help-alignment", "Alignment"],
+              ["help-providers", "Chat providers"],
+              ["help-metrics", "Metrics"],
+              ["help-modes", "Plan / Auto / YOLO"],
+            ].map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                className="linkish"
+                onClick={() => openHelp(id)}
+              >
+                {label}
+              </button>
+            ))}
+          </nav>
+
+          <HelpSection id="help-overview" title="Overview" active={helpFocus === "help-overview"}>
+            <p>
+              Chat on the left; Gallery / Styles / Civitai / Worker on the tabs. Cloud Generate needs
+              an OpenRouter key. Local LoRAs and Local generate need a diffusion worker.
+            </p>
+            <p>
+              Keys and Privacy live under Settings. Model pickers, Auto fallbacks, and chat vendors
+              live under Models.
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-civitai" title="Civitai" active={helpFocus === "help-civitai"}>
+            <p>
+              <strong>Search</strong> finds LoRAs / checkpoints (needs a Civitai API key).{" "}
+              <strong>★ Favorite</strong> is a persistent library in this browser.{" "}
+              <strong>Pin</strong> is session-only for LoRAs / adapters / embeddings — not
+              checkpoints (use Worker → Set as base). <strong>Install</strong> queues a download
+              and does not auto-pin.
+            </p>
+            <p>
+              <strong>Installed</strong> shows assets already on the worker disk as clickable cards
+              (same style as Favorites) — open a card for details, pin (adapters only), delete, or
+              set base.
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-civitai-downloads" title="Downloads" active={helpFocus === "help-civitai-downloads"}>
+            <p>
+              Background install queue on the worker (up to a few downloads in parallel). Progress
+              shows bytes / %. Cancel applies to queued or in-flight jobs. <strong>Clear</strong>{" "}
+              removes finished jobs (succeeded / failed / cancelled) from the list only — it does
+              not delete files or cancel active downloads.
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-worker" title="Worker" active={helpFocus === "help-worker"}>
+            <p>
+              Primary setup lives on the <strong>Worker</strong> tab: one-line Linux/Windows host
+              scripts (machine token included), then Host/Port → Save worker. Short reminder: GPU
+              process is <code>freya-local-worker</code> (default port {DEFAULT_WORKER_PORT}); Studio
+              is usually in-cluster and reaches it by URL (
+              <code>FreyaDiffusionWorker</code> <code>externalEndpoint</code>).
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-worker-token" title="Machine API token" active={helpFocus === "help-worker-token"}>
+            <p>
+              Service token for MCP / workers (not human sign-in). Generate rotates the token; copy
+              it once. Advanced → paste / Save token stores it in this browser for recovery.
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-keys" title="API keys" active={helpFocus === "help-keys"}>
+            <p>
+              Keys stay on the Freya API (or Kubernetes Secrets). After save they are never shown
+              back in full — empty field + “configured” badge means still on file. OpenRouter alone
+              is enough for cloud Generate. Civitai is for search / install.
+            </p>
+            {mock ? (
+              <p>Mock mode: any non-empty value counts as configured.</p>
+            ) : null}
+          </HelpSection>
+
+          <HelpSection id="help-nsfw" title="Show NSFW local assets" active={helpFocus === "help-nsfw"}>
+            <p>
+              When off, Freya hides NSFW-looking local and Civitai results by name / API flag. Turn
+              on to show them in Studio lists.
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-zdr" title="Privacy / ZDR" active={helpFocus === "help-zdr"}>
+            <p>
+              <strong>ZDR</strong> asks OpenRouter for zero-data-retention routes on Freya requests
+              (<code>provider.zdr</code>). Account-wide ZDR at{" "}
+              <a href="https://openrouter.ai/settings/privacy" target="_blank" rel="noreferrer">
+                openrouter.ai/settings/privacy
+              </a>{" "}
+              still applies — Freya can only tighten routing, not loosen it.
+            </p>
+            <p>
+              With ZDR on, Image / Video pickers filter to ZDR-capable models and Auto prefers
+              Google media models. Many Flux / Seedream endpoints have no ZDR route and fail with a
+              clear error instead of a silent dead-end.
+            </p>
+            <p>
+              <strong>Data collection</strong> — Allow (providers may store/train) or Deny (only
+              no-collection endpoints).
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-tone" title="Instruction tone" active={helpFocus === "help-tone"}>
+            <p>
+              Appends a tone hint after pack / custom system prompts: Warm (default), Direct
+              (concise), or Steerable (low-refusal creative).
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-prompts" title="System prompts" active={helpFocus === "help-prompts"}>
+            <p>
+              Override Freya pack instructions (<code>packs/instructions/*.txt</code>).{" "}
+              <strong>Route</strong> classifies chat/picture/gif/video and Auto models;{" "}
+              <strong>Converse</strong> is the chat agent (tools, Installed-first LoRAs,
+              Plan/Auto/YOLO). Empty override uses the shipped default. Tone still appends after
+              the text. Reset clears the override.
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-composer" title="Composer defaults" active={helpFocus === "help-composer"}>
+            <p>
+              Pins for Agent / Image / Video / Router. <strong>Auto</strong> is Freya’s internal
+              router: it picks a concrete model for that job. If it fails, the cost / privacy /
+              alignment fallback is used. Cost (Low / Med / High / Max) sits on the prompt bar
+              and is the same saved preference Auto uses. <strong>OpenRouter router (upstream)</strong> is{" "}
+              <code>openrouter/auto</code> — only when you select that row, not when you pick Auto.
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-cost" title="Cost" active={helpFocus === "help-cost"}>
+            <p>
+              Low, Med, High, or Max on the prompt bar chooses which built-in model the internal
+              router and Auto fallbacks use. Medium is the default. The choice is the saved cost
+              preference. Privacy (ZDR / data collection) and Alignment still change the set. A
+              filled Auto fallback box on the Models tab overrides that one cell.
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-backend" title="Cloud | Local" active={helpFocus === "help-backend"}>
+            <p>
+              Same switch as the composer bar (stored in this browser). Cloud = OpenRouter. Local =
+              GPU worker (needs a reachable worker URL).
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-auto" title="Auto fallbacks" active={helpFocus === "help-auto"}>
+            <p>
+              Concrete models when Agent / Image / Video / Router are Auto and the internal router
+              does not suggest one. Leave blank to use the built-in set for the current cost tier,
+              privacy, and alignment. ZDR rows apply when ZDR or deny-collection is on. Do not put
+              openrouter/auto here — that id is only the explicit upstream picker option.
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-alignment" title="Catalog alignment" active={helpFocus === "help-alignment"}>
+            <p>
+              Freya-side filter on <code>/v1/models</code> (OpenRouter moderation flags + name
+              heuristics): Balanced (full list), Safety (moderated / major vendors), or Uncensored
+              (prefer low-moderation). Also steers blank Auto fallbacks.
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-providers" title="Chat providers" active={helpFocus === "help-providers"}>
+            <p>
+              Checked vendors appear in the Agent / Router picker. Unchecked are hidden. New vendors
+              from OpenRouter default to checked (opt-out).
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-metrics" title="OpenRouter metrics" active={helpFocus === "help-metrics"}>
+            <p>
+              Per-key spend from Freya’s completion key. Account credits need an OpenRouter
+              Management API key — see{" "}
+              <a
+                href="https://openrouter.ai/docs/guides/overview/auth/management-api-keys"
+                target="_blank"
+                rel="noreferrer"
+              >
+                Management keys
+              </a>
+              .
+            </p>
+          </HelpSection>
+
+          <HelpSection id="help-modes" title="Plan / Auto / YOLO" active={helpFocus === "help-modes"}>
+            <p>
+              <strong>Plan</strong> — Freya proposes tool calls; confirm before they run.{" "}
+              <strong>Auto</strong> — runs tools, asks when installs or character/LoRA choice are
+              ambiguous. <strong>YOLO</strong> — picks and runs (generate, search, install when a
+              worker is set). For character likeness, Freya prefers Installed base+LoRA combos
+              before Civitai.
+            </p>
+          </HelpSection>
+        </section>
+      )}
+
+      {tab === "guidelines" && (
+        <section className="panel settings guidelines-panel" aria-label="User guidelines">
+          <h2 className="guidelines-heading">Guidelines</h2>
+          <p className="guidelines-lead">
+            Freya is yours to run — with that comes responsibility for prompts, downloads, and
+            anything you publish.
+          </p>
+          <GuidelinesBody />
+          {!guidelinesAcked ? (
+            <div className="login-actions">
+              <button type="button" className="primary" onClick={acceptGuidelines}>
+                Accept &amp; acknowledge
+              </button>
+            </div>
+          ) : (
+            <p className="hint">Acknowledged in this browser.</p>
+          )}
         </section>
       )}
         </section>

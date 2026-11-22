@@ -283,6 +283,21 @@ textarea:focus { background: var(--chrome-field); border-bottom-color: var(--apr
   width: 30px; height: 30px; flex: none; display: inline-flex; align-items: center; justify-content: center;
   padding: 0; line-height: 1;
 }
+/* Auto cost tier — same 30px hit target as the prompt icon buttons. */
+.cost-tier-switch {
+  flex: none; display: inline-flex; align-items: stretch; height: 30px;
+  border: 1px solid var(--chrome-line); border-radius: 2px; overflow: hidden;
+}
+.cost-tier-switch button {
+  min-width: 30px; height: 30px; margin: 0; padding: 0 0.2rem; border: 0; border-radius: 0;
+  background: transparent; color: var(--chrome-faint);
+  font-size: 0.62rem; font-weight: 700; letter-spacing: 0; line-height: 1;
+}
+.cost-tier-switch button + button { border-left: 1px solid var(--chrome-line); }
+.cost-tier-switch button:hover { color: var(--chrome-text); background: var(--chrome-field); }
+.cost-tier-switch button.is-active {
+  color: var(--chrome-text); background: var(--celadon-tint);
+}
 .icon-btn svg { display: block; }
 .icon-btn-primary { box-shadow: none; }
 /* Primary action cluster: Suggest + Generate grouped on the right */
