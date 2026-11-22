@@ -703,11 +703,11 @@ fn obvious_still(lower: &str) -> bool {
     contains_any(lower, PHRASES)
 }
 
-/// No request to render yet. Bare scenes and ambiguous turns are chat,
-/// even when the route model called them picture.
+/// Obvious "help me decide". A scene, outfit, or character description is not
+/// this, even when the user never said generate, draw, or make.
 pub fn message_is_chat_not_media(message: &str) -> bool {
     let lower = message.trim().to_lowercase();
-    !lower.is_empty() && direct_media_ask(message) == DirectMedia::None
+    !lower.is_empty() && obvious_guidance(&lower)
 }
 
 /// Obvious render only. A scene, outfit, or character name is not a render.
@@ -737,8 +737,9 @@ fn modality_for_ask(ask: DirectMedia) -> Option<Modality> {
     }
 }
 
-/// Override the route model: an obvious render becomes that modality.
-/// Anything else, including a visual description, stays chat.
+/// Obvious render wins. Obvious guidance stays chat.
+/// A scene, outfit, or character description keeps the route model's call.
+/// Heuristics do not force that look back to chat.
 pub fn coerce_route_to_media_ask(
     mut decision: RouteDecision,
     message: &str,
@@ -1082,12 +1083,31 @@ mod tests {
     }
 
     #[test]
-    fn pasted_scene_without_render_stays_chat() {
+    fn heuristic_leaves_a_scene_for_the_route_model() {
         let scene =
             "A cartoon meme of a grumpy cat in a cowboy hat, thick outlines, flat yellow background";
+        // No obvious render verb and no obvious advice. The fallback stays chat.
+        // A picture call from the route model is kept.
         let d = infer_modality(scene);
         assert_eq!(d.modality, Modality::Chat);
         assert_eq!(direct_media_ask(scene), DirectMedia::None);
+        assert!(!message_is_chat_not_media(scene));
+        let kept = coerce_route_to_media_ask(
+            RouteDecision {
+                modality: Modality::Picture,
+                reason: "scene meant to be seen".into(),
+                agent_model: None,
+                image_model: Some("google/gemini-2.5-flash-image".into()),
+                source: "router".into(),
+            },
+            scene,
+            &PrivacyPrefs::default(),
+            &AlignmentPrefs::default(),
+            &AutoFallbacksPrefs::default(),
+        );
+        assert_eq!(kept.modality, Modality::Picture);
+        assert!(kept.image_model.is_some());
+        assert!(!kept.source.contains("chat-guard"));
     }
 
     #[test]
@@ -1112,21 +1132,47 @@ mod tests {
             infer_modality("can you clarify the hair color before we generate?").modality,
             Modality::Chat
         );
+        assert!(!message_is_chat_not_media(
+            "a series of illustrations of a lighthouse in a storm"
+        ));
     }
 
     #[test]
-    fn advice_stays_chat_until_they_ask_to_render() {
+    fn obvious_guidance_stays_chat_without_an_explicit_render() {
         let chat_turns = [
             "you able to make an image of Frankie Foster?",
             "did we generate an image of Frankie Foster using the lora?",
-            "Frankie Foster in cozy winter layers, a chunky cream knit sweater, plaid scarf, and beanie over her red hair, holding a coffee cup in a snowy front yard with the foster home behind her.",
             "I want to create some placeholder image for this Freya app, any assets \\ models that would help?",
             "how should I prompt Frankie Foster for a night out, and which LoRA?",
+            "what should I do for Frankie Foster",
         ];
+        let picture = RouteDecision {
+            modality: Modality::Picture,
+            reason: "model called this a still".into(),
+            agent_model: None,
+            image_model: Some("google/gemini-2.5-flash-image".into()),
+            source: "router".into(),
+        };
         for turn in chat_turns {
+            assert!(message_is_chat_not_media(turn), "{turn}");
             assert_eq!(infer_modality(turn).modality, Modality::Chat, "{turn}");
             assert_eq!(direct_media_ask(turn), DirectMedia::None, "{turn}");
+            let guarded = coerce_route_to_media_ask(
+                picture.clone(),
+                turn,
+                &PrivacyPrefs::default(),
+                &AlignmentPrefs::default(),
+                &AutoFallbacksPrefs::default(),
+            );
+            assert_eq!(guarded.modality, Modality::Chat, "{turn}");
+            assert!(guarded.image_model.is_none(), "{turn}");
+            assert!(guarded.source.contains("chat-guard"), "{turn}");
         }
+        // A question that hands over the picture is an obvious render.
+        assert_eq!(
+            infer_modality("can you make an image of Frankie Foster?").modality,
+            Modality::Picture
+        );
         for turn in [
             "generate",
             "again",
@@ -1140,7 +1186,7 @@ mod tests {
     }
 
     #[test]
-    fn coerce_keeps_chat_for_a_visual_description() {
+    fn coerce_keeps_picture_for_a_look_they_want_seen() {
         let chat = RouteDecision {
             modality: Modality::Chat,
             reason: "ambiguous".into(),
@@ -1148,6 +1194,23 @@ mod tests {
             image_model: None,
             source: "router".into(),
         };
+        let outfit = "Frankie Foster in cozy winter layers, a chunky cream knit sweater, plaid scarf, and beanie over her red hair, holding a coffee cup in a snowy front yard with the foster home behind her.";
+        // Heuristic does not invent a render, and does not call the outfit advice.
+        assert_eq!(direct_media_ask(outfit), DirectMedia::None);
+        assert!(!message_is_chat_not_media(outfit));
+        assert_eq!(infer_modality(outfit).modality, Modality::Chat);
+        // A character name alone does not force picture.
+        assert_eq!(direct_media_ask("Frankie Foster"), DirectMedia::None);
+        assert!(!message_is_chat_not_media("Frankie Foster"));
+        let name = coerce_route_to_media_ask(
+            chat.clone(),
+            "Frankie Foster",
+            &PrivacyPrefs::default(),
+            &AlignmentPrefs::default(),
+            &AutoFallbacksPrefs::default(),
+        );
+        assert_eq!(name.modality, Modality::Chat);
+
         let described = coerce_route_to_media_ask(
             chat.clone(),
             "An illustration of a red bicycle in the rain, wet street, cinematic lighting",
@@ -1158,40 +1221,31 @@ mod tests {
         assert_eq!(described.modality, Modality::Chat);
         assert!(described.image_model.is_none());
 
-        let wanted = coerce_route_to_media_ask(
-            RouteDecision {
-                modality: Modality::Picture,
-                reason: "this is the scene they want seen".into(),
-                agent_model: None,
-                image_model: Some("google/gemini-2.5-flash-image".into()),
-                source: "router".into(),
-            },
+        for look in [
+            outfit,
             "An illustration of a red bicycle in the rain, wet street, cinematic lighting",
-            &PrivacyPrefs::default(),
-            &AlignmentPrefs::default(),
-            &AutoFallbacksPrefs::default(),
-        );
-        assert_eq!(wanted.modality, Modality::Chat);
-        assert!(wanted.image_model.is_none());
-        assert!(wanted.source.contains("chat-guard"));
-
-        let eager = RouteDecision {
-            modality: Modality::Picture,
-            reason: "scene".into(),
-            agent_model: None,
-            image_model: Some("google/gemini-2.5-flash-image".into()),
-            source: "router".into(),
-        };
-        let guarded = coerce_route_to_media_ask(
-            eager,
-            "did we generate an image of Frankie Foster using the lora?",
-            &PrivacyPrefs::default(),
-            &AlignmentPrefs::default(),
-            &AutoFallbacksPrefs::default(),
-        );
-        assert_eq!(guarded.modality, Modality::Chat);
-        assert!(guarded.image_model.is_none());
-        assert!(guarded.source.contains("chat-guard"));
+        ] {
+            let wanted = coerce_route_to_media_ask(
+                RouteDecision {
+                    modality: Modality::Picture,
+                    reason: "this is the scene they want seen".into(),
+                    agent_model: None,
+                    image_model: Some("google/gemini-2.5-flash-image".into()),
+                    source: "router".into(),
+                },
+                look,
+                &PrivacyPrefs::default(),
+                &AlignmentPrefs::default(),
+                &AutoFallbacksPrefs::default(),
+            );
+            assert_eq!(wanted.modality, Modality::Picture, "{look}");
+            assert_eq!(
+                wanted.image_model.as_deref(),
+                Some("google/gemini-2.5-flash-image"),
+                "{look}"
+            );
+            assert!(!wanted.source.contains("chat-guard"), "{look}");
+        }
 
         let drawn = coerce_route_to_media_ask(
             chat,
