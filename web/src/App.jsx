@@ -60,6 +60,35 @@ function normalizeAutoFallbacks(raw) {
     costTier: ["low", "high", "max"].includes(cost) ? cost : "medium",
   };
 }
+
+const COST_TIERS = [
+  { id: "low", label: "Low", title: "Low" },
+  { id: "medium", label: "Med", title: "Medium" },
+  { id: "high", label: "High", title: "High" },
+  { id: "max", label: "Max", title: "Max" },
+];
+
+function CostTierSwitch({ value, onChange }) {
+  const current = COST_TIERS.some((t) => t.id === value) ? value : "medium";
+  return (
+    <div className="cost-tier-switch" role="radiogroup" aria-label="Cost tier">
+      {COST_TIERS.map((t) => (
+        <button
+          key={t.id}
+          type="button"
+          role="radio"
+          aria-checked={current === t.id}
+          className={current === t.id ? "is-active" : ""}
+          title={`Auto cost: ${t.title}`}
+          onClick={() => onChange(t.id)}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 /** First-login / first-use acknowledgment of user liability guidelines. */
 const GUIDELINES_ACK_STORAGE_KEY = "freya.guidelinesAck";
 /** Persistent Civitai library (survives sessions). Distinct from session Pin. */
@@ -5278,6 +5307,14 @@ export default function App() {
                     ]}
                   />
                 )}
+                <CostTierSwitch
+                  value={autoFallbacks.costTier || "medium"}
+                  onChange={(costTier) =>
+                    setAutoFallbacks((prev) =>
+                      normalizeAutoFallbacks({ ...prev, costTier }),
+                    )
+                  }
+                />
                 <button
                   type="button"
                   className="ghost icon-btn"
@@ -6662,31 +6699,6 @@ export default function App() {
             </label>
           </div>
 
-          <div className="settings-block" aria-label="Cost">
-            <div className="settings-block-head">
-              <span className="label-with-help">
-                <strong>Cost</strong>
-                <HelpQ topic="help-cost" label="Cost tier" onOpen={openHelp} />
-              </span>
-            </div>
-            <label>
-              Tier
-              <select
-                value={autoFallbacks.costTier || "medium"}
-                onChange={(e) =>
-                  setAutoFallbacks((prev) =>
-                    normalizeAutoFallbacks({ ...prev, costTier: e.target.value }),
-                  )
-                }
-              >
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-                <option value="max">Max</option>
-              </select>
-            </label>
-          </div>
-
           <div className="settings-block" aria-label="Auto fallbacks">
             <div className="settings-block-head">
               <span className="label-with-help">
@@ -7033,16 +7045,18 @@ export default function App() {
             <p>
               Pins for Agent / Image / Video / Router. <strong>Auto</strong> is Freya’s internal
               router: it picks a concrete model for that job. If it fails, the cost / privacy /
-              alignment fallback is used. <strong>OpenRouter router (upstream)</strong> is{" "}
+              alignment fallback is used. Cost (Low / Med / High / Max) sits on the prompt bar
+              and is the same saved preference Auto uses. <strong>OpenRouter router (upstream)</strong> is{" "}
               <code>openrouter/auto</code> — only when you select that row, not when you pick Auto.
             </p>
           </HelpSection>
 
           <HelpSection id="help-cost" title="Cost" active={helpFocus === "help-cost"}>
             <p>
-              Low, Medium, High, or Max chooses which built-in model the internal router and Auto
-              fallbacks use. Medium is the default. Privacy (ZDR / data collection) and Alignment
-              still change the set. A filled Auto fallback box overrides that one cell.
+              Low, Med, High, or Max on the prompt bar chooses which built-in model the internal
+              router and Auto fallbacks use. Medium is the default. The choice is the saved cost
+              preference. Privacy (ZDR / data collection) and Alignment still change the set. A
+              filled Auto fallback box on the Models tab overrides that one cell.
             </p>
           </HelpSection>
 

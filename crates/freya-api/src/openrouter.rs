@@ -51,16 +51,15 @@ impl OpenRouterClient {
     }
 
     pub fn default_image_model(&self) -> String {
-        if crate::router::is_auto_image(&self.image_model) {
-            crate::router::resolve_auto_fallback(
-                crate::router::AutoFallbackKind::Image,
-                &self.privacy,
-                &self.alignment,
-                &self.auto_fallbacks,
-            )
-        } else {
-            self.image_model.clone()
+        if let Some(id) = canonical_image_model(&self.image_model) {
+            return id;
         }
+        crate::router::resolve_auto_fallback(
+            crate::router::AutoFallbackKind::Image,
+            &self.privacy,
+            &self.alignment,
+            &self.auto_fallbacks,
+        )
     }
 
     /// ZDR Auto still-image default (Google image endpoints usually pass ZDR/safety retention).
@@ -110,7 +109,10 @@ impl OpenRouterClient {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow!("{}", humanize_openrouter_error(status.as_u16(), &text)));
+            return Err(anyhow!(
+                "{}",
+                humanize_openrouter_error(status.as_u16(), &text)
+            ));
         }
         serde_json::from_str(&text).context("parse openrouter json")
     }
@@ -132,7 +134,10 @@ impl OpenRouterClient {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            return Err(anyhow!("{}", humanize_openrouter_error(status.as_u16(), &text)));
+            return Err(anyhow!(
+                "{}",
+                humanize_openrouter_error(status.as_u16(), &text)
+            ));
         }
         serde_json::from_str(&text).context("parse openrouter json")
     }
@@ -151,13 +156,9 @@ impl OpenRouterClient {
             usage_daily: data.get("usage_daily").and_then(|x| x.as_f64()),
             usage_weekly: data.get("usage_weekly").and_then(|x| x.as_f64()),
             usage_monthly: data.get("usage_monthly").and_then(|x| x.as_f64()),
-            limit: data.get("limit").and_then(|x| {
-                if x.is_null() {
-                    None
-                } else {
-                    x.as_f64()
-                }
-            }),
+            limit: data
+                .get("limit")
+                .and_then(|x| if x.is_null() { None } else { x.as_f64() }),
             limit_remaining: data.get("limit_remaining").and_then(|x| {
                 if x.is_null() {
                     None
@@ -436,7 +437,10 @@ impl OpenRouterClient {
                     Ok(img) => Ok(img),
                     Err(e2) => {
                         if is_zdr_routing_error(&e2.to_string()) {
-                            Err(anyhow!("{}", humanize_openrouter_error(404, &e2.to_string())))
+                            Err(anyhow!(
+                                "{}",
+                                humanize_openrouter_error(404, &e2.to_string())
+                            ))
                         } else {
                             Err(e2)
                         }
@@ -535,20 +539,15 @@ impl OpenRouterClient {
                     fallback = %zdr_video_fallback,
                     "video ZDR routing failed; retrying with ZDR-capable model"
                 );
-                self.generate_video_once(
-                    prompt,
-                    &zdr_video_fallback,
-                    duration_secs,
-                    aspect_ratio,
-                )
-                .await
-                .map_err(|e2| {
-                    if is_zdr_routing_error(&e2.to_string()) {
-                        anyhow!("{}", humanize_openrouter_error(404, &e2.to_string()))
-                    } else {
-                        e2
-                    }
-                })
+                self.generate_video_once(prompt, &zdr_video_fallback, duration_secs, aspect_ratio)
+                    .await
+                    .map_err(|e2| {
+                        if is_zdr_routing_error(&e2.to_string()) {
+                            anyhow!("{}", humanize_openrouter_error(404, &e2.to_string()))
+                        } else {
+                            e2
+                        }
+                    })
             }
             Err(e) => Err(e),
         }
@@ -622,7 +621,10 @@ impl OpenRouterClient {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !ok.contains(&status.as_u16()) {
-            return Err(anyhow!("{}", humanize_openrouter_error(status.as_u16(), &text)));
+            return Err(anyhow!(
+                "{}",
+                humanize_openrouter_error(status.as_u16(), &text)
+            ));
         }
         serde_json::from_str(&text).context("parse openrouter json")
     }
@@ -643,7 +645,10 @@ impl OpenRouterClient {
             let status_code = resp.status();
             let text = resp.text().await.unwrap_or_default();
             if !status_code.is_success() {
-                return Err(anyhow!("{}", humanize_openrouter_error(status_code.as_u16(), &text)));
+                return Err(anyhow!(
+                    "{}",
+                    humanize_openrouter_error(status_code.as_u16(), &text)
+                ));
             }
             let v: Value = serde_json::from_str(&text).context("parse video poll json")?;
             let st = v
@@ -737,19 +742,60 @@ fn sniff_video_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Reject chat-router ids that planners sometimes emit as "image" models.
-pub fn resolve_image_model(requested: &str, default_image: &str) -> String {
-    let m = requested.trim();
-    if m.is_empty() || !is_plausible_image_model(m) {
-        return default_image.to_string();
+/// Catalog ids are `provider/model`. `openrouter/` is the upstream-router vendor,
+/// not a prefix to put in front of another id.
+/// `openrouter/google/gemini-3-pro-image` → `google/gemini-3-pro-image`.
+/// `openrouter/google-gemini-pro-image-1` is dropped (no provider left).
+/// `openrouter/auto` is left intact so the upstream-router check still sees it.
+pub fn canonicalize_catalog_id(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return String::new();
     }
-    m.to_string()
+    let lower = s.to_ascii_lowercase();
+    const PREFIX: &str = "openrouter/";
+    if lower.starts_with(PREFIX) {
+        if lower == "openrouter/auto" || lower.starts_with("openrouter/auto:") {
+            return s.to_string();
+        }
+        let rest = s[PREFIX.len()..].trim();
+        if rest.contains('/') && !rest.starts_with('/') {
+            return rest.to_string();
+        }
+        return String::new();
+    }
+    s.to_string()
+}
+
+/// Real still-image catalog id, or `None` when the slug is Auto, prose, or invented.
+pub fn canonical_image_model(requested: &str) -> Option<String> {
+    let id = canonicalize_catalog_id(requested);
+    if id.is_empty() || !is_plausible_image_model(&id) {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+/// Reject chat-router ids and invented `openrouter/` slugs planners emit as image models.
+/// Falls back to `default_image` when that id is a real catalog id, otherwise the
+/// balanced medium still-image default.
+pub fn resolve_image_model(requested: &str, default_image: &str) -> String {
+    if let Some(id) = canonical_image_model(requested) {
+        return id;
+    }
+    if let Some(id) = canonical_image_model(default_image) {
+        return id;
+    }
+    crate::router::DEFAULT_AUTO_IMAGE_MODEL.to_string()
 }
 
 fn is_plausible_image_model(model: &str) -> bool {
     let raw = model.trim();
     let m = raw.to_ascii_lowercase();
-    if m.is_empty() || m.starts_with("openrouter/auto") || crate::router::is_auto_image(raw) {
+    // `openrouter/` is never an image vendor. `openrouter/google-gemini-pro-image-1`
+    // contains "image" but is not a catalog id.
+    if m.is_empty() || m.starts_with("openrouter/") || crate::router::is_auto_image(raw) {
         return false;
     }
     // Router / planner prose echoed as a model id (not a real HF/OpenRouter slug).
@@ -763,24 +809,13 @@ fn is_plausible_image_model(model: &str) -> bool {
     {
         return false;
     }
-    // Positive signals for OpenRouter image endpoints.
-    if m.contains("image")
-        || m.contains("flux")
-        || m.contains("seedream")
-        || m.contains("dall-e")
-        || m.contains("stable-diffusion")
-        || m.contains("sdxl")
-        || m.contains("sd3")
-        || m.contains("recraft")
-        || m.contains("riverflow")
-        || m.contains("muse-image")
-        || m.contains("grok-imagine")
-        || m.contains("nano-banana")
-        || m.contains("mai-image")
-        || m.contains("hy-image")
-        || m.contains("hy-world")
-    {
-        return true;
+    // Catalog ids are provider/model. A bare token that merely contains "image"
+    // (`google-gemini-pro-image-1`) is not an OpenRouter id.
+    let Some((vendor, name)) = raw.split_once('/') else {
+        return false;
+    };
+    if vendor.is_empty() || name.is_empty() || vendor.eq_ignore_ascii_case("openrouter") {
+        return false;
     }
     // Chat / LLM ids that planners often emit by mistake.
     if m.starts_with("anthropic/")
@@ -805,8 +840,7 @@ fn is_plausible_image_model(model: &str) -> bool {
     {
         return false;
     }
-    // Bare tokens (`ldm-xxl-256`) are not OpenRouter ids. Catalog ids are org/name.
-    raw.contains('/')
+    true
 }
 
 fn is_chat_image_model(model: &str) -> bool {
@@ -1160,11 +1194,8 @@ fn ensure_upstream_agent(models: &mut Vec<ImageModel>) {
 impl OpenRouterClient {
     fn fallback_chat_catalog(&self) -> ChatCatalog {
         let chat_providers = self.privacy.chat_providers.clone();
-        let mut models = filter_fallback_chat(
-            &fallback_chat_models(),
-            &self.alignment,
-            &chat_providers,
-        );
+        let mut models =
+            filter_fallback_chat(&fallback_chat_models(), &self.alignment, &chat_providers);
         let router = models.clone();
         if !crate::router::privacy_requires_strict(&self.privacy) {
             ensure_upstream_agent(&mut models);
@@ -1233,11 +1264,7 @@ fn is_text_chat_candidate(m: &Value) -> bool {
     let outs = arch
         .get("output_modalities")
         .and_then(|o| o.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| x.as_str())
-                .collect::<Vec<_>>()
-        })
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>())
         .unwrap_or_default();
     if !outs.iter().any(|o| *o == "text") {
         return false;
@@ -1486,6 +1513,33 @@ mod tests {
             ),
             "google/gemini-2.5-flash-image"
         );
+        // Invented slug: openrouter/ prefixed onto a non-catalog name.
+        assert_eq!(
+            resolve_image_model(
+                "openrouter/google-gemini-pro-image-1",
+                "google/gemini-2.5-flash-image"
+            ),
+            "google/gemini-2.5-flash-image"
+        );
+        assert_eq!(
+            resolve_image_model("google-gemini-pro-image-1", "google/gemini-3-pro-image"),
+            "google/gemini-3-pro-image"
+        );
+        // Prefix stripped only when a real provider/model id follows.
+        assert_eq!(
+            resolve_image_model(
+                "openrouter/google/gemini-3-pro-image",
+                "black-forest-labs/flux.2-klein-4b"
+            ),
+            "google/gemini-3-pro-image"
+        );
+        assert_eq!(
+            resolve_image_model(
+                "openrouter/google-gemini-pro-image-1",
+                "openrouter/google-gemini-pro-image-1"
+            ),
+            crate::router::DEFAULT_AUTO_IMAGE_MODEL
+        );
     }
 
     #[test]
@@ -1658,7 +1712,9 @@ mod tests {
         assert!(is_zdr_routing_error(
             r#"{"error":{"message":"No endpoints found that match your data policy (ZDR)"}}"#
         ));
-        assert!(!is_zdr_routing_error("openrouter 402: insufficient credits"));
+        assert!(!is_zdr_routing_error(
+            "openrouter 402: insufficient credits"
+        ));
     }
 
     #[test]
