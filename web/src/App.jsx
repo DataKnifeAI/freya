@@ -62,31 +62,14 @@ function normalizeAutoFallbacks(raw) {
 }
 
 const COST_TIERS = [
-  { id: "low", label: "Low", title: "Low" },
-  { id: "medium", label: "Med", title: "Medium" },
-  { id: "high", label: "High", title: "High" },
-  { id: "max", label: "Max", title: "Max" },
+  { id: "low", label: "Low" },
+  { id: "medium", label: "Medium" },
+  { id: "high", label: "High" },
+  { id: "max", label: "Max" },
 ];
 
-function CostTierSwitch({ value, onChange }) {
-  const current = COST_TIERS.some((t) => t.id === value) ? value : "medium";
-  return (
-    <div className="cost-tier-switch" role="radiogroup" aria-label="Cost tier">
-      {COST_TIERS.map((t) => (
-        <button
-          key={t.id}
-          type="button"
-          role="radio"
-          aria-checked={current === t.id}
-          className={current === t.id ? "is-active" : ""}
-          title={`Auto cost: ${t.title}`}
-          onClick={() => onChange(t.id)}
-        >
-          {t.label}
-        </button>
-      ))}
-    </div>
-  );
+function costTierCurrent(value) {
+  return COST_TIERS.find((t) => t.id === value) || COST_TIERS[1];
 }
 
 /** First-login / first-use acknowledgment of user liability guidelines. */
@@ -1509,6 +1492,59 @@ function useChromeMenuDismiss(open, onOpen, ref) {
       document.removeEventListener("keydown", onKey);
     };
   }, [open, onOpen, ref]);
+}
+
+/**
+ * $ icon → popover list (same chrome as the model menus).
+ * One pick sets the cost tier and closes.
+ */
+function CostTierMenu({ value, onChange, open, onOpen }) {
+  const ref = useRef(null);
+  useChromeMenuDismiss(open, onOpen, ref);
+  const current = costTierCurrent(value);
+
+  return (
+    <div className="chrome-menu chrome-menu-align-end composer-cost-menu" ref={ref}>
+      <button
+        type="button"
+        className={`ghost icon-btn${open ? " open" : ""}`}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label={`Cost: ${current.label}`}
+        title={`Cost: ${current.label}`}
+        onClick={() => onOpen(!open)}
+      >
+        <span className="cost-tier-mark" aria-hidden="true">$</span>
+        <span className="sr-only">Cost: {current.label}</span>
+      </button>
+      {open && (
+        <div className="chrome-popover" role="dialog" aria-label={`Cost: ${current.label}`}>
+          <div className="cost-tier-menu-current">
+            <span>Cost</span>
+            <span>{current.label}</span>
+          </div>
+          <ul className="chrome-popover-list" role="listbox" aria-label="Cost tier">
+            {COST_TIERS.map((t) => (
+              <li key={t.id}>
+                <button
+                  type="button"
+                  role="option"
+                  aria-selected={t.id === current.id}
+                  className={t.id === current.id ? "active" : ""}
+                  onClick={() => {
+                    onChange(t.id);
+                    onOpen(false);
+                  }}
+                >
+                  <span className="chrome-menu-opt-label">{t.label}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function CompactMenu({
@@ -5380,7 +5416,7 @@ export default function App() {
               <div
                 className="composer-primary-cluster"
                 role="group"
-                aria-label="Models, suggest, send, and run session"
+                aria-label="Models, cost, suggest, send, and run session"
               >
                 <GroupedChromeMenu
                   className="composer-model-menu"
@@ -5526,8 +5562,10 @@ export default function App() {
                     ]}
                   />
                 )}
-                <CostTierSwitch
+                <CostTierMenu
                   value={autoFallbacks.costTier || "medium"}
+                  open={menuOpen === "cost"}
+                  onOpen={(v) => setMenuOpen(v ? "cost" : null)}
                   onChange={(costTier) =>
                     setAutoFallbacks((prev) =>
                       normalizeAutoFallbacks({ ...prev, costTier }),
@@ -7284,18 +7322,19 @@ export default function App() {
             <p>
               Pins for Agent / Image / Video / Router. <strong>Auto</strong> is Freya’s internal
               router: it picks a concrete model for that job. If it fails, the cost / privacy /
-              alignment fallback is used. Cost (Low / Med / High / Max) sits on the prompt bar
-              and is the same saved preference Auto uses. <strong>OpenRouter router (upstream)</strong> is{" "}
+              alignment fallback is used. The $ button on the prompt bar opens Cost (Low /
+              Medium / High / Max) and is the same saved preference Auto uses. <strong>OpenRouter router (upstream)</strong> is{" "}
               <code>openrouter/auto</code> — only when you select that row, not when you pick Auto.
             </p>
           </HelpSection>
 
           <HelpSection id="help-cost" title="Cost" active={helpFocus === "help-cost"}>
             <p>
-              Low, Med, High, or Max on the prompt bar chooses which built-in model the internal
-              router and Auto fallbacks use. Medium is the default. The choice is the saved cost
-              preference. Privacy (ZDR / data collection) and Alignment still change the set. A
-              filled Auto fallback box on the Models tab overrides that one cell.
+              The $ button on the prompt bar opens Low, Medium, High, or Max and chooses which
+              built-in model the internal router and Auto fallbacks use. Medium is the default.
+              The choice is the saved cost preference. Privacy (ZDR / data collection) and
+              Alignment still change the set. A filled Auto fallback box on the Models tab
+              overrides that one cell.
             </p>
           </HelpSection>
 

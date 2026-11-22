@@ -524,31 +524,39 @@ textarea::placeholder { color: var(--chrome-faint); font-style: italic; }
 textarea:focus { background: var(--chrome-field); border-bottom-color: var(--apricot); }
 .compose-status { font-size: 0.72rem; line-height: 1.35; }
 
-/* Single-line control row: Sessions · [Router/Mode] · Cloud|Local …… [ Agent · Gen · Suggest · ↑ · Run ] */
+/* Single-line control row: Sessions · Cloud|Local …… [ Agent · Gen · $ · Suggest · ↑ · Run ] */
 .composer-bar { display: flex; flex-wrap: nowrap; align-items: center; gap: 0.35rem; min-width: 0; }
 .compose-actions { flex: none; display: flex; flex-wrap: nowrap; gap: 0.25rem; align-items: center; }
 .icon-btn {
   width: 30px; height: 30px; flex: none; display: inline-flex; align-items: center; justify-content: center;
   padding: 0; line-height: 1;
 }
-/* Auto cost tier — same 30px hit target as the prompt icon buttons. */
-.cost-tier-switch {
-  flex: none; display: inline-flex; align-items: stretch; height: 30px;
-  border: 1px solid var(--chrome-line); border-radius: 2px; overflow: hidden;
+/* $ cost tier — 30px icon-btn; popover list matches the model menus. */
+.composer-cost-menu { flex: none; }
+.cost-tier-mark {
+  font-family: var(--font-ui); font-style: normal; font-weight: 700;
+  font-size: 1rem; line-height: 1; letter-spacing: 0;
 }
-.cost-tier-switch button {
-  min-width: 30px; height: 30px; margin: 0; padding: 0 0.2rem; border: 0; border-radius: 0;
-  background: transparent; color: var(--chrome-faint);
-  font-size: 0.62rem; font-weight: 700; letter-spacing: 0; line-height: 1;
+.composer-cost-menu .icon-btn.open {
+  background: var(--chrome-field); border-color: var(--apricot); color: var(--chrome-text);
 }
-.cost-tier-switch button + button { border-left: 1px solid var(--chrome-line); }
-.cost-tier-switch button:hover { color: var(--chrome-text); background: var(--chrome-field); }
-.cost-tier-switch button.is-active {
-  color: var(--chrome-text); background: var(--celadon-tint);
+.composer-cost-menu .chrome-popover {
+  min-width: 10.5rem; max-width: 14rem; padding: 0.28rem;
 }
+.cost-tier-menu-current {
+  display: flex; align-items: baseline; gap: 0.35rem;
+  margin: 0; padding: 0.28rem 0.4rem 0.16rem;
+  font-size: 0.62rem; font-weight: 700; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--menu-text); pointer-events: none;
+}
+.cost-tier-menu-current span:last-child {
+  margin-left: auto; max-width: 8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  letter-spacing: 0; text-transform: none; font-size: 0.76rem; font-weight: 600;
+}
+.composer-cost-menu .chrome-popover-list { max-height: none; }
 .icon-btn svg { display: block; }
 .icon-btn-primary { box-shadow: none; }
-/* Primary action cluster: Model + Suggest + Send + Run session on the right */
+/* Primary action cluster: Model + $ cost + Suggest + Send + Run on the right */
 .composer-primary-cluster {
   margin-left: auto; flex: none; display: flex; flex-wrap: nowrap; align-items: center; gap: 0.25rem;
   padding: 0.2rem; background: var(--celadon-tint);
