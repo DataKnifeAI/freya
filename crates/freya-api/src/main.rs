@@ -139,12 +139,24 @@ fn build_cors(cfg: &Config) -> CorsLayer {
             .collect();
         CorsLayer::new()
             .allow_origin(AllowOrigin::list(list))
-            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
             .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
     } else if has_token {
         // Auth enabled, no explicit origins: do not use permissive `*`.
         CorsLayer::new()
-            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::OPTIONS])
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
             .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
     } else {
         CorsLayer::permissive()

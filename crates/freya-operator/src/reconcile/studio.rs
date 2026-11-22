@@ -590,8 +590,7 @@ async fn ensure_mcp_deployment(
     let image = format!("{repo}:{tag}");
     let dep_name = format!("{name}-mcp");
 
-    // Streamable HTTP Host allowlist: empty/`*` disables DNS-rebinding guard.
-    // Behind Ingress the controller already routes by Host; API bearer still applies.
+    // Host allowlist is the Ingress host when one is set. Callers still need the API bearer.
     let mut env = vec![
         EnvVar {
             name: "FREYA_API_URL".into(),
@@ -605,7 +604,15 @@ async fn ensure_mcp_deployment(
         },
         EnvVar {
             name: "FREYA_MCP_ALLOWED_HOSTS".into(),
-            value: Some("*".into()),
+            value: Some(
+                studio
+                    .spec
+                    .ingress
+                    .host
+                    .clone()
+                    .filter(|h| !h.trim().is_empty())
+                    .unwrap_or_default(),
+            ),
             ..Default::default()
         },
     ];

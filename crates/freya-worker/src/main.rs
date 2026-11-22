@@ -254,11 +254,11 @@ async fn persist_active_base(models_dir: &Path, active: &ActiveBase) -> Result<(
 
 /// Health for local ops. Includes GPU/VRAM when `nvidia-smi` is available
 /// (null inside GPU-less containers — freya-api may enrich from the host).
-async fn health(State(app): State<Arc<App>>) -> Json<Value> {
-    Json(build_stats(&app).await)
+async fn health() -> Json<Value> {
+    Json(serde_json::json!({ "ok": true, "service": "freya-worker" }))
 }
 
-/// Same payload as `/health` behind optional worker auth.
+/// GPU, disk, and model inventory. Requires the worker token when one is set.
 async fn stats(State(app): State<Arc<App>>) -> Json<Value> {
     Json(build_stats(&app).await)
 }

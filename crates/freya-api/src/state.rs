@@ -98,41 +98,36 @@ impl AppState {
         }
         let raw = tokio::fs::read(&path).await?;
         let secrets: RuntimeSecrets = serde_json::from_slice(&raw).unwrap_or_default();
-        self.apply_secrets(secrets).await;
+        self.apply_secrets_inner(secrets, true).await;
         Ok(())
     }
 
     pub async fn apply_secrets(&self, secrets: RuntimeSecrets) {
+        self.apply_secrets_inner(secrets, false).await;
+    }
+
+    async fn apply_secrets_inner(&self, secrets: RuntimeSecrets, from_disk: bool) {
         let mut cfg = self.config.write().await;
-        if let Some(k) = secrets.openrouter_api_key {
-            // Empty string clears the runtime key (UI “Clear key”).
-            cfg.openrouter_api_key = k.clone();
+        if assign_secret(&mut cfg.openrouter_api_key, secrets.openrouter_api_key, from_disk) {
+            let key = cfg.openrouter_api_key.clone();
             let mut or = self.openrouter.write().await;
-            *or = OpenRouterClient::new(&cfg).with_key(k);
+            *or = OpenRouterClient::new(&cfg).with_key(key);
         }
-        if let Some(k) = secrets.civitai_api_key {
-            cfg.civitai_api_key = k.clone();
+        if assign_secret(&mut cfg.civitai_api_key, secrets.civitai_api_key, from_disk) {
+            let key = cfg.civitai_api_key.clone();
             let mut civ = self.civitai.write().await;
-            *civ = CivitaiClient::new(k);
+            *civ = CivitaiClient::new(key);
         }
-        if let Some(k) = secrets.hf_token {
-            cfg.hf_token = k;
-        }
+        let _ = assign_secret(&mut cfg.hf_token, secrets.hf_token, from_disk);
         if let Some(url) = secrets.diffusion_worker_url {
             if url.trim().is_empty() {
                 cfg.diffusion_worker_url = None;
             } else {
                 cfg.diffusion_worker_url = Some(url);
-                cfg.worker_enabled = true;
             }
         }
         if let Some(enabled) = secrets.worker_enabled {
-            // Prefer URL-present ⇒ enabled so generate is not stuck behind a stale disable flag.
-            if cfg.diffusion_worker_url.is_some() {
-                cfg.worker_enabled = true;
-            } else {
-                cfg.worker_enabled = enabled;
-            }
+            cfg.worker_enabled = enabled;
         }
         if let Some(tok) = secrets.api_token {
             // Empty string clears auth (local/dev). Non-empty overrides env / previous value.
@@ -217,10 +212,14 @@ impl AppState {
     /// Attach or clear the in-memory worker client from the configured URL.
     pub async fn rebuild_worker_client(&self) {
         let cfg = self.config.read().await;
-        let next = cfg.diffusion_worker_url.as_ref().map(|u| {
-            DiffusionWorkerClient::new_with_tls(u.clone(), cfg.worker_tls_insecure)
-                .with_token(cfg.worker_token.clone())
-        });
+        let next = if cfg.worker_enabled {
+            cfg.diffusion_worker_url.as_ref().map(|u| {
+                DiffusionWorkerClient::new_with_tls(u.clone(), cfg.worker_tls_insecure)
+                    .with_token(cfg.worker_token.clone())
+            })
+        } else {
+            None
+        };
         *self.worker.write().await = next;
     }
 
@@ -230,9 +229,9 @@ impl AppState {
             tokio::fs::create_dir_all(parent).await?;
         }
         let secrets = RuntimeSecrets {
-            openrouter_api_key: Some(cfg.openrouter_api_key.clone()),
-            civitai_api_key: Some(cfg.civitai_api_key.clone()),
-            hf_token: Some(cfg.hf_token.clone()),
+            openrouter_api_key: none_if_blank(&cfg.openrouter_api_key),
+            civitai_api_key: none_if_blank(&cfg.civitai_api_key),
+            hf_token: none_if_blank(&cfg.hf_token),
             diffusion_worker_url: cfg.diffusion_worker_url.clone(),
             worker_enabled: Some(cfg.worker_enabled),
             api_token: if cfg.api_token.trim().is_empty() {
@@ -256,6 +255,34 @@ impl AppState {
         let raw = serde_json::to_vec_pretty(&secrets)?;
         tokio::fs::write(&cfg.secrets_file, raw).await?;
         Ok(())
+    }
+}
+
+fn none_if_blank(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Disk loads must not replace an env/Secret key with a blank. A live Settings clear still applies.
+fn assign_secret(current: &mut String, incoming: Option<String>, from_disk: bool) -> bool {
+    match incoming {
+        Some(k) if k.trim().is_empty() => {
+            if from_disk || current.trim().is_empty() {
+                false
+            } else {
+                current.clear();
+                true
+            }
+        }
+        Some(k) => {
+            *current = k;
+            true
+        }
+        None => false,
     }
 }
 

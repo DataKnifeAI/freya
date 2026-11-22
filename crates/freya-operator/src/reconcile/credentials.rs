@@ -12,6 +12,7 @@ use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use kube::api::{Patch, PatchParams};
 use kube::{Api, ResourceExt};
+use kube::Error as KubeError;
 use std::collections::BTreeMap;
 use tracing::info;
 
@@ -46,7 +47,7 @@ pub async fn ensure_studio_credentials(
         admin_secret_name: None,
         // Same meaning as game-operator status.credentialsGenerated: operator-managed bootstrap.
         admin_generated: studio.spec.generate_admin_secrets,
-        api_token: studio.spec.api_token_secret_ref.clone(),
+        api_token: studio.spec.api_token_secret_ref.clone().map(Into::into),
         api_token_generated: false,
     };
 
@@ -87,7 +88,11 @@ async fn ensure_admin_secret(
     owner: &OwnerReference,
 ) -> Result<bool, Error> {
     let api: Api<Secret> = Api::namespaced(ctx.client.clone(), ns);
-    let existing = api.get(secret_name).await.ok();
+    let existing = match api.get(secret_name).await {
+        Ok(secret) => Some(secret),
+        Err(KubeError::Api(err)) if err.code == 404 => None,
+        Err(err) => return Err(Error::Kube(err)),
+    };
     let mut data = existing
         .as_ref()
         .and_then(|s| s.data.clone())
@@ -151,7 +156,11 @@ async fn ensure_api_token_secret(
     owner: &OwnerReference,
 ) -> Result<bool, Error> {
     let api: Api<Secret> = Api::namespaced(ctx.client.clone(), ns);
-    let existing = api.get(secret_name).await.ok();
+    let existing = match api.get(secret_name).await {
+        Ok(secret) => Some(secret),
+        Err(KubeError::Api(err)) if err.code == 404 => None,
+        Err(err) => return Err(Error::Kube(err)),
+    };
     let mut data = existing
         .as_ref()
         .and_then(|s| s.data.clone())
