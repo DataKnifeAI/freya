@@ -5,13 +5,25 @@ metadata:
   namespace: freya
 spec:
   replicas: 1
+  # MCP Streamable HTTP (default true) → Deployment freya-mcp + Ingress /mcp
+  mcpEnabled: true
+  # mcpImage:
+  #   repository: harbor.dataknife.net/library/freya-mcp
+  #   tag: "0.1.0"
   openRouter:
     secretRef:
       name: freya-openrouter
       key: apiKey
-    chatModel: openrouter/auto
-    imageModel: black-forest-labs/flux.2-klein-4b
-  # Required for non-dev / Ingress — bearer on /v1 (paste into UI Settings).
+    chatModel: auto
+    imageModel: auto
+    routerModel: auto
+  # Game-operator style: operator generates freya-admin (username + admin-password)
+  # and uses this bearer Secret for MCP/machine auth. UI: Sign in with admin password.
+  generateAdminSecrets: true
+  # Optional BYO admin Secret name (default: {studio}-admin).
+  # adminCredentialsSecretRef:
+  #   name: freya-admin
+  # Machine bearer for MCP/API (UI obtains it via Sign in, or paste Apply token).
   apiTokenSecretRef:
     name: freya-api-token
     key: token
@@ -24,6 +36,7 @@ spec:
     secretRef:
       name: freya-hf
       key: token
+  # Points at FreyaDiffusionWorker/freya-gpu — apply *_external.yaml (recommended local GPU URL).
   diffusionWorkerRef: freya-gpu
   storage:
     gallerySize: 20Gi
@@ -32,7 +45,7 @@ spec:
     className: nginx
     host: freya.dataknife.net
     # Fleet TLS: Let's Encrypt *.dataknife.net (same secret as Traefik/Harbor).
-    # Kind: make kind-tls  # copies kube-system/wildcard-dataknife-net-tls + sets nginx default
+    # Kind (dev): make kind-tls  # copies kube-system/wildcard-dataknife-net-tls + sets nginx default
     # Omit tlsSecretName to rely only on the ingress controller default cert.
     tlsSecretName: wildcard-dataknife-net-tls
 ---
@@ -45,6 +58,18 @@ spec:
 #   freya-api-token   key=token   (openssl rand -hex 32)
 #   freya-worker-token key=apiKey (openssl rand -hex 32)
 #   wildcard-dataknife-net-tls  (TLS; make kind-tls or gitops cert-sync)
+# Architecture: Studio/operator/MCP/Ingress in k8s (shared cluster OK); GPU worker on host via URL.
+# kind is a local dev path — same CRs work production-shaped on shared k8s. See docs/ARCHITECTURE.md.
 # Optional style pack sample: freya_v1alpha1_freyastyle.yaml (freya.png NL example)
 # Public UI: https://freya.dataknife.net — for kind, run ./scripts/kind-hosts.sh
+# Public MCP (Streamable HTTP): https://freya.dataknife.net/mcp
+# Cursor MCP config example:
+#   {
+#     "mcpServers": {
+#       "freya": {
+#         "url": "https://freya.dataknife.net/mcp"
+#       }
+#     }
+#   }
+# In-cluster: http://freya-mcp.freya.svc.cluster.local:8090/mcp
 # (public DNS still points at prd-apps Traefik → plain-text "404 page not found")

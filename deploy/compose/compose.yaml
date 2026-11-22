@@ -1,0 +1,114 @@
+# Freya single-system stack (no Kubernetes / operator).
+# Distinct from legacy/docker-compose.yml (ComfyUI / SwarmUI / Ollama).
+#
+# Quick start:
+#   cp deploy/compose/.env.example deploy/compose/.env
+#   # edit .env — OPENROUTER_API_KEY + FREYA_ADMIN_PASSWORD
+#   make compose-up
+#   # UI http://127.0.0.1:8080  worker :8091  optional MCP :8090
+#
+# Docs: docs/COMPOSE.md
+
+name: freya
+
+services:
+  freya-api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: api
+    image: ${FREYA_API_IMAGE:-freya-api:local}
+    container_name: freya-api
+    restart: unless-stopped
+    environment:
+      FREYA_BIND: 0.0.0.0:8080
+      FREYA_GALLERY_DIR: /data/gallery
+      FREYA_SECRETS_FILE: /data/secrets/.freya-runtime.json
+      FREYA_PACKS_DIR: /packs
+      FREYA_DIFFUSION_WORKER_URL: ${FREYA_DIFFUSION_WORKER_URL:-http://freya-worker:8091}
+      FREYA_WORKER_CONTAINER: freya-worker
+      FREYA_CORS_ORIGINS: ${FREYA_CORS_ORIGINS:-http://127.0.0.1:8080,http://localhost:8080}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      CIVITAI_API_KEY: ${CIVITAI_API_KEY:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      FREYA_ADMIN_USER: ${FREYA_ADMIN_USER:-admin}
+      FREYA_ADMIN_PASSWORD: ${FREYA_ADMIN_PASSWORD:-}
+      FREYA_API_TOKEN: ${FREYA_API_TOKEN:-}
+      FREYA_WORKER_TOKEN: ${FREYA_WORKER_TOKEN:-}
+      FREYA_CHAT_MODEL: ${FREYA_CHAT_MODEL:-auto}
+      FREYA_IMAGE_MODEL: ${FREYA_IMAGE_MODEL:-black-forest-labs/flux.2-klein-4b}
+    volumes:
+      - ${FREYA_GALLERY_DIR:-/mnt/game2/freya/gallery}:/data/gallery
+      - ${FREYA_SECRETS_DIR:-/mnt/game2/freya/secrets}:/data/secrets
+    networks:
+      - freya
+    depends_on:
+      - freya-worker
+    # Distroless nonroot (UID 65532). Host dirs must be writable by that UID
+    # (see docs/COMPOSE.md). No operator / CRDs on this path.
+
+  freya-web:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.web
+    image: ${FREYA_WEB_IMAGE:-freya-web:local}
+    container_name: freya-web
+    restart: unless-stopped
+    environment:
+      FREYA_API_UPSTREAM: http://freya-api:8080
+    ports:
+      - "${FREYA_UI_PORT:-8080}:80"
+    networks:
+      - freya
+    depends_on:
+      - freya-api
+
+  freya-worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: worker
+    image: ${FREYA_WORKER_IMAGE:-freya-worker:local}
+    container_name: freya-worker
+    restart: unless-stopped
+    environment:
+      FREYA_WORKER_PORT: "8091"
+      FREYA_MODELS_DIR: /data/models
+      FREYA_WORKER_TOKEN: ${FREYA_WORKER_TOKEN:-}
+    volumes:
+      - ${FREYA_MODELS_DIR:-/mnt/game2/freya/models}:/data/models
+    ports:
+      - "${FREYA_WORKER_PORT:-8091}:8091"
+    networks:
+      - freya
+    # GPU Diffusers engine: `make compose-up-gpu` (compose.gpu.yaml / Dockerfile.worker).
+    # Default image is the Rust stub (no VRAM). Host GPU path: ./scripts/run-local-worker.sh
+
+  # Optional: `make compose-up-mcp` or COMPOSE_PROFILES=mcp
+  freya-mcp:
+    profiles: ["mcp"]
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: mcp
+    image: ${FREYA_MCP_IMAGE:-freya-mcp:local}
+    container_name: freya-mcp
+    restart: unless-stopped
+    environment:
+      FREYA_MCP_BIND: 0.0.0.0:8090
+      FREYA_API_URL: http://freya-api:8080
+      FREYA_API_TOKEN: ${FREYA_API_TOKEN:-}
+      # Host header allowlist for Streamable HTTP; * disables check (LAN/compose).
+      FREYA_MCP_ALLOWED_HOSTS: ${FREYA_MCP_ALLOWED_HOSTS:-*}
+    ports:
+      - "${FREYA_MCP_PORT:-8090}:8090"
+    networks:
+      - freya
+    depends_on:
+      - freya-api
+
+networks:
+  freya:
+    name: freya-compose
+    driver: bridge

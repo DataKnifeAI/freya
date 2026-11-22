@@ -155,6 +155,127 @@ impl CivitaiClient {
         Ok(out)
     }
 
+    /// Resolve a download URL from a Civitai model version (+ optional file id).
+    pub async fn resolve_version_download(
+        &self,
+        version_id: i64,
+        file_id: Option<i64>,
+    ) -> Result<ResolvedDownload> {
+        if !self.configured() {
+            return Err(anyhow!(
+                "Civitai API key not set — add it in Freya Settings or CIVITAI_API_KEY"
+            ));
+        }
+        let url = format!("https://civitai.com/api/v1/model-versions/{version_id}");
+        let v = self
+            .get_json(&url)
+            .await
+            .context("civitai get model version")?;
+        if v.get("error").is_some() {
+            return Err(anyhow!(
+                "civitai model version {}: {}",
+                version_id,
+                v.get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("not found")
+            ));
+        }
+        let version = parse_model_version(&v, 1);
+        let model_id = v.get("modelId").and_then(|x| x.as_i64());
+        let file = if let Some(fid) = file_id {
+            version
+                .files
+                .iter()
+                .find(|f| f.id == Some(fid))
+                .or_else(|| pick_primary_file(&version.files))
+        } else {
+            pick_primary_file(&version.files)
+        }
+        .ok_or_else(|| anyhow!("civitai model version {version_id}: no files"))?;
+        let download_url = file
+            .download_url
+            .clone()
+            .ok_or_else(|| anyhow!("civitai model version {version_id}: file has no downloadUrl"))?;
+        Ok(ResolvedDownload {
+            download_url,
+            version_id: version.id,
+            version_name: Some(version.name),
+            base_model: version.base_model,
+            file_id: file.id,
+            file_name: file.name.clone(),
+            file_format: file.format.clone().or_else(|| file.file_type.clone()),
+            model_id,
+            thumbnail_url: version
+                .image_urls
+                .as_ref()
+                .and_then(|imgs| imgs.first().cloned()),
+        })
+    }
+
+    /// Resolve a version id → full model detail (for Installed cards that only have versionId).
+    pub async fn get_model_by_version(&self, version_id: i64) -> Result<CivitaiModelDetail> {
+        if !self.configured() {
+            return Err(anyhow!(
+                "Civitai API key not set — add it in Freya Settings or CIVITAI_API_KEY"
+            ));
+        }
+        let url = format!("https://civitai.com/api/v1/model-versions/{version_id}");
+        let v = self
+            .get_json(&url)
+            .await
+            .context("civitai get model version")?;
+        if v.get("error").is_some() {
+            return Err(anyhow!(
+                "civitai model version {}: {}",
+                version_id,
+                v.get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("not found")
+            ));
+        }
+        let model_id = v
+            .get("modelId")
+            .and_then(|x| x.as_i64())
+            .ok_or_else(|| anyhow!("civitai model version {version_id}: missing modelId"))?;
+        let mut detail = self.get_model(model_id).await?;
+        // Prefer the installed version when present on the model.
+        if detail
+            .model_versions
+            .iter()
+            .any(|ver| ver.id == version_id)
+        {
+            if let Some(ver) = detail
+                .model_versions
+                .iter()
+                .find(|ver| ver.id == version_id)
+                .cloned()
+            {
+                detail.version_id = Some(ver.id);
+                detail.version_name = Some(ver.name.clone());
+                detail.base_model = ver.base_model.clone().or(detail.base_model);
+                detail.trained_words = ver.trained_words.clone().or(detail.trained_words);
+                detail.trigger_word = detail
+                    .trained_words
+                    .as_ref()
+                    .and_then(|w| w.first().cloned())
+                    .or(detail.trigger_word);
+                if let Some(imgs) = &ver.image_urls {
+                    if !imgs.is_empty() {
+                        detail.image_urls = Some(imgs.clone());
+                        detail.thumbnail_url = Some(imgs[0].clone());
+                    }
+                }
+                if let Some(file) = pick_primary_file(&ver.files) {
+                    detail.file_id = file.id;
+                    detail.file_name = file.name.clone();
+                    detail.file_format = file.format.clone().or_else(|| file.file_type.clone());
+                    detail.download_url = file.download_url.clone();
+                }
+            }
+        }
+        Ok(detail)
+    }
+
     async fn get_json(&self, url: &str) -> Result<Value> {
         let resp = self
             .http
@@ -170,6 +291,132 @@ impl CivitaiClient {
         }
         serde_json::from_str(&text).context("civitai json")
     }
+}
+
+/// Download target resolved from a version (+ optional file) id.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ResolvedDownload {
+    pub download_url: String,
+    pub version_id: i64,
+    pub version_name: Option<String>,
+    pub base_model: Option<String>,
+    pub file_id: Option<i64>,
+    pub file_name: Option<String>,
+    pub file_format: Option<String>,
+    pub model_id: Option<i64>,
+    pub thumbnail_url: Option<String>,
+}
+
+fn parse_trained_words(ver: &Value) -> Vec<String> {
+    let mut trained_words = Vec::new();
+    if let Some(words) = ver.get("trainedWords").and_then(|w| w.as_array()) {
+        for w in words {
+            if let Some(s) = w.as_str() {
+                let trimmed = s.trim().trim_end_matches(',');
+                if !trimmed.is_empty() {
+                    trained_words.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    trained_words
+}
+
+fn parse_model_file(f: &Value) -> CivitaiModelFile {
+    let size_kb = f
+        .get("sizeKB")
+        .and_then(|x| x.as_f64())
+        .or_else(|| f.get("sizeKB").and_then(|x| x.as_i64()).map(|n| n as f64));
+    let size_bytes = size_kb.map(|kb| (kb * 1024.0).round() as i64).or_else(|| {
+        f.get("size")
+            .and_then(|x| x.as_i64())
+            .or_else(|| f.get("sizeBytes").and_then(|x| x.as_i64()))
+    });
+    let format = f
+        .pointer("/metadata/format")
+        .and_then(|x| x.as_str())
+        .or_else(|| f.get("format").and_then(|x| x.as_str()))
+        .map(|s| s.to_string());
+    let file_type = f
+        .get("type")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    CivitaiModelFile {
+        id: f.get("id").and_then(|x| x.as_i64()),
+        name: f
+            .get("name")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        size_kb,
+        size_bytes,
+        file_type,
+        format,
+        primary: f.get("primary").and_then(|p| p.as_bool()).unwrap_or(false),
+        download_url: f
+            .get("downloadUrl")
+            .and_then(|u| u.as_str())
+            .map(|s| s.to_string()),
+    }
+}
+
+fn parse_model_version(ver: &Value, image_limit: usize) -> CivitaiModelVersion {
+    let trained_words = parse_trained_words(ver);
+    let files: Vec<CivitaiModelFile> = ver
+        .get("files")
+        .and_then(|f| f.as_array())
+        .map(|arr| arr.iter().map(parse_model_file).collect())
+        .unwrap_or_default();
+    let mut image_urls = Vec::new();
+    let mut example_prompt = None;
+    if let Some(images) = ver.get("images").and_then(|i| i.as_array()) {
+        for img in images.iter().take(image_limit) {
+            if let Some(u) = img.get("url").and_then(|u| u.as_str()) {
+                image_urls.push(u.to_string());
+                if example_prompt.is_none() {
+                    example_prompt = img
+                        .pointer("/meta/prompt")
+                        .and_then(|p| p.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+        }
+    }
+    CivitaiModelVersion {
+        id: ver.get("id").and_then(|x| x.as_i64()).unwrap_or(0),
+        name: ver
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("untitled")
+            .to_string(),
+        base_model: ver
+            .get("baseModel")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        created_at: ver
+            .get("createdAt")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        trained_words: if trained_words.is_empty() {
+            None
+        } else {
+            Some(trained_words)
+        },
+        files,
+        image_urls: if image_urls.is_empty() {
+            None
+        } else {
+            Some(image_urls)
+        },
+        example_prompt,
+    }
+}
+
+fn pick_primary_file(files: &[CivitaiModelFile]) -> Option<&CivitaiModelFile> {
+    files
+        .iter()
+        .find(|f| f.primary)
+        .or_else(|| files.first())
 }
 
 fn parse_model_card(item: &Value, detailed: bool) -> CivitaiModelCard {
@@ -195,69 +442,58 @@ fn parse_model_card(item: &Value, detailed: bool) -> CivitaiModelCard {
         .pointer("/stats/thumbsUpCount")
         .and_then(|x| x.as_i64());
 
+    let image_limit = if detailed { 12 } else { 1 };
+    let model_versions: Vec<CivitaiModelVersion> = item
+        .get("modelVersions")
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|ver| parse_model_version(ver, image_limit))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Default selection: first version + primary/first file (preserves prior behavior).
     let mut download_url = None;
     let mut version_id = None;
     let mut version_name = None;
+    let mut file_id = None;
+    let mut file_name = None;
+    let mut file_format = None;
     let mut example_prompt = None;
     let mut thumbnail = None;
     let mut base_model = None;
     let mut trained_words: Vec<String> = Vec::new();
     let mut image_urls: Vec<String> = Vec::new();
 
-    if let Some(versions) = item.get("modelVersions").and_then(|m| m.as_array()) {
-        if let Some(ver) = versions.first() {
-            version_id = ver.get("id").and_then(|x| x.as_i64());
-            version_name = ver
-                .get("name")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string());
-            base_model = ver
-                .get("baseModel")
+    if let Some(ver) = model_versions.first() {
+        version_id = Some(ver.id);
+        version_name = Some(ver.name.clone());
+        base_model = ver.base_model.clone().or_else(|| {
+            item.get("baseModels")
+                .and_then(|b| b.as_array())
+                .and_then(|a| a.first())
                 .and_then(|x| x.as_str())
                 .map(|s| s.to_string())
-                .or_else(|| {
-                    item.get("baseModels")
-                        .and_then(|b| b.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|x| x.as_str())
-                        .map(|s| s.to_string())
-                });
-            if let Some(words) = ver.get("trainedWords").and_then(|w| w.as_array()) {
-                for w in words {
-                    if let Some(s) = w.as_str() {
-                        let trimmed = s.trim().trim_end_matches(',');
-                        if !trimmed.is_empty() {
-                            trained_words.push(trimmed.to_string());
-                        }
-                    }
+        });
+        if let Some(words) = ver.trained_words.as_ref() {
+            trained_words = words.clone();
+        }
+        if let Some(file) = pick_primary_file(&ver.files) {
+            download_url = file.download_url.clone();
+            file_id = file.id;
+            file_name = file.name.clone();
+            file_format = file.format.clone().or_else(|| file.file_type.clone());
+        }
+        if let Some(imgs) = ver.image_urls.as_ref() {
+            for u in imgs {
+                if thumbnail.is_none() {
+                    thumbnail = Some(u.clone());
                 }
-            }
-            if let Some(files) = ver.get("files").and_then(|f| f.as_array()) {
-                download_url = files
-                    .iter()
-                    .find(|f| f.get("primary").and_then(|p| p.as_bool()) == Some(true))
-                    .or_else(|| files.first())
-                    .and_then(|f| f.get("downloadUrl"))
-                    .and_then(|u| u.as_str())
-                    .map(|s| s.to_string());
-            }
-            if let Some(images) = ver.get("images").and_then(|i| i.as_array()) {
-                for img in images.iter().take(if detailed { 12 } else { 1 }) {
-                    if let Some(u) = img.get("url").and_then(|u| u.as_str()) {
-                        if thumbnail.is_none() {
-                            thumbnail = Some(u.to_string());
-                        }
-                        image_urls.push(u.to_string());
-                        if example_prompt.is_none() {
-                            example_prompt = img
-                                .pointer("/meta/prompt")
-                                .and_then(|p| p.as_str())
-                                .map(|s| s.to_string());
-                        }
-                    }
-                }
+                image_urls.push(u.clone());
             }
         }
+        example_prompt = ver.example_prompt.clone();
     }
 
     let description = item
@@ -275,12 +511,23 @@ fn parse_model_card(item: &Value, detailed: bool) -> CivitaiModelCard {
         None
     };
 
+    let nsfw = item.get("nsfw").and_then(|x| x.as_bool()).unwrap_or(false)
+        || item
+            .get("nsfwLevel")
+            .and_then(|x| x.as_i64())
+            .map(|n| n > 1)
+            .unwrap_or(false)
+        || crate::prefs::looks_nsfw_label(&name);
+
     CivitaiModelCard {
         id,
         name,
         model_type,
         version_id,
         version_name,
+        file_id,
+        file_name,
+        file_format,
         download_url,
         thumbnail_url: thumbnail,
         example_prompt,
@@ -302,6 +549,8 @@ fn parse_model_card(item: &Value, detailed: bool) -> CivitaiModelCard {
             Some(image_urls)
         },
         civitai_url: Some(format!("https://civitai.com/models/{id}")),
+        nsfw,
+        model_versions,
     }
 }
 
@@ -320,6 +569,9 @@ fn parse_model_detail(item: &Value) -> CivitaiModelDetail {
         model_type: card.model_type,
         version_id: card.version_id,
         version_name: card.version_name,
+        file_id: card.file_id,
+        file_name: card.file_name,
+        file_format: card.file_format,
         download_url: card.download_url,
         thumbnail_url: card.thumbnail_url,
         example_prompt: card.example_prompt,
@@ -333,6 +585,7 @@ fn parse_model_detail(item: &Value) -> CivitaiModelDetail {
         image_urls: card.image_urls,
         civitai_url: card.civitai_url,
         needs_base,
+        model_versions: card.model_versions,
         related: Vec::new(),
     }
 }
@@ -373,6 +626,124 @@ fn urlencoding_lite(s: &str) -> String {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_card_defaults_to_first_version_primary_file() {
+        let item = json!({
+            "id": 42,
+            "name": "Test LoRA",
+            "type": "LORA",
+            "nsfw": false,
+            "creator": { "username": "alice" },
+            "stats": { "downloadCount": 10, "thumbsUpCount": 2 },
+            "modelVersions": [
+                {
+                    "id": 100,
+                    "name": "v1",
+                    "baseModel": "SDXL 1.0",
+                    "createdAt": "2024-01-01T00:00:00.000Z",
+                    "trainedWords": ["trigger"],
+                    "files": [
+                        {
+                            "id": 1,
+                            "name": "model.ckpt",
+                            "sizeKB": 100.0,
+                            "type": "Model",
+                            "metadata": { "format": "PickleTensor" },
+                            "primary": false,
+                            "downloadUrl": "https://civitai.com/api/download/models/1"
+                        },
+                        {
+                            "id": 2,
+                            "name": "model.safetensors",
+                            "sizeKB": 90.0,
+                            "type": "Model",
+                            "metadata": { "format": "SafeTensor" },
+                            "primary": true,
+                            "downloadUrl": "https://civitai.com/api/download/models/2"
+                        }
+                    ],
+                    "images": [{ "url": "https://example.com/a.png", "meta": { "prompt": "hi" } }]
+                },
+                {
+                    "id": 101,
+                    "name": "v2",
+                    "baseModel": "Pony",
+                    "files": [{
+                        "id": 3,
+                        "name": "v2.safetensors",
+                        "primary": true,
+                        "downloadUrl": "https://civitai.com/api/download/models/3"
+                    }]
+                }
+            ]
+        });
+        let card = parse_model_card(&item, true);
+        assert_eq!(card.version_id, Some(100));
+        assert_eq!(card.version_name.as_deref(), Some("v1"));
+        assert_eq!(card.file_id, Some(2));
+        assert_eq!(card.file_name.as_deref(), Some("model.safetensors"));
+        assert_eq!(card.file_format.as_deref(), Some("SafeTensor"));
+        assert_eq!(
+            card.download_url.as_deref(),
+            Some("https://civitai.com/api/download/models/2")
+        );
+        assert_eq!(card.base_model.as_deref(), Some("SDXL 1.0"));
+        assert_eq!(card.model_versions.len(), 2);
+        assert_eq!(card.model_versions[0].files.len(), 2);
+        assert_eq!(card.model_versions[1].base_model.as_deref(), Some("Pony"));
+        let detail = parse_model_detail(&item);
+        assert_eq!(detail.model_versions.len(), 2);
+        assert_eq!(detail.file_id, Some(2));
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CivitaiModelFile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_kb: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<i64>,
+    /// Civitai file `type` (e.g. Model, Pruned Model, Training Data).
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub file_type: Option<String>,
+    /// Format from metadata (SafeTensor, PickleTensor, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub primary: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CivitaiModelVersion {
+    pub id: i64,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trained_words: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<CivitaiModelFile>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_urls: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub example_prompt: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CivitaiModelCard {
@@ -383,6 +754,13 @@ pub struct CivitaiModelCard {
     pub version_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_name: Option<String>,
+    /// Selected file within the default (or chosen) version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub download_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -409,6 +787,12 @@ pub struct CivitaiModelCard {
     pub image_urls: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub civitai_url: Option<String>,
+    /// From Civitai `nsfw` / nsfwLevel — used when Freya NSFW filter is off.
+    #[serde(default)]
+    pub nsfw: bool,
+    /// All versions + file variants (present on search when Civitai returns them; always on detail).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_versions: Vec<CivitaiModelVersion>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -430,6 +814,12 @@ pub struct CivitaiModelDetail {
     pub version_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub download_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -457,6 +847,8 @@ pub struct CivitaiModelDetail {
     /// Human hint when adapters need a compatible checkpoint family.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub needs_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_versions: Vec<CivitaiModelVersion>,
     /// Popular checkpoints for the same baseModel family (best-effort related assets).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub related: Vec<CivitaiModelCard>,

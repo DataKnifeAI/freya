@@ -1,0 +1,29 @@
+[package]
+name = "freya-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Freya MCP server — thin Streamable HTTP proxy over freya-api"
+
+[[bin]]
+name = "freya-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+rmcp = { version = "3.11", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = "0.7"
+tower-http = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+urlencoding = "2"

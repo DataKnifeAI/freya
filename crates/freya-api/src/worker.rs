@@ -85,6 +85,14 @@ impl DiffusionWorkerClient {
         self.list_assets("/v1/checkpoints").await
     }
 
+    pub async fn list_embeddings(&self) -> Result<Vec<LocalAsset>> {
+        self.list_assets("/v1/embeddings").await
+    }
+
+    pub async fn list_vaes(&self) -> Result<Vec<LocalAsset>> {
+        self.list_assets("/v1/vae").await
+    }
+
     async fn list_assets(&self, path: &str) -> Result<Vec<LocalAsset>> {
         let resp = self
             .apply_auth(self.http.get(format!("{}{path}", self.base)))
@@ -121,6 +129,24 @@ impl DiffusionWorkerClient {
                         .map(str::to_string),
                     name: a
                         .get("name")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string),
+                    size_bytes: a
+                        .get("sizeBytes")
+                        .and_then(|x| x.as_u64())
+                        .or_else(|| a.get("sizeBytes").and_then(|x| x.as_i64()).map(|n| n as u64)),
+                    model_type: a
+                        .get("modelType")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string),
+                    version_id: a.get("versionId").and_then(|x| x.as_i64()),
+                    model_id: a.get("modelId").and_then(|x| x.as_i64()),
+                    source: a
+                        .get("source")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string),
+                    thumbnail_url: a
+                        .get("thumbnailUrl")
                         .and_then(|x| x.as_str())
                         .map(str::to_string),
                 });
@@ -218,18 +244,71 @@ impl DiffusionWorkerClient {
             .context("decode worker image")
     }
 
-    pub async fn install_asset(
+    /// Local multi-frame GIF via Diffusers engine (`POST /v1/videos/generations` format=gif).
+    pub async fn generate_gif(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        size: Option<&str>,
+        seed: Option<i64>,
+        negative: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let mut body = serde_json::json!({
+            "prompt": prompt,
+            "format": "gif",
+            "frames": 6,
+        });
+        if let Some(m) = model {
+            body["model"] = Value::String(m.into());
+        }
+        if let Some(s) = size {
+            body["size"] = Value::String(s.into());
+        }
+        if let Some(seed) = seed {
+            body["seed"] = Value::from(seed);
+        }
+        if let Some(neg) = negative {
+            body["negative_prompt"] = Value::String(neg.into());
+        }
+        let resp = self
+            .apply_auth(
+                self.http
+                    .post(format!("{}/v1/videos/generations", self.base))
+                    .json(&body),
+            )
+            .send()
+            .await
+            .context("worker gif generate")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("worker gif {status}: {text}"));
+        }
+        let v: Value = serde_json::from_str(&text)?;
+        let b64 = v
+            .pointer("/data/0/b64_json")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("worker gif missing b64_json"))?;
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .context("decode worker gif")
+    }
+
+    fn install_body(
         &self,
         source: &str,
         url: &str,
         dest_path: &str,
         auth_token: Option<&str>,
         meta: Option<&InstallMeta>,
-    ) -> Result<()> {
+        r#async: bool,
+    ) -> Value {
         let mut body = serde_json::json!({
             "source": source,
             "url": url,
             "destPath": dest_path,
+            "async": r#async,
         });
         if let Some(t) = auth_token.map(str::trim).filter(|t| !t.is_empty()) {
             body["authToken"] = Value::String(t.into());
@@ -244,10 +323,29 @@ impl DiffusionWorkerClient {
             if let Some(v) = m.version_id {
                 body["versionId"] = Value::from(v);
             }
+            if let Some(mid) = m.model_id {
+                body["modelId"] = Value::from(mid);
+            }
             if let Some(t) = m.model_type.as_deref().filter(|s| !s.is_empty()) {
                 body["modelType"] = Value::String(t.into());
             }
+            if let Some(thumb) = m.thumbnail_url.as_deref().filter(|s| !s.is_empty()) {
+                body["thumbnailUrl"] = Value::String(thumb.into());
+            }
         }
+        body
+    }
+
+    /// Synchronous install (blocks until complete). Prefer `enqueue_install` for UI/agent.
+    pub async fn install_asset(
+        &self,
+        source: &str,
+        url: &str,
+        dest_path: &str,
+        auth_token: Option<&str>,
+        meta: Option<&InstallMeta>,
+    ) -> Result<()> {
+        let body = self.install_body(source, url, dest_path, auth_token, meta, false);
         let resp = self
             .apply_auth(
                 self.http
@@ -263,6 +361,122 @@ impl DiffusionWorkerClient {
         }
         Ok(())
     }
+
+    /// Enqueue a background install job; returns worker JSON (`jobId`, `status`, `job`, …).
+    pub async fn enqueue_install(
+        &self,
+        source: &str,
+        url: &str,
+        dest_path: &str,
+        auth_token: Option<&str>,
+        meta: Option<&InstallMeta>,
+    ) -> Result<Value> {
+        let body = self.install_body(source, url, dest_path, auth_token, meta, true);
+        let resp = self
+            .apply_auth(
+                self.http
+                    .post(format!("{}/v1/assets/jobs", self.base))
+                    .json(&body),
+            )
+            .send()
+            .await
+            .context("worker enqueue install")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("enqueue failed: {text}"));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    pub async fn list_install_jobs(&self) -> Result<Value> {
+        let resp = self
+            .apply_auth(self.http.get(format!("{}/v1/assets/jobs", self.base)))
+            .send()
+            .await
+            .context("list install jobs")?;
+        if !resp.status().is_success() {
+            let t = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("list jobs failed: {t}"));
+        }
+        Ok(resp.json().await.unwrap_or(Value::Null))
+    }
+
+    pub async fn get_install_job(&self, id: &str) -> Result<Value> {
+        let resp = self
+            .apply_auth(
+                self.http
+                    .get(format!("{}/v1/assets/jobs/{}", self.base, id)),
+            )
+            .send()
+            .await
+            .context("get install job")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 404 {
+            return Err(anyhow!("job not found"));
+        }
+        if !status.is_success() {
+            return Err(anyhow!("get job failed: {text}"));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    pub async fn cancel_install_job(&self, id: &str) -> Result<Value> {
+        let resp = self
+            .apply_auth(
+                self.http
+                    .post(format!("{}/v1/assets/jobs/{}/cancel", self.base, id)),
+            )
+            .send()
+            .await
+            .context("cancel install job")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("cancel failed: {text}"));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    /// Clear finished install jobs on the worker (succeeded/failed/cancelled).
+    pub async fn clear_install_jobs(&self, include_queued: bool) -> Result<Value> {
+        let body = serde_json::json!({ "includeQueued": include_queued });
+        let resp = self
+            .apply_auth(
+                self.http
+                    .post(format!("{}/v1/assets/jobs/clear", self.base))
+                    .json(&body),
+            )
+            .send()
+            .await
+            .context("clear install jobs")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("clear jobs failed: {text}"));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    pub async fn delete_asset(&self, path: &str) -> Result<Value> {
+        let body = serde_json::json!({ "path": path });
+        let resp = self
+            .apply_auth(
+                self.http
+                    .delete(format!("{}/v1/assets", self.base))
+                    .json(&body),
+            )
+            .send()
+            .await
+            .context("delete asset")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("delete failed: {text}"));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -270,7 +484,9 @@ pub struct InstallMeta {
     pub name: Option<String>,
     pub base_model: Option<String>,
     pub version_id: Option<i64>,
+    pub model_id: Option<i64>,
     pub model_type: Option<String>,
+    pub thumbnail_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -293,4 +509,16 @@ pub struct LocalAsset {
     pub base_model: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub model_type: Option<String>,
+    #[serde(default)]
+    pub version_id: Option<i64>,
+    #[serde(default)]
+    pub model_id: Option<i64>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
 }

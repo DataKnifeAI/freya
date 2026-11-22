@@ -1,0 +1,21 @@
+# Fast image packaging from host `cargo build --release` binaries (kind/dev).
+# Prefer the multi-stage Dockerfile for CI/prod builds.
+# Build context must include target/release/* and packs/ (see Makefile kind-bin-*).
+
+FROM gcr.io/distroless/cc-debian12:nonroot AS operator
+COPY target/release/freya-operator /usr/local/bin/freya-operator
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/freya-operator"]
+
+FROM gcr.io/distroless/cc-debian12:nonroot AS api
+COPY target/release/freya-api /usr/local/bin/freya-api
+COPY packs /packs
+USER nonroot:nonroot
+ENV FREYA_PACKS_DIR=/packs
+ENTRYPOINT ["/usr/local/bin/freya-api"]
+
+FROM gcr.io/distroless/cc-debian12:nonroot AS mcp
+COPY target/release/freya-mcp /usr/local/bin/freya-mcp
+USER nonroot:nonroot
+ENV FREYA_MCP_BIND=0.0.0.0:8090
+ENTRYPOINT ["/usr/local/bin/freya-mcp"]

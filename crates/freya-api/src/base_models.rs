@@ -16,7 +16,7 @@ pub fn suggest_hf_model(base_model: &str) -> Option<&'static str> {
             "stabilityai/stable-diffusion-xl-base-1.0"
         }
         "sdxl turbo" | "sdxl-turbo" => "stabilityai/sdxl-turbo",
-        "pony" | "pony diffusion" => "checkpoints/ponyDiffusionV6XL.safetensors",
+        "pony" | "pony diffusion" => "checkpoints/pony-diffusion-v6-xl.safetensors",
         "illustrious" => "checkpoints/illustrious.safetensors",
         "flux" | "flux.1 d" | "flux.1 s" | "flux1" => "black-forest-labs/FLUX.1-dev",
         "noobai" => "checkpoints/noobai.safetensors",
@@ -62,7 +62,7 @@ pub fn catalog() -> Vec<Value> {
         ),
         entry(
             "Pony",
-            "checkpoints/ponyDiffusionV6XL.safetensors",
+            "checkpoints/pony-diffusion-v6-xl.safetensors",
             "SDXL-family; install a Pony checkpoint under checkpoints/",
         ),
         entry(
@@ -99,6 +99,52 @@ pub fn resolve_model_from_loras(loras: &[LoraBaseHint]) -> Option<String> {
         }
     }
     None
+}
+
+/// True when `model` is a local checkpoint path the Diffusers worker can load as a file
+/// (not an OpenRouter Auto sentinel, cloud id, or router prose).
+///
+/// Local generate must never pass strings like `"None, letting Freya use Auto default
+/// (ZDR-aware)."` or `black-forest-labs/flux…` when the user picked Auto — those become
+/// invalid HF repo ids. Prefer the worker active base instead.
+pub fn is_usable_local_model(model: &str) -> bool {
+    let m = model.trim();
+    if m.is_empty() {
+        return false;
+    }
+    // Auto / cloud sentinels and router prose (spaces, commas, parentheses).
+    if crate::router::is_auto_image(m) {
+        return false;
+    }
+    if m.contains(char::is_whitespace) || m.contains(',') || m.contains('(') {
+        return false;
+    }
+    let lower = m.to_ascii_lowercase();
+    if lower == "none"
+        || lower.starts_with("none,")
+        || lower.contains("zdr-aware")
+        || lower.contains("letting freya")
+        || lower.contains("auto default")
+    {
+        return false;
+    }
+    // Checkpoint file / relative path under models PVC.
+    if m.ends_with(".safetensors")
+        || m.starts_with("checkpoints/")
+        || m.starts_with("models/")
+        || (m.starts_with('/') && m.contains(".safetensors"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Keep only a local-usable checkpoint ref; otherwise `None` (worker active base).
+pub fn filter_local_model(model: Option<&str>) -> Option<String> {
+    model
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && is_usable_local_model(s))
+        .map(str::to_string)
 }
 
 #[derive(Debug, Clone)]
@@ -140,5 +186,27 @@ mod tests {
         assert!(resolve_model_from_loras(&hints)
             .unwrap()
             .contains("pony"));
+    }
+
+    #[test]
+    fn local_model_rejects_auto_prose_and_cloud() {
+        assert!(is_usable_local_model(
+            "checkpoints/pony-diffusion-v6-xl.safetensors"
+        ));
+        assert!(is_usable_local_model("checkpoints/foo.safetensors"));
+        assert!(!is_usable_local_model("auto"));
+        assert!(!is_usable_local_model("openrouter/auto"));
+        assert!(!is_usable_local_model(
+            "None, letting Freya use Auto default (ZDR-aware)."
+        ));
+        assert!(!is_usable_local_model(
+            "black-forest-labs/flux.2-klein-4b"
+        ));
+        assert!(!is_usable_local_model("google/gemini-2.5-flash-image"));
+        assert!(filter_local_model(Some("auto")).is_none());
+        assert!(filter_local_model(Some(
+            "checkpoints/pony-diffusion-v6-xl.safetensors"
+        ))
+        .is_some());
     }
 }

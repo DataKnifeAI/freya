@@ -12,3 +12,11 @@ swarmui/bin/
 .git/
 .env
 .env.*
+target/
+web/node_modules/
+web/dist/
+data/
+legacy/
+*.png
+*.md
+.github/

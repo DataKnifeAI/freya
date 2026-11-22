@@ -2,6 +2,9 @@ import { isMockMode, mockApi } from "./mockApi.js";
 
 export { isMockMode };
 
+/** Fired when a live API call returns 401 — UI should show Sign in. */
+export const AUTH_REQUIRED_EVENT = "freya:auth-required";
+
 function apiAuthHeaders() {
   const token =
     (typeof import.meta !== "undefined" && import.meta.env?.VITE_FREYA_API_TOKEN) ||
@@ -9,6 +12,14 @@ function apiAuthHeaders() {
     "";
   if (!token) return {};
   return { Authorization: `Bearer ${token}` };
+}
+
+export function hasBrowserBearer() {
+  const token =
+    (typeof import.meta !== "undefined" && import.meta.env?.VITE_FREYA_API_TOKEN) ||
+    (typeof localStorage !== "undefined" && localStorage.getItem("freya.apiToken")) ||
+    "";
+  return Boolean(String(token || "").trim());
 }
 
 export async function api(path, opts) {
@@ -38,6 +49,18 @@ export async function api(path, opts) {
   }
 
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || res.statusText);
+  if (!res.ok) {
+    if (res.status === 401) {
+      if (typeof window !== "undefined") {
+        window.dispatchEvent(
+          new CustomEvent(AUTH_REQUIRED_EVENT, {
+            detail: { path, message: data.error || "Unauthorized" },
+          }),
+        );
+      }
+      throw new Error("Unauthorized (401) — Sign in with admin username and password.");
+    }
+    throw new Error(data.error || res.statusText || `HTTP ${res.status}`);
+  }
   return data;
 }
