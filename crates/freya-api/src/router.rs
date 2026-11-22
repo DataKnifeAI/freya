@@ -492,91 +492,86 @@ fn contains_any(hay: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| hay.contains(n))
 }
 
+fn has_word(lower: &str, word: &str) -> bool {
+    lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|t| t == word)
+}
+
+fn trim_punct(lower: &str) -> &str {
+    lower
+        .trim()
+        .trim_matches(|c: char| matches!(c, '?' | '!' | '.' | '"' | '\'' | '“' | '”' | '«' | '»'))
+}
+
+/// Comma-tag soup or an explicit `<lora:>` prompt. A character name is not this.
 fn looks_like_tag_prompt(lower: &str) -> bool {
     if lower.contains("<lora:") || lower.contains("<lyco:") || lower.contains("(lora:") {
         return true;
     }
+    if lower.contains('?') {
+        return false;
+    }
     let commas = lower.matches(',').count();
-    commas >= 3 && !lower.contains('?')
+    if commas < 4 {
+        return false;
+    }
+    let words = lower.split_whitespace().count();
+    words >= 6 && commas * 2 >= words
 }
 
-fn visual_cue_count(lower: &str) -> usize {
-    const CUES: &[&str] = &[
-        "cartoon",
-        "meme",
-        "illustration",
-        "illustrated",
-        "painting",
-        "portrait",
-        "sketch",
-        "artwork",
-        "comic",
-        "anime",
-        "watercolor",
-        "oil painting",
-        "background",
-        "lighting",
-        "wearing",
-        "standing",
-        "sitting",
-        "close-up",
-        "close up",
-        "wide shot",
-        "cinematic",
-        "linework",
-        "line art",
-        "landscape",
-        "sunset",
-        "moonlight",
-        "waterfall",
-        "armor",
-        "wings",
-        "cowboy",
-        "outline",
-        "studio light",
-        "digital art",
-        "concept art",
-        "photograph",
-        "in the style",
-        "masterpiece",
-        "highly detailed",
-        "1girl",
-        "1boy",
-        "photo of",
-        "picture of",
-        "image of",
-        "drawing of",
-        "shot of",
+/// Whole message is "do that again", not a sentence that happens to say again.
+fn is_whole_message_redo(lower: &str) -> bool {
+    matches!(
+        trim_punct(lower),
+        "again"
+            | "do it again"
+            | "do that again"
+            | "another"
+            | "another one"
+            | "another image"
+            | "another picture"
+            | "one more"
+            | "once more"
+            | "regenerate"
+            | "redo"
+            | "same again"
+            | "generate"
+            | "generate it"
+            | "generate this"
+            | "generate again"
+            | "make it"
+            | "draw it"
+            | "draw this"
+            | "render it"
+    )
+}
+
+/// Obvious "help me decide". Not every question, and not a look they want seen.
+fn obvious_guidance(lower: &str) -> bool {
+    const HOLDS: &[&str] = &[
+        "don't generate",
+        "dont generate",
+        "do not generate",
+        "don't draw",
+        "do not draw",
+        "before we generate",
+        "before generating",
+        "not yet",
     ];
-    CUES.iter().filter(|c| lower.contains(*c)).count()
-}
-
-/// Questions, how-it-works, and LoRA/model clarification — not a prompt to render.
-pub fn message_is_chat_not_media(message: &str) -> bool {
-    let lower = message.trim().to_lowercase();
-    if lower.is_empty() {
-        return false;
+    if contains_any(lower, HOLDS) {
+        return true;
     }
-    if looks_like_tag_prompt(&lower) && !lower.trim_end().ends_with('?') {
-        return false;
-    }
-    const PHRASES: &[&str] = &[
+    const ADVICE: &[&str] = &[
         "how does",
         "how do ",
+        "how do i",
         "how can ",
         "how would ",
-        "what is ",
-        "what are ",
-        "what was ",
-        "what's ",
-        "whats ",
-        "why does",
-        "why is ",
-        "why do ",
-        "explain ",
-        "tell me how",
-        "tell me about",
-        "tell me what",
+        "how to prompt",
+        "how should i",
+        "what should i",
+        "what should we",
         "which lora",
         "what lora",
         "which model",
@@ -585,136 +580,74 @@ pub fn message_is_chat_not_media(message: &str) -> bool {
         "what checkpoint",
         "which base",
         "what base",
-        "clarify",
-        "before we generate",
-        "before generating",
-        "don't generate",
-        "do not generate",
-        "not yet",
-        "how it works",
-        "how this works",
-        "what should i",
+        "which style",
+        "what style",
         "should i use",
         "can you explain",
         "could you explain",
         "help me understand",
+        "help me decide",
+        "help me choose",
+        "help me pick",
         "search civitai",
         "find a lora",
         "find loras",
         "suggest idea",
         "brainstorm",
-        "list lora",
-        "list checkpoint",
-        "worker status",
+        "any ideas",
+        "any assets",
+        "which assets",
+        "would help",
+        "models that",
+        "you able",
+        "are you able",
+        "did we ",
+        "did you ",
+        "have we ",
+        "have you ",
+        "was that generated",
+        "using the lora?",
     ];
-    if contains_any(&lower, PHRASES) {
-        return true;
-    }
-    let words: Vec<&str> = lower.split_whitespace().collect();
-    let first = words.first().copied().unwrap_or("");
-    if matches!(
-        first,
-        "who" | "what" | "why" | "how" | "when" | "where" | "which" | "whose"
-    ) && !(first == "how" && words.get(1) == Some(&"about"))
-        && (lower.trim_end().ends_with('?') || words.len() < 14)
-    {
-        return true;
-    }
-    if words.len() < 24
-        && (lower.starts_with("can you ")
-            || lower.starts_with("could you ")
-            || lower.starts_with("would you ")
-            || lower.starts_with("please explain"))
-    {
-        let imperative = contains_any(
-            &lower,
-            &[
-                "draw",
-                "generat",
-                "illustrat",
-                "render",
-                "paint",
-                "video",
-                "gif",
-                "animat",
-                "picture",
-                "image",
-            ],
-        );
-        if !imperative {
-            return true;
-        }
-    }
-    false
+    contains_any(lower, ADVICE)
 }
 
-fn looks_like_prose_scene(lower: &str) -> bool {
-    let stripped = lower
-        .trim()
-        .trim_matches(|c: char| matches!(c, '"' | '\'' | '“' | '”' | '«' | '»'));
-    if stripped.contains('?') {
-        return false;
-    }
-    let words: Vec<&str> = stripped.split_whitespace().collect();
-    if words.len() < 6 {
-        return false;
-    }
-    let cues = visual_cue_count(stripped);
-    if cues >= 2 && words.len() >= 6 {
-        return true;
-    }
-    if cues >= 1 && words.len() >= 8 {
-        return true;
-    }
-    let starts_scene = stripped.starts_with("a ")
-        || stripped.starts_with("an ")
-        || stripped.starts_with("prompt:")
-        || stripped.starts_with("\"")
-        || stripped.starts_with("“");
-    starts_scene && words.len() >= 10 && (stripped.contains(',') || stripped.contains(" with "))
-}
-
-/// Classify a message as media to produce, without requiring the word "generate".
-pub fn direct_media_ask(message: &str) -> DirectMedia {
-    let lower = message.trim().to_lowercase();
-    if lower.is_empty() || message_is_chat_not_media(message) {
-        return DirectMedia::None;
-    }
-    let has_gif_token = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|t| t == "gif")
+/// Obvious motion request. The bare words "video" or "gif" are not enough.
+fn obvious_motion(lower: &str) -> Option<DirectMedia> {
+    let gif = lower.contains("gif of")
+        || lower.contains("make a gif")
+        || lower.contains("animated gif")
         || lower.contains(".gif")
-        || lower.contains("animated gif");
-    if has_gif_token
         || lower.contains("looping animation")
-        || lower.contains("animated meme")
-        || lower.contains("short animation")
         || lower.contains("animate as gif")
-    {
-        return DirectMedia::Gif;
+        || (has_word(lower, "gif") && (lower.contains("make ") || lower.contains("generate ")));
+    if gif {
+        return Some(DirectMedia::Gif);
     }
     const VIDEO: &[&str] = &[
-        "video",
-        "t2v",
-        "i2v",
         "text-to-video",
         "image-to-video",
         "text to video",
         "image to video",
+        "make a video",
         "make a clip",
-        "generate a clip",
-        "motion clip",
-        "animate this into",
+        "video of",
+        "short video",
+        "animate this",
         "short clip",
-        "wan 2",
-        "ltx video",
-        "mp4",
-        "webm",
     ];
-    if contains_any(&lower, VIDEO)
-        || (lower.contains("animat") && !lower.contains("still") && !has_gif_token)
-    {
-        return DirectMedia::Video;
+    if contains_any(lower, VIDEO) {
+        Some(DirectMedia::Video)
+    } else {
+        None
+    }
+}
+
+fn obvious_series(lower: &str) -> bool {
+    if lower.contains('?') {
+        return false;
+    }
+    if contains_any(lower, &["run session", "run a session"]) {
+        return true;
     }
     const SERIES: &[&str] = &[
         "series of",
@@ -726,41 +659,70 @@ pub fn direct_media_ask(message: &str) -> DirectMedia {
         "storyboard",
         "sequence of images",
         "sequence of pictures",
-        "several versions",
-        "a few versions",
-        "a few images",
-        "a few pictures",
-        "several images",
-        "several pictures",
-        "variations",
-        "run session",
-        "run a session",
-        "batch of",
     ];
-    if contains_any(&lower, SERIES) {
+    if !contains_any(lower, SERIES) {
+        return false;
+    }
+    // A bare "series of illustrations…" is a description, not a request to render.
+    has_word(lower, "generate")
+        || has_word(lower, "draw")
+        || has_word(lower, "render")
+        || has_word(lower, "paint")
+        || lower.contains("make ")
+}
+
+/// Obvious "render this now". A character name or a visual noun is not enough.
+fn obvious_still(lower: &str) -> bool {
+    if is_whole_message_redo(lower)
+        || looks_like_tag_prompt(lower)
+        || lower.trim().starts_with("prompt:")
+    {
+        return true;
+    }
+    const PHRASES: &[&str] = &[
+        "draw me",
+        "draw a ",
+        "draw an ",
+        "draw the ",
+        "make an image",
+        "make a picture",
+        "make me an image",
+        "make me a picture",
+        "make the image",
+        "make the picture",
+        "generate an image",
+        "generate a picture",
+        "generate the image",
+        "generate this",
+        "render a ",
+        "render an ",
+        "paint a ",
+        "paint an ",
+        "paint me ",
+    ];
+    contains_any(lower, PHRASES)
+}
+
+/// No request to render yet. Bare scenes and ambiguous turns are chat,
+/// even when the route model called them picture.
+pub fn message_is_chat_not_media(message: &str) -> bool {
+    let lower = message.trim().to_lowercase();
+    !lower.is_empty() && direct_media_ask(message) == DirectMedia::None
+}
+
+/// Obvious render only. A scene, outfit, or character name is not a render.
+pub fn direct_media_ask(message: &str) -> DirectMedia {
+    let lower = message.trim().to_lowercase();
+    if lower.is_empty() || obvious_guidance(&lower) {
+        return DirectMedia::None;
+    }
+    if let Some(kind) = obvious_motion(&lower) {
+        return kind;
+    }
+    if obvious_series(&lower) {
         return DirectMedia::Series;
     }
-    const PICTURE: &[&str] = &[
-        "generate",
-        "make an image",
-        "make me an image",
-        "create an image",
-        "make a picture",
-        "create a picture",
-        "draw ",
-        "draw me",
-        "render ",
-        "paint ",
-        "produce an image",
-        "still image",
-        "illustration",
-        "generate this",
-        "image prompt",
-    ];
-    if contains_any(&lower, PICTURE) || lower.starts_with("prompt:") {
-        return DirectMedia::Picture;
-    }
-    if looks_like_tag_prompt(&lower) || looks_like_prose_scene(&lower) {
+    if obvious_still(&lower) {
         return DirectMedia::Picture;
     }
     DirectMedia::None
@@ -775,7 +737,8 @@ fn modality_for_ask(ask: DirectMedia) -> Option<Modality> {
     }
 }
 
-/// Force picture/gif/video when the text is a prompt, and chat when it is a question.
+/// Override the route model: an obvious render becomes that modality.
+/// Anything else, including a visual description, stays chat.
 pub fn coerce_route_to_media_ask(
     mut decision: RouteDecision,
     message: &str,
@@ -796,8 +759,7 @@ pub fn coerce_route_to_media_ask(
                     fallbacks,
                 ));
             }
-            decision.reason =
-                "Chat: question, how-it-works, or LoRA/character clarification.".into();
+            decision.reason = "Guidance: they want help deciding, not a picture yet.".into();
             if !decision.source.contains("chat-guard") {
                 decision.source = format!("{}+chat-guard", decision.source);
             }
@@ -807,12 +769,8 @@ pub fn coerce_route_to_media_ask(
     if decision.modality != modality {
         decision.modality = modality;
         decision.reason = match ask {
-            DirectMedia::Series => {
-                "Visual series prompt — stills, without requiring the word generate.".into()
-            }
-            DirectMedia::Picture => {
-                "Pasted or described still — picture, without requiring the word generate.".into()
-            }
+            DirectMedia::Series => "Asked to render a series of stills now.".into(),
+            DirectMedia::Picture => "Asked to render a still now.".into(),
             DirectMedia::Gif => "GIF / looping animation wording.".into(),
             DirectMedia::Video => "Video / motion wording.".into(),
             DirectMedia::None => decision.reason,
@@ -887,7 +845,7 @@ pub fn infer_modality_prefs(
         },
         DirectMedia::Picture => RouteDecision {
             modality: Modality::Picture,
-            reason: "Heuristic: still prompt (scene, meme, illustration, or quoted prompt).".into(),
+            reason: "Heuristic: asked to render a still now.".into(),
             agent_model: None,
             image_model: Some(resolve_auto_fallback(
                 AutoFallbackKind::Image,
@@ -899,7 +857,7 @@ pub fn infer_modality_prefs(
         },
         DirectMedia::Series => RouteDecision {
             modality: Modality::Picture,
-            reason: "Heuristic: series of stills.".into(),
+            reason: "Heuristic: asked for a series of stills.".into(),
             agent_model: None,
             image_model: Some(resolve_auto_fallback(
                 AutoFallbackKind::Image,
@@ -1124,28 +1082,27 @@ mod tests {
     }
 
     #[test]
-    fn pasted_scene_is_picture_without_generate() {
-        let d = infer_modality(
-            "A cartoon meme of a grumpy cat in a cowboy hat, thick outlines, flat yellow background",
-        );
-        assert_eq!(d.modality, Modality::Picture);
-        assert_eq!(
-            direct_media_ask(
-                "A cartoon meme of a grumpy cat in a cowboy hat, thick outlines, flat yellow background"
-            ),
-            DirectMedia::Picture
-        );
+    fn pasted_scene_without_render_stays_chat() {
+        let scene =
+            "A cartoon meme of a grumpy cat in a cowboy hat, thick outlines, flat yellow background";
+        let d = infer_modality(scene);
+        assert_eq!(d.modality, Modality::Chat);
+        assert_eq!(direct_media_ask(scene), DirectMedia::None);
     }
 
     #[test]
-    fn series_and_questions_stay_distinct() {
+    fn series_of_stills_is_picture() {
         assert_eq!(
             direct_media_ask("a series of illustrations of a lighthouse in a storm"),
-            DirectMedia::Series
+            DirectMedia::None
         );
         assert_eq!(
             infer_modality("a series of illustrations of a lighthouse in a storm").modality,
-            Modality::Picture
+            Modality::Chat
+        );
+        assert_eq!(
+            direct_media_ask("make a series of illustrations of a lighthouse in a storm"),
+            DirectMedia::Series
         );
         assert_eq!(
             infer_modality("how does flux work?").modality,
@@ -1158,7 +1115,32 @@ mod tests {
     }
 
     #[test]
-    fn coerce_overrides_chat_router_for_visual_prompt() {
+    fn advice_stays_chat_until_they_ask_to_render() {
+        let chat_turns = [
+            "you able to make an image of Frankie Foster?",
+            "did we generate an image of Frankie Foster using the lora?",
+            "Frankie Foster in cozy winter layers, a chunky cream knit sweater, plaid scarf, and beanie over her red hair, holding a coffee cup in a snowy front yard with the foster home behind her.",
+            "I want to create some placeholder image for this Freya app, any assets \\ models that would help?",
+            "how should I prompt Frankie Foster for a night out, and which LoRA?",
+        ];
+        for turn in chat_turns {
+            assert_eq!(infer_modality(turn).modality, Modality::Chat, "{turn}");
+            assert_eq!(direct_media_ask(turn), DirectMedia::None, "{turn}");
+        }
+        for turn in [
+            "generate",
+            "again",
+            "draw this",
+            "make it",
+            "make the picture",
+            "can you draw me a cat?",
+        ] {
+            assert_eq!(infer_modality(turn).modality, Modality::Picture, "{turn}");
+        }
+    }
+
+    #[test]
+    fn coerce_keeps_chat_for_a_visual_description() {
         let chat = RouteDecision {
             modality: Modality::Chat,
             reason: "ambiguous".into(),
@@ -1166,15 +1148,60 @@ mod tests {
             image_model: None,
             source: "router".into(),
         };
-        let d = coerce_route_to_media_ask(
-            chat,
+        let described = coerce_route_to_media_ask(
+            chat.clone(),
             "An illustration of a red bicycle in the rain, wet street, cinematic lighting",
             &PrivacyPrefs::default(),
             &AlignmentPrefs::default(),
             &AutoFallbacksPrefs::default(),
         );
-        assert_eq!(d.modality, Modality::Picture);
-        assert!(d.image_model.is_some());
+        assert_eq!(described.modality, Modality::Chat);
+        assert!(described.image_model.is_none());
+
+        let wanted = coerce_route_to_media_ask(
+            RouteDecision {
+                modality: Modality::Picture,
+                reason: "this is the scene they want seen".into(),
+                agent_model: None,
+                image_model: Some("google/gemini-2.5-flash-image".into()),
+                source: "router".into(),
+            },
+            "An illustration of a red bicycle in the rain, wet street, cinematic lighting",
+            &PrivacyPrefs::default(),
+            &AlignmentPrefs::default(),
+            &AutoFallbacksPrefs::default(),
+        );
+        assert_eq!(wanted.modality, Modality::Chat);
+        assert!(wanted.image_model.is_none());
+        assert!(wanted.source.contains("chat-guard"));
+
+        let eager = RouteDecision {
+            modality: Modality::Picture,
+            reason: "scene".into(),
+            agent_model: None,
+            image_model: Some("google/gemini-2.5-flash-image".into()),
+            source: "router".into(),
+        };
+        let guarded = coerce_route_to_media_ask(
+            eager,
+            "did we generate an image of Frankie Foster using the lora?",
+            &PrivacyPrefs::default(),
+            &AlignmentPrefs::default(),
+            &AutoFallbacksPrefs::default(),
+        );
+        assert_eq!(guarded.modality, Modality::Chat);
+        assert!(guarded.image_model.is_none());
+        assert!(guarded.source.contains("chat-guard"));
+
+        let drawn = coerce_route_to_media_ask(
+            chat,
+            "draw this",
+            &PrivacyPrefs::default(),
+            &AlignmentPrefs::default(),
+            &AutoFallbacksPrefs::default(),
+        );
+        assert_eq!(drawn.modality, Modality::Picture);
+        assert!(drawn.image_model.is_some());
     }
 
     #[test]
