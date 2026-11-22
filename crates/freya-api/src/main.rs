@@ -1,3 +1,4 @@
+mod auto_matrix;
 mod base_models;
 mod civitai;
 mod config;
