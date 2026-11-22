@@ -4,6 +4,7 @@ mod gallery;
 mod openrouter;
 mod routes;
 mod state;
+mod studio;
 mod styles;
 mod worker;
 
@@ -47,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
     let protected = Router::new()
         .route("/v1/assist", post(routes::assist))
         .route("/v1/generate", post(routes::generate))
+        .route("/v1/series", post(routes::generate_series))
         .route("/v1/run", post(routes::run))
         .route("/v1/gallery", get(routes::gallery_list))
         .route("/v1/gallery/{id}", get(routes::gallery_get))
@@ -60,6 +62,31 @@ async fn main() -> anyhow::Result<()> {
             "/v1/settings",
             get(routes::settings_get).put(routes::settings_put),
         )
+        .route(
+            "/v1/studio",
+            get(routes::studio_get).put(routes::studio_put),
+        )
+        .route("/v1/metrics/openrouter", get(routes::openrouter_metrics))
+        .route("/v1/auth/token", post(routes::auth_token_create))
+        .route("/v1/worker/stats", get(routes::worker_stats))
+        .route("/v1/worker/start", post(routes::worker_start))
+        .route("/v1/worker/stop", post(routes::worker_stop))
+        .route("/v1/worker/enable", post(routes::worker_enable))
+        .route("/v1/worker/disable", post(routes::worker_disable))
+        .route("/v1/worker/installed", get(routes::worker_installed))
+        .route("/v1/worker/loras", get(routes::worker_loras))
+        .route("/v1/worker/checkpoints", get(routes::worker_checkpoints))
+        .route("/v1/worker/embeddings", get(routes::worker_embeddings))
+        .route("/v1/worker/vae", get(routes::worker_vaes))
+        .route(
+            "/v1/worker/assets",
+            axum::routing::delete(routes::worker_asset_delete),
+        )
+        .route(
+            "/v1/worker/base-model",
+            get(routes::worker_base_model_get).put(routes::worker_base_model_put),
+        )
+        .route("/v1/base-models", get(routes::base_models_catalog))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_api_token,

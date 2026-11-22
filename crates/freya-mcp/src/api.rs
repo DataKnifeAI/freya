@@ -55,17 +55,16 @@ impl FreyaApiClient {
         self.request(Method::PUT, path, Some(body.clone())).await
     }
 
+    pub async fn delete_json(&self, path: &str, body: &Value) -> Result<Value> {
+        self.request(Method::DELETE, path, Some(body.clone())).await
+    }
+
     async fn request(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value> {
         let url = format!("{}{}", self.base, path);
         self.request_url(method, &url, body).await
     }
 
-    async fn request_url(
-        &self,
-        method: Method,
-        url: &str,
-        body: Option<Value>,
-    ) -> Result<Value> {
+    async fn request_url(&self, method: Method, url: &str, body: Option<Value>) -> Result<Value> {
         let mut req = self.http.request(method.clone(), url);
         if !self.token.is_empty() {
             req = req.header(AUTHORIZATION, format!("Bearer {}", self.token));
@@ -76,7 +75,10 @@ impl FreyaApiClient {
         if let Some(b) = body {
             req = req.json(&b);
         }
-        let resp = req.send().await.with_context(|| format!("{method} {url}"))?;
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("{method} {url}"))?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if status == StatusCode::UNAUTHORIZED {

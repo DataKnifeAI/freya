@@ -616,6 +616,58 @@ function readStoredModels() {
   return { agentModel: "openrouter/auto", imageModel: "auto" };
 }
 
+function artifactExt(item, src) {
+  const named = String(item?.filename || "");
+  const fromName = named.match(/\.([a-z0-9]{2,5})$/i);
+  if (fromName) return fromName[1].toLowerCase();
+  const m = String(artifactMime(item) || "").toLowerCase();
+  if (m.includes("webp")) return "webp";
+  if (m.includes("gif")) return "gif";
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("webm")) return "webm";
+  if (m.includes("mp4") || m.includes("video")) return "mp4";
+  if (m.includes("png")) return "png";
+  const s = String(src || "").toLowerCase();
+  if (s.includes(".webp")) return "webp";
+  if (s.includes(".gif")) return "gif";
+  if (s.includes(".mp4")) return "mp4";
+  if (s.includes(".webm")) return "webm";
+  if (isVideoArtifact(item)) return "mp4";
+  if (isGifArtifact(item)) return "gif";
+  return "png";
+}
+
+function artifactFilename(item, src) {
+  const existing = String(item?.filename || "");
+  if (existing && !existing.includes("/") && !existing.includes("\\")) return existing;
+  const id =
+    String(item?.id || item?.artifactId || "image")
+      .replace(/[^a-z0-9-]/gi, "")
+      .slice(0, 8) || "image";
+  const slug = String(item?.prompt || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+  return `${slug ? `freya-${slug}-${id}` : `freya-${id}`}.${artifactExt(item, src)}`;
+}
+
+/** Save the gallery/artifact bytes. Does not open a tab. */
+async function downloadArtifact(src, item) {
+  const filename = artifactFilename(item, src);
+  const res = await fetch(src);
+  if (!res.ok) throw new Error(`Download failed (${res.status})`);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
 function installableLoras(loras = []) {
   return (loras || []).filter((l) => l.downloadUrl);
 }
@@ -695,6 +747,32 @@ const IconChevron = () => (
     <path d="m6 9 6 6 6-6" />
   </Svg>
 );
+const IconTrash = () => (
+  <Svg>
+    <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6" />
+    <path d="M10 11v6M14 11v6" />
+  </Svg>
+);
+function MediaDownload({ src, item, className, onError }) {
+  if (!src) return null;
+  return (
+    <button
+      type="button"
+      className={className || "ghost icon-btn"}
+      title="Download"
+      aria-label="Download file"
+      onClick={(e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        downloadArtifact(src, item).catch((err) =>
+          onError?.(err?.message || "Download failed"),
+        );
+      }}
+    >
+      <IconDownload />
+    </button>
+  );
+}
 const IconSessions = () => (
   <Svg>
     <rect x="3" y="4" width="18" height="16" rx="2" />
@@ -1032,16 +1110,237 @@ export default function App() {
       const items = s.items || [];
       setStyles(items);
       setSettings(st);
-      setWorkerUrl(st.diffusionWorkerUrl || "");
-      setGallery(g.items || []);
-      const featured = items[0]?.examplePrompt;
-      if (featured) {
-        setCivitaiQ((prev) =>
-          !prev.trim() || prev === BEGINNER_CIVITAI_QUERY ? demoCivitaiQuery(featured) : prev,
-        );
+      applyPrivacyAlignmentFromSettings(st);
+      applyInstructionsFromSettings(st);
+      if (typeof st.chatModel === "string" && st.chatModel.trim()) {
+        setAgentModel(st.chatModel.trim());
       }
+      if (typeof st.imageModel === "string" && st.imageModel.trim()) {
+        setImageModel(st.imageModel.trim());
+      }
+      if (typeof st.routerModel === "string" && st.routerModel.trim()) {
+        setRouterModel(st.routerModel.trim());
+      }
+      persistModels(
+        st.chatModel || agentModel,
+        st.imageModel || imageModel,
+        st.routerModel || routerModel,
+        st.studio?.videoModel || videoModel,
+      );
+      applyStudioFromSettings(st);
+      {
+        const ep = parseWorkerEndpoint(st.diffusionWorkerUrl || "");
+        setWorkerHost(ep.host);
+        setWorkerPort(ep.port);
+        setWorkerUrlOverride(ep.advancedUrl);
+        setUseWorkerUrlOverride(ep.useAdvanced);
+      }
+      setGallery(g.items || []);
+      setError("");
+      setAuthCta("");
     } catch (e) {
       setError(e.message);
+    }
+    await refreshModels();
+  };
+
+  const submitLogin = async (e) => {
+    e?.preventDefault?.();
+    setLoginBusy(true);
+    setLoginError("");
+    try {
+      const res = await api("/v1/auth/login", {
+        method: "POST",
+        body: JSON.stringify({ username: loginUser, password: loginPass }),
+      });
+      const tok = res.token || "";
+      localStorage.setItem("freya.apiToken", tok);
+      setStudioToken(tok);
+      setLoginPass("");
+      setShowLogin(false);
+      setAuthCta("");
+      setSavedMsg(res.note || "Signed in.");
+      if (!readGuidelinesAck()) setGuidelinesAcked(false);
+      await refresh();
+    } catch (err) {
+      setLoginError(err.message || "Sign-in failed");
+    } finally {
+      setLoginBusy(false);
+    }
+  };
+
+  const acceptGuidelines = () => {
+    persistGuidelinesAck();
+    setGuidelinesAcked(true);
+    // No sticky status under the prompt — Guidelines tab still shows “Acknowledged”.
+  };
+
+  const signOut = () => {
+    localStorage.removeItem("freya.apiToken");
+    setStudioToken("");
+    setModelsCatalogReady(false);
+    setAgentModels(PLACEHOLDER_AGENT_MODELS);
+    setImageModels(PLACEHOLDER_IMAGE_MODELS);
+    setRouterModels(PLACEHOLDER_ROUTER_MODELS);
+    setShowLogin(true);
+    setAuthCta(AUTH_SIGN_IN_HINT);
+    setSavedMsg("Signed out.");
+  };
+
+  const isFavorite = (item) =>
+    favorites.some((f) => loraKey(f) === loraKey(item));
+
+  const toggleFavorite = (item) => {
+    setFavorites((prev) => {
+      const key = loraKey(item);
+      const exists = prev.some((f) => loraKey(f) === key);
+      const civitaiId = resolveCivitaiModelId(item);
+      const next = exists
+        ? prev.filter((f) => loraKey(f) !== key)
+        : [
+            {
+              id: civitaiId ?? item.id,
+              modelId: civitaiId ?? item.modelId ?? null,
+              versionId: item.versionId ?? null,
+              name: item.name,
+              modelType: item.modelType,
+              downloadUrl: item.downloadUrl,
+              thumbnailUrl: item.thumbnailUrl,
+              triggerWord: item.triggerWord || item.trainedWords?.[0],
+              baseModel: item.baseModel,
+              civitaiUrl:
+                item.civitaiUrl ||
+                (civitaiId ? `https://civitai.com/models/${civitaiId}` : null),
+              trainedWords: item.trainedWords,
+            },
+            ...prev,
+          ].slice(0, 200);
+      writeFavorites(next);
+      void persistStudio({ favorites: next });
+      return next;
+    });
+  };
+
+  const closeCivitaiDetail = () => {
+    setCivitaiDetail(null);
+    setDetailImageIdx(0);
+  };
+
+  const selectCivitaiVariant = (versionId, fileId) => {
+    setCivitaiDetail((prev) => {
+      if (!prev?.model) return prev;
+      const next = applyCivitaiVariant(prev.model, versionId, fileId);
+      return { ...prev, model: next };
+    });
+    setDetailImageIdx(0);
+  };
+
+  const openCivitaiDetail = async (item) => {
+    if (!item?.id && !item?.name && !item?.path) return;
+    setCivitaiDetailBusy(true);
+    setDetailImageIdx(0);
+    let civitaiId = resolveCivitaiModelId(item);
+    const versionId = item.versionId != null && item.versionId !== "" ? item.versionId : null;
+    const canFetch = Boolean(settings?.civitaiConfigured);
+    const willFetch = canFetch && (civitaiId != null || versionId != null);
+    const thumbHint = pickCivitaiThumb(
+      { ...item, modelId: civitaiId ?? item.modelId, versionId },
+      favorites,
+    );
+    const initial = applyCivitaiVariant(
+      {
+        ...item,
+        modelId: civitaiId ?? item.modelId,
+        thumbnailUrl: thumbHint || item.thumbnailUrl,
+        localAsset: Boolean(item.path) && !willFetch,
+      },
+      item.versionId,
+      item.fileId,
+    );
+    setCivitaiDetail({
+      model: initial,
+      related: [],
+      loading: willFetch,
+      localOnly: !willFetch && Boolean(item.path),
+    });
+    try {
+      if (willFetch) {
+        let data;
+        if (civitaiId != null) {
+          data = await api(`/v1/civitai/models/${civitaiId}`);
+        } else {
+          // Installed sidecars often have versionId but null modelId — resolve via version.
+          data = await api(`/v1/civitai/model-versions/${versionId}`);
+        }
+        // Accept nested { model, related } or a flat detail payload.
+        const model = data.model || data;
+        const related = Array.isArray(data.related)
+          ? data.related
+          : Array.isArray(model.related)
+            ? model.related
+            : [];
+        const resolvedId = model.id ?? model.modelId ?? civitaiId;
+        if (resolvedId != null) civitaiId = resolvedId;
+        const merged = applyCivitaiVariant(
+          {
+            ...item,
+            ...model,
+            modelId: civitaiId,
+            id: civitaiId ?? model.id ?? item.id,
+            path: item.path || model.path,
+            thumbnailUrl:
+              model.thumbnailUrl ||
+              model.imageUrls?.[0] ||
+              thumbHint ||
+              item.thumbnailUrl,
+          },
+          item.versionId ?? model.versionId,
+          item.fileId ?? model.fileId,
+        );
+        const resolvedThumb = merged.thumbnailUrl || merged.imageUrls?.[0] || null;
+        rememberCivitaiThumb(
+          { modelId: civitaiId, versionId: merged.versionId ?? versionId },
+          resolvedThumb,
+        );
+        if (item.path && resolvedThumb) {
+          setInstalledAssets((prev) =>
+            prev.map((a) =>
+              a.path === item.path
+                ? {
+                    ...a,
+                    thumbnailUrl: a.thumbnailUrl || resolvedThumb,
+                    modelId: a.modelId ?? civitaiId ?? null,
+                    imageUrls: a.imageUrls?.length ? a.imageUrls : merged.imageUrls,
+                  }
+                : a,
+            ),
+          );
+        }
+        setCivitaiDetail({
+          model: merged,
+          related,
+          loading: false,
+          localOnly: false,
+        });
+      } else {
+        setCivitaiDetail({
+          model: initial,
+          related: item.related || [],
+          loading: false,
+          localOnly: Boolean(item.path) && civitaiId == null,
+        });
+      }
+    } catch (e) {
+      // Keep the list/suggest card usable if detail fetch misses (e.g. mock catalog vs live id).
+      setCivitaiDetail({
+        model: initial,
+        related: [],
+        loading: false,
+        localOnly: Boolean(item.path),
+        error: item?.name ? null : e.message,
+      });
+    } finally {
+      setCivitaiDetailBusy(false);
     }
   };
 
@@ -1060,6 +1359,85 @@ export default function App() {
     }
   };
 
+  const persistRouterToApi = async (id) => {
+    if (mock) return;
+    try {
+      const st = await api("/v1/settings", {
+        method: "PUT",
+        body: JSON.stringify({ routerModel: id }),
+      });
+      // API flattens SettingsPublic + persisted
+      setSettings(st);
+    } catch {
+      /* offline / unauth — localStorage still holds the pick */
+    }
+  };
+
+  const persistModelPins = async (patch) => {
+    if (mock) return;
+    try {
+      const st = await api("/v1/settings", {
+        method: "PUT",
+        body: JSON.stringify(patch),
+      });
+      setSettings(st);
+    } catch {
+      /* localStorage still holds the pick */
+    }
+  };
+
+  const persistStudio = async (patch) => {
+    if (mock) return;
+    try {
+      await api("/v1/studio", {
+        method: "PUT",
+        body: JSON.stringify(patch),
+      });
+    } catch {
+      /* local state still applies */
+    }
+  };
+
+  const applyStudioFromSettings = (st) => {
+    const s = st?.studio;
+    if (!s || typeof s !== "object") return;
+    if (Array.isArray(s.favorites)) {
+      if (s.favorites.length) {
+        setFavorites(s.favorites);
+        writeFavorites(s.favorites);
+      } else {
+        const local = readFavorites();
+        if (local.length) void persistStudio({ favorites: local });
+      }
+    }
+    if (Array.isArray(s.pinnedLoras) && s.pinnedLoras.length) {
+      setSession((prev) => ({
+        ...prev,
+        pinnedLoras: s.pinnedLoras.filter(isPinnableAsset),
+      }));
+    } else if (Array.isArray(s.pinnedLoras)) {
+      const localPins = (session.pinnedLoras || []).filter(isPinnableAsset);
+      if (localPins.length) void persistStudio({ pinnedLoras: localPins });
+    }
+    if (s.generateBackend === "local" || s.generateBackend === "cloud") {
+      setGenerateBackend(s.generateBackend);
+      persistGenerateBackend(s.generateBackend);
+    }
+    if (typeof s.videoModel === "string" && s.videoModel.trim()) {
+      const video = s.videoModel.trim();
+      setVideoModel(video);
+      persistModels(agentModel, imageModel, routerModel, video);
+    }
+    if (s.automationMode === "plan" || s.automationMode === "auto" || s.automationMode === "yolo") {
+      setAutomationMode(s.automationMode);
+      try {
+        localStorage.setItem(AUTOMATION_STORAGE_KEY, s.automationMode);
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+
   const setMode = (mode) => {
     if (!AUTOMATION_MODES.includes(mode)) return;
     setAutomationMode(mode);
@@ -1068,19 +1446,55 @@ export default function App() {
     } catch {
       /* ignore */
     }
+    void persistStudio({ automationMode: mode });
   };
 
   const changeAgentModel = (id) => {
     setAgentModel(id);
-    persistModels(id, imageModel);
+    persistModels(id, imageModel, routerModel, videoModel);
+    void persistModelPins({ chatModel: id });
   };
 
   const changeImageModel = (id) => {
     setImageModel(id);
-    persistModels(agentModel, id);
+    persistModels(agentModel, id, routerModel, videoModel);
+    void persistModelPins({ imageModel: id });
   };
 
-  const hasWorker = () => Boolean(settings?.diffusionWorkerUrl || workerUrl.trim());
+  const changeVideoModel = (id) => {
+    if (!modelsCatalogReady && id === AUTO_VIDEO.id) return;
+    setVideoModel(id);
+    persistModels(agentModel, imageModel, routerModel, id);
+    void persistStudio({ videoModel: id });
+  };
+
+  const changeRouterModel = (id) => {
+    if (!modelsCatalogReady && id === AUTO_ROUTER.id) return;
+    setRouterModel(id);
+    persistModels(agentModel, imageModel, id, videoModel);
+    void persistRouterToApi(id);
+  };
+
+  const composedWorkerUrl = () =>
+    useWorkerUrlOverride
+      ? workerUrlOverride.trim()
+      : composeWorkerUrl(workerHost, workerPort);
+  // Prefer persisted URL so default placeholders do not fake a configured worker.
+  const hasWorker = () => Boolean(settings?.diffusionWorkerUrl);
+  const workerReachable = Boolean(workerStats?.reachable);
+  const localBackendOk = hasWorker() && workerReachable;
+  const localBackendReason = !hasWorker()
+    ? "Set a worker URL on the Worker tab first"
+    : !workerReachable
+      ? "Worker URL set but unreachable"
+      : "";
+  const changeGenerateBackend = (next) => {
+    if (next === "local" && !localBackendOk) return;
+    setGenerateBackend(next);
+    persistGenerateBackend(next);
+    void persistStudio({ generateBackend: next });
+    if (menuOpen === "gen-bundle") setMenuOpen(null);
+  };
   const canAutoInstall = () => Boolean(settings?.civitaiConfigured && hasWorker());
   const canCloudGenerate = () => Boolean(settings?.openRouterConfigured);
 
@@ -1104,9 +1518,14 @@ export default function App() {
         triggerWord: item.triggerWord || null,
         scale: 0.8,
       };
+      const baseHint = item.baseModel
+        ? ` Needs base family “${item.baseModel}” on the local worker (Worker → active base / install checkpoint).`
+        : "";
+      const pinnedLoras = [...(prev.pinnedLoras || []).filter(isPinnableAsset), next];
+      void persistStudio({ pinnedLoras });
       return {
         ...prev,
-        pinnedLoras: [...(prev.pinnedLoras || []), next],
+        pinnedLoras,
         sessionNote: item.triggerWord
           ? `Pinned “${item.name}”. Trigger word “${item.triggerWord}” is optional — Freya keeps your prompt as you wrote it.`
           : `Pinned “${item.name}” for this session. Your prompt stays as you wrote it.`,
@@ -1116,10 +1535,11 @@ export default function App() {
   };
 
   const unpinLora = (item) => {
-    setSession((prev) => ({
-      ...prev,
-      pinnedLoras: (prev.pinnedLoras || []).filter((p) => loraKey(p) !== loraKey(item)),
-    }));
+    setSession((prev) => {
+      const pinnedLoras = (prev.pinnedLoras || []).filter((p) => loraKey(p) !== loraKey(item));
+      void persistStudio({ pinnedLoras });
+      return { ...prev, pinnedLoras };
+    });
   };
 
   const pushTurn = (text, artifactIds = []) => {
@@ -1131,6 +1551,318 @@ export default function App() {
         12,
       ),
     }));
+  };
+
+  const appendMessages = (...msgs) => {
+    setSession((prev) => ({
+      ...prev,
+      messages: [...(prev.messages || []), ...msgs].slice(-40),
+    }));
+  };
+
+  const applyChatResponse = (data, userText) => {
+    const actions = Array.isArray(data.actions) ? data.actions : [];
+    const artifacts = Array.isArray(data.artifacts)
+      ? data.artifacts.filter((a) => a && (a.artifactId || a.url))
+      : [];
+    const artifactIds = artifacts.map((a) => a.artifactId).filter(Boolean);
+    const ideasNext = Array.isArray(data.ideas) ? data.ideas : [];
+    const lorasNext = Array.isArray(data.loras) ? data.loras : [];
+    const query = data.civitaiQuery || "";
+
+    if (ideasNext.length) setIdeas(ideasNext);
+    if (lorasNext.length) setSuggestedLoras(lorasNext);
+    if (query) {
+      setCivitaiQuery(query);
+      setCivitaiQ(query);
+    }
+
+    if (artifacts.length) {
+      setBatchResults(artifacts.length > 1 ? artifacts : []);
+      setResult(artifacts[0]);
+      setModelBrief(artifacts[0]?.enhancedPrompt || "");
+    }
+
+    const proposed = actions.filter((a) => a.status === "proposed");
+    if (data.pendingConfirmation && proposed.length) {
+      setPendingPlan({
+        status: automationMode === "plan" ? "plan" : "auto",
+        goal: userText,
+        actions: proposed,
+        batchPrompts: proposed
+          .filter((a) => a.type === "generate_image" || a.type === "run_session")
+          .map((a) => a.args?.prompt || a.args?.goal)
+          .filter(Boolean),
+        pendingInstalls: proposed
+          .filter((a) => a.type === "install_asset")
+          .map((a) => ({
+            name: a.args?.name,
+            downloadUrl: a.args?.downloadUrl,
+            destPath: a.args?.destPath,
+          })),
+        steps: proposed.map((a) => ({
+          kind: a.type,
+          note: a.args?.prompt || a.args?.query || a.args?.goal || a.type,
+        })),
+        civitaiQuery: query,
+        sessionNote: data.reply || "",
+      });
+    } else {
+      setPendingPlan(null);
+    }
+
+    if (data.question) {
+      setPendingQuestion({
+        kind: data.question.kind || "tool",
+        text: data.question.text || "Freya needs a decision before continuing.",
+        choices: data.question.choices || [
+          { id: "confirm", label: "Confirm & run", value: "confirm" },
+          { id: "skip", label: "Skip tools", value: "skip" },
+        ],
+      });
+    } else if (!data.pendingConfirmation) {
+      setPendingQuestion(null);
+    }
+
+    const toolLines = actions
+      .filter((a) => a.status === "executed" || a.status === "error" || a.status === "proposed")
+      .map((a) => {
+        if (a.status === "proposed") return `Proposed: ${a.type}`;
+        if (a.status === "error") return `${a.type} failed: ${a.error || "error"}`;
+        if (a.type === "generate_image") return `Generated image`;
+        if (a.type === "run_session")
+          return `Generated ${(a.result?.results || []).length || "a"} variation(s)`;
+        if (a.type === "search_civitai")
+          return `Searched Civitai for “${a.result?.query || a.args?.query || "…"}”`;
+        if (a.type === "suggest_ideas")
+          return `Suggested ${(a.result?.ideas || []).length || "some"} ideas`;
+        if (a.type === "install_asset") {
+          // Queued downloads are signaled by the Downloads label color cycle — no status line.
+          if (a.result?.jobId) return null;
+          return `Installed “${a.args?.name || "asset"}”`;
+        }
+        if (a.type === "worker_status")
+          return `Worker ${
+            a.result?.reachable
+              ? "reachable"
+              : a.result?.workerConfigured || a.result?.workerEnabled
+                ? "unreachable"
+                : "not configured"
+          }`;
+        if (a.type === "list_checkpoints")
+          return `Listed ${(a.result?.checkpoints || []).length || 0} checkpoint(s)`;
+        if (a.type === "get_base_model")
+          return `Active base: ${a.result?.model || "—"}${
+            a.result?.baseModel ? ` (${a.result.baseModel})` : ""
+          }`;
+        if (a.type === "set_base_model")
+          return `Set active base to ${a.result?.model || a.args?.model || "—"}`;
+        if (a.type === "generate_video") return `Generated ${a.result?.modality || "video"}`;
+        if (a.type === "gallery_list")
+          return `Gallery: ${(a.result?.items || []).length || 0} item(s)`;
+        if (a.type === "gallery_get") return `Gallery item ${a.result?.id || a.args?.id || "—"}`;
+        if (a.type === "list_styles")
+          return `Listed ${(a.result?.items || []).length || 0} style(s)`;
+        if (a.type === "apply_style")
+          return `Style ${a.result?.displayName || a.args?.styleRef || "—"}`;
+        if (a.type === "list_models") return `Listed models`;
+        if (a.type === "get_settings") return `Read settings`;
+        if (a.type === "get_route_defaults") return `Route defaults`;
+        if (a.type === "set_chat_models")
+          return `Saved models (image=${a.result?.imageModel || a.args?.imageModel || "—"})`;
+        if (a.type === "openrouter_metrics") return `OpenRouter metrics`;
+        return `${a.type}: ${a.status}`;
+      })
+      .filter(Boolean);
+    if (toolLines.length) setSessionLog(toolLines);
+
+    for (const a of actions) {
+      if (a.status !== "executed") continue;
+      if (
+        (a.type === "favorite_asset" || a.type === "unfavorite_asset" || a.type === "list_favorites") &&
+        Array.isArray(a.result?.favorites)
+      ) {
+        setFavorites(a.result.favorites);
+        writeFavorites(a.result.favorites);
+      }
+      if (
+        (a.type === "pin_lora" || a.type === "unpin_lora" || a.type === "list_pins") &&
+        Array.isArray(a.result?.pinnedLoras)
+      ) {
+        const pins = a.result.pinnedLoras.filter(isPinnableAsset);
+        setSession((prev) => ({ ...prev, pinnedLoras: pins }));
+      }
+      if (a.type === "set_generate_backend" && (a.result?.backend === "local" || a.result?.backend === "cloud")) {
+        setGenerateBackend(a.result.backend);
+        persistGenerateBackend(a.result.backend);
+      }
+      if (
+        a.type === "set_automation_mode" &&
+        ["plan", "auto", "yolo"].includes(a.result?.automationMode)
+      ) {
+        setAutomationMode(a.result.automationMode);
+        try {
+          localStorage.setItem(AUTOMATION_STORAGE_KEY, a.result.automationMode);
+        } catch {
+          /* ignore */
+        }
+      }
+      if (a.type === "set_chat_models") {
+        const chat = a.result?.chatModel;
+        const image = a.result?.imageModel;
+        const routerM = a.result?.routerModel;
+        const video = a.result?.studio?.videoModel;
+        if (typeof chat === "string" && chat) setAgentModel(chat);
+        if (typeof image === "string" && image) setImageModel(image);
+        if (typeof routerM === "string" && routerM) setRouterModel(routerM);
+        if (typeof video === "string" && video) setVideoModel(video);
+        persistModels(chat || agentModel, image || imageModel, routerM || routerModel, video || videoModel);
+        setSettings((prev) => ({ ...(prev || {}), ...a.result }));
+      }
+      if (a.type === "set_privacy" || a.type === "set_alignment" || a.type === "set_cost_tier") {
+        applyPrivacyAlignmentFromSettings(a.result);
+        setSettings((prev) => ({ ...(prev || {}), ...a.result }));
+      }
+      if (a.type === "set_base_model" && a.result?.model) setActiveBasePath(a.result.model);
+      if (a.type === "gallery_delete" && a.result?.id) {
+        const id = a.result.id;
+        setGallery((prev) => prev.filter((g) => g.id !== id && g.artifactId !== id));
+        setBatchResults((prev) => prev.filter((r) => r.artifactId !== id));
+        setResult((prev) => (prev?.artifactId === id ? null : prev));
+      }
+    }
+
+    const zdrErr = actions.find(
+      (a) =>
+        a.status === "error" &&
+        (a.type === "generate_image" || a.type === "generate_video") &&
+        /zdr|zero data retention|data-policy|data policy|no endpoints matching/i.test(
+          String(a.error || ""),
+        ),
+    );
+    if (zdrErr?.error) {
+      setError(
+        `${zdrErr.error} — Freya Settings → Privacy (Zero Data Retention), or https://openrouter.ai/settings/privacy`,
+      );
+    }
+
+    const route = data.route || null;
+    const routeContext = data.routeContext || null;
+    const resolvedModels = data.resolvedModels || null;
+    const genBackend =
+      artifacts.find((a) => a?.backend)?.backend ||
+      actions.find(
+        (a) =>
+          (a.type === "generate_image" || a.type === "generate_video") &&
+          a.status === "executed" &&
+          a.result?.backend,
+      )?.result?.backend ||
+      null;
+    const at = new Date().toISOString();
+    appendMessages({
+      role: "assistant",
+      content: data.reply || (artifacts.length ? "Done." : "…"),
+      at,
+      actions,
+      artifactIds,
+      ideas: ideasNext,
+      loras: lorasNext,
+      route,
+      routeContext,
+      resolvedModels,
+      genBackend: genBackend || routeContext?.backend || null,
+    });
+
+    if (artifactIds.length) {
+      setSession((prev) => ({
+        ...prev,
+        goal: prev.goal || userText,
+        turns: [
+          { prompt: userText, at, artifactIds },
+          ...(prev.turns || []),
+        ].slice(0, 12),
+      }));
+    }
+
+    return artifacts;
+  };
+
+  const chatBody = (message, extra = {}) => {
+    const body = {
+      message,
+      automationMode,
+      backend: generateBackend === "local" ? "local" : "openrouter",
+      messages: (session.messages || []).slice(-8).map((m) => ({
+        role: m.role,
+        content: m.content,
+      })),
+      session: {
+        goal: session.goal || message,
+        pinnedLoras: session.pinnedLoras,
+        recentPrompts: (session.turns || []).slice(0, 5).map((t) => t.prompt),
+      },
+      loras: pinnedPayload(),
+      ...extra,
+    };
+    body.videoModel = videoModel || AUTO_VIDEO.id;
+    if (agentModel && agentModel !== AUTO_AGENT.id) body.model = agentModel;
+    if (
+      generateBackend !== "local" &&
+      imageModel &&
+      imageModel !== AUTO_IMAGE.id
+    ) {
+      body.imageModel = imageModel;
+    }
+    return body;
+  };
+
+  /** Primary composer action — send a chat message; tools run per Plan/Auto/YOLO. */
+  const submitChat = async (overrideText, extra = {}) => {
+    const text = (overrideText ?? prompt).trim();
+    if (!text && !extra.confirm) return;
+    if (generateBackend === "local" && !localBackendOk) {
+      setError(localBackendReason || "Local worker unavailable");
+      return;
+    }
+    const sessionId = activeIdRef.current;
+    const userText = text || session.goal || examplePrompt;
+    setBusy(true);
+    setError("");
+    setSavedMsg("");
+    try {
+      if (!extra.confirm) {
+        const at = new Date().toISOString();
+        appendMessages({ role: "user", content: userText, at });
+        setSession((prev) => ({ ...prev, goal: prev.goal || userText }));
+        setPrompt("");
+      }
+      const data = await api("/v1/chat", {
+        method: "POST",
+        body: JSON.stringify(chatBody(userText, extra)),
+      });
+      if (activeIdRef.current !== sessionId) return;
+      applyChatResponse(data, userText);
+      const g = await api("/v1/gallery");
+      if (activeIdRef.current !== sessionId) return;
+      setGallery(g.items || []);
+    } catch (e) {
+      if (activeIdRef.current === sessionId) setError(e.message);
+    } finally {
+      if (activeIdRef.current === sessionId) setBusy(false);
+    }
+  };
+
+  /** Same generate path as asking in chat — uses the turn's prompt, not a retype. */
+  const runGenerateOffer = async (offer) => {
+    if (!offer?.prompt) return;
+    const type = offer.type || "generate_image";
+    const action =
+      type === "run_session"
+        ? { type, args: { goal: offer.prompt } }
+        : type === "generate_video"
+          ? { type, args: { prompt: offer.prompt, modality: offer.modality || "video" } }
+          : { type: "generate_image", args: { prompt: offer.prompt, batch: false } };
+    await submitChat(offer.prompt, { confirm: true, actions: [action] });
   };
 
   const runBody = (nlPrompt) => {
@@ -1861,9 +2593,84 @@ export default function App() {
                     </span>
                   )}
                 </div>
-                <button type="button" className="t-prompt" onClick={() => setPrompt(t.prompt)}>
-                  {t.prompt}
-                </button>
+                <p className="t-bubble">{m.content}</p>
+                {m.role !== "user" &&
+                  (() => {
+                    const offer = generateOfferForTurn(conversation, i);
+                    if (!offer) return null;
+                    return (
+                      <div className="t-generate-row">
+                        <button
+                          type="button"
+                          className="primary t-generate"
+                          disabled={busy}
+                          onClick={() => runGenerateOffer(offer)}
+                        >
+                          Generate
+                        </button>
+                      </div>
+                    );
+                  })()}
+                {Array.isArray(m.actions) && m.actions.length > 0 && (
+                  <ul className="t-tools">
+                    {m.actions.map((a, ai) => (
+                      <li key={`${a.type}-${ai}`} className={`t-tool t-tool-${a.status || "done"}`}>
+                        <span className="t-tool-type">{a.type}</span>
+                        <span className="t-tool-status">{a.status || "done"}</span>
+                        {a.status === "error" && a.error ? ` — ${a.error}` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {m.artifactIds?.length > 0 && (
+                  <div className="t-thumbs">
+                    {m.artifactIds.map((id) => {
+                      const art =
+                        batchResults.find((r) => r.artifactId === id) ||
+                        (result?.artifactId === id ? result : null) ||
+                        gallery.find((g) => g.id === id);
+                      const src = art?.url || (art ? gallerySrc(art) : `/v1/gallery/${id}/image`);
+                      const file = art || { id, artifactId: id };
+                      return (
+                        <div className="t-thumb-wrap" key={id}>
+                          <button
+                            type="button"
+                            className="t-thumb"
+                            onClick={() => {
+                              if (art) selectGalleryPreview(art);
+                            }}
+                          >
+                            {isVideoArtifact(art) ? (
+                              <video src={src} muted playsInline preload="metadata" />
+                            ) : (
+                              <img src={src} alt="" />
+                            )}
+                          </button>
+                          <MediaDownload
+                            src={src}
+                            item={file}
+                            className="ghost icon-btn t-thumb-dl"
+                            onError={setError}
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {Array.isArray(m.ideas) && m.ideas.length > 0 && (
+                  <div className="idea-chips">
+                    {m.ideas.map((idea) => (
+                      <button
+                        key={idea}
+                        type="button"
+                        className="idea-chip"
+                        onClick={() => setPrompt(idea)}
+                      >
+                        {idea}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </article>
             ))}
 
@@ -2435,6 +3242,28 @@ export default function App() {
                   if (r.prompt) setPrompt(r.prompt);
                 }}
               >
+                {r.url ? (
+                  <MediaDownload
+                    src={r.url}
+                    item={r}
+                    className="ghost icon-btn salon-work-dl"
+                    onError={setError}
+                  />
+                ) : null}
+                {r.artifactId ? (
+                  <button
+                    type="button"
+                    className="ghost salon-work-del"
+                    title="Delete from gallery"
+                    aria-label="Delete variation"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      deleteGalleryItem(r.artifactId);
+                    }}
+                  >
+                    <IconTrash />
+                  </button>
+                ) : null}
                 <figure>
                   <img src={r.url} alt={r.prompt || "variation"} />
                   <figcaption>
@@ -2468,6 +3297,38 @@ export default function App() {
                 {result.model ? ` · ${result.model}` : ""}
                 {mock ? " · mock" : ""}
               </span>
+              {previewResult.artifactId && (
+                <div className="salon-actions">
+                  <MediaDownload
+                    src={previewResult.url}
+                    item={previewResult}
+                    className="ghost icon-btn"
+                    onError={setError}
+                  />
+                  <button
+                    type="button"
+                    className="ghost remix-btn"
+                    onClick={async () => {
+                      const remix = await api(
+                        `/v1/gallery/${previewResult.artifactId}/remix`,
+                        { method: "POST" },
+                      );
+                      setPrompt(remix.prompt || "");
+                    }}
+                  >
+                    Remix this prompt
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost remix-btn salon-del-btn"
+                    title="Delete from gallery"
+                    onClick={() => deleteGalleryItem(previewResult.artifactId)}
+                  >
+                    <IconTrash />
+                    Delete
+                  </button>
+                </div>
+              )}
             </figcaption>
           </figure>
           {modelBrief && (
@@ -2596,6 +3457,24 @@ export default function App() {
                   setTab("gallery");
                 }}
               >
+                <MediaDownload
+                  src={gallerySrc(g)}
+                  item={g}
+                  className="ghost icon-btn salon-work-dl"
+                  onError={setError}
+                />
+                <button
+                  type="button"
+                  className="ghost salon-work-del"
+                  title="Delete from gallery"
+                  aria-label={`Delete ${(g.prompt || "generation").slice(0, 40)}`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    deleteGalleryItem(g.id);
+                  }}
+                >
+                  <IconTrash />
+                </button>
                 <figure>
                   <img src={gallerySrc(g)} alt={g.prompt} />
                   <figcaption>

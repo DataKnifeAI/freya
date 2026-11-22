@@ -29,6 +29,324 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+/// Proxy worker GPU/runtime stats; enrich VRAM from host `nvidia-smi` when worker returns null.
+pub async fn worker_stats(State(state): State<AppState>) -> impl IntoResponse {
+    let (enabled, url, container, unit) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.worker_enabled,
+            cfg.diffusion_worker_url.clone(),
+            cfg.worker_container.clone(),
+            cfg.worker_systemd_unit.clone(),
+        )
+    };
+    let runtime = crate::worker_ctl::detect(&container, &unit).await;
+    let mut worker_payload = Value::Null;
+    let mut reachable = false;
+    if enabled {
+        let w = state.worker.read().await;
+        if let Some(c) = w.as_ref() {
+            if let Some(detail) = c.stats_detail().await {
+                reachable = true;
+                worker_payload = detail;
+            }
+        }
+    } else if let Some(url) = url.as_ref() {
+        // Still probe reachability for the panel when disabled (URL kept, client detached).
+        let probe = crate::worker::DiffusionWorkerClient::new_with_tls(
+            url.clone(),
+            state.config.read().await.worker_tls_insecure,
+        )
+        .with_token(state.config.read().await.worker_token.clone());
+        if let Some(detail) = probe.stats_detail().await {
+            reachable = true;
+            worker_payload = detail;
+        }
+    }
+
+    let mut vram = worker_payload.get("vram").cloned().unwrap_or(Value::Null);
+    let mut host = worker_payload.get("host").cloned().unwrap_or(Value::Null);
+    if vram.is_null() {
+        let host_vram = crate::gpu::collect_host_vram().await;
+        if !host_vram.is_null() {
+            vram = host_vram;
+            if host.is_null() {
+                host = json!({
+                    "hostname": crate::gpu::hostname_string(),
+                    "source": "host-nvidia-smi",
+                });
+            }
+        }
+    }
+
+    let gallery_dir = state.config.read().await.gallery_dir.clone();
+    let gallery_disk = crate::disk::collect_path_disk(&gallery_dir);
+    let models_disk = worker_payload.get("disk").cloned().unwrap_or(Value::Null);
+
+    Json(json!({
+        "ok": true,
+        "enabled": enabled,
+        "configured": url.is_some(),
+        "url": url,
+        "reachable": reachable,
+        "runtime": runtime.to_json(),
+        "vram": vram,
+        "host": host,
+        "loras": worker_payload.get("loras").cloned().unwrap_or(Value::Null),
+        "checkpoints": worker_payload.get("checkpoints").cloned().unwrap_or(Value::Null),
+        "uptimeSec": worker_payload.get("uptimeSec").cloned().unwrap_or(Value::Null),
+        "modelLoaded": worker_payload.get("modelLoaded").cloned().unwrap_or(Value::Null),
+        "modelsDir": worker_payload.get("modelsDir").cloned().unwrap_or(Value::Null),
+        "modelsDirHost": worker_payload.get("modelsDirHost").cloned().unwrap_or(Value::Null),
+        "engine": worker_payload.get("engine").cloned().unwrap_or(Value::Null),
+        "vramBehavior": worker_payload
+            .get("vramBehavior")
+            .cloned()
+            .unwrap_or(Value::Null),
+        "layout": worker_payload.get("layout").cloned().unwrap_or(Value::Null),
+        "storage": {
+            "gallery": gallery_disk,
+            "models": models_disk,
+        },
+        "worker": worker_payload,
+    }))
+}
+
+fn local_asset_json(a: crate::worker::LocalAsset) -> Value {
+    json!({
+        "id": a.id,
+        "name": a.name.unwrap_or_else(|| a.id.clone()),
+        "kind": a.kind,
+        "path": a.path,
+        "baseModel": a.base_model,
+        "modelType": a.model_type,
+        "versionId": a.version_id,
+        "modelId": a.model_id,
+        "sizeBytes": a.size_bytes,
+        "source": a.source,
+        "thumbnailUrl": a.thumbnail_url,
+        "backend": "local",
+    })
+}
+
+pub async fn worker_checkpoints(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let items = client.list_checkpoints().await.map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "data": items.into_iter().map(local_asset_json).collect::<Vec<_>>(),
+    })))
+}
+
+pub async fn worker_installed(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    installed_payload(&state).await.map(Json)
+}
+
+async fn installed_payload(state: &AppState) -> ApiResult<Value> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let loras = client.list_loras().await.map_err(ApiError::from)?;
+    let checkpoints = client.list_checkpoints().await.map_err(ApiError::from)?;
+    let embeddings = client.list_embeddings().await.unwrap_or_default();
+    let vaes = client.list_vaes().await.unwrap_or_default();
+    Ok(json!({
+        "loras": loras.into_iter().map(local_asset_json).collect::<Vec<_>>(),
+        "checkpoints": checkpoints.into_iter().map(local_asset_json).collect::<Vec<_>>(),
+        "embeddings": embeddings.into_iter().map(local_asset_json).collect::<Vec<_>>(),
+        "vaes": vaes.into_iter().map(local_asset_json).collect::<Vec<_>>(),
+    }))
+}
+
+pub async fn worker_loras(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let items = client.list_loras().await.map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "data": items.into_iter().map(local_asset_json).collect::<Vec<_>>(),
+    })))
+}
+
+pub async fn worker_embeddings(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let items = client.list_embeddings().await.map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "data": items.into_iter().map(local_asset_json).collect::<Vec<_>>(),
+    })))
+}
+
+pub async fn worker_vaes(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let items = client.list_vaes().await.map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "data": items.into_iter().map(local_asset_json).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteWorkerAsset {
+    pub path: String,
+}
+
+pub async fn worker_asset_delete(
+    State(state): State<AppState>,
+    Json(req): Json<DeleteWorkerAsset>,
+) -> ApiResult<Json<Value>> {
+    let path = req.path.trim();
+    if path.is_empty() {
+        return Err(ApiError::Msg("path required".into()));
+    }
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let v = client.delete_asset(path).await.map_err(ApiError::from)?;
+    Ok(Json(v))
+}
+
+pub async fn civitai_jobs_list(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let v = client.list_install_jobs().await.map_err(ApiError::from)?;
+    Ok(Json(v))
+}
+
+pub async fn civitai_job_get(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<Json<Value>> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let v = client.get_install_job(&id).await.map_err(|e| {
+        if e.to_string().contains("not found") {
+            ApiError::NotFound
+        } else {
+            ApiError::from(e)
+        }
+    })?;
+    Ok(Json(v))
+}
+
+pub async fn civitai_job_cancel(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> ApiResult<Json<Value>> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let v = client
+        .cancel_install_job(&id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(v))
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearCivitaiJobsRequest {
+    /// When true, also drop idle queued jobs. Active downloads are never cleared.
+    #[serde(default)]
+    pub include_queued: bool,
+}
+
+pub async fn civitai_jobs_clear(
+    State(state): State<AppState>,
+    body: Option<Json<ClearCivitaiJobsRequest>>,
+) -> ApiResult<Json<Value>> {
+    let include_queued = body.map(|Json(b)| b.include_queued).unwrap_or(false);
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let v = client
+        .clear_install_jobs(include_queued)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(v))
+}
+
+pub async fn worker_base_model_get(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let v = client.get_active_base().await.map_err(ApiError::from)?;
+    Ok(Json(v))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetWorkerBaseModel {
+    pub model: String,
+    #[serde(default)]
+    pub base_model: Option<String>,
+}
+
+pub async fn worker_base_model_put(
+    State(state): State<AppState>,
+    Json(req): Json<SetWorkerBaseModel>,
+) -> ApiResult<Json<Value>> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let v = client
+        .set_active_base(&req.model, req.base_model.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(v))
+}
+
+pub async fn base_models_catalog() -> Json<Value> {
+    Json(json!({
+        "items": crate::base_models::catalog(),
+        "note": "Local GPU worker hosts SD/SDXL/Pony/Flux checkpoints under FREYA_MODELS_DIR. Remote LLM/vLLM text endpoints typically cannot run these.",
+    }))
+}
+
+pub async fn worker_start(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let (container, unit) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.worker_container.clone(),
+            cfg.worker_systemd_unit.clone(),
+        )
+    };
+    let runtime = crate::worker_ctl::start(&container, &unit)
+        .await
+        .map_err(ApiError::Msg)?;
+    // Brief wait so /health can come up before the UI polls.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    Ok(Json(json!({ "ok": true, "runtime": runtime.to_json() })))
+}
+
+pub async fn worker_stop(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let (container, unit) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.worker_container.clone(),
+            cfg.worker_systemd_unit.clone(),
+        )
+    };
+    let runtime = crate::worker_ctl::stop(&container, &unit)
+        .await
+        .map_err(ApiError::Msg)?;
+    Ok(Json(json!({ "ok": true, "runtime": runtime.to_json() })))
+}
+
+pub async fn worker_enable(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    {
+        let mut cfg = state.config.write().await;
+        cfg.worker_enabled = true;
+    }
+    state.rebuild_worker_client().await;
+    let _ = state.persist_secrets().await;
+    Ok(Json(json!({ "ok": true, "enabled": true })))
+}
+
+pub async fn worker_disable(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    {
+        let mut cfg = state.config.write().await;
+        cfg.worker_enabled = false;
+    }
+    state.rebuild_worker_client().await;
+    let _ = state.persist_secrets().await;
+    Ok(Json(json!({ "ok": true, "enabled": false })))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistRequest {
@@ -161,9 +479,12 @@ pub struct ChatRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub image_model: Option<String>,
-    /// Composer Cloud | Local preference: `openrouter` | `local` (optional).
+    /// Composer Cloud | Local preference: `openrouter` | `local` | `cloud` (optional).
     #[serde(default)]
     pub backend: Option<String>,
+    /// Composer video model pin (`auto` or a provider/model id). Not an API key.
+    #[serde(default)]
+    pub video_model: Option<String>,
     /// When true, skip LLM planning and execute `actions` (Plan confirmation).
     #[serde(default)]
     pub confirm: bool,
@@ -180,7 +501,9 @@ struct PlannedAction {
 }
 
 fn wants_image_intent(message: &str) -> bool {
-    crate::router::infer_modality(message).modality.is_still_image()
+    crate::router::infer_modality(message)
+        .modality
+        .is_still_image()
 }
 
 fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
@@ -227,13 +550,15 @@ fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
         || m.contains("installed loras")
         || m.contains("what loras")
         || m.contains("which loras")
-        || (m.contains("lora") && (m.contains("installed") || m.contains("on the worker") || m.contains("on disk")));
+        || (m.contains("lora")
+            && (m.contains("installed") || m.contains("on the worker") || m.contains("on disk")));
     let asks_list_checkpoints = m.contains("list checkpoint")
         || m.contains("list checkpoints")
         || m.contains("available checkpoint")
         || m.contains("which checkpoints")
         || m.contains("what checkpoints")
-        || (m.contains("checkpoint") && (m.contains("list") || m.contains("show") || m.contains("available")));
+        || (m.contains("checkpoint")
+            && (m.contains("list") || m.contains("show") || m.contains("available")));
     let asks_get_base = m.contains("active base")
         || m.contains("current base")
         || m.contains("what base")
@@ -299,7 +624,10 @@ fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
         format!(
             "Happy to talk through it. Tell me when you want me to generate, search Civitai, tweak the worker base, or suggest ideas — I’ll wait until you ask."
         )
-    } else if actions.iter().any(|a| a.action_type == "generate_image" || a.action_type == "run_session") {
+    } else if actions
+        .iter()
+        .any(|a| a.action_type == "generate_image" || a.action_type == "run_session")
+    {
         "On it — I’ll make that image for you.".into()
     } else if actions.iter().any(|a| a.action_type == "search_civitai") {
         "I’ll search Civitai for matching assets.".into()
@@ -364,9 +692,24 @@ fn is_side_effect_action(ty: &str) -> bool {
         "generate_image"
             | "generate_video"
             | "install_asset"
+            | "cancel_install_job"
+            | "clear_install_jobs"
+            | "delete_installed"
             | "run_session"
             | "set_base_model"
             | "set_chat_models"
+            | "set_cost_tier"
+            | "set_alignment"
+            | "set_privacy"
+            | "set_generate_backend"
+            | "set_automation_mode"
+            | "favorite_asset"
+            | "unfavorite_asset"
+            | "pin_lora"
+            | "unpin_lora"
+            | "gallery_delete"
+            | "worker_start"
+            | "worker_stop"
     )
 }
 
@@ -475,9 +818,7 @@ fn enrich_reply_with_route(
     let preferred = preferred_backend
         .map(str::trim)
         .filter(|b| !b.is_empty() && *b != "auto");
-    let backend = preferred
-        .or(backend_from_gen.as_deref())
-        .unwrap_or("cloud");
+    let backend = preferred.or(backend_from_gen.as_deref()).unwrap_or("cloud");
     let line = format_route_visibility(&RouteFooter {
         route,
         agent: resolved_agent,
@@ -503,10 +844,7 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
     let ty = ar.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let status = ar.get("status").and_then(|s| s.as_str()).unwrap_or("");
     if status == "error" {
-        let err = ar
-            .get("error")
-            .and_then(|e| e.as_str())
-            .unwrap_or("error");
+        let err = ar.get("error").and_then(|e| e.as_str()).unwrap_or("error");
         return Some(format!("{ty} failed: {err}"));
     }
     if status == "proposed" {
@@ -547,7 +885,11 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
             })
         }
         "list_checkpoints" | "list_loras" => {
-            let key = if ty == "list_loras" { "loras" } else { "checkpoints" };
+            let key = if ty == "list_loras" {
+                "loras"
+            } else {
+                "checkpoints"
+            };
             let label = if ty == "list_loras" {
                 "LoRAs"
             } else {
@@ -571,15 +913,16 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
                 .iter()
                 .take(8)
                 .map(|c| {
-                    let name = c
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or(if ty == "list_loras" { "lora" } else { "checkpoint" });
+                    let name =
+                        c.get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or(if ty == "list_loras" {
+                                "lora"
+                            } else {
+                                "checkpoint"
+                            });
                     let path = c.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                    let base = c
-                        .get("baseModel")
-                        .and_then(|b| b.as_str())
-                        .unwrap_or("");
+                    let base = c.get("baseModel").and_then(|b| b.as_str()).unwrap_or("");
                     if base.is_empty() {
                         format!("{name} ({path})")
                     } else {
@@ -604,10 +947,7 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
                 .get("model")
                 .and_then(|m| m.as_str())
                 .unwrap_or("(none)");
-            let base = res
-                .get("baseModel")
-                .and_then(|b| b.as_str())
-                .unwrap_or("");
+            let base = res.get("baseModel").and_then(|b| b.as_str()).unwrap_or("");
             let verb = if ty == "set_base_model" {
                 "Active base set to"
             } else {
@@ -656,7 +996,9 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
                 .get("displayName")
                 .and_then(|n| n.as_str())
                 .unwrap_or(id);
-            Some(format!("Style ready: {name} (pass styleRef={id} on generate)."))
+            Some(format!(
+                "Style ready: {name} (pass styleRef={id} on generate)."
+            ))
         }
         "list_models" => {
             let chat_n = res
@@ -690,8 +1032,14 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
                 .and_then(|z| z.as_bool())
                 .unwrap_or(false);
             let chat = res.get("chatModel").and_then(|m| m.as_str()).unwrap_or("?");
-            let image = res.get("imageModel").and_then(|m| m.as_str()).unwrap_or("?");
-            let router = res.get("routerModel").and_then(|m| m.as_str()).unwrap_or("?");
+            let image = res
+                .get("imageModel")
+                .and_then(|m| m.as_str())
+                .unwrap_or("?");
+            let router = res
+                .get("routerModel")
+                .and_then(|m| m.as_str())
+                .unwrap_or("?");
             Some(format!(
                 "Settings: agent={chat}, image={image}, router={router}, ZDR={}.",
                 if zdr { "on" } else { "off" }
@@ -716,8 +1064,14 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
         }
         "set_chat_models" => {
             let chat = res.get("chatModel").and_then(|m| m.as_str()).unwrap_or("?");
-            let image = res.get("imageModel").and_then(|m| m.as_str()).unwrap_or("?");
-            let router = res.get("routerModel").and_then(|m| m.as_str()).unwrap_or("?");
+            let image = res
+                .get("imageModel")
+                .and_then(|m| m.as_str())
+                .unwrap_or("?");
+            let router = res
+                .get("routerModel")
+                .and_then(|m| m.as_str())
+                .unwrap_or("?");
             Some(format!(
                 "Saved model prefs: agent={chat}, image={image}, router={router}."
             ))
@@ -744,6 +1098,56 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
                 _ => "OpenRouter metrics fetched.".into(),
             })
         }
+        "gallery_delete" => {
+            let id = res.get("id").and_then(|i| i.as_str()).unwrap_or("?");
+            Some(format!("Removed gallery item {id}."))
+        }
+        "gallery_download" => {
+            let url = res.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            Some(if url.is_empty() {
+                "Gallery file is ready in the UI download control.".into()
+            } else {
+                format!("Download in the UI: {url}")
+            })
+        }
+        "list_install_jobs" => {
+            let n = res
+                .get("data")
+                .or_else(|| res.get("jobs"))
+                .and_then(|d| d.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            Some(format!("Download jobs: {n}."))
+        }
+        "cancel_install_job" => Some("Cancelled that download.".into()),
+        "list_installed" => Some("Listed installed worker assets.".into()),
+        "favorite_asset" | "unfavorite_asset" => {
+            let n = res
+                .get("favorites")
+                .and_then(|f| f.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            Some(format!("Favorites: {n}."))
+        }
+        "pin_lora" | "unpin_lora" => {
+            let n = res
+                .get("pinnedLoras")
+                .and_then(|f| f.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            Some(format!("Session LoRA pins: {n}."))
+        }
+        "set_cost_tier" => {
+            let tier = res
+                .get("autoFallbacks")
+                .and_then(|a| a.get("costTier"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("?");
+            Some(format!("Cost tier set to {tier}."))
+        }
+        "set_privacy" | "set_alignment" | "set_generate_backend" | "set_automation_mode" => {
+            Some(format!("{ty} saved."))
+        }
         "generate_image" | "generate_video" => {
             let backend = res.get("backend").and_then(|b| b.as_str()).unwrap_or("?");
             let model = res
@@ -751,10 +1155,14 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
                 .and_then(|m| m.as_str())
                 .map(short_model_id)
                 .unwrap_or("?");
-            let modality = res
-                .get("modality")
-                .and_then(|m| m.as_str())
-                .unwrap_or(if ty == "generate_video" { "video" } else { "picture" });
+            let modality =
+                res.get("modality")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or(if ty == "generate_video" {
+                        "video"
+                    } else {
+                        "picture"
+                    });
             Some(format!("Generated {modality} via {backend} ({model})."))
         }
         _ => None,
@@ -813,7 +1221,10 @@ async fn chat_generate_backend(
     pinned: &[LoraIn],
     preferred: Option<&str>,
 ) -> String {
-    if let Some(b) = preferred.map(str::trim).filter(|b| !b.is_empty() && *b != "auto") {
+    if let Some(b) = preferred
+        .map(str::trim)
+        .filter(|b| !b.is_empty() && *b != "auto")
+    {
         return b.to_string();
     }
     if !pinned.is_empty() && state.worker.read().await.is_some() {
@@ -833,6 +1244,77 @@ fn resolve_action_image_model(image_model: Option<&str>, backend: &str) -> Optio
     }
     // OpenRouter path still rejects non-image prose via resolve_image_model later.
     Some(m.to_string())
+}
+
+fn action_error(ty: &str, args: &Value, error: impl Into<String>) -> Value {
+    json!({
+        "type": ty,
+        "status": "error",
+        "args": args,
+        "error": error.into()
+    })
+}
+
+fn action_ok(ty: &str, args: &Value, result: Value) -> Value {
+    json!({
+        "type": ty,
+        "status": "executed",
+        "args": args,
+        "result": result
+    })
+}
+
+fn api_err_msg(e: ApiError) -> String {
+    match e {
+        ApiError::Msg(m) => m,
+        ApiError::Unauthorized(m) | ApiError::Unavailable(m) => m,
+        ApiError::NoWorker => "No diffusion worker configured".into(),
+        ApiError::NotFound => "not found".into(),
+    }
+}
+
+/// Refuse args whose names look like credentials. Values are never echoed.
+fn reject_secret_fields(args: &Value) -> Option<String> {
+    let obj = args.as_object()?;
+    for key in obj.keys() {
+        let l = key.to_ascii_lowercase().replace(['_', '-'], "");
+        if l.contains("apikey")
+            || l.contains("apitoken")
+            || l.contains("password")
+            || l.contains("secret")
+            || l == "token"
+            || l.contains("admintoken")
+            || l.contains("bearertoken")
+            || l.contains("hftoken")
+            || l.contains("workertoken")
+        {
+            return Some(format!("refusing to read or set {key}"));
+        }
+    }
+    None
+}
+
+fn with_gallery_url(meta: &ArtifactMeta) -> Value {
+    let mut v = serde_json::to_value(meta).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "url".into(),
+            json!(format!("/v1/gallery/{}/image", meta.id)),
+        );
+    }
+    v
+}
+
+async fn persist_prefs(state: &AppState) -> bool {
+    let persisted = state.persist_secrets().await.is_ok();
+    let cfg = state.config.read().await;
+    let mut or = state.openrouter.write().await;
+    *or = crate::openrouter::OpenRouterClient::new(&cfg);
+    persisted
+}
+
+async fn settings_value(state: &AppState) -> Value {
+    serde_json::to_value(settings_public_from_state(state).await).unwrap_or(json!({}))
 }
 
 async fn execute_chat_action(
@@ -873,7 +1355,13 @@ async fn execute_chat_action(
                     if ideas.is_empty() {
                         ideas = text
                             .lines()
-                            .map(|l| l.trim().trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')').trim())
+                            .map(|l| {
+                                l.trim()
+                                    .trim_start_matches(|c: char| {
+                                        c.is_ascii_digit() || c == '.' || c == ')'
+                                    })
+                                    .trim()
+                            })
                             .filter(|l| !l.is_empty())
                             .take(5)
                             .map(str::to_string)
@@ -1372,10 +1860,7 @@ async fn execute_chat_action(
                     "error": "No diffusion worker configured"
                 });
             };
-            match client
-                .set_active_base(model, base_model.as_deref())
-                .await
-            {
+            match client.set_active_base(model, base_model.as_deref()).await {
                 Ok(v) => json!({
                     "type": ty,
                     "status": "executed",
@@ -1415,11 +1900,12 @@ async fn execute_chat_action(
                             .collect(),
                         None => items.into_iter().take(24).collect(),
                     };
+                    let items: Vec<Value> = filtered.iter().map(with_gallery_url).collect();
                     json!({
                         "type": ty,
                         "status": "executed",
                         "args": action.args,
-                        "result": { "items": filtered, "query": query }
+                        "result": { "items": items, "query": query }
                     })
                 }
                 Err(e) => json!({
@@ -1450,7 +1936,7 @@ async fn execute_chat_action(
                     "type": ty,
                     "status": "executed",
                     "args": action.args,
-                    "result": meta
+                    "result": with_gallery_url(&meta)
                 }),
                 Ok(None) => json!({
                     "type": ty,
@@ -1629,7 +2115,7 @@ async fn execute_chat_action(
                     "notes": [
                         "Pin agent/image/router with set_chat_models (persists to Settings).",
                         "Cloud vs Local is the Studio composer switch (backend), not a chat model pref.",
-                        "Video Auto follows Privacy/Alignment-aware defaults; composer video pin is per-request.",
+                        "Pin video with set_chat_models videoModel (id only). Cloud vs Local is set_generate_backend.",
                         "Configure Auto fallbacks on the Models tab when the router does not pin a model.",
                     ],
                 }
@@ -1658,14 +2144,31 @@ async fn execute_chat_action(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            if chat.is_none() && image.is_none() && router.is_none() {
-                return json!({
-                    "type": ty,
-                    "status": "error",
-                    "args": action.args,
-                    "error": "provide chatModel and/or imageModel and/or routerModel"
-                });
+            let video = action
+                .args
+                .get("videoModel")
+                .and_then(|m| m.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            if chat.is_none() && image.is_none() && router.is_none() && video.is_none() {
+                return action_error(
+                    ty,
+                    &action.args,
+                    "provide chatModel, imageModel, routerModel, and/or videoModel",
+                );
             }
+            if let Some(msg) = reject_secret_fields(&action.args) {
+                return action_error(ty, &action.args, msg);
+            }
+            let video_norm = if let Some(v) = video.as_deref() {
+                match crate::studio::normalize_video_model(v) {
+                    Ok(id) => Some(id),
+                    Err(e) => return action_error(ty, &action.args, e),
+                }
+            } else {
+                None
+            };
             {
                 let mut cfg = state.config.write().await;
                 if let Some(m) = chat {
@@ -1676,6 +2179,9 @@ async fn execute_chat_action(
                 }
                 if let Some(m) = router {
                     cfg.router_model = m;
+                }
+                if let Some(v) = video_norm {
+                    cfg.studio.video_model = v;
                 }
             }
             let persisted = state.persist_secrets().await.is_ok();
@@ -1718,6 +2224,390 @@ async fn execute_chat_action(
                 })
             }
         },
+        "list_install_jobs" => {
+            let worker = state.worker.read().await;
+            let Some(client) = worker.as_ref() else {
+                return action_error(ty, &action.args, "No diffusion worker configured");
+            };
+            match client.list_install_jobs().await {
+                Ok(v) => action_ok(ty, &action.args, v),
+                Err(e) => action_error(ty, &action.args, e.to_string()),
+            }
+        }
+        "cancel_install_job" => {
+            let id = action
+                .args
+                .get("jobId")
+                .or_else(|| action.args.get("id"))
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if id.is_empty() {
+                return action_error(ty, &action.args, "missing jobId");
+            }
+            let worker = state.worker.read().await;
+            let Some(client) = worker.as_ref() else {
+                return action_error(ty, &action.args, "No diffusion worker configured");
+            };
+            match client.cancel_install_job(&id).await {
+                Ok(v) => action_ok(ty, &action.args, v),
+                Err(e) => action_error(ty, &action.args, e.to_string()),
+            }
+        }
+        "clear_install_jobs" => {
+            let include_queued = action
+                .args
+                .get("includeQueued")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let worker = state.worker.read().await;
+            let Some(client) = worker.as_ref() else {
+                return action_error(ty, &action.args, "No diffusion worker configured");
+            };
+            match client.clear_install_jobs(include_queued).await {
+                Ok(v) => action_ok(ty, &action.args, v),
+                Err(e) => action_error(ty, &action.args, e.to_string()),
+            }
+        }
+        "list_installed" => match installed_payload(state).await {
+            Ok(v) => action_ok(ty, &action.args, v),
+            Err(e) => action_error(ty, &action.args, api_err_msg(e)),
+        },
+        "delete_installed" => {
+            let path = action
+                .args
+                .get("path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if path.is_empty() || path.contains("..") {
+                return action_error(ty, &action.args, "missing worker path");
+            }
+            let worker = state.worker.read().await;
+            let Some(client) = worker.as_ref() else {
+                return action_error(ty, &action.args, "No diffusion worker configured");
+            };
+            match client.delete_asset(&path).await {
+                Ok(v) => action_ok(ty, &action.args, v),
+                Err(e) => action_error(ty, &action.args, e.to_string()),
+            }
+        }
+        "favorite_asset" => {
+            if let Some(msg) = reject_secret_fields(&action.args) {
+                return action_error(ty, &action.args, msg);
+            }
+            let card = crate::studio::asset_from_action_args(&action.args);
+            let mut saved = None;
+            let mut err = None;
+            {
+                let mut cfg = state.config.write().await;
+                match crate::studio::favorite_add(&mut cfg.studio, &card) {
+                    Ok(c) => saved = Some(c),
+                    Err(e) => err = Some(e),
+                }
+            }
+            if let Some(e) = err {
+                return action_error(ty, &action.args, e);
+            }
+            let persisted = state.persist_secrets().await.is_ok();
+            let favorites = state.config.read().await.studio.favorites.clone();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "favorites": favorites, "favorite": saved, "persisted": persisted }),
+            )
+        }
+        "unfavorite_asset" => {
+            let card = crate::studio::asset_from_action_args(&action.args);
+            let removed = {
+                let mut cfg = state.config.write().await;
+                crate::studio::favorite_remove(&mut cfg.studio, &card)
+            };
+            let persisted = state.persist_secrets().await.is_ok();
+            let favorites = state.config.read().await.studio.favorites.clone();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "favorites": favorites, "removed": removed, "persisted": persisted }),
+            )
+        }
+        "list_favorites" => {
+            let favorites = state.config.read().await.studio.favorites.clone();
+            action_ok(ty, &action.args, json!({ "favorites": favorites }))
+        }
+        "pin_lora" => {
+            if let Some(msg) = reject_secret_fields(&action.args) {
+                return action_error(ty, &action.args, msg);
+            }
+            let card = crate::studio::asset_from_action_args(&action.args);
+            let mut err = None;
+            {
+                let mut cfg = state.config.write().await;
+                if let Err(e) = crate::studio::pin_add(&mut cfg.studio, &card) {
+                    err = Some(e);
+                }
+            }
+            if let Some(e) = err {
+                return action_error(ty, &action.args, e);
+            }
+            let persisted = state.persist_secrets().await.is_ok();
+            let pins = state.config.read().await.studio.pinned_loras.clone();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "pinnedLoras": pins, "persisted": persisted }),
+            )
+        }
+        "unpin_lora" => {
+            let card = crate::studio::asset_from_action_args(&action.args);
+            {
+                let mut cfg = state.config.write().await;
+                crate::studio::pin_remove(&mut cfg.studio, &card);
+            }
+            let persisted = state.persist_secrets().await.is_ok();
+            let pins = state.config.read().await.studio.pinned_loras.clone();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "pinnedLoras": pins, "persisted": persisted }),
+            )
+        }
+        "list_pins" => {
+            let pins = state.config.read().await.studio.pinned_loras.clone();
+            action_ok(ty, &action.args, json!({ "pinnedLoras": pins }))
+        }
+        "set_cost_tier" => {
+            let tier = action
+                .args
+                .get("costTier")
+                .or_else(|| action.args.get("tier"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if tier.is_empty() {
+                return action_error(ty, &action.args, "missing costTier (low|medium|high|max)");
+            }
+            {
+                let mut cfg = state.config.write().await;
+                let mut prefs = cfg.auto_fallbacks_prefs();
+                prefs.cost_tier = tier;
+                cfg.apply_auto_fallbacks(prefs);
+            }
+            let persisted = persist_prefs(state).await;
+            let mut out = settings_value(state).await;
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("persisted".into(), json!(persisted));
+            }
+            action_ok(ty, &action.args, out)
+        }
+        "set_privacy" => {
+            if let Some(msg) = reject_secret_fields(&action.args) {
+                return action_error(ty, &action.args, msg);
+            }
+            let zdr = action
+                .args
+                .get("zeroDataRetention")
+                .and_then(|v| v.as_bool());
+            let data_collection = action
+                .args
+                .get("dataCollection")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if zdr.is_none() && data_collection.is_none() {
+                return action_error(
+                    ty,
+                    &action.args,
+                    "provide zeroDataRetention and/or dataCollection (allow|deny)",
+                );
+            }
+            {
+                let mut cfg = state.config.write().await;
+                let mut prefs = cfg.privacy_prefs();
+                if let Some(z) = zdr {
+                    prefs.zero_data_retention = z;
+                }
+                if let Some(dc) = data_collection {
+                    prefs.data_collection = dc;
+                }
+                cfg.apply_privacy(prefs);
+            }
+            let persisted = persist_prefs(state).await;
+            let mut out = settings_value(state).await;
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("persisted".into(), json!(persisted));
+            }
+            action_ok(ty, &action.args, out)
+        }
+        "set_alignment" => {
+            if let Some(msg) = reject_secret_fields(&action.args) {
+                return action_error(ty, &action.args, msg);
+            }
+            let alignment = action
+                .args
+                .get("modelAlignment")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let nsfw = action
+                .args
+                .get("allowNsfwLocal")
+                .or_else(|| action.args.get("showNsfw"))
+                .and_then(|v| v.as_bool());
+            let tone = action
+                .args
+                .get("instructionTone")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if alignment.is_none() && nsfw.is_none() && tone.is_none() {
+                return action_error(
+                    ty,
+                    &action.args,
+                    "provide modelAlignment, allowNsfwLocal, and/or instructionTone",
+                );
+            }
+            {
+                let mut cfg = state.config.write().await;
+                let mut prefs = cfg.alignment_prefs();
+                if let Some(a) = alignment {
+                    prefs.model_alignment = a;
+                }
+                if let Some(n) = nsfw {
+                    prefs.allow_nsfw_local = n;
+                }
+                if let Some(t) = tone {
+                    prefs.instruction_tone = t;
+                }
+                cfg.apply_alignment(prefs);
+            }
+            let persisted = persist_prefs(state).await;
+            let mut out = settings_value(state).await;
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("persisted".into(), json!(persisted));
+            }
+            action_ok(ty, &action.args, out)
+        }
+        "set_generate_backend" => {
+            let raw = action
+                .args
+                .get("backend")
+                .and_then(|b| b.as_str())
+                .unwrap_or("");
+            let backend = match crate::studio::normalize_backend(raw) {
+                Ok(b) => b,
+                Err(e) => return action_error(ty, &action.args, e),
+            };
+            {
+                let mut cfg = state.config.write().await;
+                cfg.studio.generate_backend = backend.clone();
+            }
+            let persisted = state.persist_secrets().await.is_ok();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "backend": backend, "persisted": persisted }),
+            )
+        }
+        "set_automation_mode" => {
+            let raw = action
+                .args
+                .get("mode")
+                .or_else(|| action.args.get("automationMode"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            let mode = match crate::studio::normalize_mode(raw) {
+                Ok(m) => m,
+                Err(e) => return action_error(ty, &action.args, e),
+            };
+            {
+                let mut cfg = state.config.write().await;
+                cfg.studio.automation_mode = mode.clone();
+            }
+            let persisted = state.persist_secrets().await.is_ok();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "automationMode": mode, "persisted": persisted }),
+            )
+        }
+        "gallery_delete" => {
+            let id = action
+                .args
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if id.is_empty() {
+                return action_error(ty, &action.args, "missing id");
+            }
+            match state.gallery.delete(&id).await {
+                Ok(true) => action_ok(ty, &action.args, json!({ "ok": true, "id": id })),
+                Ok(false) => action_error(ty, &action.args, "not found"),
+                Err(e) => action_error(ty, &action.args, e.to_string()),
+            }
+        }
+        "gallery_download" => {
+            let id = action
+                .args
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if id.is_empty() {
+                return action_error(ty, &action.args, "missing id");
+            }
+            match state.gallery.get(&id).await {
+                Ok(Some(meta)) => {
+                    let mut item = with_gallery_url(&meta);
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.insert(
+                            "note".into(),
+                            json!("Client downloads this url. Bytes are not returned here."),
+                        );
+                    }
+                    action_ok(ty, &action.args, item)
+                }
+                Ok(None) => action_error(ty, &action.args, "not found"),
+                Err(e) => action_error(ty, &action.args, e.to_string()),
+            }
+        }
+        "worker_start" => {
+            let (container, unit) = {
+                let cfg = state.config.read().await;
+                (
+                    cfg.worker_container.clone(),
+                    cfg.worker_systemd_unit.clone(),
+                )
+            };
+            match crate::worker_ctl::start(&container, &unit).await {
+                Ok(runtime) => action_ok(
+                    ty,
+                    &action.args,
+                    json!({ "ok": true, "runtime": runtime.to_json() }),
+                ),
+                Err(e) => action_error(ty, &action.args, e),
+            }
+        }
+        "worker_stop" => {
+            let (container, unit) = {
+                let cfg = state.config.read().await;
+                (
+                    cfg.worker_container.clone(),
+                    cfg.worker_systemd_unit.clone(),
+                )
+            };
+            match crate::worker_ctl::stop(&container, &unit).await {
+                Ok(runtime) => action_ok(
+                    ty,
+                    &action.args,
+                    json!({ "ok": true, "runtime": runtime.to_json() }),
+                ),
+                Err(e) => action_error(ty, &action.args, e),
+            }
+        }
         other => json!({
             "type": other,
             "status": "error",
@@ -1741,9 +2631,9 @@ async fn civitai_install_inner(
 
     // Prefer client URL; otherwise resolve from versionId (+ optional fileId).
     if req.download_url.trim().is_empty() {
-        let version_id = req.version_id.ok_or_else(|| {
-            ApiError::Msg("downloadUrl or versionId required to install".into())
-        })?;
+        let version_id = req
+            .version_id
+            .ok_or_else(|| ApiError::Msg("downloadUrl or versionId required to install".into()))?;
         let civ = state.civitai.read().await;
         let resolved = civ
             .resolve_version_download(version_id, req.file_id)
@@ -1862,6 +2752,92 @@ async fn civitai_install_inner(
     }))
 }
 
+struct ActionRun {
+    loras: Vec<LoraIn>,
+    image_model: Option<String>,
+    video_model: Option<String>,
+    backend: Option<String>,
+}
+
+impl ActionRun {
+    async fn exec(&mut self, state: &AppState, action: &PlannedAction) -> Value {
+        let v = execute_chat_action(
+            state,
+            action,
+            &self.loras,
+            self.image_model.as_deref(),
+            self.video_model.as_deref(),
+            self.backend.as_deref(),
+        )
+        .await;
+        self.absorb(&v);
+        v
+    }
+
+    fn absorb(&mut self, v: &Value) {
+        if v.get("status").and_then(|s| s.as_str()) != Some("executed") {
+            return;
+        }
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let Some(res) = v.get("result") else {
+            return;
+        };
+        match ty {
+            "set_chat_models" => {
+                if let Some(m) = res.get("imageModel").and_then(|m| m.as_str()) {
+                    if !m.is_empty() {
+                        self.image_model = Some(m.to_string());
+                    }
+                }
+                let video = res.get("videoModel").and_then(|m| m.as_str()).or_else(|| {
+                    res.get("studio")
+                        .and_then(|s| s.get("videoModel"))
+                        .and_then(|m| m.as_str())
+                });
+                if let Some(m) = video {
+                    if !m.is_empty() {
+                        self.video_model = Some(m.to_string());
+                    }
+                }
+            }
+            "set_generate_backend" => {
+                if let Some(b) = res.get("backend").and_then(|b| b.as_str()) {
+                    self.backend = Some(if b == "local" {
+                        "local".into()
+                    } else {
+                        "cloud".into()
+                    });
+                }
+            }
+            "pin_lora" | "unpin_lora" => {
+                if let Some(arr) = res.get("pinnedLoras").and_then(|a| a.as_array()) {
+                    self.loras = arr.iter().filter_map(lora_from_pin_value).collect();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn lora_from_pin_value(v: &Value) -> Option<LoraIn> {
+    if !crate::studio::is_pinnable(v) {
+        return None;
+    }
+    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(LoraIn {
+        name: name.to_string(),
+        scale: v.get("scale").and_then(|s| s.as_f64()).unwrap_or(0.8) as f32,
+        path: v.get("path").and_then(|p| p.as_str()).map(str::to_string),
+        base_model: v
+            .get("baseModel")
+            .and_then(|b| b.as_str())
+            .map(str::to_string),
+    })
+}
+
 pub async fn chat(
     State(state): State<AppState>,
     Json(mut req): Json<ChatRequest>,
@@ -1952,8 +2928,24 @@ pub async fn chat(
         &alignment,
         &auto_fallbacks,
     );
+    let stored_video = {
+        let cfg = state.config.read().await;
+        let v = cfg.studio.video_model.trim().to_string();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    };
+    let video_pin = req
+        .video_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or(stored_video);
     let resolved_video = crate::router::resolve_video_model_choice_prefs(
-        req.image_model.as_deref(),
+        video_pin.as_deref(),
         &route,
         &video_default,
         &privacy,
@@ -2115,9 +3107,12 @@ pub async fn chat(
     };
 
     // Prefer router-resolved image model when executing generates under Auto.
-    let image_model_for_actions = Some(resolved_image.as_str());
-    let video_model_for_actions = Some(resolved_video.as_str());
-    let backend_for_actions = req.backend.as_deref();
+    let mut env = ActionRun {
+        loras: req.loras.clone(),
+        image_model: Some(resolved_image.clone()),
+        video_model: Some(resolved_video.clone()),
+        backend: req.backend.clone(),
+    };
 
     let side_effects: Vec<_> = planned
         .iter()
@@ -2139,21 +3134,12 @@ pub async fn chat(
                     "args": a.args,
                 }));
             } else {
-                action_results.push(
-                    execute_chat_action(
-                        &state,
-                        a,
-                        &req.loras,
-                        image_model_for_actions,
-                        video_model_for_actions,
-                        backend_for_actions,
-                    )
-                    .await,
-                );
+                action_results.push(env.exec(&state, a).await);
             }
         }
         if reply.is_empty() {
-            reply = "Here’s what I’d do — confirm to run generate/install, or keep chatting.".into();
+            reply =
+                "Here’s what I’d do — confirm to run generate/install, or keep chatting.".into();
         }
     } else if mode == "auto" && !req.confirm {
         let install_count = planned
@@ -2174,17 +3160,7 @@ pub async fn chat(
                     "proposed"
                 } else {
                     // execute discovery
-                    action_results.push(
-                        execute_chat_action(
-                        &state,
-                        a,
-                        &req.loras,
-                        image_model_for_actions,
-                        video_model_for_actions,
-                        backend_for_actions,
-                    )
-                    .await,
-                    );
+                    action_results.push(env.exec(&state, a).await);
                     continue;
                 };
                 action_results.push(json!({
@@ -2195,18 +3171,7 @@ pub async fn chat(
             }
         } else {
             for a in &planned {
-                action_results
-                    .push(
-                        execute_chat_action(
-                            &state,
-                            a,
-                            &req.loras,
-                            image_model_for_actions,
-                            video_model_for_actions,
-                            backend_for_actions,
-                        )
-                        .await,
-                    );
+                action_results.push(env.exec(&state, a).await);
             }
         }
     } else {
@@ -2220,18 +3185,7 @@ pub async fn chat(
                 }));
                 pending_confirmation = true;
             } else {
-                action_results
-                    .push(
-                        execute_chat_action(
-                            &state,
-                            a,
-                            &req.loras,
-                            image_model_for_actions,
-                            video_model_for_actions,
-                            backend_for_actions,
-                        )
-                        .await,
-                    );
+                action_results.push(env.exec(&state, a).await);
             }
         }
     }
@@ -2270,17 +3224,15 @@ pub async fn chat(
 
     // Tool results arrive after the LLM reply — fold worker summaries into reply.
     let reply = enrich_reply_with_worker_results(&reply, &action_results);
-    let local_backend = req
-        .backend
-        .as_deref()
-        .is_some_and(|b| b.eq_ignore_ascii_case("local"));
+    let effective_backend = env.backend.as_deref().or(req.backend.as_deref());
+    let local_backend = effective_backend.is_some_and(|b| b.eq_ignore_ascii_case("local"));
     let base_name = if local_backend {
         local_base_display(&state).await
     } else {
         String::new()
     };
     let lora_line = if local_backend {
-        pinned_lora_footer(&req.loras)
+        pinned_lora_footer(&env.loras)
     } else {
         String::new()
     };
@@ -2292,7 +3244,7 @@ pub async fn chat(
         &resolved_image,
         &resolved_video,
         &action_results,
-        req.backend.as_deref(),
+        effective_backend,
         &base_name,
         &lora_line,
         &mode,
@@ -2430,6 +3382,48 @@ pub async fn generate(
     run_generate(&state, req).await.map(Json)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesRequest {
+    pub goal: String,
+    #[serde(default)]
+    pub style_ref: Option<String>,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub loras: Vec<LoraIn>,
+}
+
+/// Short still series — same planner as the chat `run_session` action.
+pub async fn generate_series(
+    State(state): State<AppState>,
+    Json(req): Json<SeriesRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let goal = req.goal.trim();
+    if goal.is_empty() {
+        return Err(ApiError::Msg("missing goal".into()));
+    }
+    let image = state.config.read().await.image_model.clone();
+    let action = PlannedAction {
+        action_type: "run_session".into(),
+        args: json!({
+            "goal": goal,
+            "styleRef": req.style_ref,
+        }),
+    };
+    let pins = session_lora_pins(req.loras);
+    let v = execute_chat_action(
+        &state,
+        &action,
+        &pins,
+        Some(image.as_str()),
+        None,
+        req.backend.as_deref(),
+    )
+    .await;
+    Ok(Json(v))
+}
+
 pub async fn run(
     State(state): State<AppState>,
     Json(mut req): Json<GenerateRequest>,
@@ -2543,6 +3537,58 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
                 lora_scale: l.scale,
             })
             .collect();
+        // Resolve base checkpoint: explicit local path → worker active → LoRA baseModel hint.
+        // Never forward Auto / OpenRouter cloud ids / router prose as Diffusers repo ids.
+        let mut model = crate::base_models::filter_local_model(req.model.as_deref());
+        if model.is_none() {
+            if let Some(raw) = req
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                tracing::debug!(
+                    ignored_model = %raw,
+                    "local generate ignored non-checkpoint model; using worker active base"
+                );
+            }
+        }
+        let mut active_base_label: Option<String> = None;
+        if let Ok(active) = client.get_active_base().await {
+            active_base_label = active
+                .get("baseModel")
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
+            if model.is_none() {
+                if let Some(m) = active.get("model").and_then(|x| x.as_str()) {
+                    if !m.is_empty() {
+                        model = Some(m.to_string());
+                    }
+                }
+            }
+        }
+        if model.is_none() {
+            let hints: Vec<_> = req
+                .loras
+                .iter()
+                .map(|l| crate::base_models::LoraBaseHint {
+                    base_model: l.base_model.clone(),
+                })
+                .collect();
+            model = crate::base_models::resolve_model_from_loras(&hints);
+        }
+        if let (Some(active_b), Some(lora_b)) = (
+            active_base_label.as_deref(),
+            req.loras.iter().find_map(|l| l.base_model.as_deref()),
+        ) {
+            if !crate::base_models::bases_compatible(active_b, lora_b) {
+                tracing::warn!(
+                    active = %active_b,
+                    lora_base = %lora_b,
+                    "active worker base may not match pinned LoRA baseModel"
+                );
+            }
+        }
         let bytes = client
             .generate(
                 &final_prompt,
@@ -2607,22 +3653,190 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     }))
 }
 
+fn resolve_generate_modality(req: &GenerateRequest) -> crate::router::Modality {
+    if let Some(m) = req
+        .modality
+        .as_deref()
+        .and_then(crate::router::Modality::parse)
+    {
+        return m;
+    }
+    crate::router::infer_modality(&req.prompt).modality
+}
+
+async fn run_motion_generate(
+    state: &AppState,
+    req: &GenerateRequest,
+    final_prompt: &str,
+    modality: crate::router::Modality,
+) -> ApiResult<(Vec<u8>, String, String, String)> {
+    let want_gif = matches!(modality, crate::router::Modality::Gif);
+    let backend = req.backend.as_deref().unwrap_or("auto");
+    let pinned_local = backend == "local";
+
+    // Local motion is a worker GIF (the engine has no mp4 T2V). Cloud video stays on OpenRouter.
+    // Do not fall through to OpenRouter when the composer pinned Local.
+    if pinned_local || (want_gif && backend == "auto") {
+        let worker = state.worker.read().await;
+        if let Some(client) = worker.as_ref() {
+            let gif_model = crate::base_models::filter_local_model(req.model.as_deref());
+            match client
+                .generate_gif(
+                    final_prompt,
+                    gif_model.as_deref(),
+                    req.size.as_deref(),
+                    req.seed,
+                    req.negative_prompt.as_deref(),
+                )
+                .await
+            {
+                Ok(bytes) => {
+                    return Ok((
+                        bytes,
+                        "image/gif".into(),
+                        gif_model.unwrap_or_else(|| "local-gif".into()),
+                        "local".into(),
+                    ));
+                }
+                Err(e) => {
+                    if pinned_local {
+                        return Err(ApiError::Msg(format!(
+                            "local worker motion failed (GIF is the local video path): {e}"
+                        )));
+                    }
+                    tracing::warn!(error = %e, "local gif failed; falling back to OpenRouter video");
+                }
+            }
+        } else if pinned_local {
+            return Err(ApiError::NoWorker);
+        }
+    }
+
+    let or = state.openrouter.read().await;
+    let privacy = or.privacy().clone();
+    let alignment = or.alignment().clone();
+    let auto_fallbacks = or.auto_fallbacks().clone();
+    let video_default = crate::router::resolve_auto_fallback(
+        crate::router::AutoFallbackKind::Video,
+        &privacy,
+        &alignment,
+        &auto_fallbacks,
+    );
+    let model = crate::router::resolve_video_model_choice_prefs(
+        req.model.as_deref(),
+        &crate::router::RouteDecision {
+            modality,
+            reason: String::new(),
+            agent_model: None,
+            image_model: None,
+            source: "generate".into(),
+        },
+        &video_default,
+        &privacy,
+        &alignment,
+        &auto_fallbacks,
+    );
+    let duration = req.duration.or(if want_gif { Some(4) } else { Some(5) });
+    let aspect = req.size.as_deref().and_then(size_to_video_aspect);
+    let vid = or
+        .generate_video(final_prompt, Some(&model), duration, aspect)
+        .await
+        .map_err(ApiError::from)?;
+    let (bytes, mime) = if want_gif {
+        match mp4_to_gif(&vid.bytes).await {
+            Ok(gif) => (gif, "image/gif".into()),
+            Err(e) => {
+                tracing::warn!(error = %e, "gif convert failed; serving mp4");
+                (vid.bytes, vid.mime)
+            }
+        }
+    } else {
+        (vid.bytes, vid.mime)
+    };
+    Ok((bytes, mime, vid.model, "openrouter".into()))
+}
+
+fn size_to_video_aspect(size: &str) -> Option<&'static str> {
+    let s = size.to_ascii_lowercase();
+    if s.contains("1024x1792") || s.contains("9:16") || s.contains("576x1024") {
+        Some("9:16")
+    } else if s.contains("1792x1024") || s.contains("16:9") || s.contains("1280x720") {
+        Some("16:9")
+    } else if s.contains("1024x1024") || s.contains("1:1") {
+        Some("1:1")
+    } else {
+        None
+    }
+}
+
+async fn mp4_to_gif(mp4: &[u8]) -> Result<Vec<u8>, String> {
+    let id = uuid::Uuid::new_v4();
+    let dir = std::env::temp_dir().join(format!("freya-gif-{id}"));
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    let in_path = dir.join("in.mp4");
+    let out_path = dir.join("out.gif");
+    let result = async {
+        tokio::fs::write(&in_path, mp4)
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i",
+                in_path.to_str().unwrap_or("in.mp4"),
+                "-vf",
+                "fps=8,scale=512:-1:flags=lanczos",
+                "-loop",
+                "0",
+                out_path.to_str().unwrap_or("out.gif"),
+            ])
+            .output()
+            .await
+            .map_err(|e| format!("ffmpeg: {e}"))?;
+        if !status.status.success() {
+            return Err(format!(
+                "ffmpeg exit {}: {}",
+                status.status,
+                String::from_utf8_lossy(&status.stderr)
+            ));
+        }
+        tokio::fs::read(&out_path).await.map_err(|e| e.to_string())
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    result
+}
+
 pub async fn gallery_list(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let items = state.gallery.list().await.map_err(ApiError::from)?;
+    let items: Vec<Value> = items.iter().map(with_gallery_url).collect();
     Ok(Json(json!({ "items": items })))
 }
 
 pub async fn gallery_get(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<ArtifactMeta>> {
+) -> ApiResult<Json<Value>> {
     let meta = state
         .gallery
         .get(&id)
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(meta))
+    Ok(Json(with_gallery_url(&meta)))
+}
+
+pub async fn gallery_delete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let removed = state.gallery.delete(&id).await.map_err(ApiError::from)?;
+    if !removed {
+        return Err(ApiError::NotFound);
+    }
+    Ok(Json(json!({ "ok": true, "id": id })))
 }
 
 pub async fn gallery_image(
@@ -2788,18 +4002,380 @@ pub struct SettingsPublic {
     pub diffusion_worker_url: Option<String>,
     pub chat_model: String,
     pub image_model: String,
+    /// Freya intent router model (`auto` = Llama 3.1 8B-class).
+    pub router_model: String,
+    /// Whether `FREYA_API_TOKEN` / rotated runtime token is set (never returns the value).
+    pub api_token_configured: bool,
+    /// Whether operator admin login (`FREYA_ADMIN_PASSWORD`) is configured.
+    pub admin_login_configured: bool,
+    /// True when bearer and/or admin password is required for `/v1`.
+    pub auth_required: bool,
+    /// OpenRouter privacy (ZDR / data_collection) + Freya chat-provider checkboxes.
+    pub privacy: PrivacyPrefs,
+    /// Freya-side model catalog / tone prefs (not OpenRouter API flags).
+    pub alignment: AlignmentPrefs,
+    /// Configurable Auto fallbacks when the router does not pin a concrete model.
+    pub auto_fallbacks: AutoFallbacksPrefs,
+    /// Editable system prompts (packs defaults + Settings overrides).
+    pub instructions: Vec<InstructionSetting>,
+    /// Favorites, LoRA pins, composer backend, video pin. No secrets.
+    pub studio: crate::studio::StudioPrefs,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsPutResponse {
+    #[serde(flatten)]
+    pub settings: SettingsPublic,
+    /// Whether the secrets snapshot was written to `FREYA_SECRETS_FILE`.
+    pub persisted: bool,
+}
+
+async fn settings_public_from_state(state: &AppState) -> SettingsPublic {
+    let (base, overrides) = {
+        let cfg = state.config.read().await;
+        (
+            SettingsPublic {
+                open_router_configured: cfg.openrouter_configured(),
+                civitai_configured: cfg.civitai_configured(),
+                hf_configured: !cfg.hf_token.is_empty(),
+                diffusion_worker_url: cfg.diffusion_worker_url.clone(),
+                worker_enabled: cfg.worker_enabled,
+                chat_model: cfg.chat_model.clone(),
+                image_model: cfg.image_model.clone(),
+                router_model: cfg.router_model.clone(),
+                api_token_configured: !cfg.api_token.trim().is_empty(),
+                admin_login_configured: cfg.admin_login_configured(),
+                auth_required: cfg.auth_required(),
+                privacy: cfg.privacy_prefs(),
+                alignment: cfg.alignment_prefs(),
+                auto_fallbacks: cfg.auto_fallbacks_prefs(),
+                instructions: Vec::new(),
+                studio: cfg.studio.clone(),
+            },
+            cfg.instruction_overrides.clone(),
+        )
+    };
+    let mut instructions = Vec::with_capacity(styles::EDITABLE_INSTRUCTION_MODES.len());
+    for id in styles::EDITABLE_INSTRUCTION_MODES {
+        let default_text = styles::load_instruction_default(&state.packs_dir, id).await;
+        let overridden = overrides
+            .get(*id)
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
+        let text = if overridden {
+            overrides
+                .get(*id)
+                .cloned()
+                .unwrap_or_else(|| default_text.clone())
+        } else {
+            default_text.clone()
+        };
+        instructions.push(InstructionSetting {
+            id: (*id).to_string(),
+            label: styles::instruction_mode_label(id),
+            text,
+            default_text,
+            overridden,
+        });
+    }
+    SettingsPublic {
+        instructions,
+        ..base
+    }
+}
+
+async fn load_instruction_toned(state: &AppState, mode: &str) -> String {
+    let (tone, overrides) = {
+        let cfg = state.config.read().await;
+        (cfg.alignment_prefs(), cfg.instruction_overrides.clone())
+    };
+    let raw = styles::load_instruction(&state.packs_dir, mode, Some(&overrides)).await;
+    tone.apply_tone(&raw)
+}
+
+async fn load_instruction_raw(state: &AppState, mode: &str) -> String {
+    let overrides = {
+        let cfg = state.config.read().await;
+        cfg.instruction_overrides.clone()
+    };
+    styles::load_instruction(&state.packs_dir, mode, Some(&overrides)).await
+}
+
+/// Public auth probe — no bearer required. Used by the UI to show Sign in / locked state.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthStatusResponse {
+    pub auth_required: bool,
+    pub admin_login_configured: bool,
+    pub api_token_configured: bool,
+    pub open_router_configured: bool,
+    pub admin_username: String,
+    pub note: String,
+}
+
+pub async fn auth_status(State(state): State<AppState>) -> Json<AuthStatusResponse> {
+    let cfg = state.config.read().await;
+    let admin_login = cfg.admin_login_configured();
+    let note = if !cfg.auth_required() {
+        "API open (local/dev).".into()
+    } else if admin_login {
+        "Sign in required.".into()
+    } else {
+        "API token required.".into()
+    };
+    Json(AuthStatusResponse {
+        auth_required: cfg.auth_required(),
+        admin_login_configured: admin_login,
+        api_token_configured: !cfg.api_token.trim().is_empty(),
+        open_router_configured: cfg.openrouter_configured(),
+        admin_username: if cfg.admin_user.trim().is_empty() {
+            "admin".into()
+        } else {
+            cfg.admin_user.clone()
+        },
+        note,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthLoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthLoginResponse {
+    pub token: String,
+    pub username: String,
+    pub note: String,
+}
+
+/// Exchange admin username/password for a browser session token.
+pub async fn auth_login(
+    State(state): State<AppState>,
+    Json(req): Json<AuthLoginRequest>,
+) -> ApiResult<Json<AuthLoginResponse>> {
+    let (admin_user, admin_password, mut token) = {
+        let cfg = state.config.read().await;
+        (
+            if cfg.admin_user.trim().is_empty() {
+                "admin".to_string()
+            } else {
+                cfg.admin_user.trim().to_string()
+            },
+            cfg.admin_password.trim().to_string(),
+            cfg.api_token.trim().to_string(),
+        )
+    };
+    if admin_password.is_empty() {
+        return Err(ApiError::Unavailable(
+            "Admin login is not configured on this Studio".into(),
+        ));
+    }
+    let user_ok = const_eq_str(req.username.trim(), &admin_user);
+    let pass_ok = const_eq_str(req.password.trim(), &admin_password);
+    if !user_ok || !pass_ok {
+        return Err(ApiError::Unauthorized(
+            "Invalid username or password".into(),
+        ));
+    }
+    if token.is_empty() {
+        // No machine bearer yet — mint one so the UI can stay on Bearer after login.
+        token = generate_api_token();
+        {
+            let mut cfg = state.config.write().await;
+            cfg.api_token = token.clone();
+        }
+        let _ = state.persist_secrets().await;
+        let _ = crate::k8s_secret::try_sync_api_token_secret(&token).await;
+    }
+    Ok(Json(AuthLoginResponse {
+        token,
+        username: admin_user,
+        note: "Signed in.".into(),
+    }))
+}
+
+fn const_eq_str(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 pub async fn settings_get(State(state): State<AppState>) -> Json<SettingsPublic> {
-    let cfg = state.config.read().await;
-    Json(SettingsPublic {
-        open_router_configured: cfg.openrouter_configured(),
-        civitai_configured: cfg.civitai_configured(),
-        hf_configured: !cfg.hf_token.is_empty(),
-        diffusion_worker_url: cfg.diffusion_worker_url.clone(),
-        chat_model: cfg.chat_model.clone(),
-        image_model: cfg.image_model.clone(),
+    Json(settings_public_from_state(&state).await)
+}
+
+pub async fn studio_get(State(state): State<AppState>) -> Json<crate::studio::StudioPrefs> {
+    Json(state.config.read().await.studio.clone())
+}
+
+pub async fn studio_put(
+    State(state): State<AppState>,
+    Json(patch): Json<crate::studio::StudioPatch>,
+) -> ApiResult<Json<serde_json::Value>> {
+    {
+        let mut cfg = state.config.write().await;
+        crate::studio::apply_patch(&mut cfg.studio, patch).map_err(ApiError::Msg)?;
+    }
+    let persisted = state.persist_secrets().await.is_ok();
+    let studio = state.config.read().await.studio.clone();
+    Ok(Json(json!({ "studio": studio, "persisted": persisted })))
+}
+
+/// OpenRouter usage / credits snapshot for the Metrics UI.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenRouterMetricsResponse {
+    pub configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<crate::openrouter::OpenRouterKeyUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits: Option<crate::openrouter::OpenRouterCredits>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credits_error: Option<String>,
+    pub notes: Vec<String>,
+}
+
+async fn openrouter_metrics_payload(state: &AppState) -> ApiResult<OpenRouterMetricsResponse> {
+    let configured = {
+        let cfg = state.config.read().await;
+        cfg.openrouter_configured()
+    };
+    let notes = vec![
+        "GET /api/v1/key works with Freya’s normal completion key: per-key spend (day/week/month) and optional key spend cap.".into(),
+        "GET /api/v1/credits (account purchased − used) requires an OpenRouter Management API key — unavailable with a normal key.".into(),
+        "OpenRouter does not expose a rich recent-transactions feed for completion keys; Freya shows lifetime + period usage from /key.".into(),
+    ];
+    if !configured {
+        return Ok(OpenRouterMetricsResponse {
+            configured: false,
+            key: None,
+            key_error: Some("OpenRouter API key not configured".into()),
+            credits: None,
+            credits_error: None,
+            notes,
+        });
+    }
+
+    let or = state.openrouter.read().await;
+    let (key, key_error) = match or.key_usage().await {
+        Ok(k) => (Some(k), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    let (credits, credits_error) = match or.account_credits().await {
+        Ok(c) => (Some(c), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+
+    Ok(OpenRouterMetricsResponse {
+        configured: true,
+        key,
+        key_error,
+        credits,
+        credits_error,
+        notes,
     })
+}
+
+pub async fn openrouter_metrics(
+    State(state): State<AppState>,
+) -> ApiResult<Json<OpenRouterMetricsResponse>> {
+    openrouter_metrics_payload(&state).await.map(Json)
+}
+
+/// Generate or rotate the studio API bearer. Shown once in the response; also stored in
+/// `FREYA_SECRETS_FILE` so local/kind restarts keep it when that path is durable.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthTokenResponse {
+    pub token: String,
+    pub rotated: bool,
+    pub persisted: bool,
+    /// Whether the Kubernetes Secret named by `FREYA_API_TOKEN_SECRET_NAME` was patched.
+    pub secret_synced: bool,
+    pub note: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_commands: Option<Vec<String>>,
+}
+
+pub async fn auth_token_create(
+    State(state): State<AppState>,
+) -> ApiResult<Json<AuthTokenResponse>> {
+    let token = generate_api_token();
+    let (had_token, secret_name, secret_key, ns_hint) = {
+        let cfg = state.config.read().await;
+        (
+            !cfg.api_token.trim().is_empty(),
+            cfg.api_token_secret_name.clone(),
+            cfg.api_token_secret_key.clone(),
+            std::env::var("FREYA_NAMESPACE").unwrap_or_else(|_| "freya".into()),
+        )
+    };
+    {
+        let mut cfg = state.config.write().await;
+        cfg.api_token = token.clone();
+    }
+    let persisted = state.persist_secrets().await.is_ok();
+    let secret_synced = crate::k8s_secret::try_sync_api_token_secret(&token).await;
+
+    let sec = if secret_name.trim().is_empty() {
+        "freya-api-token".to_string()
+    } else {
+        secret_name
+    };
+    let key = if secret_key.trim().is_empty() {
+        "token".to_string()
+    } else {
+        secret_key
+    };
+    let sync_commands = if secret_synced {
+        Some(vec![format!(
+            "kubectl -n {ns_hint} rollout restart deploy/freya-mcp  # pick up Secret {sec}"
+        )])
+    } else {
+        Some(vec![
+            format!(
+                "kubectl -n {ns_hint} create secret generic {sec} --from-literal={key}='{token}' --dry-run=client -o yaml | kubectl apply -f -"
+            ),
+            format!("kubectl -n {ns_hint} rollout restart deploy/freya-mcp"),
+            "./scripts/sync-api-token-from-pvc.sh".into(),
+        ])
+    };
+    let note = match (persisted, secret_synced) {
+        (true, true) => "Machine API token rotated and synced.".into(),
+        (true, false) => {
+            "Machine API token rotated (secrets file). Sync freya-api-token if MCP needs it.".into()
+        }
+        (false, true) => "Machine API token rotated (in-memory + Secret).".into(),
+        (false, false) => "Machine API token rotated (in-memory only) — copy it now.".into(),
+    };
+    Ok(Json(AuthTokenResponse {
+        token,
+        rotated: had_token,
+        persisted,
+        secret_synced,
+        note,
+        sync_commands,
+    }))
+}
+
+fn generate_api_token() -> String {
+    // 64 hex chars ≈ openssl rand -hex 32
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -2851,6 +4427,18 @@ pub async fn settings_put(
         openrouter_api_key: upd.openrouter_api_key,
         civitai_api_key: upd.civitai_api_key,
         hf_token: upd.hf_token,
+        diffusion_worker_url: None, // URL already applied above; persist_secrets writes full snapshot
+        worker_enabled: None,
+        api_token: None,
+        chat_model: None,
+        image_model: None,
+        router_model: None,
+        privacy: None,
+        alignment: None,
+        auto_fallbacks: None,
+        legacy_upstream_auto_migrated: false,
+        instruction_overrides: None, // persist_secrets writes full snapshot from cfg
+        studio: None,
     };
     state.apply_secrets(secrets).await;
     let _ = state.persist_secrets().await;

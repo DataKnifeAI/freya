@@ -2,6 +2,8 @@ use crate::civitai::CivitaiClient;
 use crate::config::Config;
 use crate::gallery::Gallery;
 use crate::openrouter::OpenRouterClient;
+use crate::prefs::{AlignmentPrefs, AutoFallbacksPrefs, PrivacyPrefs};
+use crate::studio::StudioPrefs;
 use crate::worker::DiffusionWorkerClient;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -27,6 +29,41 @@ pub struct RuntimeSecrets {
     pub civitai_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hf_token: Option<String>,
+    /// Persisted worker URL so Settings survive API restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diffusion_worker_url: Option<String>,
+    /// When false, API skips local gens / treats worker as unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_enabled: Option<bool>,
+    /// Studio bearer (`FREYA_API_TOKEN`). Overrides env when present so UI rotate survives restarts
+    /// when the secrets file lives on durable storage (e.g. gallery PVC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<String>,
+    /// Persisted model picks (Auto sentinels allowed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_model: Option<String>,
+    /// OpenRouter privacy prefs (ZDR / data_collection) + Freya chat-provider checkboxes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy: Option<PrivacyPrefs>,
+    /// Freya-side model alignment / NSFW / tone prefs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<AlignmentPrefs>,
+    /// Configurable Auto fallbacks when the router does not pin a concrete model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_fallbacks: Option<AutoFallbacksPrefs>,
+    /// Set after the old `openrouter/auto` Auto sentinel is rewritten to internal `auto`.
+    #[serde(default)]
+    pub legacy_upstream_auto_migrated: bool,
+    /// Per-mode system prompt overrides (non-empty values only). Empty map omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_overrides: Option<HashMap<String, String>>,
+    /// Studio UI prefs (favorites, pins, backend, video model). Never includes secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub studio: Option<StudioPrefs>,
 }
 
 impl AppState {
@@ -71,7 +108,11 @@ impl AppState {
 
     async fn apply_secrets_inner(&self, secrets: RuntimeSecrets, from_disk: bool) {
         let mut cfg = self.config.write().await;
-        if assign_secret(&mut cfg.openrouter_api_key, secrets.openrouter_api_key, from_disk) {
+        if assign_secret(
+            &mut cfg.openrouter_api_key,
+            secrets.openrouter_api_key,
+            from_disk,
+        ) {
             let key = cfg.openrouter_api_key.clone();
             let mut or = self.openrouter.write().await;
             *or = OpenRouterClient::new(&cfg).with_key(key);
@@ -134,6 +175,9 @@ impl AppState {
         if let Some(overrides) = secrets.instruction_overrides {
             cfg.instruction_overrides = normalize_instruction_overrides(overrides);
         }
+        if let Some(studio) = secrets.studio {
+            cfg.studio = studio;
+        }
         if models_changed || prefs_changed {
             let key = cfg.openrouter_api_key.clone();
             let mut or = self.openrouter.write().await;
@@ -150,7 +194,11 @@ impl AppState {
             if cfg.legacy_upstream_auto_migrated {
                 false
             } else {
-                if cfg.chat_model.trim().eq_ignore_ascii_case("openrouter/auto") {
+                if cfg
+                    .chat_model
+                    .trim()
+                    .eq_ignore_ascii_case("openrouter/auto")
+                {
                     cfg.chat_model = "auto".into();
                 }
                 cfg.legacy_upstream_auto_migrated = true;
@@ -214,6 +262,7 @@ impl AppState {
             } else {
                 Some(cfg.instruction_overrides.clone())
             },
+            studio: Some(cfg.studio.clone()),
         };
         let raw = serde_json::to_vec_pretty(&secrets)?;
         tokio::fs::write(&cfg.secrets_file, raw).await?;

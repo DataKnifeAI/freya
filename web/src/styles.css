@@ -382,6 +382,41 @@ button.linkish:hover { text-decoration-color: var(--ember); }
 .t-meta time { font-variant-numeric: tabular-nums; }
 .t-prompt { padding: 0; border: none; background: transparent; text-align: left; font-weight: 500; font-size: 0.9rem; line-height: 1.45; color: var(--paper-text); }
 .t-prompt:hover { color: var(--ember-deep); }
+.t-msg.t-user { border-left-color: var(--ember); }
+.t-msg.t-assistant { border-left-color: var(--apricot-deep); }
+.t-bubble { margin: 0; font-size: 0.9rem; line-height: 1.45; white-space: pre-wrap; }
+.t-generate-row { margin-top: 0.35rem; }
+.t-generate { padding: 0.35rem 0.75rem; font-size: 0.78rem; }
+.t-tools { list-style: none; margin: 0.35rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.t-tool {
+  font-size: 0.68rem; font-weight: 600; letter-spacing: 0.02em;
+  padding: 0.15rem 0.45rem; border: 1px solid var(--line); border-radius: 2px;
+  display: inline-flex; gap: 0.35rem; align-items: baseline;
+}
+.t-tool-type { text-transform: none; }
+.t-tool-status { opacity: 0.65; text-transform: uppercase; letter-spacing: 0.08em; font-size: 0.6rem; }
+.t-tool-proposed { border-color: var(--apricot-deep); color: var(--apricot-deep); }
+.t-tool-executed { border-color: var(--ember); }
+.t-tool-error { border-color: var(--err-on-paper); color: var(--err-on-paper); }
+.t-thumbs { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.4rem; }
+.t-thumb-wrap { position: relative; width: 72px; height: 72px; }
+.t-thumb {
+  padding: 0; border: 1px solid var(--line); border-radius: 2px; background: transparent;
+  width: 72px; height: 72px; overflow: hidden; cursor: pointer;
+}
+.t-thumb-dl {
+  position: absolute; top: 2px; right: 2px; z-index: 2;
+  width: 22px; height: 22px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  opacity: 0; pointer-events: none;
+  background: color-mix(in srgb, var(--mat) 88%, transparent) !important;
+}
+.t-thumb-wrap:hover .t-thumb-dl,
+.t-thumb-wrap:focus-within .t-thumb-dl { opacity: 1; pointer-events: auto; }
+.t-thumb-dl svg { width: 12px; height: 12px; }
+.t-thumb img,
+.t-thumb video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.t-thumb:hover { border-color: var(--ember); }
 .pin-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.3rem; }
 .pin-list li { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; font-size: 0.82rem; }
 .pin-list li button { padding: 0.15rem 0.45rem; font-size: 0.66rem; }
@@ -450,6 +485,34 @@ button.linkish:hover { text-decoration-color: var(--ember); }
 .salon-feature figcaption { padding-top: 0.45rem; color: var(--mat-text); display: grid; gap: 0.3rem; }
 .remix-btn { justify-self: start; padding: 0.3rem 0.6rem; font-size: 0.72rem; color: var(--mat-text) !important; border-color: var(--mat-line) !important; }
 .remix-btn:hover { color: var(--ember-deep) !important; border-color: var(--ember) !important; }
+.salon-del-btn:hover { color: var(--err-on-paper) !important; border-color: var(--err-on-paper) !important; }
+.salon-work-dl {
+  position: absolute; top: 0.35rem; right: 2.15rem; z-index: 2;
+  width: 28px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--mat) 88%, transparent) !important;
+  border-color: var(--mat-line) !important; color: var(--mat-text) !important;
+  opacity: 0; pointer-events: none; transition: opacity 120ms ease;
+}
+.salon-work:hover .salon-work-dl,
+.salon-work:focus-within .salon-work-dl,
+.salon-work.selected .salon-work-dl {
+  opacity: 1; pointer-events: auto;
+}
+.salon-work-dl svg { width: 13px; height: 13px; }
+.salon-work-del {
+  position: absolute; top: 0.35rem; right: 0.35rem; z-index: 2;
+  width: 28px; height: 28px; padding: 0; display: inline-flex; align-items: center; justify-content: center;
+  background: color-mix(in srgb, var(--mat) 88%, transparent) !important;
+  border-color: var(--mat-line) !important; color: var(--mat-text) !important;
+  opacity: 0; pointer-events: none; transition: opacity 120ms ease;
+}
+.salon-work:hover .salon-work-del,
+.salon-work:focus-within .salon-work-del,
+.salon-work.selected .salon-work-del {
+  opacity: 1; pointer-events: auto;
+}
+.salon-work-del:hover { color: var(--err-on-paper) !important; border-color: var(--err-on-paper) !important; }
+.salon-work-del svg { width: 13px; height: 13px; }
 .salon-wall { display: grid; grid-template-columns: repeat(auto-fill, minmax(165px, 1fr)); gap: 0.8rem; counter-reset: work; }
 .salon-work { cursor: pointer; background: transparent; border: none; padding: 0; counter-increment: work; text-align: left; }
 .salon-work figure { margin: 0; display: grid; background: var(--mat); padding: 0.4rem 0.4rem 0.5rem; box-shadow: var(--shadow); transition: outline-color 140ms ease; }
