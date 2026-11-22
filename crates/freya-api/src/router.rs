@@ -18,49 +18,145 @@ pub const AUTO_ROUTER: &str = "auto";
 /// Explicit opt-in for OpenRouter's upstream router. Never an Auto sentinel.
 pub const UPSTREAM_ROUTER: &str = "openrouter/auto";
 
-/// Medium + balanced. Cells live in `packs/auto-models.json` (ZDR off and ZDR on match for chat).
-/// Router / agent: DeepSeek V4 Pro (tools + JSON, not an uncensored specialist, not Claude/GPT).
-pub const DEFAULT_ROUTER_MODEL: &str = "deepseek/deepseek-v4-pro";
-/// Picture Auto medium, ZDR off: Seedream 4.5 (capable default; Flux is the uncensored row).
-pub const DEFAULT_AUTO_IMAGE_MODEL: &str = "bytedance-seed/seedream-4.5";
-/// Picture Auto medium when ZDR is on. Microsoft MAI is on the ZDR image catalog; Flux is not.
-pub const DEFAULT_AUTO_IMAGE_MODEL_ZDR: &str = "microsoft/mai-image-2.7";
+/// Medium + balanced + ZDR off. These are the default column of `builtin_auto_fallback`.
+/// Router: Llama 3.3 70B (tools + structured JSON, on the ZDR catalog). 8B is the low tier.
+pub const DEFAULT_ROUTER_MODEL: &str = "meta-llama/llama-3.3-70b-instruct";
+/// Picture Auto medium: Flux Pro (Klein 4B is the low tier).
+pub const DEFAULT_AUTO_IMAGE_MODEL: &str = "black-forest-labs/flux.2-pro";
+/// Picture Auto when Freya ZDR is on — this Google image id is on the ZDR catalog.
+pub const DEFAULT_AUTO_IMAGE_MODEL_ZDR: &str = "google/gemini-2.5-flash-image";
 /// Agent Auto medium: tool-calling chat. Not `openrouter/auto`.
-pub const DEFAULT_AUTO_AGENT_MODEL: &str = "deepseek/deepseek-v4-pro";
-/// Same id: DeepSeek V4 Pro is on the ZDR chat catalog.
-pub const DEFAULT_AUTO_AGENT_MODEL_ZDR: &str = "deepseek/deepseek-v4-pro";
-pub const DEFAULT_AUTO_AGENT_MODEL_SAFETY: &str = "openai/gpt-5-mini";
-/// Cydonia's description is uncensored. It has JSON, not tools. Tool calls may be weaker.
-pub const DEFAULT_AUTO_AGENT_MODEL_UNCENSORED: &str = "thedrummer/cydonia-24b-v4.1";
-pub const DEFAULT_ROUTER_MODEL_ZDR: &str = "deepseek/deepseek-v4-pro";
-pub const DEFAULT_ROUTER_MODEL_SAFETY: &str = "openai/gpt-5-mini";
+pub const DEFAULT_AUTO_AGENT_MODEL: &str = "openai/gpt-4.1-mini";
+/// Same id: gpt-4.1-mini is on the ZDR catalog (gemini-2.5-flash is not).
+pub const DEFAULT_AUTO_AGENT_MODEL_ZDR: &str = "openai/gpt-4.1-mini";
+pub const DEFAULT_AUTO_AGENT_MODEL_SAFETY: &str = "openai/gpt-4.1-mini";
+/// Dolphin Venice has JSON but no tools, so it cannot be the agent. 70B is tool-capable and unmoderated.
+pub const DEFAULT_AUTO_AGENT_MODEL_UNCENSORED: &str = "meta-llama/llama-3.3-70b-instruct";
+pub const DEFAULT_ROUTER_MODEL_ZDR: &str = "meta-llama/llama-3.3-70b-instruct";
+pub const DEFAULT_ROUTER_MODEL_SAFETY: &str = "openai/gpt-4.1-mini";
 
 /// Whether routing must prefer ZDR / no-collection endpoints.
 pub fn privacy_requires_strict(privacy: &PrivacyPrefs) -> bool {
     privacy.zero_data_retention || privacy.data_collection.eq_ignore_ascii_case("deny")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CostTier {
+    Low,
+    Medium,
+    High,
+    Max,
+}
+
+fn parse_cost_tier(raw: &str) -> CostTier {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "low" | "cheap" => CostTier::Low,
+        "high" => CostTier::High,
+        "max" | "maximum" => CostTier::Max,
+        _ => CostTier::Medium,
+    }
+}
+
 /// Built-in Auto matrix: role × privacy × alignment × cost.
-/// User overrides in `AutoFallbacksPrefs` win one cell. Ids come from
-/// `packs/auto-models.json` (researched against OpenRouter). A missing file
-/// uses the small fallback in `auto_matrix` so the API still boots.
+/// User overrides in `AutoFallbacksPrefs` win one cell. Ids were checked against
+/// OpenRouter `GET /models` (and `?zdr=true` / image / video catalogs).
 ///
-/// Video: `GET /models?output_modalities=video&zdr=true` lists no models.
-/// ZDR video cells repeat the non-ZDR picks and OpenRouter may reject them.
+/// Video: the ZDR catalog lists **no** video-output models. Strict video cells
+/// still name Google Veo (the only Google-class T2V Freya can call) and OpenRouter may reject them.
 pub fn builtin_auto_fallback(
     kind: AutoFallbackKind,
     privacy: &PrivacyPrefs,
     alignment: &AlignmentPrefs,
     cost: &str,
-) -> String {
+) -> &'static str {
     let strict = privacy_requires_strict(privacy);
-    let role = match kind {
-        AutoFallbackKind::Router => "router",
-        AutoFallbackKind::Agent => "agent",
-        AutoFallbackKind::Image => "image",
-        AutoFallbackKind::Video => "video",
-    };
-    crate::auto_matrix::model_for(role, strict, alignment.model_alignment.as_str(), cost)
+    let align = alignment.model_alignment.as_str();
+    let cost = parse_cost_tier(cost);
+    match kind {
+        AutoFallbackKind::Router => router_default(align, cost),
+        AutoFallbackKind::Agent => agent_default(align, cost),
+        AutoFallbackKind::Image => image_default(strict, align, cost),
+        AutoFallbackKind::Video => video_default(strict, align, cost),
+    }
+}
+
+/// Every router id below is on the ZDR catalog, so privacy does not change the cell.
+fn router_default(align: &str, cost: CostTier) -> &'static str {
+    match (align, cost) {
+        ("safety", CostTier::Low) => "openai/gpt-4o-mini",
+        ("safety", CostTier::Medium) => DEFAULT_ROUTER_MODEL_SAFETY,
+        ("safety", CostTier::High) => "anthropic/claude-sonnet-5.5",
+        ("safety", CostTier::Max) => "anthropic/claude-opus-5.5",
+        // Dolphin Venice: response_format, no tools. Router-ok, not an agent.
+        ("uncensored", CostTier::Low) => "cognitivecomputations/dolphin-mistral-24b-venice-edition",
+        ("uncensored", CostTier::Medium) => "meta-llama/llama-3.3-70b-instruct",
+        ("uncensored", CostTier::High) => "google/gemini-4-neon",
+        ("uncensored", CostTier::Max) => "meta/muse-wonder",
+        (_, CostTier::Low) => "meta-llama/llama-3.1-8b-instruct",
+        (_, CostTier::Medium) => DEFAULT_ROUTER_MODEL,
+        (_, CostTier::High) => "anthropic/claude-sonnet-5.5",
+        (_, CostTier::Max) => "anthropic/claude-opus-5.5",
+    }
+}
+
+/// Tool-calling chat. Dolphin has no `tools`/`tool_choice`, so uncensored uses unmoderated Llama.
+/// Every id here is on the ZDR catalog.
+fn agent_default(align: &str, cost: CostTier) -> &'static str {
+    match (align, cost) {
+        ("safety", CostTier::Low) => "openai/gpt-4o-mini",
+        ("safety", CostTier::Medium) => DEFAULT_AUTO_AGENT_MODEL_SAFETY,
+        ("safety", CostTier::High) => "anthropic/claude-sonnet-5.5",
+        ("safety", CostTier::Max) => "anthropic/claude-opus-5.5",
+        ("uncensored", CostTier::Low) => "meta-llama/llama-3.1-8b-instruct",
+        ("uncensored", CostTier::Medium) => DEFAULT_AUTO_AGENT_MODEL_UNCENSORED,
+        ("uncensored", CostTier::High) => "google/gemini-4-neon",
+        ("uncensored", CostTier::Max) => "meta/muse-wonder",
+        (_, CostTier::Low) => "meta-llama/llama-3.1-8b-instruct",
+        (_, CostTier::Medium) => DEFAULT_AUTO_AGENT_MODEL,
+        (_, CostTier::High) => "anthropic/claude-sonnet-5.5",
+        (_, CostTier::Max) => "anthropic/claude-opus-5.5",
+    }
+}
+
+fn image_default(strict: bool, align: &str, cost: CostTier) -> &'static str {
+    // Flux and GPT Image are not on the ZDR image catalog. Strict → Google image ids that are.
+    if strict {
+        return match cost {
+            CostTier::Low => "google/gemini-3.1-flash-lite-image",
+            CostTier::Medium => DEFAULT_AUTO_IMAGE_MODEL_ZDR,
+            CostTier::High => "google/gemini-3.1-flash-image",
+            CostTier::Max => "google/gemini-3-pro-image",
+        };
+    }
+    match (align, cost) {
+        ("safety", CostTier::Low) => "openai/gpt-image-1-mini",
+        ("safety", CostTier::Medium) => "openai/gpt-image-1",
+        ("safety", CostTier::High) => "openai/gpt-5-image-mini",
+        ("safety", CostTier::Max) => "openai/gpt-5-image",
+        (_, CostTier::Low) => "black-forest-labs/flux.2-klein-4b",
+        (_, CostTier::Medium) => DEFAULT_AUTO_IMAGE_MODEL,
+        (_, CostTier::High) => "black-forest-labs/flux.2-max",
+        (_, CostTier::Max) => "black-forest-labs/flux-3-image",
+    }
+}
+
+fn video_default(strict: bool, align: &str, cost: CostTier) -> &'static str {
+    // Safety prefers Google Veo. Strict privacy has no ZDR video id; Veo is the attempt.
+    if strict || align == "safety" {
+        return match cost {
+            CostTier::Low => "google/veo-3.1-lite",
+            CostTier::Medium => "google/veo-3.1-fast",
+            CostTier::High | CostTier::Max => DEFAULT_AUTO_VIDEO_MODEL_ZDR,
+        };
+    }
+    match (align, cost) {
+        ("uncensored", CostTier::High) => "black-forest-labs/flux-3-video",
+        ("uncensored", CostTier::Max) => "minimax/hailuo-3-max",
+        (_, CostTier::Low) => "bytedance/seedance-2.5-flash",
+        (_, CostTier::Medium) => DEFAULT_AUTO_VIDEO_MODEL,
+        (_, CostTier::High) => "google/veo-3.1",
+        (_, CostTier::Max) => "minimax/hailuo-3-max",
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,34 +186,24 @@ pub fn resolve_auto_fallback(
     };
     let user = user.trim();
     if !user.is_empty() {
-        let user_id = if kind == AutoFallbackKind::Image {
-            match crate::openrouter::canonical_image_model(user) {
-                Some(id) => id,
-                None => {
-                    return builtin_auto_fallback(kind, privacy, alignment, &fallbacks.cost_tier);
-                }
-            }
-        } else {
-            user.to_string()
-        };
         // When strict privacy is on, ignore non-Google Flux-ish image/video overrides.
         if strict {
             match kind {
                 AutoFallbackKind::Image
-                    if !user_id.starts_with("google/")
-                        && (user_id.contains("flux")
-                            || user_id.contains("seedream")
-                            || user_id.contains("black-forest")) =>
+                    if !user.starts_with("google/")
+                        && (user.contains("flux")
+                            || user.contains("seedream")
+                            || user.contains("black-forest")) =>
                 {
                     return builtin_auto_fallback(kind, privacy, alignment, &fallbacks.cost_tier)
                         .to_string();
                 }
                 AutoFallbackKind::Video
-                    if !user_id.starts_with("google/")
-                        && (user_id.contains("seedance")
-                            || user_id.contains("kling")
-                            || user_id.contains("hailuo")
-                            || user_id.contains("flux")) =>
+                    if !user.starts_with("google/")
+                        && (user.contains("seedance")
+                            || user.contains("kling")
+                            || user.contains("hailuo")
+                            || user.contains("flux")) =>
                 {
                     return builtin_auto_fallback(kind, privacy, alignment, &fallbacks.cost_tier)
                         .to_string();
@@ -125,7 +211,7 @@ pub fn resolve_auto_fallback(
                 _ => {}
             }
         }
-        return user_id;
+        return user.to_string();
     }
     builtin_auto_fallback(kind, privacy, alignment, &fallbacks.cost_tier).to_string()
 }
@@ -211,10 +297,10 @@ impl RouteDecision {
     }
 }
 
-/// Default Auto video model (balanced medium). No video id is on the ZDR catalog,
-/// so the ZDR balanced-medium cell is the same id.
+/// Default Auto video model (OpenRouter T2V).
 pub const DEFAULT_AUTO_VIDEO_MODEL: &str = crate::openrouter::DEFAULT_AUTO_VIDEO_MODEL;
-pub const DEFAULT_AUTO_VIDEO_MODEL_ZDR: &str = "bytedance/seedance-2.5-flash";
+/// Video Auto when Freya ZDR is on (Google Veo family typically offers ZDR/safety retention).
+pub const DEFAULT_AUTO_VIDEO_MODEL_ZDR: &str = "google/veo-3.1";
 
 pub fn default_auto_video_model(zdr: bool) -> &'static str {
     if zdr {
@@ -271,8 +357,7 @@ pub fn resolve_video_model_choice_prefs(
     alignment: &AlignmentPrefs,
     fallbacks: &AutoFallbacksPrefs,
 ) -> String {
-    let auto_default =
-        resolve_auto_fallback(AutoFallbackKind::Video, privacy, alignment, fallbacks);
+    let auto_default = resolve_auto_fallback(AutoFallbackKind::Video, privacy, alignment, fallbacks);
     if let Some(p) = pinned.map(str::trim).filter(|s| !s.is_empty()) {
         if !is_auto_video(p) {
             return crate::openrouter::resolve_video_model(p, &auto_default);
@@ -292,11 +377,7 @@ pub fn resolve_video_model_choice_prefs(
             || sug_l.contains("/kling")
             || (sug_l.starts_with("minimax/") && sug_l.contains("hailuo"))
             || sug_l.contains("wan-")
-            || sug_l.contains("/ltx")
-            || sug_l.starts_with("x-ai/grok-imagine-video")
-            || sug_l.starts_with("black-forest-labs/flux-3-video")
-            || sug_l.starts_with("black-forest-labs/flux-video")
-            || sug_l.starts_with("runway/gen-");
+            || sug_l.contains("/ltx");
         if known_video {
             if privacy_requires_strict(privacy)
                 && !sug.starts_with("google/")
@@ -396,16 +477,6 @@ pub fn resolve_agent_model_prefs(
                 fallbacks,
             ));
         }
-        // Uncensored Auto must not be overridden by a high-refusal suggestion
-        // (route used to ask for Llama). A pinned model is returned above.
-        if alignment.model_alignment == "uncensored" && !keeps_uncensored_agent(&sug) {
-            return Some(resolve_auto_fallback(
-                AutoFallbackKind::Agent,
-                privacy,
-                alignment,
-                fallbacks,
-            ));
-        }
         return Some(sug);
     }
     Some(resolve_auto_fallback(
@@ -458,8 +529,7 @@ pub fn resolve_image_model_choice_prefs(
     alignment: &AlignmentPrefs,
     fallbacks: &AutoFallbacksPrefs,
 ) -> String {
-    let auto_default =
-        resolve_auto_fallback(AutoFallbackKind::Image, privacy, alignment, fallbacks);
+    let auto_default = resolve_auto_fallback(AutoFallbackKind::Image, privacy, alignment, fallbacks);
     if let Some(p) = pinned.map(str::trim).filter(|s| !s.is_empty()) {
         if !is_auto_image(p) {
             return crate::openrouter::resolve_image_model(p, &auto_default);
@@ -502,86 +572,91 @@ fn contains_any(hay: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| hay.contains(n))
 }
 
-fn has_word(lower: &str, word: &str) -> bool {
-    lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|t| t == word)
-}
-
-fn trim_punct(lower: &str) -> &str {
-    lower
-        .trim()
-        .trim_matches(|c: char| matches!(c, '?' | '!' | '.' | '"' | '\'' | '“' | '”' | '«' | '»'))
-}
-
-/// Comma-tag soup or an explicit `<lora:>` prompt. A character name is not this.
 fn looks_like_tag_prompt(lower: &str) -> bool {
     if lower.contains("<lora:") || lower.contains("<lyco:") || lower.contains("(lora:") {
         return true;
     }
-    if lower.contains('?') {
-        return false;
-    }
     let commas = lower.matches(',').count();
-    if commas < 4 {
+    commas >= 3 && !lower.contains('?')
+}
+
+fn visual_cue_count(lower: &str) -> usize {
+    const CUES: &[&str] = &[
+        "cartoon",
+        "meme",
+        "illustration",
+        "illustrated",
+        "painting",
+        "portrait",
+        "sketch",
+        "artwork",
+        "comic",
+        "anime",
+        "watercolor",
+        "oil painting",
+        "background",
+        "lighting",
+        "wearing",
+        "standing",
+        "sitting",
+        "close-up",
+        "close up",
+        "wide shot",
+        "cinematic",
+        "linework",
+        "line art",
+        "landscape",
+        "sunset",
+        "moonlight",
+        "waterfall",
+        "armor",
+        "wings",
+        "cowboy",
+        "outline",
+        "studio light",
+        "digital art",
+        "concept art",
+        "photograph",
+        "in the style",
+        "masterpiece",
+        "highly detailed",
+        "1girl",
+        "1boy",
+        "photo of",
+        "picture of",
+        "image of",
+        "drawing of",
+        "shot of",
+    ];
+    CUES.iter().filter(|c| lower.contains(*c)).count()
+}
+
+/// Questions, how-it-works, and LoRA/model clarification — not a prompt to render.
+pub fn message_is_chat_not_media(message: &str) -> bool {
+    let lower = message.trim().to_lowercase();
+    if lower.is_empty() {
         return false;
     }
-    let words = lower.split_whitespace().count();
-    words >= 6 && commas * 2 >= words
-}
-
-/// Whole message is "do that again", not a sentence that happens to say again.
-fn is_whole_message_redo(lower: &str) -> bool {
-    matches!(
-        trim_punct(lower),
-        "again"
-            | "do it again"
-            | "do that again"
-            | "another"
-            | "another one"
-            | "another image"
-            | "another picture"
-            | "one more"
-            | "once more"
-            | "regenerate"
-            | "redo"
-            | "same again"
-            | "generate"
-            | "generate it"
-            | "generate this"
-            | "generate again"
-            | "make it"
-            | "draw it"
-            | "draw this"
-            | "render it"
-    )
-}
-
-/// Obvious "help me decide". Not every question, and not a look they want seen.
-fn obvious_guidance(lower: &str) -> bool {
-    const HOLDS: &[&str] = &[
-        "don't generate",
-        "dont generate",
-        "do not generate",
-        "don't draw",
-        "do not draw",
-        "before we generate",
-        "before generating",
-        "not yet",
-    ];
-    if contains_any(lower, HOLDS) {
-        return true;
+    if looks_like_tag_prompt(&lower) && !lower.trim_end().ends_with('?') {
+        return false;
     }
-    const ADVICE: &[&str] = &[
+    const PHRASES: &[&str] = &[
         "how does",
         "how do ",
-        "how do i",
         "how can ",
         "how would ",
-        "how to prompt",
-        "how should i",
-        "what should i",
-        "what should we",
+        "what is ",
+        "what are ",
+        "what was ",
+        "what's ",
+        "whats ",
+        "why does",
+        "why is ",
+        "why do ",
+        "explain ",
+        "tell me how",
+        "tell me about",
+        "tell me what",
         "which lora",
         "what lora",
         "which model",
@@ -590,81 +665,128 @@ fn obvious_guidance(lower: &str) -> bool {
         "what checkpoint",
         "which base",
         "what base",
-        "which style",
-        "what style",
+        "clarify",
+        "before we generate",
+        "before generating",
+        "don't generate",
+        "do not generate",
+        "not yet",
+        "how it works",
+        "how this works",
+        "what should i",
         "should i use",
         "can you explain",
         "could you explain",
         "help me understand",
-        "help me decide",
-        "help me choose",
-        "help me pick",
         "search civitai",
         "find a lora",
         "find loras",
         "suggest idea",
         "brainstorm",
-        "any ideas",
-        "any assets",
-        "which assets",
-        "models that",
-        "you able",
-        "are you able",
-        "did we ",
-        "did you ",
-        "have we ",
-        "have you ",
-        "was that generated",
+        "list lora",
+        "list checkpoint",
+        "worker status",
     ];
-    if contains_any(lower, ADVICE) {
+    if contains_any(&lower, PHRASES) {
         return true;
     }
-    // Broad fragments only count when the message is not already a render.
-    if obvious_still(lower) || obvious_motion(lower).is_some() {
-        return false;
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let first = words.first().copied().unwrap_or("");
+    if matches!(
+        first,
+        "who" | "what" | "why" | "how" | "when" | "where" | "which" | "whose"
+    ) && !(first == "how" && words.get(1) == Some(&"about"))
+        && (lower.trim_end().ends_with('?') || words.len() < 14)
+    {
+        return true;
     }
-    const SOFT: &[&str] = &["using the lora?", "would help"];
-    contains_any(lower, SOFT)
+    if words.len() < 24
+        && (lower.starts_with("can you ")
+            || lower.starts_with("could you ")
+            || lower.starts_with("would you ")
+            || lower.starts_with("please explain"))
+    {
+        let imperative = contains_any(
+            &lower,
+            &[
+                "draw", "generat", "illustrat", "render", "paint", "video", "gif", "animat",
+                "picture", "image",
+            ],
+        );
+        if !imperative {
+            return true;
+        }
+    }
+    false
 }
 
-/// Obvious motion request. The bare words "video" or "gif" are not enough.
-fn obvious_motion(lower: &str) -> Option<DirectMedia> {
-    let asked = lower.contains('?');
-    let gif_imperative = lower.contains("make a gif")
-        || lower.contains("generate a gif")
-        || lower.contains("animated gif")
-        || lower.contains("animate as gif")
-        || lower.contains("looping animation");
-    let gif_loose = lower.contains("gif of")
-        || lower.contains(".gif")
-        || (has_word(lower, "gif") && (lower.contains("make ") || lower.contains("generate ")));
-    if gif_imperative || (!asked && gif_loose) {
-        return Some(DirectMedia::Gif);
+fn looks_like_prose_scene(lower: &str) -> bool {
+    let stripped = lower.trim().trim_matches(|c: char| {
+        matches!(c, '"' | '\'' | '“' | '”' | '«' | '»')
+    });
+    if stripped.contains('?') {
+        return false;
     }
-    const VIDEO_IMPERATIVE: &[&str] = &[
+    let words: Vec<&str> = stripped.split_whitespace().collect();
+    if words.len() < 6 {
+        return false;
+    }
+    let cues = visual_cue_count(stripped);
+    if cues >= 2 && words.len() >= 6 {
+        return true;
+    }
+    if cues >= 1 && words.len() >= 8 {
+        return true;
+    }
+    let starts_scene = stripped.starts_with("a ")
+        || stripped.starts_with("an ")
+        || stripped.starts_with("prompt:")
+        || stripped.starts_with("\"")
+        || stripped.starts_with("“");
+    starts_scene && words.len() >= 10 && (stripped.contains(',') || stripped.contains(" with "))
+}
+
+/// Classify a message as media to produce, without requiring the word "generate".
+pub fn direct_media_ask(message: &str) -> DirectMedia {
+    let lower = message.trim().to_lowercase();
+    if lower.is_empty() || message_is_chat_not_media(message) {
+        return DirectMedia::None;
+    }
+    let has_gif_token = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|t| t == "gif")
+        || lower.contains(".gif")
+        || lower.contains("animated gif");
+    if has_gif_token
+        || lower.contains("looping animation")
+        || lower.contains("animated meme")
+        || lower.contains("short animation")
+        || lower.contains("animate as gif")
+    {
+        return DirectMedia::Gif;
+    }
+    const VIDEO: &[&str] = &[
+        "video",
+        "t2v",
+        "i2v",
         "text-to-video",
         "image-to-video",
         "text to video",
         "image to video",
-        "make a video",
         "make a clip",
-        "generate a video",
-        "animate this",
+        "generate a clip",
+        "motion clip",
+        "animate this into",
+        "short clip",
+        "wan 2",
+        "ltx video",
+        "mp4",
+        "webm",
     ];
-    const VIDEO_LOOSE: &[&str] = &["video of", "short video", "short clip"];
-    if contains_any(lower, VIDEO_IMPERATIVE) || (!asked && contains_any(lower, VIDEO_LOOSE)) {
-        Some(DirectMedia::Video)
-    } else {
-        None
-    }
-}
-
-fn obvious_series(lower: &str) -> bool {
-    if lower.contains('?') {
-        return false;
-    }
-    if contains_any(lower, &["run session", "run a session"]) {
-        return true;
+    if contains_any(&lower, VIDEO)
+        || (lower.contains("animat") && !lower.contains("still") && !has_gif_token)
+    {
+        return DirectMedia::Video;
     }
     const SERIES: &[&str] = &[
         "series of",
@@ -676,78 +798,41 @@ fn obvious_series(lower: &str) -> bool {
         "storyboard",
         "sequence of images",
         "sequence of pictures",
+        "several versions",
+        "a few versions",
+        "a few images",
+        "a few pictures",
+        "several images",
+        "several pictures",
+        "variations",
+        "run session",
+        "run a session",
+        "batch of",
     ];
-    if !contains_any(lower, SERIES) {
-        return false;
-    }
-    // A bare "series of illustrations…" is a description, not a request to render.
-    has_word(lower, "generate")
-        || has_word(lower, "draw")
-        || has_word(lower, "render")
-        || has_word(lower, "paint")
-        || lower.contains("make ")
-}
-
-/// Obvious "render this now". A character name or a visual noun is not enough.
-fn obvious_still(lower: &str) -> bool {
-    if is_whole_message_redo(lower)
-        || looks_like_tag_prompt(lower)
-        || lower.trim().starts_with("prompt:")
-    {
-        return true;
-    }
-    const PHRASES: &[&str] = &[
-        "draw me",
-        "draw a ",
-        "draw an ",
-        "draw the ",
-        "make an image",
-        "make a picture",
-        "make me an image",
-        "make me a picture",
-        "make the image",
-        "make the picture",
-        "generate an image",
-        "generate a picture",
-        "generate a ",
-        "generate an ",
-        "generate the image",
-        "generate this",
-        "generate that",
-        "please generate",
-        "create an image",
-        "create a picture",
-        "create me an image",
-        "create me a picture",
-        "render a ",
-        "render an ",
-        "paint a ",
-        "paint an ",
-        "paint me ",
-    ];
-    contains_any(lower, PHRASES)
-}
-
-/// Obvious "help me decide". A scene, outfit, or character description is not
-/// this, even when the user never said generate, draw, or make.
-pub fn message_is_chat_not_media(message: &str) -> bool {
-    let lower = message.trim().to_lowercase();
-    !lower.is_empty() && obvious_guidance(&lower)
-}
-
-/// Obvious render only. A scene, outfit, or character name is not a render.
-pub fn direct_media_ask(message: &str) -> DirectMedia {
-    let lower = message.trim().to_lowercase();
-    if lower.is_empty() || obvious_guidance(&lower) {
-        return DirectMedia::None;
-    }
-    if let Some(kind) = obvious_motion(&lower) {
-        return kind;
-    }
-    if obvious_series(&lower) {
+    if contains_any(&lower, SERIES) {
         return DirectMedia::Series;
     }
-    if obvious_still(&lower) {
+    const PICTURE: &[&str] = &[
+        "generate",
+        "make an image",
+        "make me an image",
+        "create an image",
+        "make a picture",
+        "create a picture",
+        "draw ",
+        "draw me",
+        "render ",
+        "paint ",
+        "produce an image",
+        "still image",
+        "illustration",
+        "generate this",
+        "image prompt",
+    ];
+    if contains_any(&lower, PICTURE) || lower.starts_with("prompt:") {
+        return DirectMedia::Picture;
+    }
+    if looks_like_tag_prompt(&lower) || looks_like_prose_scene(&lower) {
         return DirectMedia::Picture;
     }
     DirectMedia::None
@@ -762,9 +847,7 @@ fn modality_for_ask(ask: DirectMedia) -> Option<Modality> {
     }
 }
 
-/// Obvious render wins. Obvious guidance stays chat.
-/// A scene, outfit, or character description keeps the route model's call.
-/// Heuristics do not force that look back to chat.
+/// Force picture/gif/video when the text is a prompt, and chat when it is a question.
 pub fn coerce_route_to_media_ask(
     mut decision: RouteDecision,
     message: &str,
@@ -785,7 +868,7 @@ pub fn coerce_route_to_media_ask(
                     fallbacks,
                 ));
             }
-            decision.reason = "Guidance: they want help deciding, not a picture yet.".into();
+            decision.reason = "Chat: question, how-it-works, or LoRA/character clarification.".into();
             if !decision.source.contains("chat-guard") {
                 decision.source = format!("{}+chat-guard", decision.source);
             }
@@ -795,8 +878,12 @@ pub fn coerce_route_to_media_ask(
     if decision.modality != modality {
         decision.modality = modality;
         decision.reason = match ask {
-            DirectMedia::Series => "Asked to render a series of stills now.".into(),
-            DirectMedia::Picture => "Asked to render a still now.".into(),
+            DirectMedia::Series => {
+                "Visual series prompt — stills, without requiring the word generate.".into()
+            }
+            DirectMedia::Picture => {
+                "Pasted or described still — picture, without requiring the word generate.".into()
+            }
             DirectMedia::Gif => "GIF / looping animation wording.".into(),
             DirectMedia::Video => "Video / motion wording.".into(),
             DirectMedia::None => decision.reason,
@@ -871,7 +958,7 @@ pub fn infer_modality_prefs(
         },
         DirectMedia::Picture => RouteDecision {
             modality: Modality::Picture,
-            reason: "Heuristic: asked to render a still now.".into(),
+            reason: "Heuristic: still prompt (scene, meme, illustration, or quoted prompt).".into(),
             agent_model: None,
             image_model: Some(resolve_auto_fallback(
                 AutoFallbackKind::Image,
@@ -883,7 +970,7 @@ pub fn infer_modality_prefs(
         },
         DirectMedia::Series => RouteDecision {
             modality: Modality::Picture,
-            reason: "Heuristic: asked for a series of stills.".into(),
+            reason: "Heuristic: series of stills.".into(),
             agent_model: None,
             image_model: Some(resolve_auto_fallback(
                 AutoFallbackKind::Image,
@@ -911,287 +998,6 @@ pub fn infer_modality_prefs(
 
 /// Drop router prose / null-ish placeholders that LLMs echo from the prompt
 /// (e.g. `"None, letting Freya use Auto default (ZDR-aware)."`).
-/// Router suggestions that stay on the uncensored agent row.
-/// Llama-instruct, Claude, and GPT are not in that row.
-fn keeps_uncensored_agent(id: &str) -> bool {
-    let l = id.to_ascii_lowercase();
-    const MARKERS: &[&str] = &[
-        "uncensored",
-        "dolphin",
-        "cydonia",
-        "venice",
-        "abliterat",
-        "cognitivecomputations",
-        "thedrummer",
-        "wizard-vicuna",
-    ];
-    MARKERS.iter().any(|m| l.contains(m))
-}
-
-/// Which chat model writes a local checkpoint prompt.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocalEnhancePath {
-    /// Alignment allows adult scenes and the user text is sexual.
-    pub adult: bool,
-    /// Concrete chat model id. Never the raw user one-liner.
-    pub model: String,
-}
-
-/// Local prompt-sd writer.
-/// Ordinary requests use the balanced Auto agent (the normal matrix cell) or
-/// an explicit chat pin. Adult requests use the uncensored matrix cell
-/// (Cydonia at medium and above, Dolphin Venice at low) unless the pin is
-/// already an uncensored-safe model.
-pub fn local_enhance_path(
-    prompt: &str,
-    alignment: &AlignmentPrefs,
-    pinned_chat: Option<&str>,
-    privacy: &PrivacyPrefs,
-    fallbacks: &AutoFallbacksPrefs,
-) -> LocalEnhancePath {
-    let adult = alignment.local_adult_passthrough() && prompt_is_adult_scene(prompt);
-    let strict = privacy_requires_strict(privacy);
-    let cost = fallbacks.cost_tier.as_str();
-    let model = if adult {
-        match explicit_chat_pin(pinned_chat) {
-            // Adult rewrite only: a pinned Llama, Claude, GPT, or Gemini is
-            // moderated, so the uncensored matrix model writes this checkpoint prompt.
-            Some(id) if !moderated_chat_family(id) && !is_upstream_router(id) => id.to_string(),
-            _ => crate::auto_matrix::model_for("agent", strict, "uncensored", cost),
-        }
-    } else {
-        match explicit_chat_pin(pinned_chat) {
-            Some(id) => id.to_string(),
-            None => crate::auto_matrix::model_for("agent", strict, "balanced", cost),
-        }
-    };
-    LocalEnhancePath { adult, model }
-}
-
-/// Uncensored Auto chat cell for a local adult rewrite (matrix, not the pin).
-pub fn local_adult_matrix_model(privacy: &PrivacyPrefs, fallbacks: &AutoFallbacksPrefs) -> String {
-    crate::auto_matrix::model_for(
-        "agent",
-        privacy_requires_strict(privacy),
-        "uncensored",
-        fallbacks.cost_tier.as_str(),
-    )
-}
-
-fn explicit_chat_pin(pinned: Option<&str>) -> Option<&str> {
-    let p = pinned.map(str::trim).filter(|s| !s.is_empty())?;
-    if is_auto_agent(p) {
-        None
-    } else {
-        Some(p)
-    }
-}
-
-/// Llama, Claude, GPT, and Gemini. Dolphin and Cydonia are not in this set.
-fn moderated_chat_family(id: &str) -> bool {
-    let l = id.trim().to_ascii_lowercase();
-    if l.is_empty() || keeps_uncensored_agent(&l) {
-        return false;
-    }
-    l.contains("llama")
-        || l.contains("claude")
-        || l.starts_with("anthropic/")
-        || l.starts_with("openai/")
-        || l.contains("gpt")
-        || l.contains("gemini")
-}
-
-/// Sexual or adult scene text. Uncensored alignment alone is not a match.
-pub fn prompt_is_adult_scene(text: &str) -> bool {
-    let l = text.to_ascii_lowercase();
-    const TERMS: &[&str] = &[
-        "nsfw",
-        "nude",
-        "nudes",
-        "naked",
-        "topless",
-        "bottomless",
-        "porn",
-        "hentai",
-        "erotic",
-        "erotica",
-        "lewd",
-        "ecchi",
-        "ahegao",
-        "orgasm",
-        "orgasmic",
-        "penis",
-        "vagina",
-        "vulva",
-        "clitoris",
-        "nipple",
-        "nipples",
-        "areola",
-        "genitals",
-        "genitalia",
-        "intercourse",
-        "blowjob",
-        "handjob",
-        "fellatio",
-        "cunnilingus",
-        "bondage",
-        "bdsm",
-        "fetish",
-        "lingerie",
-        "panties",
-        "thong",
-        "boobs",
-        "cock",
-        "cocks",
-        "dick",
-        "pussy",
-        "cum",
-        "cumshot",
-        "cumming",
-        "fucking",
-        "fuck",
-        "fucked",
-        "sex",
-        "sexual",
-        "sexually",
-        "xxx",
-        "undressed",
-        "stripper",
-        "whore",
-        "slut",
-        "dildo",
-        "erection",
-        "softcore",
-        "rule34",
-        "r34",
-        "yaoi",
-        "incest",
-        "milf",
-        "anal",
-        "orgy",
-        "threesome",
-        "gangbang",
-        "creampie",
-        "deepthroat",
-        "moaning",
-        "making love",
-        "clothes off",
-        "no clothes",
-        "without clothes",
-        "spread legs",
-        "spread her legs",
-        "spread his legs",
-        "in the nude",
-        "adult scene",
-        "adult content",
-        "sex scene",
-        "blow job",
-        "hand job",
-        "jerking off",
-        "get naked",
-        "gets naked",
-        "18+",
-    ];
-    if TERMS.iter().any(|term| contains_term(&l, term)) {
-        return true;
-    }
-    // "breast" / "breasts" / "tits" are ordinary in food and bird names.
-    contextual_term(
-        &l,
-        "breast",
-        &["chicken", "turkey", "duck", "goose", "quail"],
-        &["pocket", "cancer", "milk"],
-    ) || contextual_term(
-        &l,
-        "breasts",
-        &["chicken", "turkey", "duck", "goose", "quail"],
-        &[],
-    ) || contextual_term(
-        &l,
-        "tits",
-        &[
-            "blue",
-            "great",
-            "crested",
-            "bearded",
-            "coal",
-            "marsh",
-            "willow",
-            "long-tailed",
-        ],
-        &[],
-    )
-}
-
-/// Word-bounded `term` that is not sitting next to an ordinary neighbor.
-fn contextual_term(hay: &str, term: &str, deny_prev: &[&str], deny_next: &[&str]) -> bool {
-    let bytes = hay.as_bytes();
-    let needle = term.as_bytes();
-    if needle.is_empty() || needle.len() > bytes.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] == needle {
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-            let end = i + needle.len();
-            let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
-            if before_ok && after_ok {
-                let prev = previous_word(hay, i);
-                let next = next_word(hay, end);
-                let denied =
-                    deny_prev.iter().any(|w| prev == *w) || deny_next.iter().any(|w| next == *w);
-                if !denied {
-                    return true;
-                }
-            }
-        }
-        i += 1;
-    }
-    false
-}
-
-fn previous_word(hay: &str, at: usize) -> &str {
-    let head = hay[..at].trim_end();
-    let start = head
-        .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-')
-        .map(|i| {
-            let sep = head[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
-            i + sep
-        })
-        .unwrap_or(0);
-    &head[start..]
-}
-
-fn next_word(hay: &str, end: usize) -> &str {
-    let tail = hay[end..].trim_start();
-    let n = tail
-        .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
-        .unwrap_or(tail.len());
-    &tail[..n]
-}
-
-fn contains_term(hay: &str, term: &str) -> bool {
-    let bytes = hay.as_bytes();
-    let needle = term.as_bytes();
-    if needle.is_empty() || needle.len() > bytes.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i + needle.len() <= bytes.len() {
-        if &bytes[i..i + needle.len()] == needle {
-            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
-            let end = i + needle.len();
-            let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
-            if before_ok && after_ok {
-                return true;
-            }
-        }
-        i += 1;
-    }
-    false
-}
-
 fn sanitize_router_model_suggestion(raw: &str) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() {
@@ -1213,22 +1019,15 @@ fn sanitize_router_model_suggestion(raw: &str) -> Option<String> {
     if s.contains(char::is_whitespace) {
         return None;
     }
-    // Strip a mistaken `openrouter/` prefix. Invented slugs
-    // (`openrouter/google-gemini-pro-image-1`) become empty and fall through to Auto.
-    // A real first-party id (`openrouter/horizon-alpha`) stays.
-    let s = crate::openrouter::canonicalize_catalog_id(s);
-    if s.is_empty() {
-        return None;
-    }
-    // OpenRouter ids are `provider/model`. Bare tokens (`light`, `ldm-xxl-256`)
+    // OpenRouter ids are `org/name`. Bare tokens (`light`, `ldm-xxl-256`, `chat-0.4.0`)
     // are router prose, not models — drop them so Auto fallbacks are used.
     if !s.contains('/') {
         return None;
     }
-    if is_auto_image(&s) || is_auto_agent(&s) || is_upstream_router(&s) {
+    if is_auto_image(s) || is_auto_agent(s) || is_upstream_router(s) {
         return None;
     }
-    Some(s)
+    Some(s.to_string())
 }
 
 fn parse_route_json(text: &str) -> Option<RouteDecision> {
@@ -1268,7 +1067,7 @@ fn parse_route_json(text: &str) -> Option<RouteDecision> {
 /// Context injected into the router user blob so Auto picks respect Privacy/Alignment.
 pub fn router_prefs_context(privacy: &PrivacyPrefs, alignment: &AlignmentPrefs) -> String {
     format!(
-        "Privacy: ZDR={} data_collection={}. Alignment: {}. Prefer concrete provider/model ids that satisfy these (image examples: google/gemini-2.5-flash-image, google/gemini-3-pro-image). Never prefix openrouter/ onto a provider/model id and never invent openrouter/google-gemini-pro-image-1. Safety: moderated high-refusal models (GPT, Claude, Cohere; GPT Image or Google image; Veo for video). Balanced: a capable default, not an uncensored specialist and not the strictest safety model. Uncensored: models whose name or description is uncensored (Dolphin, Venice, Cydonia) or, for image and video, the least-moderated catalog option (Flux, Krea, Grok). Do not suggest Llama-instruct, Claude, or GPT as uncensored. When ZDR or deny-collection is on, stay on ids from the ZDR catalog. No video model is on that catalog.",
+        "Privacy: ZDR={} data_collection={}. Alignment: {}. Prefer concrete OpenRouter model ids that satisfy these. When ZDR or deny-collection is on, prefer Google media/chat endpoints. For safety alignment prefer moderated major vendors; for uncensored prefer low-moderation / open-weight chat (still Google for media under ZDR).",
         if privacy.zero_data_retention {
             "on"
         } else {
@@ -1322,7 +1121,13 @@ pub async fn classify_prefs(
                 if d.reason.is_empty() {
                     d.reason = format!("Routed as {} via {model}", d.modality.as_str());
                 }
-                return coerce_route_to_media_ask(d, user_message, privacy, alignment, fallbacks);
+                return coerce_route_to_media_ask(
+                    d,
+                    user_message,
+                    privacy,
+                    alignment,
+                    fallbacks,
+                );
             }
             tracing::debug!(raw = %text, "router returned non-JSON; using heuristic");
             let mut h = infer_modality_prefs(user_message, privacy, alignment, fallbacks);
@@ -1387,46 +1192,28 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_leaves_a_scene_for_the_route_model() {
-        let scene =
-            "A cartoon meme of a grumpy cat in a cowboy hat, thick outlines, flat yellow background";
-        // No obvious render verb and no obvious advice. The fallback stays chat.
-        // A picture call from the route model is kept.
-        let d = infer_modality(scene);
-        assert_eq!(d.modality, Modality::Chat);
-        assert_eq!(direct_media_ask(scene), DirectMedia::None);
-        assert!(!message_is_chat_not_media(scene));
-        let kept = coerce_route_to_media_ask(
-            RouteDecision {
-                modality: Modality::Picture,
-                reason: "scene meant to be seen".into(),
-                agent_model: None,
-                image_model: Some("google/gemini-2.5-flash-image".into()),
-                source: "router".into(),
-            },
-            scene,
-            &PrivacyPrefs::default(),
-            &AlignmentPrefs::default(),
-            &AutoFallbacksPrefs::default(),
+    fn pasted_scene_is_picture_without_generate() {
+        let d = infer_modality(
+            "A cartoon meme of a grumpy cat in a cowboy hat, thick outlines, flat yellow background",
         );
-        assert_eq!(kept.modality, Modality::Picture);
-        assert!(kept.image_model.is_some());
-        assert!(!kept.source.contains("chat-guard"));
+        assert_eq!(d.modality, Modality::Picture);
+        assert_eq!(
+            direct_media_ask(
+                "A cartoon meme of a grumpy cat in a cowboy hat, thick outlines, flat yellow background"
+            ),
+            DirectMedia::Picture
+        );
     }
 
     #[test]
-    fn series_of_stills_is_picture() {
+    fn series_and_questions_stay_distinct() {
         assert_eq!(
             direct_media_ask("a series of illustrations of a lighthouse in a storm"),
-            DirectMedia::None
+            DirectMedia::Series
         );
         assert_eq!(
             infer_modality("a series of illustrations of a lighthouse in a storm").modality,
-            Modality::Chat
-        );
-        assert_eq!(
-            direct_media_ask("make a series of illustrations of a lighthouse in a storm"),
-            DirectMedia::Series
+            Modality::Picture
         );
         assert_eq!(
             infer_modality("how does flux work?").modality,
@@ -1436,112 +1223,10 @@ mod tests {
             infer_modality("can you clarify the hair color before we generate?").modality,
             Modality::Chat
         );
-        assert!(!message_is_chat_not_media(
-            "a series of illustrations of a lighthouse in a storm"
-        ));
     }
 
     #[test]
-    fn obvious_guidance_stays_chat_without_an_explicit_render() {
-        let chat_turns = [
-            "you able to make an image of Frankie Foster?",
-            "did we generate an image of Frankie Foster using the lora?",
-            "I want to create some placeholder image for this Freya app, any assets \\ models that would help?",
-            "how should I prompt Frankie Foster for a night out, and which LoRA?",
-            "what should I do for Frankie Foster",
-        ];
-        let picture = RouteDecision {
-            modality: Modality::Picture,
-            reason: "model called this a still".into(),
-            agent_model: None,
-            image_model: Some("google/gemini-2.5-flash-image".into()),
-            source: "router".into(),
-        };
-        for turn in chat_turns {
-            assert!(message_is_chat_not_media(turn), "{turn}");
-            assert_eq!(infer_modality(turn).modality, Modality::Chat, "{turn}");
-            assert_eq!(direct_media_ask(turn), DirectMedia::None, "{turn}");
-            let guarded = coerce_route_to_media_ask(
-                picture.clone(),
-                turn,
-                &PrivacyPrefs::default(),
-                &AlignmentPrefs::default(),
-                &AutoFallbacksPrefs::default(),
-            );
-            assert_eq!(guarded.modality, Modality::Chat, "{turn}");
-            assert!(guarded.image_model.is_none(), "{turn}");
-            assert!(guarded.source.contains("chat-guard"), "{turn}");
-        }
-        // A question that hands over the picture is an obvious render.
-        assert_eq!(
-            infer_modality("can you make an image of Frankie Foster?").modality,
-            Modality::Picture
-        );
-        for turn in [
-            "generate",
-            "again",
-            "draw this",
-            "make it",
-            "make the picture",
-            "can you draw me a cat?",
-            "please generate",
-            "generate a cat",
-            "generate that",
-            "create an image of a harbor",
-            "generate an image of Frankie using the lora?",
-            "draw me a cat that would help tell the story",
-        ] {
-            assert_eq!(infer_modality(turn).modality, Modality::Picture, "{turn}");
-        }
-        assert_eq!(
-            direct_media_ask("what gif should I make?"),
-            DirectMedia::None
-        );
-        assert_eq!(
-            direct_media_ask("is that video of Frankie any good?"),
-            DirectMedia::None
-        );
-        assert_eq!(
-            infer_modality("can you make a gif of a cat?").modality,
-            Modality::Gif
-        );
-        assert_eq!(
-            infer_modality("make a video of a cat").modality,
-            Modality::Video
-        );
-    }
-
-    #[test]
-    fn ordinary_wording_is_not_an_adult_scene() {
-        assert!(!prompt_is_adult_scene("chicken breast on a plate"));
-        assert!(!prompt_is_adult_scene("chicken breasts on a plate"));
-        assert!(!prompt_is_adult_scene("a pair of blue tits on a branch"));
-        assert!(!prompt_is_adult_scene(
-            "explicit instructions for the checkpoint install"
-        ));
-        assert!(!prompt_is_adult_scene(
-            "portrait of Yuri in a school uniform"
-        ));
-        assert!(!prompt_is_adult_scene("hardcore parkour on a rooftop"));
-        assert!(!prompt_is_adult_scene("straddling a fence at dusk"));
-        assert!(prompt_is_adult_scene("nude woman on a bed, explicit sex"));
-        assert!(prompt_is_adult_scene("her breasts, soft light"));
-        assert!(prompt_is_adult_scene("close crop of her tits"));
-    }
-
-    #[test]
-    fn adult_scene_scan_survives_non_ascii() {
-        assert_eq!(
-            previous_word("sofía breasts", "sofía breasts".find("breasts").unwrap()),
-            "a"
-        );
-        assert!(prompt_is_adult_scene("Sofía breasts"));
-        assert!(prompt_is_adult_scene("café, nude portrait"));
-        assert!(!prompt_is_adult_scene("Sofía plating a chicken breast"));
-    }
-
-    #[test]
-    fn coerce_keeps_picture_for_a_look_they_want_seen() {
+    fn coerce_overrides_chat_router_for_visual_prompt() {
         let chat = RouteDecision {
             modality: Modality::Chat,
             reason: "ambiguous".into(),
@@ -1549,68 +1234,15 @@ mod tests {
             image_model: None,
             source: "router".into(),
         };
-        let outfit = "Frankie Foster in cozy winter layers, a chunky cream knit sweater, plaid scarf, and beanie over her red hair, holding a coffee cup in a snowy front yard with the foster home behind her.";
-        // Heuristic does not invent a render, and does not call the outfit advice.
-        assert_eq!(direct_media_ask(outfit), DirectMedia::None);
-        assert!(!message_is_chat_not_media(outfit));
-        assert_eq!(infer_modality(outfit).modality, Modality::Chat);
-        // A character name alone does not force picture.
-        assert_eq!(direct_media_ask("Frankie Foster"), DirectMedia::None);
-        assert!(!message_is_chat_not_media("Frankie Foster"));
-        let name = coerce_route_to_media_ask(
-            chat.clone(),
-            "Frankie Foster",
-            &PrivacyPrefs::default(),
-            &AlignmentPrefs::default(),
-            &AutoFallbacksPrefs::default(),
-        );
-        assert_eq!(name.modality, Modality::Chat);
-
-        let described = coerce_route_to_media_ask(
-            chat.clone(),
-            "An illustration of a red bicycle in the rain, wet street, cinematic lighting",
-            &PrivacyPrefs::default(),
-            &AlignmentPrefs::default(),
-            &AutoFallbacksPrefs::default(),
-        );
-        assert_eq!(described.modality, Modality::Chat);
-        assert!(described.image_model.is_none());
-
-        for look in [
-            outfit,
-            "An illustration of a red bicycle in the rain, wet street, cinematic lighting",
-        ] {
-            let wanted = coerce_route_to_media_ask(
-                RouteDecision {
-                    modality: Modality::Picture,
-                    reason: "this is the scene they want seen".into(),
-                    agent_model: None,
-                    image_model: Some("google/gemini-2.5-flash-image".into()),
-                    source: "router".into(),
-                },
-                look,
-                &PrivacyPrefs::default(),
-                &AlignmentPrefs::default(),
-                &AutoFallbacksPrefs::default(),
-            );
-            assert_eq!(wanted.modality, Modality::Picture, "{look}");
-            assert_eq!(
-                wanted.image_model.as_deref(),
-                Some("google/gemini-2.5-flash-image"),
-                "{look}"
-            );
-            assert!(!wanted.source.contains("chat-guard"), "{look}");
-        }
-
-        let drawn = coerce_route_to_media_ask(
+        let d = coerce_route_to_media_ask(
             chat,
-            "draw this",
+            "An illustration of a red bicycle in the rain, wet street, cinematic lighting",
             &PrivacyPrefs::default(),
             &AlignmentPrefs::default(),
             &AutoFallbacksPrefs::default(),
         );
-        assert_eq!(drawn.modality, Modality::Picture);
-        assert!(drawn.image_model.is_some());
+        assert_eq!(d.modality, Modality::Picture);
+        assert!(d.image_model.is_some());
     }
 
     #[test]
@@ -1626,10 +1258,12 @@ mod tests {
             resolve_agent_model(Some("anthropic/claude-sonnet-5.5"), &route).as_deref(),
             Some("anthropic/claude-sonnet-5.5")
         );
-        assert!(
-            resolve_image_model_choice(Some("openai/gpt-image-1-mini"), &route, AUTO_IMAGE)
-                .contains("gpt-image")
-        );
+        assert!(resolve_image_model_choice(
+            Some("openai/gpt-image-1-mini"),
+            &route,
+            AUTO_IMAGE
+        )
+        .contains("gpt-image"));
     }
 
     #[test]
@@ -1679,35 +1313,13 @@ mod tests {
             sanitize_router_model_suggestion("black-forest-labs/flux.2-klein-4b").as_deref(),
             Some("black-forest-labs/flux.2-klein-4b")
         );
-        assert!(sanitize_router_model_suggestion("openrouter/google-gemini-pro-image-1").is_none());
-        assert_eq!(
-            sanitize_router_model_suggestion("openrouter/google/gemini-3-pro-image").as_deref(),
-            Some("google/gemini-3-pro-image")
-        );
-        assert_eq!(
-            sanitize_router_model_suggestion("openrouter/horizon-alpha").as_deref(),
-            Some("openrouter/horizon-alpha")
-        );
-        let first_party = RouteDecision {
-            modality: Modality::Picture,
-            reason: "t".into(),
-            agent_model: Some("openrouter/horizon-alpha".into()),
-            image_model: Some("openrouter/horizon-alpha".into()),
-            source: "t".into(),
-        };
-        assert_eq!(
-            resolve_agent_model(Some(AUTO_AGENT), &first_party).as_deref(),
-            Some("openrouter/horizon-alpha")
-        );
-        assert_eq!(
-            resolve_image_model_choice(Some(AUTO_IMAGE), &first_party, AUTO_IMAGE),
-            DEFAULT_AUTO_IMAGE_MODEL
-        );
         let route = RouteDecision {
             modality: Modality::Picture,
             reason: "t".into(),
             agent_model: None,
-            image_model: Some("None, letting Freya use Auto default (ZDR-aware).".into()),
+            image_model: Some(
+                "None, letting Freya use Auto default (ZDR-aware).".into(),
+            ),
             source: "t".into(),
         };
         // Prose suggestion ignored → Auto default.
@@ -1738,52 +1350,6 @@ mod tests {
             resolve_auto_fallback(AutoFallbackKind::Agent, &privacy, &alignment, &fb),
             DEFAULT_AUTO_AGENT_MODEL_SAFETY
         );
-        assert_eq!(
-            resolve_auto_fallback(AutoFallbackKind::Router, &privacy, &alignment, &fb),
-            DEFAULT_ROUTER_MODEL_SAFETY
-        );
-        assert_eq!(DEFAULT_AUTO_AGENT_MODEL_SAFETY, "openai/gpt-5-mini");
-        assert_eq!(DEFAULT_ROUTER_MODEL_SAFETY, "openai/gpt-5-mini");
-        let uncensored = AlignmentPrefs {
-            model_alignment: "uncensored".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            resolve_auto_fallback(AutoFallbackKind::Agent, &privacy, &uncensored, &fb),
-            "thedrummer/cydonia-24b-v4.1"
-        );
-        assert_eq!(
-            resolve_auto_fallback(AutoFallbackKind::Router, &privacy, &uncensored, &fb),
-            "thedrummer/cydonia-24b-v4.1"
-        );
-        let low = AutoFallbacksPrefs {
-            cost_tier: "low".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            resolve_auto_fallback(AutoFallbackKind::Agent, &privacy, &uncensored, &low),
-            "cognitivecomputations/dolphin-mistral-24b-venice-edition"
-        );
-        let deny = PrivacyPrefs {
-            data_collection: "deny".into(),
-            ..Default::default()
-        };
-        let balanced = AlignmentPrefs::default();
-        assert_eq!(
-            resolve_auto_fallback(AutoFallbackKind::Image, &deny, &balanced, &fb),
-            DEFAULT_AUTO_IMAGE_MODEL_ZDR
-        );
-        assert_eq!(
-            resolve_auto_fallback(AutoFallbackKind::Image, &deny, &alignment, &fb),
-            "google/gemini-2.5-flash-image"
-        );
-        assert_eq!(
-            resolve_auto_fallback(AutoFallbackKind::Video, &deny, &balanced, &fb),
-            DEFAULT_AUTO_VIDEO_MODEL_ZDR
-        );
-        assert!(
-            !resolve_auto_fallback(AutoFallbackKind::Video, &deny, &uncensored, &fb).is_empty()
-        );
     }
 
     #[test]
@@ -1798,56 +1364,6 @@ mod tests {
             resolve_auto_fallback(AutoFallbackKind::Image, &privacy, &alignment, &fb),
             "openai/gpt-image-1"
         );
-    }
-
-    #[test]
-    fn invented_openrouter_image_id_uses_real_catalog_id() {
-        let route = RouteDecision {
-            modality: Modality::Picture,
-            reason: "t".into(),
-            agent_model: None,
-            image_model: Some("openrouter/google-gemini-pro-image-1".into()),
-            source: "t".into(),
-        };
-        assert_eq!(
-            resolve_image_model_choice(Some(AUTO_IMAGE), &route, AUTO_IMAGE),
-            DEFAULT_AUTO_IMAGE_MODEL
-        );
-        assert_eq!(
-            resolve_image_model_choice(
-                Some("openrouter/google-gemini-pro-image-1"),
-                &route,
-                AUTO_IMAGE
-            ),
-            DEFAULT_AUTO_IMAGE_MODEL
-        );
-        assert_eq!(
-            resolve_image_model_choice(Some("google/gemini-3-pro-image"), &route, AUTO_IMAGE),
-            "google/gemini-3-pro-image"
-        );
-        assert_eq!(
-            resolve_image_model_choice(
-                Some("openrouter/google/gemini-3-pro-image"),
-                &route,
-                AUTO_IMAGE
-            ),
-            "google/gemini-3-pro-image"
-        );
-        let privacy = PrivacyPrefs::default();
-        let alignment = AlignmentPrefs::default();
-        let fb = AutoFallbacksPrefs {
-            image: "openrouter/google-gemini-pro-image-1".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            resolve_auto_fallback(AutoFallbackKind::Image, &privacy, &alignment, &fb),
-            DEFAULT_AUTO_IMAGE_MODEL
-        );
-        let d = parse_route_json(
-            r#"{"modality":"picture","reason":"gen","agentModel":null,"imageModel":"openrouter/google-gemini-pro-image-1"}"#,
-        )
-        .expect("parse");
-        assert!(d.image_model.is_none());
     }
 
     #[test]
@@ -1873,49 +1389,6 @@ mod tests {
     }
 
     #[test]
-    fn uncensored_auto_ignores_llama_suggestion() {
-        let route = RouteDecision {
-            modality: Modality::Picture,
-            reason: "t".into(),
-            agent_model: Some("meta-llama/llama-3.1-8b-instruct".into()),
-            image_model: None,
-            source: "t".into(),
-        };
-        let privacy = PrivacyPrefs {
-            zero_data_retention: true,
-            ..Default::default()
-        };
-        let alignment = AlignmentPrefs {
-            model_alignment: "uncensored".into(),
-            ..Default::default()
-        };
-        let fb = AutoFallbacksPrefs::default();
-        assert_eq!(
-            resolve_agent_model_prefs(Some("auto"), &route, &privacy, &alignment, &fb).as_deref(),
-            Some(DEFAULT_AUTO_AGENT_MODEL_UNCENSORED)
-        );
-        assert_eq!(
-            resolve_agent_model_prefs(
-                Some("meta-llama/llama-3.1-8b-instruct"),
-                &route,
-                &privacy,
-                &alignment,
-                &fb
-            )
-            .as_deref(),
-            Some("meta-llama/llama-3.1-8b-instruct")
-        );
-        let cydonia = RouteDecision {
-            agent_model: Some("thedrummer/cydonia-24b-v4.1".into()),
-            ..route
-        };
-        assert_eq!(
-            resolve_agent_model_prefs(Some("auto"), &cydonia, &privacy, &alignment, &fb).as_deref(),
-            Some("thedrummer/cydonia-24b-v4.1")
-        );
-    }
-
-    #[test]
     fn upstream_router_is_opt_in_and_cost_selects_column() {
         assert_eq!(AUTO_AGENT, "auto");
         assert!(!is_auto_agent(UPSTREAM_ROUTER));
@@ -1926,7 +1399,7 @@ mod tests {
         let fb = AutoFallbacksPrefs::default();
         assert_eq!(
             resolve_auto_fallback(AutoFallbackKind::Router, &privacy, &alignment, &fb),
-            DEFAULT_ROUTER_MODEL
+            "meta-llama/llama-3.3-70b-instruct"
         );
         assert_ne!(
             resolve_auto_fallback(AutoFallbackKind::Agent, &privacy, &alignment, &fb),
@@ -1942,7 +1415,7 @@ mod tests {
         );
         assert_eq!(
             resolve_auto_fallback(AutoFallbackKind::Image, &privacy, &alignment, &low),
-            "bytedance-seed/seedream-5-0-flash"
+            "black-forest-labs/flux.2-klein-4b"
         );
         let route = RouteDecision {
             modality: Modality::Chat,
@@ -1966,7 +1439,7 @@ mod tests {
         };
         assert_eq!(
             resolve_auto_fallback(AutoFallbackKind::Agent, &strict, &alignment, &fb),
-            DEFAULT_AUTO_AGENT_MODEL_ZDR
+            "openai/gpt-4.1-mini"
         );
         assert_eq!(
             resolve_auto_fallback(AutoFallbackKind::Image, &strict, &alignment, &fb),
@@ -1974,115 +1447,5 @@ mod tests {
         );
         assert_eq!(DEFAULT_AUTO_AGENT_MODEL, DEFAULT_AUTO_AGENT_MODEL_ZDR);
         assert_eq!(DEFAULT_ROUTER_MODEL, DEFAULT_ROUTER_MODEL_ZDR);
-    }
-
-    fn align(alignment: &str, nsfw: bool) -> AlignmentPrefs {
-        AlignmentPrefs {
-            model_alignment: alignment.into(),
-            allow_nsfw_local: nsfw,
-            ..Default::default()
-        }
-        .normalize()
-    }
-
-    fn tier(cost: &str) -> AutoFallbacksPrefs {
-        AutoFallbacksPrefs {
-            cost_tier: cost.into(),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn local_enhance_path_ordinary_vs_adult() {
-        let privacy = PrivacyPrefs::default();
-        let medium = tier("medium");
-        let low = tier("low");
-        let unc = align("uncensored", false);
-        let show = align("safety", true);
-        let balanced = align("balanced", false);
-        let scene = "nude woman on a bed, explicit sex";
-        let barn = "a red barn at sunset";
-
-        let ordinary = local_enhance_path(barn, &unc, Some("auto"), &privacy, &medium);
-        assert!(!ordinary.adult);
-        assert_eq!(ordinary.model, "deepseek/deepseek-v4-pro");
-
-        let ordinary_low = local_enhance_path(barn, &unc, None, &privacy, &low);
-        assert!(!ordinary_low.adult);
-        assert_eq!(ordinary_low.model, "meta-llama/llama-3.1-8b-instruct");
-
-        let show_landscape = local_enhance_path(
-            "portrait of a scientist in a lab coat",
-            &show,
-            Some("auto"),
-            &privacy,
-            &medium,
-        );
-        assert!(!show_landscape.adult);
-        assert_eq!(show_landscape.model, "deepseek/deepseek-v4-pro");
-
-        let not_adult_words = local_enhance_path(
-            "essex countryside, cocktail on the patio, structural analysis",
-            &unc,
-            None,
-            &privacy,
-            &medium,
-        );
-        assert!(!not_adult_words.adult);
-        assert_eq!(not_adult_words.model, "deepseek/deepseek-v4-pro");
-
-        let adult = local_enhance_path(scene, &unc, Some("auto"), &privacy, &medium);
-        assert!(adult.adult);
-        assert_eq!(adult.model, "thedrummer/cydonia-24b-v4.1");
-
-        let adult_low = local_enhance_path(scene, &show, None, &privacy, &low);
-        assert!(adult_low.adult);
-        assert_eq!(
-            adult_low.model,
-            "cognitivecomputations/dolphin-mistral-24b-venice-edition"
-        );
-        assert_eq!(adult_low.model, local_adult_matrix_model(&privacy, &low));
-
-        let adult_high = local_enhance_path(scene, &unc, None, &privacy, &tier("high"));
-        assert_eq!(adult_high.model, "thedrummer/cydonia-24b-v4.1");
-
-        // Sexual text without Uncensored or Show NSFW stays on the baseline writer.
-        let gated = local_enhance_path(scene, &balanced, None, &privacy, &medium);
-        assert!(!gated.adult);
-        assert_eq!(gated.model, "deepseek/deepseek-v4-pro");
-
-        let pinned = local_enhance_path(
-            barn,
-            &unc,
-            Some("mistralai/mistral-small"),
-            &privacy,
-            &medium,
-        );
-        assert!(!pinned.adult);
-        assert_eq!(pinned.model, "mistralai/mistral-small");
-
-        for moderated in [
-            "meta-llama/llama-3.1-8b-instruct",
-            "anthropic/claude-sonnet-5.5",
-            "openai/gpt-5-mini",
-            "google/gemini-4-neon",
-        ] {
-            let path = local_enhance_path(scene, &unc, Some(moderated), &privacy, &medium);
-            assert!(path.adult, "{moderated}");
-            assert_eq!(path.model, "thedrummer/cydonia-24b-v4.1", "{moderated}");
-        }
-
-        let dolphin_pin = local_enhance_path(
-            scene,
-            &unc,
-            Some("cognitivecomputations/dolphin-mistral-24b-venice-edition"),
-            &privacy,
-            &medium,
-        );
-        assert!(dolphin_pin.adult);
-        assert_eq!(
-            dolphin_pin.model,
-            "cognitivecomputations/dolphin-mistral-24b-venice-edition"
-        );
     }
 }

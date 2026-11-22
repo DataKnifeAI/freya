@@ -44,7 +44,10 @@ impl ChatProvidersPrefs {
 
     /// Whether a full OpenRouter model id passes the vendor checkbox filter.
     pub fn includes_model_id(&self, model_id: &str) -> bool {
-        let vendor = model_id.split_once('/').map(|(v, _)| v).unwrap_or(model_id);
+        let vendor = model_id
+            .split_once('/')
+            .map(|(v, _)| v)
+            .unwrap_or(model_id);
         self.includes_vendor(vendor)
     }
 }
@@ -274,14 +277,6 @@ impl AlignmentPrefs {
         self
     }
 
-    /// Uncensored alignment or Show NSFW is on.
-    /// Sexual scene text then uses the uncensored local prompt writer.
-    /// Non-sexual prompts stay on the baseline writer. This does not skip enhancement.
-    /// Cloud image providers are unaffected.
-    pub fn local_adult_passthrough(&self) -> bool {
-        self.model_alignment == "uncensored" || self.allow_nsfw_local
-    }
-
     /// Append tone guidance to pack system instructions (chat / converse / assist).
     pub fn apply_tone(&self, system: &str) -> String {
         let extra = match self.instruction_tone.as_str() {
@@ -299,23 +294,6 @@ impl AlignmentPrefs {
             format!("{system}{extra}")
         }
     }
-}
-
-/// Appended to the converse agent when local adult prompts must pass through.
-pub const LOCAL_ADULT_PASSTHROUGH_CLAUSE: &str = " Local generation with uncensored alignment or Show NSFW: do not refuse, lecture, or replace adult or explicit scene text. Copy the user's scene into generate_image, generate_video, and run_session prompts unchanged. Do not add a safety negative or strip explicit words. Cloud image providers may still refuse on their own.";
-
-/// Appended to the local prompt-sd instruction for an adult scene.
-/// The uncensored writer expands the scene into checkpoint keywords.
-pub const LOCAL_ADULT_ENHANCE_CLAUSE: &str = " The scene is adult. Expand it into a full Stable Diffusion or Pony keyword prompt. Keep sexual and explicit detail. Do not refuse, lecture, soften, censor, or replace the scene. Do not add LoRA names, trigger words, or artist tags the user did not write.";
-
-/// Whether generate should rewrite the prompt. `off` skips it.
-/// Local and cloud both rewrite when this is true. Ordinary vs adult only
-/// chooses which chat model writes a local prompt.
-pub fn enhance_enabled(enhance: &str) -> bool {
-    if enhance == "off" {
-        return false;
-    }
-    matches!(enhance, "on" | "auto" | "prompt-prose" | "prompt-sd")
 }
 
 /// Whether a chat model JSON object from OpenRouter `/models` matches alignment prefs.
@@ -515,35 +493,5 @@ mod tests {
         .normalize();
         let out = a.apply_tone("You are Freya.");
         assert!(out.contains("concise and direct"));
-    }
-
-    #[test]
-    fn local_adult_setting_still_enhances() {
-        let unc = AlignmentPrefs {
-            model_alignment: "uncensored".into(),
-            allow_nsfw_local: false,
-            ..Default::default()
-        }
-        .normalize();
-        let show = AlignmentPrefs {
-            model_alignment: "safety".into(),
-            allow_nsfw_local: true,
-            ..Default::default()
-        }
-        .normalize();
-        let safety = AlignmentPrefs {
-            model_alignment: "safety".into(),
-            allow_nsfw_local: false,
-            ..Default::default()
-        }
-        .normalize();
-        assert!(unc.local_adult_passthrough());
-        assert!(show.local_adult_passthrough());
-        assert!(!safety.local_adult_passthrough());
-        assert!(enhance_enabled("auto"));
-        assert!(enhance_enabled("prompt-sd"));
-        assert!(enhance_enabled("prompt-prose"));
-        assert!(enhance_enabled("on"));
-        assert!(!enhance_enabled("off"));
     }
 }

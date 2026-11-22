@@ -1,10 +1,16 @@
-.PHONY: help check-deps fix-docker-group build build-comfyui build-swarmui up down sui sui-rebuild swarmui-update cui llm llm-pull llm-import-hf llm-list llm-rm llm-logs swarmui-rebuild swarmui-extensions-check restart logs clean
+IMG ?= harbor.dataknife.net/library/freya-operator:0.1.0
+API_IMG ?= harbor.dataknife.net/library/freya-api:0.1.0
+WEB_IMG ?= harbor.dataknife.net/library/freya-web:0.1.0
+WORKER_IMG ?= harbor.dataknife.net/library/freya-diffusion-worker:0.1.0
+MCP_IMG ?= harbor.dataknife.net/library/freya-mcp:0.1.0
 
 VERSION ?= 0.1.0
 CARGO ?= cargo
 
 .PHONY: all help build release test fmt fmt-check lint vet ci run-api run-worker run-operator \
-	manifests install deploy up-local kind-hosts kind-tls clean docker-build
+	run-mcp manifests install deploy up-local kind-hosts kind-tls clean docker-build \
+	kind-load-mcp kind-bin-mcp kind-deploy-mcp kind-bin-api kind-bin-web kind-deploy-api-web \
+	sync-api-token compose-up compose-up-gpu compose-up-mcp compose-down compose-logs compose-ps
 
 all: build
 
@@ -82,20 +88,61 @@ deploy: ## Deploy operator + sample studio (edit secrets first)
 run-api: ## Run Freya API locally
 	$(CARGO) run -p freya-api -- --bind 127.0.0.1:8080
 
-run-worker: ## Run diffusion worker stub locally
+run-worker: ## Run diffusion worker locally (stub PNG unless FREYA_ENGINE_URL set)
 	$(CARGO) run -p freya-worker -- --port 8091
+
+.PHONY: run-local-worker
+run-local-worker: ## Build/run Docker freya-local-worker with GPU + Diffusers
+	./scripts/run-local-worker.sh
 
 run-operator: ## Run operator (needs kubeconfig)
 	$(CARGO) run -p freya-operator --bin freya-operator
+
+run-mcp: ## Run Freya MCP Streamable HTTP locally (:8090/mcp)
+	$(CARGO) run -p freya-mcp -- --bind 127.0.0.1:8090 --api-url http://127.0.0.1:8080
 
 up-local: ## API + notes for UI (copy .env.example → .env first)
 	@echo "cp .env.example .env  # fill OPENROUTER_API_KEY (required)"
 	@echo "set -a && source .env && set +a"
 	@echo "Terminal A: make run-api"
 	@echo "Terminal B: cd web && npm install && npm run dev"
+	@echo "Optional MCP: make run-mcp  # http://127.0.0.1:8090/mcp"
 	@echo "UI mock only:  make mock-ui"
 	@echo "Optional worker: make run-worker  then Settings → http://127.0.0.1:8091"
 	@echo "Optional: CIVITAI_API_KEY, FREYA_API_TOKEN, FREYA_WORKER_TOKEN, FREYA_CORS_ORIGINS"
+	@echo "Single-system Docker (no k8s): make compose-up  # see docs/COMPOSE.md"
+
+# --- Docker Compose single-system (no k8s / operator; distinct from legacy/) ---
+COMPOSE_FILE ?= deploy/compose/compose.yaml
+COMPOSE_GPU_FILE ?= deploy/compose/compose.gpu.yaml
+COMPOSE_ENV ?= deploy/compose/.env
+COMPOSE := docker compose -f $(COMPOSE_FILE) --env-file $(COMPOSE_ENV)
+
+compose-up: ## Single-system Freya via Compose (api+web+worker)
+	@test -f $(COMPOSE_ENV) || (echo "Copy deploy/compose/.env.example → $(COMPOSE_ENV) and set keys"; exit 1)
+	$(COMPOSE) up -d --build
+	@echo "UI http://127.0.0.1:$${FREYA_UI_PORT:-8080}  worker :$${FREYA_WORKER_PORT:-8091}"
+	@echo "Docs: docs/COMPOSE.md"
+
+compose-up-gpu: ## Compose + NVIDIA GPU for freya-worker
+	@test -f $(COMPOSE_ENV) || (echo "Copy deploy/compose/.env.example → $(COMPOSE_ENV) and set keys"; exit 1)
+	docker compose -f $(COMPOSE_FILE) -f $(COMPOSE_GPU_FILE) --env-file $(COMPOSE_ENV) up -d --build
+	@echo "UI http://127.0.0.1:$${FREYA_UI_PORT:-8080}  worker :$${FREYA_WORKER_PORT:-8091} (GPU)"
+
+compose-up-mcp: ## Compose + optional freya-mcp (:8090)
+	@test -f $(COMPOSE_ENV) || (echo "Copy deploy/compose/.env.example → $(COMPOSE_ENV) and set keys"; exit 1)
+	COMPOSE_PROFILES=mcp $(COMPOSE) up -d --build
+	@echo "UI :8080  worker :8091  MCP http://127.0.0.1:$${FREYA_MCP_PORT:-8090}/mcp"
+
+compose-down: ## Stop Compose stack
+	@# No --env-file required for teardown; defaults in compose.yaml apply.
+	-docker compose -f $(COMPOSE_FILE) -f $(COMPOSE_GPU_FILE) --profile mcp down
+
+compose-logs: ## Follow Compose logs
+	$(COMPOSE) logs -f
+
+compose-ps: ## Compose service status
+	$(COMPOSE) ps
 
 .PHONY: mock-ui
 mock-ui: ## Interactive Freya UI mock (no API / keys required)
@@ -110,111 +157,61 @@ kind-tls: ## Sync LE *.dataknife.net wildcard into kind + nginx default cert
 clean:
 	$(CARGO) clean
 
-logs-swarmui: ## Show logs from SwarmUI service
-	docker compose logs -f swarmui
+docker-build: ## Build container images
+	docker build -f Dockerfile -t $(IMG) --target operator .
+	docker build -f Dockerfile -t $(API_IMG) --target api .
+	docker build -f Dockerfile -t $(WORKER_IMG) --target worker .
+	docker build -f Dockerfile -t $(MCP_IMG) --target mcp .
+	docker build -f Dockerfile.web -t $(WEB_IMG) .
 
-llm-logs: ## Show logs from Ollama service
-	docker compose logs -f ollama
+KIND_CLUSTER ?= freya
 
-clean: ## Remove containers, volumes, and images
-	docker compose down -v
+kind-load-mcp: ## Full Docker multi-stage build of operator+mcp → kind
+	docker build -f Dockerfile -t $(IMG) --target operator .
+	docker build -f Dockerfile -t $(MCP_IMG) --target mcp .
+	kind load docker-image $(IMG) --name $(KIND_CLUSTER)
+	kind load docker-image $(MCP_IMG) --name $(KIND_CLUSTER)
 
-ps: ## Show running containers
-	docker compose ps
+# Fast kind path: host release binaries → distroless images (Dockerfile.bin).
+kind-bin-mcp: ## cargo release + load operator/mcp images into kind
+	# freya-api binary required in context: legacy docker builds prior Dockerfile.bin stages.
+	$(CARGO) build --release -p freya-operator -p freya-mcp -p freya-api
+	@rm -rf /tmp/freya-bin-ctx && mkdir -p /tmp/freya-bin-ctx/target/release /tmp/freya-bin-ctx/packs
+	cp target/release/freya-operator target/release/freya-mcp target/release/freya-api /tmp/freya-bin-ctx/target/release/
+	cp -a packs/. /tmp/freya-bin-ctx/packs/
+	cp Dockerfile.bin /tmp/freya-bin-ctx/Dockerfile
+	docker build -f /tmp/freya-bin-ctx/Dockerfile -t $(IMG) --target operator /tmp/freya-bin-ctx
+	docker build -f /tmp/freya-bin-ctx/Dockerfile -t $(MCP_IMG) --target mcp /tmp/freya-bin-ctx
+	kind load docker-image $(IMG) --name $(KIND_CLUSTER)
+	kind load docker-image $(MCP_IMG) --name $(KIND_CLUSTER)
 
-shell-comfyui: ## Open shell in ComfyUI container
-	docker compose exec comfyui /bin/bash
+kind-deploy-mcp: kind-bin-mcp manifests install ## Fast load + apply CRDs + restart operator
+	kubectl -n freya-system set image deploy/freya-operator manager=$(IMG)
+	kubectl -n freya-system rollout restart deploy/freya-operator
+	kubectl -n freya-system rollout status deploy/freya-operator --timeout=120s
+	@echo "MCP: https://freya.dataknife.net/mcp  (after Studio reconcile)"
+	@echo "In-cluster: kubectl -n freya get freyastudio freya -o jsonpath='{.status.mcpEndpoint}'"
 
-shell-swarmui: ## Open shell in SwarmUI container
-	docker compose exec swarmui /bin/bash
+kind-bin-api: ## cargo release freya-api → kind
+	$(CARGO) build --release -p freya-api -p freya-operator
+	@rm -rf /tmp/freya-bin-api && mkdir -p /tmp/freya-bin-api/target/release
+	# Legacy docker builder evaluates earlier Dockerfile.bin stages — include operator bin too.
+	cp target/release/freya-api target/release/freya-operator /tmp/freya-bin-api/target/release/
+	cp -a packs /tmp/freya-bin-api/packs
+	cp Dockerfile.bin /tmp/freya-bin-api/Dockerfile
+	docker build -f /tmp/freya-bin-api/Dockerfile -t $(API_IMG) --target api /tmp/freya-bin-api
+	kind load docker-image $(API_IMG) --name $(KIND_CLUSTER)
 
-swarmui-rebuild: ## [Debug] Force rebuild inside container without git pull. Prefer: make swarmui-update
-	@docker ps >/dev/null 2>&1 || (echo "Error: Docker not accessible. Run: make fix-docker-group, then newgrp docker" && exit 1)
-	@docker compose ps swarmui 2>/dev/null | grep -q Up || (echo "Error: SwarmUI not running. Start with: make sui" && exit 1)
-	docker compose exec swarmui bash -c "set -e; cd /app/SwarmUI && dotnet build src/SwarmUI.csproj -c Release -o src/bin/live_release"
-	docker compose restart swarmui
+kind-bin-web: ## Build freya-web image → kind
+	docker build -f Dockerfile.web -t $(WEB_IMG) .
+	kind load docker-image $(WEB_IMG) --name $(KIND_CLUSTER)
 
-swarmui-extensions-check: ## [Debug] List extensions dir and run build; use if extension not showing after restart
-	@docker ps >/dev/null 2>&1 || (echo "Error: Docker not accessible. Run: make fix-docker-group, then newgrp docker" && exit 1)
-	@docker compose ps swarmui 2>/dev/null | grep -q Up || (echo "Error: SwarmUI not running. Start with: make sui" && exit 1)
-	@echo "=== Extension dir (host: swarmui/extensions) ==="
-	@docker compose exec swarmui ls -la /app/SwarmUI/src/Extensions/ 2>/dev/null || true
-	@echo "=== Extension subdirs (.cs) ==="
-	@docker compose exec swarmui find /app/SwarmUI/src/Extensions -maxdepth 2 -type f -name "*.cs" 2>/dev/null || true
-	@echo "=== Manual build (SwarmUI usually builds at startup) ==="
-	docker compose exec swarmui bash -c "set -e; cd /app/SwarmUI && dotnet build src/SwarmUI.csproj -c Release -o src/bin/live_release -v minimal"
+kind-deploy-api-web: kind-bin-api kind-bin-web ## Load api+web into kind and restart Studio deploys
+	kubectl -n freya set image deploy/freya-api api=$(API_IMG)
+	kubectl -n freya set image deploy/freya-ui ui=$(WEB_IMG)
+	kubectl -n freya rollout restart deploy/freya-api deploy/freya-ui
+	kubectl -n freya rollout status deploy/freya-api --timeout=180s
+	kubectl -n freya rollout status deploy/freya-ui --timeout=120s
 
-llm-pull: ## Download Ollama model (usage: make llm-pull MODEL=dolphin3)
-	@if [ -z "$(MODEL)" ]; then \
-		echo "Usage: make llm-pull MODEL=<model_name>"; \
-		echo "Example: make llm-pull MODEL=dolphin3  (default for MagicPrompt: https://ollama.com/library/dolphin3)"; \
-		echo "Browse available models: https://ollama.com/library"; \
-		echo "Popular: dolphin3, llama3.2:1b, llama3.2:3b, mistral, gemma2:7b"; \
-		exit 1; \
-	fi
-	@echo "Pulling Ollama model: $(MODEL)"
-	@docker compose exec ollama ollama pull $(MODEL) || \
-		docker compose run --rm ollama ollama pull $(MODEL)
-
-llm-import-hf: ## Import GGUF model from Hugging Face into Ollama (usage: make llm-import-hf REPO=user/repo [QUANT=Q4_K_M])
-	@if [ -z "$(REPO)" ]; then \
-		echo "Usage: make llm-import-hf REPO=<user/repo> [QUANT=<quantization>]"; \
-		echo "Example: make llm-import-hf REPO=bartowski/Llama-3.2-1B-Instruct-GGUF"; \
-		echo "Example: make llm-import-hf REPO=bartowski/Llama-3.2-3B-Instruct-GGUF QUANT=IQ3_M"; \
-		echo "Browse GGUF models: https://huggingface.co/models?library=gguf"; \
-		echo "Ollama uses hf.co/REPO; default quant is Q4_K_M when present."; \
-		echo ""; \
-		echo "Note: Only GGUF repos work. Transformers/Safetensors models (e.g. dphn/dolphin-vision-72b)"; \
-		echo "cannot be imported unless a GGUF version exists on Hugging Face."; \
-		exit 1; \
-	fi
-	@HF_MODEL="hf.co/$(REPO)"; \
-	if [ -n "$(QUANT)" ]; then HF_MODEL="$$HF_MODEL:$(QUANT)"; fi; \
-	echo "Importing from Hugging Face: $$HF_MODEL"; \
-	docker compose exec ollama ollama pull "$$HF_MODEL" || \
-		docker compose run --rm ollama ollama pull "$$HF_MODEL"
-
-llm-list: ## List installed Ollama models and show available models link
-	@echo "=== Available models ==="
-	@echo "Browse: https://ollama.com/library"
-	@echo ""
-	@echo "Default for MagicPrompt (control + compatibility): dolphin3 — https://ollama.com/library/dolphin3"
-	@echo "Other options: Light (1-3B) llama3.2:1b, phi3:mini | Balanced (7-8B) mistral, gemma2:7b"
-	@echo ""
-	@echo "=== Installed models ==="
-	@docker compose exec ollama ollama list 2>/dev/null || \
-		docker compose run --rm ollama ollama list || \
-		(echo "Ollama not running. Start with: make llm" && exit 1)
-	@echo ""
-	@echo "Pull a model: make llm-pull MODEL=<name>"
-	@echo "Import from Hugging Face (GGUF): make llm-import-hf REPO=user/repo [QUANT=...]"
-	@echo "Remove a model: make llm-rm MODEL=<name>"
-
-llm-rm: ## Remove an Ollama model (usage: make llm-rm MODEL=dolphin3)
-	@if [ -z "$(MODEL)" ]; then \
-		echo "Usage: make llm-rm MODEL=<model_name>"; \
-		echo "Example: make llm-rm MODEL=dolphin3"; \
-		echo "List installed models: make llm-list"; \
-		exit 1; \
-	fi
-	@echo "Removing Ollama model: $(MODEL)"
-	@docker compose exec ollama ollama rm $(MODEL) || \
-		docker compose run --rm ollama ollama rm $(MODEL)
-
-check-gpu: ## Run GPU diagnostic check
-	chmod +x scripts/linux/check-gpu.sh && ./scripts/linux/check-gpu.sh
-
-check-gpu-comfyui: ## Check GPU availability in ComfyUI container
-	docker compose exec comfyui python3 -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'GPU count: {torch.cuda.device_count()}'); [torch.cuda.is_available()] and print(f'GPU name: {torch.cuda.get_device_name(0)}')"
-
-check-gpu-swarmui: ## Check GPU availability in SwarmUI container
-	docker compose exec swarmui nvidia-smi || echo "nvidia-smi not available, checking CUDA..."
-	@docker compose exec swarmui dotnet --version || echo "DotNET check failed"
-
-status: ## Show service status and URLs
-	@echo "=== Service Status ==="
-	@docker compose ps
-	@echo "\n=== Access URLs ==="
-	@echo "ComfyUI:         http://localhost:8188"
-	@echo "SwarmUI:         http://localhost:7801"
-	@echo "Ollama API:      http://localhost:11434"
+sync-api-token: ## Align freya-api-token Secret with gallery PVC runtime token
+	./scripts/sync-api-token-from-pvc.sh

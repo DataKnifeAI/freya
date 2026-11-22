@@ -2,8 +2,10 @@ use crate::civitai::CivitaiClient;
 use crate::config::Config;
 use crate::gallery::Gallery;
 use crate::openrouter::OpenRouterClient;
+use crate::prefs::{AlignmentPrefs, AutoFallbacksPrefs, PrivacyPrefs};
 use crate::worker::DiffusionWorkerClient;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -37,6 +39,28 @@ pub struct RuntimeSecrets {
     /// when the secrets file lives on durable storage (e.g. gallery PVC).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_token: Option<String>,
+    /// Persisted model picks (Auto sentinels allowed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub router_model: Option<String>,
+    /// OpenRouter privacy prefs (ZDR / data_collection) + Freya chat-provider checkboxes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub privacy: Option<PrivacyPrefs>,
+    /// Freya-side model alignment / NSFW / tone prefs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alignment: Option<AlignmentPrefs>,
+    /// Configurable Auto fallbacks when the router does not pin a concrete model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_fallbacks: Option<AutoFallbacksPrefs>,
+    /// Set after the old `openrouter/auto` Auto sentinel is rewritten to internal `auto`.
+    #[serde(default)]
+    pub legacy_upstream_auto_migrated: bool,
+    /// Per-mode system prompt overrides (non-empty values only). Empty map omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction_overrides: Option<HashMap<String, String>>,
 }
 
 impl AppState {
@@ -44,14 +68,11 @@ impl AppState {
         let gallery = Gallery::open(cfg.gallery_dir.clone()).await?;
         let openrouter = OpenRouterClient::new(&cfg);
         let civitai = CivitaiClient::new(cfg.civitai_api_key.clone());
-        let worker = if cfg.worker_enabled {
-            cfg.diffusion_worker_url.as_ref().map(|u| {
-                DiffusionWorkerClient::new_with_tls(u.clone(), cfg.worker_tls_insecure)
-                    .with_token(cfg.worker_token.clone())
-            })
-        } else {
-            None
-        };
+        // Client attaches when a worker URL is set (enable flag kept for API compat only).
+        let worker = cfg.diffusion_worker_url.as_ref().map(|u| {
+            DiffusionWorkerClient::new_with_tls(u.clone(), cfg.worker_tls_insecure)
+                .with_token(cfg.worker_token.clone())
+        });
         let packs_dir = cfg.packs_dir.clone();
         let state = Self {
             config: Arc::new(RwLock::new(cfg)),
@@ -62,6 +83,7 @@ impl AppState {
             worker: Arc::new(RwLock::new(worker)),
         };
         state.load_secrets_file().await?;
+        state.migrate_legacy_upstream_auto().await?;
         Ok(state)
     }
 
@@ -82,53 +104,122 @@ impl AppState {
     pub async fn apply_secrets(&self, secrets: RuntimeSecrets) {
         let mut cfg = self.config.write().await;
         if let Some(k) = secrets.openrouter_api_key {
-            if !k.is_empty() {
-                cfg.openrouter_api_key = k.clone();
-                let mut or = self.openrouter.write().await;
-                *or = OpenRouterClient::new(&cfg).with_key(k);
-            }
+            // Empty string clears the runtime key (UI “Clear key”).
+            cfg.openrouter_api_key = k.clone();
+            let mut or = self.openrouter.write().await;
+            *or = OpenRouterClient::new(&cfg).with_key(k);
         }
         if let Some(k) = secrets.civitai_api_key {
-            if !k.is_empty() {
-                cfg.civitai_api_key = k.clone();
-                let mut civ = self.civitai.write().await;
-                *civ = CivitaiClient::new(k);
-            }
+            cfg.civitai_api_key = k.clone();
+            let mut civ = self.civitai.write().await;
+            *civ = CivitaiClient::new(k);
         }
         if let Some(k) = secrets.hf_token {
-            if !k.is_empty() {
-                cfg.hf_token = k;
-            }
+            cfg.hf_token = k;
         }
         if let Some(url) = secrets.diffusion_worker_url {
             if url.trim().is_empty() {
                 cfg.diffusion_worker_url = None;
             } else {
                 cfg.diffusion_worker_url = Some(url);
+                cfg.worker_enabled = true;
             }
         }
         if let Some(enabled) = secrets.worker_enabled {
-            cfg.worker_enabled = enabled;
+            // Prefer URL-present ⇒ enabled so generate is not stuck behind a stale disable flag.
+            if cfg.diffusion_worker_url.is_some() {
+                cfg.worker_enabled = true;
+            } else {
+                cfg.worker_enabled = enabled;
+            }
         }
         if let Some(tok) = secrets.api_token {
             // Empty string clears auth (local/dev). Non-empty overrides env / previous value.
             cfg.api_token = tok;
         }
+        let mut models_changed = false;
+        if let Some(m) = secrets.chat_model {
+            if !m.trim().is_empty() {
+                cfg.chat_model = m;
+                models_changed = true;
+            }
+        }
+        if let Some(m) = secrets.image_model {
+            if !m.trim().is_empty() {
+                cfg.image_model = m;
+                models_changed = true;
+            }
+        }
+        if let Some(m) = secrets.router_model {
+            if !m.trim().is_empty() {
+                cfg.router_model = m;
+                models_changed = true;
+            }
+        }
+        let mut prefs_changed = false;
+        if let Some(p) = secrets.privacy {
+            cfg.apply_privacy(p);
+            prefs_changed = true;
+        }
+        if let Some(a) = secrets.alignment {
+            cfg.apply_alignment(a);
+            prefs_changed = true;
+        }
+        if let Some(f) = secrets.auto_fallbacks {
+            cfg.apply_auto_fallbacks(f);
+            prefs_changed = true;
+        }
+        if secrets.legacy_upstream_auto_migrated {
+            cfg.legacy_upstream_auto_migrated = true;
+        }
+        if let Some(overrides) = secrets.instruction_overrides {
+            cfg.instruction_overrides = normalize_instruction_overrides(overrides);
+        }
+        if models_changed || prefs_changed {
+            let key = cfg.openrouter_api_key.clone();
+            let mut or = self.openrouter.write().await;
+            *or = OpenRouterClient::new(&cfg).with_key(key);
+        }
         drop(cfg);
         self.rebuild_worker_client().await;
     }
 
-    /// Attach or clear the in-memory worker client from URL + enabled flag.
+    /// Old Auto was stored as `openrouter/auto`. Rewrite that sentinel to internal `auto` once.
+    async fn migrate_legacy_upstream_auto(&self) -> anyhow::Result<()> {
+        let changed = {
+            let mut cfg = self.config.write().await;
+            if cfg.legacy_upstream_auto_migrated {
+                false
+            } else {
+                if cfg.chat_model.trim().eq_ignore_ascii_case("openrouter/auto") {
+                    cfg.chat_model = "auto".into();
+                }
+                cfg.legacy_upstream_auto_migrated = true;
+                true
+            }
+        };
+        if !changed {
+            return Ok(());
+        }
+        {
+            let cfg = self.config.read().await;
+            let key = cfg.openrouter_api_key.clone();
+            let mut or = self.openrouter.write().await;
+            *or = OpenRouterClient::new(&cfg).with_key(key);
+        }
+        if let Err(e) = self.persist_secrets().await {
+            tracing::warn!(error = %e, "legacy auto migration could not persist");
+        }
+        Ok(())
+    }
+
+    /// Attach or clear the in-memory worker client from the configured URL.
     pub async fn rebuild_worker_client(&self) {
         let cfg = self.config.read().await;
-        let next = if cfg.worker_enabled {
-            cfg.diffusion_worker_url.as_ref().map(|u| {
-                DiffusionWorkerClient::new_with_tls(u.clone(), cfg.worker_tls_insecure)
-                    .with_token(cfg.worker_token.clone())
-            })
-        } else {
-            None
-        };
+        let next = cfg.diffusion_worker_url.as_ref().map(|u| {
+            DiffusionWorkerClient::new_with_tls(u.clone(), cfg.worker_tls_insecure)
+                .with_token(cfg.worker_token.clone())
+        });
         *self.worker.write().await = next;
     }
 
@@ -148,9 +239,29 @@ impl AppState {
             } else {
                 Some(cfg.api_token.clone())
             },
+            chat_model: Some(cfg.chat_model.clone()),
+            image_model: Some(cfg.image_model.clone()),
+            router_model: Some(cfg.router_model.clone()),
+            privacy: Some(cfg.privacy_prefs()),
+            alignment: Some(cfg.alignment_prefs()),
+            auto_fallbacks: Some(cfg.auto_fallbacks_prefs()),
+            legacy_upstream_auto_migrated: cfg.legacy_upstream_auto_migrated,
+            instruction_overrides: if cfg.instruction_overrides.is_empty() {
+                None
+            } else {
+                Some(cfg.instruction_overrides.clone())
+            },
         };
         let raw = serde_json::to_vec_pretty(&secrets)?;
         tokio::fs::write(&cfg.secrets_file, raw).await?;
         Ok(())
     }
+}
+
+/// Keep only safe mode ids with non-empty trimmed text.
+pub fn normalize_instruction_overrides(raw: HashMap<String, String>) -> HashMap<String, String> {
+    raw.into_iter()
+        .filter(|(k, v)| crate::styles::is_editable_instruction_mode(k) && !v.trim().is_empty())
+        .map(|(k, v)| (k, v))
+        .collect()
 }

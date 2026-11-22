@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Point freya.dataknife.net at this machine's kind Ingress (ports 80/443).
-# Public DNS CNAMEs freya → prd-apps Traefik, which returns plain-text:
-#   404 page not found
+# DEV ONLY: Point freya.dataknife.net at this machine's kind Ingress (ports 80/443).
+# Production Studio lives on prd-apps (Traefik Gateway HTTPRoute). Public DNS already
+# CNAMEs freya.dataknife.net → prd-apps-wk.dataknife.net. Running this script adds a
+# /etc/hosts override to 127.0.0.1 and bypasses prd — remove those lines when using prd:
+#   sudo sed -i -E '/freya\.dataknife\.net|# Freya kind-local/d' /etc/hosts && resolvectl flush-caches
 set -euo pipefail
 
 IP="${FREYA_HOSTS_IP:-127.0.0.1}"

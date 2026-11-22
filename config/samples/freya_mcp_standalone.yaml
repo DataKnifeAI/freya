@@ -38,10 +38,6 @@ spec:
                 secretKeyRef:
                   name: freya-api-token
                   key: token
-            # Empty or * is loopback only and does not disable the check.
-            # Service DNS, port-forward loopback, and the public Ingress host.
-            - name: FREYA_MCP_ALLOWED_HOSTS
-              value: freya.dataknife.net,freya-mcp,freya-mcp.freya,freya-mcp.freya.svc,freya-mcp.freya.svc.cluster.local,localhost,127.0.0.1,::1
 ---
 apiVersion: v1
 kind: Service

@@ -4,16 +4,13 @@ mod api;
 mod tools;
 
 use anyhow::Context;
-use axum::body::Body;
-use axum::extract::State;
-use axum::http::{header, Request, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService,
+};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,21 +28,19 @@ struct Args {
     bind: String,
 
     /// In-cluster Freya API base URL (no trailing slash).
-    #[arg(long, env = "FREYA_API_URL", default_value = "http://127.0.0.1:8080")]
+    #[arg(
+        long,
+        env = "FREYA_API_URL",
+        default_value = "http://127.0.0.1:8080"
+    )]
     api_url: String,
 
     /// Bearer token for freya-api (same Secret as Studio `apiTokenSecretRef`).
-    /// Required. `/mcp` returns 401 when this is empty unless
-    /// `--allow-unauthenticated` is set.
     #[arg(long, env = "FREYA_API_TOKEN", default_value = "")]
     api_token: String,
 
-    /// Accept `/mcp` with no bearer. Off by default. Local dev only.
-    #[arg(long, env = "FREYA_MCP_ALLOW_UNAUTHENTICATED", default_value_t = false)]
-    allow_unauthenticated: bool,
-
     /// Comma-separated Host headers allowed by Streamable HTTP (DNS-rebinding guard).
-    /// Empty or `*` means loopback only. It does not disable the check.
+    /// Empty or `*` disables the check (typical behind Ingress). Local default: localhost.
     #[arg(long, env = "FREYA_MCP_ALLOWED_HOSTS", default_value = "")]
     allowed_hosts: String,
 }
@@ -69,16 +64,14 @@ async fn main() -> anyhow::Result<()> {
         .with_json_response(true)
         .with_cancellation_token(ct.child_token());
     let hosts = parse_allowed_hosts(&args.allowed_hosts);
-    let raw_hosts = args.allowed_hosts.trim();
-    if raw_hosts.is_empty() || raw_hosts == "*" {
-        info!(
-            ?hosts,
-            "MCP Host allowlist defaulted to loopback (empty or * does not disable it)"
-        );
+    if hosts.is_empty() {
+        // Behind Ingress / in-cluster Service DNS — Host is already gated by the mesh.
+        config = config.disable_allowed_hosts();
+        info!("MCP Host header allowlist disabled (FREYA_MCP_ALLOWED_HOSTS empty or *)");
     } else {
         info!(?hosts, "MCP Host header allowlist");
+        config = config.with_allowed_hosts(hosts);
     }
-    config = config.with_allowed_hosts(hosts);
 
     let api_for_factory = api.clone();
     let mcp = StreamableHttpService::new(
@@ -87,16 +80,9 @@ async fn main() -> anyhow::Result<()> {
         config,
     );
 
-    let mcp_auth = McpAuth {
-        token: args.api_token.clone(),
-        allow_unauthenticated: args.allow_unauthenticated,
-    };
-    let protected = Router::new()
-        .nest_service("/mcp", mcp)
-        .layer(middleware::from_fn_with_state(mcp_auth, require_mcp_token));
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .merge(protected);
+        .nest_service("/mcp", mcp);
 
     let addr: SocketAddr = args
         .bind
@@ -119,85 +105,18 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Clone)]
-struct McpAuth {
-    token: String,
-    allow_unauthenticated: bool,
-}
-
-async fn require_mcp_token(
-    State(auth): State<McpAuth>,
-    req: Request<Body>,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    if auth.token.is_empty() {
-        if auth.allow_unauthenticated {
-            tracing::warn!(
-                "FREYA_MCP_ALLOW_UNAUTHENTICATED is set; /mcp is accepting unauthenticated calls"
-            );
-            return Ok(next.run(req).await);
-        }
-        return Err(StatusCode::UNAUTHORIZED);
-    }
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .unwrap_or("");
-    if presented == auth.token {
-        Ok(next.run(req).await)
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
-}
-
 async fn healthz() -> Json<serde_json::Value> {
     Json(json!({ "ok": true, "service": "freya-mcp" }))
-}
-
-fn loopback_hosts() -> Vec<String> {
-    vec!["localhost".into(), "127.0.0.1".into(), "::1".into()]
 }
 
 fn parse_allowed_hosts(raw: &str) -> Vec<String> {
     let raw = raw.trim();
     if raw.is_empty() || raw == "*" {
-        return loopback_hosts();
+        return Vec::new();
     }
-    let hosts: Vec<String> = raw
-        .split(',')
+    raw.split(',')
         .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "*")
+        .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .collect();
-    if hosts.is_empty() {
-        loopback_hosts()
-    } else {
-        hosts
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_allowed_hosts;
-
-    #[test]
-    fn empty_or_star_stays_on_loopback() {
-        let loopback = || vec!["localhost".to_string(), "127.0.0.1".into(), "::1".into()];
-        assert_eq!(parse_allowed_hosts(""), loopback());
-        assert_eq!(parse_allowed_hosts("*"), loopback());
-        assert_eq!(
-            parse_allowed_hosts(" freya.example, localhost "),
-            vec!["freya.example".to_string(), "localhost".into()]
-        );
-        // A star in a real list does not open the check or drop the Ingress host.
-        assert_eq!(
-            parse_allowed_hosts("freya.dataknife.net, freya-mcp.freya.svc, *"),
-            vec![
-                "freya.dataknife.net".to_string(),
-                "freya-mcp.freya.svc".into()
-            ]
-        );
-    }
+        .collect()
 }

@@ -5,12 +5,14 @@ members = [
     "crates/freya-operator",
     "crates/freya-api",
     "crates/freya-worker",
+    "crates/freya-mcp",
 ]
 default-members = [
     "crates/freya-crd",
     "crates/freya-operator",
     "crates/freya-api",
     "crates/freya-worker",
+    "crates/freya-mcp",
 ]
 
 [workspace.package]

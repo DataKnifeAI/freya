@@ -1,4 +1,4 @@
-//! Reconcile FreyaDiffusionWorker — in-cluster GPU Deployment or external remote endpoint.
+//! Reconcile FreyaDiffusionWorker — external URL (recommended) or optional in-cluster GPU.
 
 use crate::reconcile::{
     default_worker_image, LABEL_COMPONENT, LABEL_INSTANCE, LABEL_MANAGED, LABEL_NAME, MANAGED_BY,
