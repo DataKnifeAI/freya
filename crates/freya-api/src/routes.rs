@@ -111,7 +111,59 @@ pub async fn worker_stats(State(state): State<AppState>) -> impl IntoResponse {
         "uptimeSec": worker_payload.get("uptimeSec").cloned().unwrap_or(Value::Null),
         "modelLoaded": worker_payload.get("modelLoaded").cloned().unwrap_or(Value::Null),
         "modelsDir": worker_payload.get("modelsDir").cloned().unwrap_or(Value::Null),
+        "layout": worker_payload.get("layout").cloned().unwrap_or(Value::Null),
         "worker": worker_payload,
+    }))
+}
+
+pub async fn worker_checkpoints(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let items = client.list_checkpoints().await.map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "data": items.into_iter().map(|a| json!({
+            "id": a.id,
+            "name": a.name.unwrap_or_else(|| a.id.clone()),
+            "kind": a.kind,
+            "path": a.path,
+            "baseModel": a.base_model,
+            "backend": "local",
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+pub async fn worker_base_model_get(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let v = client.get_active_base().await.map_err(ApiError::from)?;
+    Ok(Json(v))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetWorkerBaseModel {
+    pub model: String,
+    #[serde(default)]
+    pub base_model: Option<String>,
+}
+
+pub async fn worker_base_model_put(
+    State(state): State<AppState>,
+    Json(req): Json<SetWorkerBaseModel>,
+) -> ApiResult<Json<Value>> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let v = client
+        .set_active_base(&req.model, req.base_model.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(v))
+}
+
+pub async fn base_models_catalog() -> Json<Value> {
+    Json(json!({
+        "items": crate::base_models::catalog(),
+        "note": "Local GPU worker hosts SD/SDXL/Pony/Flux checkpoints under FREYA_MODELS_DIR. Remote LLM/vLLM text endpoints typically cannot run these.",
     }))
 }
 
@@ -676,6 +728,20 @@ async fn execute_chat_action(
                 download_url: download_url.to_string(),
                 dest_path: dest_path.to_string(),
                 name,
+                base_model: action
+                    .args
+                    .get("baseModel")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string),
+                version_id: action
+                    .args
+                    .get("versionId")
+                    .and_then(|x| x.as_i64()),
+                model_type: action
+                    .args
+                    .get("modelType")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string),
             };
             match civitai_install_inner(state, install_req).await {
                 Ok(v) => json!({
@@ -731,14 +797,23 @@ async fn civitai_install_inner(
     let auth = cfg.civitai_api_key.clone();
     let url = req.download_url.clone();
     drop(cfg);
+    let meta = crate::worker::InstallMeta {
+        name: req.name.clone(),
+        base_model: req.base_model.clone(),
+        version_id: req.version_id,
+        model_type: req.model_type.clone(),
+    };
     client
-        .install_asset("civitai", &url, &req.dest_path, Some(&auth))
+        .install_asset("civitai", &url, &req.dest_path, Some(&auth), Some(&meta))
         .await
         .map_err(ApiError::from)?;
     Ok(json!({
         "ok": true,
         "destPath": req.dest_path,
         "name": req.name,
+        "baseModel": req.base_model,
+        "versionId": req.version_id,
+        "modelType": req.model_type,
     }))
 }
 
@@ -969,6 +1044,12 @@ pub struct LoraIn {
     pub name: String,
     #[serde(default = "one")]
     pub scale: f32,
+    /// Relative path on the worker (`loras/foo.safetensors`) when known.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Civitai base family (SDXL 1.0, Pony, …) — used to pick a checkpoint.
+    #[serde(default)]
+    pub base_model: Option<String>,
 }
 
 fn one() -> f32 {
@@ -1058,6 +1139,8 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
                 .map(|l| LoraIn {
                     name: l.name.clone(),
                     scale: l.scale,
+                    path: None,
+                    base_model: None,
                 })
                 .collect();
         }
@@ -1100,18 +1183,67 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     let (bytes, mime, model_used, backend_used) = if backend == "local" {
         let worker = state.worker.read().await;
         let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+        // Prefer installed basename for lora_request so it matches on-disk files.
         let loras: Vec<LoraWeight> = req
             .loras
             .iter()
-            .map(|l| LoraWeight {
-                lora_name: l.name.clone(),
-                lora_scale: l.scale,
+            .map(|l| {
+                let lora_name = l
+                    .path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_stem())
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(l.name.as_str())
+                    .to_string();
+                LoraWeight {
+                    lora_name,
+                    lora_scale: l.scale,
+                }
             })
             .collect();
+        // Resolve base checkpoint: explicit model → worker active → LoRA baseModel hint.
+        let mut model = req.model.clone();
+        let mut active_base_label: Option<String> = None;
+        if let Ok(active) = client.get_active_base().await {
+            active_base_label = active
+                .get("baseModel")
+                .and_then(|x| x.as_str())
+                .map(str::to_string);
+            if model.is_none() {
+                if let Some(m) = active.get("model").and_then(|x| x.as_str()) {
+                    if !m.is_empty() {
+                        model = Some(m.to_string());
+                    }
+                }
+            }
+        }
+        if model.is_none() {
+            let hints: Vec<_> = req
+                .loras
+                .iter()
+                .map(|l| crate::base_models::LoraBaseHint {
+                    base_model: l.base_model.clone(),
+                })
+                .collect();
+            model = crate::base_models::resolve_model_from_loras(&hints);
+        }
+        if let (Some(active_b), Some(lora_b)) = (
+            active_base_label.as_deref(),
+            req.loras.iter().find_map(|l| l.base_model.as_deref()),
+        ) {
+            if !crate::base_models::bases_compatible(active_b, lora_b) {
+                tracing::warn!(
+                    active = %active_b,
+                    lora_base = %lora_b,
+                    "active worker base may not match pinned LoRA baseModel"
+                );
+            }
+        }
         let bytes = client
             .generate(
                 &final_prompt,
-                req.model.as_deref(),
+                model.as_deref(),
                 &loras,
                 req.size.as_deref(),
                 req.seed,
@@ -1122,7 +1254,7 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
         (
             bytes,
             "image/png".to_string(),
-            req.model.clone().unwrap_or_else(|| "local".into()),
+            model.unwrap_or_else(|| "local".into()),
             "local".to_string(),
         )
     } else {
@@ -1238,24 +1370,47 @@ pub async fn gallery_remix(
 pub async fn models(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let or = state.openrouter.read().await;
     let mut cloud = or.list_image_models().await.unwrap_or_default();
+    let chat = or.list_chat_models().await.unwrap_or_default();
     let video = or.list_video_models().await.unwrap_or_default();
     let mut local = Vec::new();
+    let mut active_base = Value::Null;
     if let Some(w) = state.worker.read().await.as_ref() {
         if let Ok(loras) = w.list_loras().await {
             for a in loras {
                 local.push(json!({
                     "id": a.id,
-                    "name": a.id,
+                    "name": a.name.unwrap_or_else(|| a.id.clone()),
                     "backend": "local",
                     "kind": a.kind,
                     "path": a.path,
+                    "baseModel": a.base_model,
                 }));
             }
         }
+        if let Ok(cps) = w.list_checkpoints().await {
+            for a in cps {
+                local.push(json!({
+                    "id": a.id,
+                    "name": a.name.unwrap_or_else(|| a.id.clone()),
+                    "backend": "local",
+                    "kind": "checkpoint",
+                    "path": a.path,
+                    "baseModel": a.base_model,
+                }));
+            }
+        }
+        if let Ok(v) = w.get_active_base().await {
+            active_base = v;
+        }
     }
     Ok(Json(json!({
+        // Image-capable cloud models (OpenRouter GET /images/models).
         "openrouter": cloud.drain(..).map(|m| json!({
             "id": m.id, "name": m.name, "backend": m.backend, "modality": "image"
+        })).collect::<Vec<_>>(),
+        // Text chat models for the agent picker (filtered subset of GET /models).
+        "chat": chat.into_iter().map(|m| json!({
+            "id": m.id, "name": m.name, "backend": m.backend, "modality": "chat"
         })).collect::<Vec<_>>(),
         // Video is async on OpenRouter (POST /videos + poll) — listed for discovery; Freya UI
         // does not generate video yet.
@@ -1269,6 +1424,8 @@ pub async fn models(State(state): State<AppState>) -> ApiResult<Json<serde_json:
             "supportedAspectRatios": m.supported_aspect_ratios,
         })).collect::<Vec<_>>(),
         "local": local,
+        "activeBase": active_base,
+        "baseModelCatalog": crate::base_models::catalog(),
     })))
 }
 
@@ -1379,6 +1536,13 @@ pub struct InstallCivitaiRequest {
     pub dest_path: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// Civitai base family — stored beside the weight for LoRA→checkpoint selection.
+    #[serde(default)]
+    pub base_model: Option<String>,
+    #[serde(default)]
+    pub version_id: Option<i64>,
+    #[serde(default)]
+    pub model_type: Option<String>,
 }
 
 /// Allowlist Civitai hosts before attaching the API token (never send token to untrusted URLs).
@@ -1416,6 +1580,8 @@ pub struct SettingsPublic {
     pub worker_enabled: bool,
     pub chat_model: String,
     pub image_model: String,
+    /// Whether `FREYA_API_TOKEN` / rotated runtime token is set (never returns the value).
+    pub api_token_configured: bool,
 }
 
 pub async fn settings_get(State(state): State<AppState>) -> Json<SettingsPublic> {
@@ -1428,7 +1594,62 @@ pub async fn settings_get(State(state): State<AppState>) -> Json<SettingsPublic>
         worker_enabled: cfg.worker_enabled,
         chat_model: cfg.chat_model.clone(),
         image_model: cfg.image_model.clone(),
+        api_token_configured: !cfg.api_token.trim().is_empty(),
     })
+}
+
+/// Generate or rotate the studio API bearer. Shown once in the response; also stored in
+/// `FREYA_SECRETS_FILE` so local/kind restarts keep it when that path is durable.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthTokenResponse {
+    pub token: String,
+    pub rotated: bool,
+    pub persisted: bool,
+    pub note: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_commands: Option<Vec<String>>,
+}
+
+pub async fn auth_token_create(State(state): State<AppState>) -> ApiResult<Json<AuthTokenResponse>> {
+    let token = generate_api_token();
+    let had_token = {
+        let cfg = state.config.read().await;
+        !cfg.api_token.trim().is_empty()
+    };
+    {
+        let mut cfg = state.config.write().await;
+        cfg.api_token = token.clone();
+    }
+    let persisted = state.persist_secrets().await.is_ok();
+    let sync_commands = Some(vec![
+        format!(
+            "kubectl -n freya create secret generic freya-api-token --from-literal=token='{token}' --dry-run=client -o yaml | kubectl apply -f -"
+        ),
+        "kubectl -n freya rollout restart deploy/freya-api".into(),
+    ]);
+    Ok(Json(AuthTokenResponse {
+        token,
+        rotated: had_token,
+        persisted,
+        note: if persisted {
+            "Token applied immediately. Copy it now — it is not shown again. Stored in this browser after you confirm, and on the API secrets file when writable."
+                .into()
+        } else {
+            "Token applied in-memory for this process. Copy it now. Persist with the kubectl commands below (or fix FREYA_SECRETS_FILE) so restarts keep it."
+                .into()
+        },
+        sync_commands,
+    }))
+}
+
+fn generate_api_token() -> String {
+    // 64 hex chars ≈ openssl rand -hex 32
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -1477,6 +1698,7 @@ pub async fn settings_put(
         hf_token: upd.hf_token,
         diffusion_worker_url: None, // URL already applied above; persist_secrets writes full snapshot
         worker_enabled: None,
+        api_token: None,
     };
     state.apply_secrets(secrets).await;
     state.rebuild_worker_client().await;

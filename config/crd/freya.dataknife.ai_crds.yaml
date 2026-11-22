@@ -120,6 +120,10 @@ spec:
                   host:
                     nullable: true
                     type: string
+                  tlsSecretName:
+                    description: 'TLS Secret in the Studio namespace (e.g. `wildcard-dataknife-net-tls`). Fleet pattern: same Let''s Encrypt `*.dataknife.net` secret synced to `kube-system` as the ingress default cert; copy into this namespace when setting `tlsSecretName`. Omit to rely on the controller default cert only.'
+                    nullable: true
+                    type: string
                 type: object
               openRouter:
                 default:

@@ -116,6 +116,78 @@ impl OpenRouterClient {
         Ok(out)
     }
 
+    /// Discover chat/agent models via `GET /models`, filtered to text-capable
+    /// providers Freya uses for Plan/Auto/YOLO (not the full OpenRouter catalog).
+    pub async fn list_chat_models(&self) -> Result<Vec<ImageModel>> {
+        if self.api_key.is_empty() {
+            return Ok(fallback_chat_models());
+        }
+        let url = format!("{}/models", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("list chat models")?;
+        if !resp.status().is_success() {
+            return Ok(fallback_chat_models());
+        }
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        let mut scored: Vec<(i64, ImageModel)> = Vec::new();
+        if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+            for m in arr {
+                if !is_agent_chat_candidate(m) {
+                    continue;
+                }
+                let id = m
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = m
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or(&id)
+                    .to_string();
+                let created = m.get("created").and_then(|c| c.as_i64()).unwrap_or(0);
+                scored.push((
+                    created,
+                    ImageModel {
+                        id,
+                        name,
+                        backend: "openrouter".into(),
+                    },
+                ));
+            }
+        }
+        if scored.is_empty() {
+            return Ok(fallback_chat_models());
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+
+        // Prefer a few well-known agent ids even when they fall outside the newest window.
+        let mut out: Vec<ImageModel> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for pin in CHAT_PINNED_IDS {
+            if let Some((_, model)) = scored.iter().find(|(_, m)| m.id == *pin) {
+                if seen.insert(model.id.clone()) {
+                    out.push(model.clone());
+                }
+            }
+        }
+        const MAX_CHAT: usize = 48;
+        for (_, model) in scored.into_iter() {
+            if out.len() >= MAX_CHAT {
+                break;
+            }
+            if seen.insert(model.id.clone()) {
+                out.push(model);
+            }
+        }
+        Ok(out)
+    }
+
     /// Discover OpenRouter video models via `GET /videos/models` (async gen API; not wired to Freya generate yet).
     pub async fn list_video_models(&self) -> Result<Vec<VideoModel>> {
         if self.api_key.is_empty() {
@@ -367,8 +439,8 @@ fn extract_image_from_chat(v: &Value) -> Result<GeneratedImage> {
 fn fallback_models() -> Vec<ImageModel> {
     vec![
         ImageModel {
-            id: "black-forest-labs/flux.2-klein-4b".into(),
-            name: "FLUX.2 Klein 4B".into(),
+            id: "black-forest-labs/flux-3-image-klein".into(),
+            name: "FLUX 3 Image Klein".into(),
             backend: "openrouter".into(),
         },
         ImageModel {
@@ -383,6 +455,118 @@ fn fallback_models() -> Vec<ImageModel> {
         },
     ]
 }
+
+fn fallback_chat_models() -> Vec<ImageModel> {
+    vec![
+        ImageModel {
+            id: "anthropic/claude-sonnet-5.5".into(),
+            name: "Claude Sonnet 5.5".into(),
+            backend: "openrouter".into(),
+        },
+        ImageModel {
+            id: "google/gemini-4-neon".into(),
+            name: "Gemini 4 Neon".into(),
+            backend: "openrouter".into(),
+        },
+        ImageModel {
+            id: "openai/gpt-5.2".into(),
+            name: "GPT-5.2".into(),
+            backend: "openrouter".into(),
+        },
+    ]
+}
+
+/// Keep the agent picker to text chat models from major providers — not the
+/// entire OpenRouter catalog (embeddings, image-gen, routing variants, …).
+fn is_agent_chat_candidate(m: &Value) -> bool {
+    let id = m.get("id").and_then(|x| x.as_str()).unwrap_or("");
+    if id.is_empty() {
+        return false;
+    }
+    // Skip provider routing suffixes (:batch, :nitro, :free, …).
+    if id.contains(':') {
+        return false;
+    }
+    let id_l = id.to_ascii_lowercase();
+    if CHAT_PROVIDER_PREFIXES
+        .iter()
+        .all(|p| !id_l.starts_with(p))
+    {
+        return false;
+    }
+    if id_l.contains("embed")
+        || id_l.contains("whisper")
+        || id_l.contains("tts")
+        || id_l.contains("moderation")
+        || id_l.contains("upscale")
+    {
+        return false;
+    }
+    // Image-generation oriented ids (even when they expose chat completions).
+    if id_l.contains("nano-banana")
+        || id_l.contains("gpt-image")
+        || id_l.contains("dall-e")
+        || id_l.contains("flux")
+        || id_l.contains("seedream")
+        || id_l.contains("imagen")
+        || id_l.contains("recraft")
+        || (id_l.contains("image") && !id_l.contains("chatgpt"))
+    {
+        return false;
+    }
+
+    let arch = m.get("architecture").unwrap_or(&Value::Null);
+    let outs = arch
+        .get("output_modalities")
+        .and_then(|o| o.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !outs.iter().any(|o| *o == "text") {
+        return false;
+    }
+    // Pure image (or image+audio) generators — not agent chat.
+    if outs.iter().all(|o| *o != "text") {
+        return false;
+    }
+
+    if let Some(ends) = m.get("endpoints").and_then(|e| e.as_array()) {
+        if !ends.is_empty() {
+            let chat_ok = ends.iter().any(|e| {
+                e.as_str()
+                    .map(|s| s.contains("chat/completions"))
+                    .unwrap_or(false)
+            });
+            if !chat_ok {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+const CHAT_PROVIDER_PREFIXES: &[&str] = &[
+    "anthropic/",
+    "openai/",
+    "google/",
+    "deepseek/",
+    "meta-llama/",
+    "mistralai/",
+    "qwen/",
+    "x-ai/",
+];
+
+/// Always surface these (when OpenRouter still lists them) ahead of the newest-N window.
+const CHAT_PINNED_IDS: &[&str] = &[
+    "anthropic/claude-sonnet-5.5",
+    "anthropic/claude-opus-5.5",
+    "google/gemini-4-neon",
+    "openai/gpt-5.2",
+    "openai/gpt-4.1-mini",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageModel {
@@ -501,6 +685,31 @@ mod tests {
     fn detects_chat_image_models() {
         assert!(is_chat_image_model("google/gemini-2.5-flash-image"));
         assert!(!is_chat_image_model("black-forest-labs/flux.2-klein-4b"));
+    }
+
+    #[test]
+    fn filters_agent_chat_candidates() {
+        let chat = serde_json::json!({
+            "id": "anthropic/claude-sonnet-5.5",
+            "name": "Anthropic: Claude Sonnet 5.5",
+            "architecture": { "output_modalities": ["text"] },
+            "endpoints": ["/api/v1/chat/completions"]
+        });
+        assert!(is_agent_chat_candidate(&chat));
+
+        let batch = serde_json::json!({
+            "id": "google/gemini-4-neon:batch",
+            "architecture": { "output_modalities": ["text"] },
+            "endpoints": ["/api/v1/chat/completions"]
+        });
+        assert!(!is_agent_chat_candidate(&batch));
+
+        let image = serde_json::json!({
+            "id": "google/gemini-2.5-flash-image",
+            "architecture": { "output_modalities": ["text", "image"] },
+            "endpoints": ["/api/v1/chat/completions"]
+        });
+        assert!(!is_agent_chat_candidate(&image));
     }
 
     #[test]

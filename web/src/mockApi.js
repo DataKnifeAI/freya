@@ -1,6 +1,26 @@
 /** In-memory Freya API mock for UI design without backend. */
 
-const delay = (ms = 400) => new Promise((r) => setTimeout(r, ms));
+function abortError() {
+  const err = new Error("Aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+/** Resolves after ms, or rejects with AbortError if signal aborts (search-as-you-type). */
+const delay = (ms = 400, signal) =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const t = setTimeout(resolve, ms);
+    if (!signal) return;
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 
 /**
  * Repo image sources for mock examples (viewed on disk):
@@ -362,7 +382,9 @@ const state = {
     workerEnabled: true,
     chatModel: "openrouter/auto",
     imageModel: "black-forest-labs/flux.2-klein-4b",
+    apiTokenConfigured: false,
   },
+  mockApiToken: "",
   workerRuntime: { kind: "none", name: "mock", running: false, detail: "mock" },
   styles: STYLE_PACKS,
   gallery: [
@@ -692,9 +714,12 @@ function isSideEffectAction(ty) {
 }
 
 export async function mockApi(path, opts = {}) {
+  const signal = opts.signal;
   await delay(
     path.includes("/run") || path.includes("/generate") || path.includes("/chat") ? 900 : 280,
+    signal,
   );
+  if (signal?.aborted) throw abortError();
   const method = (opts.method || "GET").toUpperCase();
   const url = new URL(path, "http://mock.local");
   const p = url.pathname;
@@ -711,6 +736,50 @@ export async function mockApi(path, opts = {}) {
           name: "FLUX.2 Klein 4B",
           backend: "openrouter",
           modality: "image",
+        },
+        {
+          id: "google/gemini-2.5-flash-image",
+          name: "Google: Gemini 2.5 Flash Image",
+          backend: "openrouter",
+          modality: "image",
+        },
+        {
+          id: "openai/gpt-image-1-mini",
+          name: "OpenAI: GPT Image 1 Mini",
+          backend: "openrouter",
+          modality: "image",
+        },
+        {
+          id: "bytedance-seed/seedream-5-5",
+          name: "ByteDance Seed: Seedream 5.5",
+          backend: "openrouter",
+          modality: "image",
+        },
+      ],
+      chat: [
+        {
+          id: "anthropic/claude-sonnet-5.5",
+          name: "Anthropic: Claude Sonnet 5.5",
+          backend: "openrouter",
+          modality: "chat",
+        },
+        {
+          id: "google/gemini-4-neon",
+          name: "Google: Gemini 4 Neon",
+          backend: "openrouter",
+          modality: "chat",
+        },
+        {
+          id: "openai/gpt-4.1-mini",
+          name: "OpenAI: GPT-4.1 Mini",
+          backend: "openrouter",
+          modality: "chat",
+        },
+        {
+          id: "deepseek/deepseek-v4.1-flash-1017",
+          name: "DeepSeek: DeepSeek V4.1 Flash",
+          backend: "openrouter",
+          modality: "chat",
         },
       ],
       video: [
@@ -744,6 +813,26 @@ export async function mockApi(path, opts = {}) {
     return { ...state.settings };
   }
 
+  if (p === "/v1/auth/token" && method === "POST") {
+    const rotated = Boolean(state.mockApiToken);
+    const bytes = new Uint8Array(32);
+    if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+      crypto.getRandomValues(bytes);
+    } else {
+      for (let i = 0; i < bytes.length; i++) bytes[i] = (Math.random() * 256) | 0;
+    }
+    const token = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    state.mockApiToken = token;
+    state.settings.apiTokenConfigured = true;
+    return {
+      token,
+      rotated,
+      persisted: true,
+      note: "Mock token — stored only in this page's memory.",
+      syncCommands: null,
+    };
+  }
+
   if (p === "/v1/worker/stats" && method === "GET") {
     const configured = Boolean(state.settings.diffusionWorkerUrl);
     const enabled = state.settings.workerEnabled !== false;
@@ -757,11 +846,80 @@ export async function mockApi(path, opts = {}) {
       vram: null,
       host: null,
       loras: configured ? 2 : null,
-      checkpoints: configured ? 0 : null,
+      checkpoints: configured ? 1 : null,
       uptimeSec: configured ? 42 : null,
-      modelLoaded: null,
-      modelsDir: null,
+      modelLoaded: configured
+        ? {
+            model: "checkpoints/mock-sdxl.safetensors",
+            baseModel: "SDXL 1.0",
+            loadedInVram: false,
+            engine: "stub",
+          }
+        : null,
+      modelsDir: configured ? "/mnt/game2/freya/models" : null,
+      layout: {
+        loras: "loras/*.safetensors",
+        checkpoints: "checkpoints/*.safetensors",
+        activeBase: "active-base.json",
+      },
       worker: {},
+    };
+  }
+
+  if (p === "/v1/worker/checkpoints" && method === "GET") {
+    return {
+      data: [
+        {
+          id: "mock-sdxl",
+          name: "Mock SDXL",
+          kind: "checkpoint",
+          path: "checkpoints/mock-sdxl.safetensors",
+          baseModel: "SDXL 1.0",
+          backend: "local",
+        },
+      ],
+    };
+  }
+
+  if (p === "/v1/worker/base-model" && method === "GET") {
+    return {
+      ok: true,
+      model: "checkpoints/mock-sdxl.safetensors",
+      baseModel: "SDXL 1.0",
+      modelsDir: "/mnt/game2/freya/models",
+    };
+  }
+
+  if (p === "/v1/worker/base-model" && method === "PUT") {
+    const body = parseBody(opts);
+    return {
+      ok: true,
+      model: body.model || "checkpoints/mock-sdxl.safetensors",
+      baseModel: body.baseModel || "SDXL 1.0",
+      loadedInVram: false,
+      engine: "stub",
+    };
+  }
+
+  if (p === "/v1/base-models" && method === "GET") {
+    return {
+      items: [
+        {
+          baseModel: "SDXL 1.0",
+          family: "SDXL",
+          suggestedModel: "stabilityai/stable-diffusion-xl-base-1.0",
+          note: "mock",
+          localOnly: true,
+        },
+        {
+          baseModel: "Pony",
+          family: "Pony",
+          suggestedModel: "checkpoints/ponyDiffusionV6XL.safetensors",
+          note: "mock",
+          localOnly: true,
+        },
+      ],
+      note: "mock catalog",
     };
   }
 
