@@ -4,10 +4,14 @@
 User → Freya UI → Freya API
                      ├─ OpenRouter (chat + images)
                      ├─ Civitai API (search; authenticated downloads)
-                     └─ Diffusion worker (in-cluster or remote)
-                            └─ /v1/images/generations
-                            └─ /v1/assets/install  (LoRAs for UI)
+                     └─ Diffusion worker (local GPU preferred for SD / LoRAs)
+                            └─ /v1/images/generations   (model + lora_request)
+                            └─ /v1/assets/install         (LoRAs + checkpoints + meta)
+                            └─ /v1/loras | /v1/checkpoints
+                            └─ /v1/base-model             (active checkpoint selection)
 ```
+
+**Where bases live:** `FREYA_MODELS_DIR` (`loras/`, `checkpoints/`, `active-base.json`). Civitai `baseModel` is stored in `*.safetensors.meta.json` and used when the UI/API omits an explicit generate `model`. Remote LLM/vLLM hosts are often **not** SD-capable — use the local RTX worker for multi-base hosting.
 
 ## Secrets
 

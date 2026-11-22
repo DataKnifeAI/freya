@@ -104,6 +104,12 @@ pub struct IngressSpec {
     pub class_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
+    /// TLS Secret in the Studio namespace (e.g. `wildcard-dataknife-net-tls`).
+    /// Fleet pattern: same Let's Encrypt `*.dataknife.net` secret synced to
+    /// `kube-system` as the ingress default cert; copy into this namespace when
+    /// setting `tlsSecretName`. Omit to rely on the controller default cert only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_secret_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

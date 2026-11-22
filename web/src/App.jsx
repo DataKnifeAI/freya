@@ -13,9 +13,70 @@ const AUTOMATION_STORAGE_KEY = "freya.automationMode";
 const MODELS_STORAGE_KEY = "freya.models";
 const SESSIONS_STORAGE_KEY = "freya.sessions";
 const SIDEBAR_STORAGE_KEY = "freya.sidebarOpen";
+const WORKSPACE_SPLIT_STORAGE_KEY = "freya.workspaceSplit";
+/** Default / clamp for left chat pane width as % of `.workspace`. */
+const WORKSPACE_SPLIT_DEFAULT = 45;
+const WORKSPACE_SPLIT_MIN_LEFT_PX = 340;
+const WORKSPACE_SPLIT_MIN_RIGHT_PX = 280;
 const THEME_STORAGE_KEY = "freya.theme";
+const TAB_STORAGE_KEY = "freya.tab";
+/** Top-level Studio tabs (nav + restore must stay in sync). */
+const STUDIO_TABS = ["gallery", "styles", "civitai", "worker", "settings"];
 /** Persistent Civitai library (survives sessions). Distinct from session Pin. */
 const FAVORITES_STORAGE_KEY = "freya.civitaiFavorites";
+const CIVITAI_SUBVIEW_STORAGE_KEY = "freya.civitaiSubview";
+const CIVITAI_SUBVIEWS = ["search", "favorites"];
+/** Debounce for Civitai search-as-you-type (ms). */
+const CIVITAI_SEARCH_DEBOUNCE_MS = 350;
+const CIVITAI_SEARCH_TYPES = "LORA,LoCon,DoRA,Checkpoint,TextualInversion,VAE";
+/** Local freya-worker / freya-local-worker defaults (see .env.example, docs/LOCAL.md). */
+const DEFAULT_WORKER_HOST = "localhost";
+const DEFAULT_WORKER_PORT = "8091";
+
+function parseWorkerEndpoint(url) {
+  // No saved URL → show local defaults in the fields (hasWorker still uses persisted settings).
+  const empty = {
+    host: DEFAULT_WORKER_HOST,
+    port: DEFAULT_WORKER_PORT,
+    advancedUrl: "",
+    useAdvanced: false,
+  };
+  if (!url || !String(url).trim()) return empty;
+  try {
+    const u = new URL(String(url).trim());
+    const path = (u.pathname || "/").replace(/\/$/, "") || "";
+    const simpleHttp =
+      u.protocol === "http:" && !path && !u.search && !u.hash && Boolean(u.hostname);
+    if (simpleHttp) {
+      return {
+        host: u.hostname,
+        port: u.port || DEFAULT_WORKER_PORT,
+        advancedUrl: "",
+        useAdvanced: false,
+      };
+    }
+    return {
+      host: "",
+      port: "",
+      advancedUrl: String(url).trim(),
+      useAdvanced: true,
+    };
+  } catch {
+    return {
+      host: "",
+      port: "",
+      advancedUrl: String(url).trim(),
+      useAdvanced: true,
+    };
+  }
+}
+
+function composeWorkerUrl(host, port) {
+  const h = String(host || "").trim();
+  if (!h) return "";
+  const p = String(port || DEFAULT_WORKER_PORT).trim() || DEFAULT_WORKER_PORT;
+  return `http://${h}:${p}`;
+}
 
 function readFavorites() {
   try {
@@ -54,6 +115,44 @@ function readStoredTheme() {
   return null;
 }
 
+function readStoredTab() {
+  try {
+    const v = localStorage.getItem(TAB_STORAGE_KEY);
+    if (STUDIO_TABS.includes(v)) return v;
+  } catch {
+    /* ignore */
+  }
+  return "gallery";
+}
+
+function persistTab(tab) {
+  try {
+    if (STUDIO_TABS.includes(tab)) localStorage.setItem(TAB_STORAGE_KEY, tab);
+  } catch {
+    /* ignore */
+  }
+}
+
+function readStoredCivitaiSubview() {
+  try {
+    const v = localStorage.getItem(CIVITAI_SUBVIEW_STORAGE_KEY);
+    if (CIVITAI_SUBVIEWS.includes(v)) return v;
+  } catch {
+    /* ignore */
+  }
+  return "search";
+}
+
+function persistCivitaiSubview(subview) {
+  try {
+    if (CIVITAI_SUBVIEWS.includes(subview)) {
+      localStorage.setItem(CIVITAI_SUBVIEW_STORAGE_KEY, subview);
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 function systemTheme() {
   try {
     return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
@@ -75,19 +174,49 @@ const MODE_HINTS = {
   yolo: "YOLO — Freya runs tools freely (generate, search, install when a worker is set).",
 };
 
-const AGENT_MODELS = [
-  { id: "openrouter/auto", label: "Auto", short: "Auto" },
-  { id: "anthropic/claude-sonnet-4", label: "Claude Sonnet 4", short: "Sonnet 4" },
-  { id: "openai/gpt-4.1-mini", label: "GPT-4.1 Mini", short: "GPT-4.1 Mini" },
-  { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash", short: "Gemini Flash" },
+/** Offline / unauth fallbacks — live lists come from GET /v1/models. */
+const AUTO_AGENT = { id: "openrouter/auto", label: "Auto", short: "Auto" };
+const AUTO_IMAGE = { id: "auto", label: "Auto", short: "Auto" };
+
+const FALLBACK_AGENT_MODELS = [
+  AUTO_AGENT,
+  { id: "anthropic/claude-sonnet-5.5", label: "Claude Sonnet 5.5", short: "Sonnet 5.5" },
+  { id: "google/gemini-4-neon", label: "Gemini 4 Neon", short: "Gemini Neon" },
+  { id: "openai/gpt-5.2", label: "GPT-5.2", short: "GPT-5.2" },
 ];
 
-const IMAGE_MODELS = [
-  { id: "auto", label: "Auto", short: "Auto" },
-  { id: "black-forest-labs/flux.2-klein-4b", label: "FLUX.2 Klein 4B", short: "FLUX Klein" },
+const FALLBACK_IMAGE_MODELS = [
+  AUTO_IMAGE,
+  { id: "black-forest-labs/flux-3-image-klein", label: "FLUX 3 Image Klein", short: "FLUX 3 Klein" },
   { id: "google/gemini-2.5-flash-image", label: "Gemini 2.5 Flash Image", short: "Gemini Image" },
   { id: "openai/gpt-image-1-mini", label: "GPT Image 1 Mini", short: "GPT Image Mini" },
 ];
+
+function shortFromName(name, id) {
+  let s = String(name || id || "").trim();
+  const colon = s.indexOf(": ");
+  if (colon > 0 && colon < 32) s = s.slice(colon + 2).trim();
+  if (s.length > 22) s = `${s.slice(0, 20)}…`;
+  return s || id;
+}
+
+/** Map API catalog rows → CompactMenu options; always keep Auto first. */
+function catalogToOptions(items, { auto, fallback }) {
+  const mapped = (Array.isArray(items) ? items : [])
+    .filter((m) => m && m.id)
+    .map((m) => ({
+      id: m.id,
+      label: m.name || m.id,
+      short: shortFromName(m.name, m.id),
+    }));
+  if (!mapped.length) return fallback;
+  return [auto, ...mapped];
+}
+
+function ensureSelectedOption(list, id) {
+  if (!id || list.some((m) => m.id === id)) return list;
+  return [...list, { id, label: id, short: shortFromName(id, id) }];
+}
 
 const emptySession = () => ({
   goal: "",
@@ -198,6 +327,24 @@ function readStoredSidebarOpen() {
   return true;
 }
 
+function readStoredWorkspaceSplit() {
+  try {
+    const n = Number(localStorage.getItem(WORKSPACE_SPLIT_STORAGE_KEY));
+    if (Number.isFinite(n) && n >= 15 && n <= 85) return n;
+  } catch {
+    /* ignore */
+  }
+  return WORKSPACE_SPLIT_DEFAULT;
+}
+
+function persistWorkspaceSplit(pct) {
+  try {
+    localStorage.setItem(WORKSPACE_SPLIT_STORAGE_KEY, String(Math.round(pct * 10) / 10));
+  } catch {
+    /* ignore */
+  }
+}
+
 function readStoredSessions() {
   try {
     const raw = localStorage.getItem(SESSIONS_STORAGE_KEY);
@@ -246,14 +393,15 @@ function readStoredModels() {
     const raw = localStorage.getItem(MODELS_STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      return {
-        agentModel: AGENT_MODELS.some((m) => m.id === parsed.agentModel)
-          ? parsed.agentModel
-          : "openrouter/auto",
-        imageModel: IMAGE_MODELS.some((m) => m.id === parsed.imageModel)
-          ? parsed.imageModel
-          : "auto",
-      };
+      const agent =
+        typeof parsed.agentModel === "string" && parsed.agentModel.trim()
+          ? parsed.agentModel.trim()
+          : "openrouter/auto";
+      const image =
+        typeof parsed.imageModel === "string" && parsed.imageModel.trim()
+          ? parsed.imageModel.trim()
+          : "auto";
+      return { agentModel: agent, imageModel: image };
     }
   } catch {
     /* ignore */
@@ -428,7 +576,11 @@ export default function App() {
   const [mock] = useState(() => isMockMode());
   /** `make mock-ui` / `npm run dev:mock` bake mock in — Exit cannot leave. */
   const mockLocked = import.meta.env.VITE_FREYA_MOCK === "true";
-  const [tab, setTab] = useState("gallery");
+  const [tab, setTabState] = useState(readStoredTab);
+  const setTab = (next) => {
+    setTabState(next);
+    persistTab(next);
+  };
   const [prompt, setPrompt] = useState(() => bootSession.prompt || "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -445,17 +597,29 @@ export default function App() {
     () =>
       (typeof localStorage !== "undefined" && localStorage.getItem("freya.apiToken")) || "",
   );
-  const [workerUrl, setWorkerUrl] = useState("");
+  const [generatedToken, setGeneratedToken] = useState(null);
+  const [tokenBusy, setTokenBusy] = useState(false);
+  const [tokenCopyMsg, setTokenCopyMsg] = useState("");
+  const [workerHost, setWorkerHost] = useState(DEFAULT_WORKER_HOST);
+  const [workerPort, setWorkerPort] = useState(DEFAULT_WORKER_PORT);
+  const [workerUrlOverride, setWorkerUrlOverride] = useState("");
+  const [useWorkerUrlOverride, setUseWorkerUrlOverride] = useState(false);
   const [workerStats, setWorkerStats] = useState(null);
   const [workerCtlBusy, setWorkerCtlBusy] = useState(false);
   const [civitaiQ, setCivitaiQ] = useState(BEGINNER_CIVITAI_QUERY);
   const [civitaiItems, setCivitaiItems] = useState([]);
-  const [civitaiSubview, setCivitaiSubview] = useState("search");
+  const [civitaiSubview, setCivitaiSubviewState] = useState(readStoredCivitaiSubview);
+  const setCivitaiSubview = (next) => {
+    setCivitaiSubviewState(next);
+    persistCivitaiSubview(next);
+  };
   const [favorites, setFavorites] = useState(readFavorites);
   const [civitaiDetail, setCivitaiDetail] = useState(null);
   const [civitaiDetailBusy, setCivitaiDetailBusy] = useState(false);
   const [detailImageIdx, setDetailImageIdx] = useState(0);
   const [videoModels, setVideoModels] = useState([]);
+  const [agentModels, setAgentModels] = useState(FALLBACK_AGENT_MODELS);
+  const [imageModels, setImageModels] = useState(FALLBACK_IMAGE_MODELS);
   const [savedMsg, setSavedMsg] = useState("");
   const [ideas, setIdeas] = useState(() =>
     Array.isArray(bootSession.ideas) ? bootSession.ideas : [],
@@ -481,6 +645,8 @@ export default function App() {
   const [menuOpen, setMenuOpen] = useState(null);
   const [theme, setTheme] = useState(resolveInitialTheme);
   const [sidebarOpen, setSidebarOpen] = useState(readStoredSidebarOpen);
+  const [workspaceSplit, setWorkspaceSplit] = useState(readStoredWorkspaceSplit);
+  const [workspaceResizing, setWorkspaceResizing] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState(
     () => bootSession.id || makeSessionId(),
   );
@@ -490,6 +656,14 @@ export default function App() {
   const sessionsRef = useRef(sessions);
   const activeIdRef = useRef(activeSessionId);
   const timelineRef = useRef(null);
+  const workspaceRef = useRef(null);
+  const workspaceSplitRef = useRef(workspaceSplit);
+  const civitaiAbortRef = useRef(null);
+  const lastCivitaiSearchQRef = useRef("");
+
+  useEffect(() => {
+    workspaceSplitRef.current = workspaceSplit;
+  }, [workspaceSplit]);
 
   useEffect(() => {
     sessionsRef.current = sessions;
@@ -630,6 +804,73 @@ export default function App() {
     }
   };
 
+  const clampWorkspaceSplit = (clientX) => {
+    const el = workspaceRef.current;
+    if (!el) return workspaceSplitRef.current;
+    const rect = el.getBoundingClientRect();
+    const gutter = 6;
+    const usable = Math.max(1, rect.width - gutter);
+    const minLeftPct = (WORKSPACE_SPLIT_MIN_LEFT_PX / usable) * 100;
+    const minRightPct = (WORKSPACE_SPLIT_MIN_RIGHT_PX / usable) * 100;
+    const raw = ((clientX - rect.left) / usable) * 100;
+    const lo = Math.min(minLeftPct, 85);
+    const hi = Math.max(100 - Math.min(minRightPct, 85), lo);
+    return Math.min(hi, Math.max(lo, raw));
+  };
+
+  const onWorkspaceSplitPointerDown = (e) => {
+    if (e.button != null && e.button !== 0) return;
+    e.preventDefault();
+    const handle = e.currentTarget;
+    handle.setPointerCapture?.(e.pointerId);
+    setWorkspaceResizing(true);
+    const pct = clampWorkspaceSplit(e.clientX);
+    workspaceSplitRef.current = pct;
+    setWorkspaceSplit(pct);
+
+    const onMove = (ev) => {
+      const next = clampWorkspaceSplit(ev.clientX);
+      workspaceSplitRef.current = next;
+      setWorkspaceSplit(next);
+    };
+    const onUp = (ev) => {
+      handle.releasePointerCapture?.(ev.pointerId);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      setWorkspaceResizing(false);
+      persistWorkspaceSplit(workspaceSplitRef.current);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  };
+
+  const onWorkspaceSplitKeyDown = (e) => {
+    const step = e.shiftKey ? 5 : 2;
+    let next = workspaceSplitRef.current;
+    if (e.key === "ArrowLeft") next -= step;
+    else if (e.key === "ArrowRight") next += step;
+    else if (e.key === "Home") next = 20;
+    else if (e.key === "End") next = 80;
+    else return;
+    e.preventDefault();
+    const el = workspaceRef.current;
+    if (el) {
+      const rect = el.getBoundingClientRect();
+      const gutter = 6;
+      const usable = Math.max(1, rect.width - gutter);
+      const minLeftPct = (WORKSPACE_SPLIT_MIN_LEFT_PX / usable) * 100;
+      const minRightPct = (WORKSPACE_SPLIT_MIN_RIGHT_PX / usable) * 100;
+      next = Math.min(100 - Math.min(minRightPct, 85), Math.max(Math.min(minLeftPct, 85), next));
+    } else {
+      next = Math.min(80, Math.max(20, next));
+    }
+    workspaceSplitRef.current = next;
+    setWorkspaceSplit(next);
+    persistWorkspaceSplit(next);
+  };
+
   // Keep the active session entry fresh for reload / switch (mock persistence).
   useEffect(() => {
     const snap = snapshotCurrent();
@@ -654,28 +895,56 @@ export default function App() {
     sessionLog,
   ]);
 
+  const applyModelCatalog = (models) => {
+    setVideoModels(Array.isArray(models?.video) ? models.video : []);
+    setAgentModels(
+      catalogToOptions(models?.chat, {
+        auto: AUTO_AGENT,
+        fallback: FALLBACK_AGENT_MODELS,
+      }),
+    );
+    setImageModels(
+      catalogToOptions(models?.openrouter, {
+        auto: AUTO_IMAGE,
+        fallback: FALLBACK_IMAGE_MODELS,
+      }),
+    );
+  };
+
   const refresh = async () => {
+    // Studio payload and OpenRouter catalogs are independent: a 401/failure on
+    // styles/gallery must not skip model discovery once a bearer is present.
     try {
-      const [s, st, g, models] = await Promise.all([
+      const [s, st, g] = await Promise.all([
         api("/v1/styles"),
         api("/v1/settings"),
         api("/v1/gallery"),
-        api("/v1/models").catch(() => ({})),
       ]);
       const items = s.items || [];
       setStyles(items);
       setSettings(st);
-      setWorkerUrl(st.diffusionWorkerUrl || "");
+      {
+        const ep = parseWorkerEndpoint(st.diffusionWorkerUrl || "");
+        setWorkerHost(ep.host);
+        setWorkerPort(ep.port);
+        setWorkerUrlOverride(ep.advancedUrl);
+        setUseWorkerUrlOverride(ep.useAdvanced);
+      }
       setGallery(g.items || []);
-      setVideoModels(Array.isArray(models?.video) ? models.video : []);
       const featured = items[0]?.examplePrompt;
       if (featured) {
         setCivitaiQ((prev) =>
           !prev.trim() || prev === BEGINNER_CIVITAI_QUERY ? demoCivitaiQuery(featured) : prev,
         );
       }
+      setError("");
     } catch (e) {
       setError(e.message);
+    }
+    try {
+      applyModelCatalog(await api("/v1/models"));
+    } catch {
+      /* keep prior / offline FALLBACK_* lists until auth or OpenRouter works */
     }
   };
 
@@ -762,9 +1031,11 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (tab !== "settings" || mock) return undefined;
+    if (mock) return undefined;
+    // Keep topbar Worker status fresh; poll faster while on the Worker tab.
     refreshWorkerStats();
-    const id = setInterval(refreshWorkerStats, 5000);
+    const ms = tab === "worker" ? 5000 : 20000;
+    const id = setInterval(refreshWorkerStats, ms);
     return () => clearInterval(id);
   }, [tab, mock]);
 
@@ -776,6 +1047,7 @@ export default function App() {
       await api(`/v1/worker/${action}`, { method: "POST", body: "{}" });
       const st = await api("/v1/settings");
       setSettings(st);
+      applyWorkerEndpoint(st.diffusionWorkerUrl || "");
       await refreshWorkerStats();
       const health = await api("/v1/health").catch(() => null);
       setSavedMsg(
@@ -825,20 +1097,132 @@ export default function App() {
     persistModels(agentModel, id);
   };
 
-  const hasWorker = () => Boolean(settings?.diffusionWorkerUrl || workerUrl.trim());
+  const composedWorkerUrl = () =>
+    useWorkerUrlOverride
+      ? workerUrlOverride.trim()
+      : composeWorkerUrl(workerHost, workerPort);
+  // Prefer persisted URL so default placeholders do not fake a configured worker.
+  const hasWorker = () => Boolean(settings?.diffusionWorkerUrl);
   const canAutoInstall = () => Boolean(settings?.civitaiConfigured && hasWorker());
+
+  const applyWorkerEndpoint = (url) => {
+    const ep = parseWorkerEndpoint(url || "");
+    setWorkerHost(ep.host);
+    setWorkerPort(ep.port);
+    setWorkerUrlOverride(ep.advancedUrl);
+    setUseWorkerUrlOverride(ep.useAdvanced);
+  };
+
+  const generateApiToken = async () => {
+    setTokenBusy(true);
+    setError("");
+    setSavedMsg("");
+    setTokenCopyMsg("");
+    try {
+      const res = await api("/v1/auth/token", { method: "POST", body: "{}" });
+      const tok = res?.token || "";
+      if (!tok) throw new Error("API returned no token");
+      setGeneratedToken(tok);
+      setStudioToken(tok);
+      localStorage.setItem("freya.apiToken", tok);
+      await refresh();
+      setSavedMsg(
+        res.rotated
+          ? "API token rotated — copy it now; the previous bearer no longer works. Model lists refreshed."
+          : "API token generated — copy it now; it will not be shown again. Model lists refreshed.",
+      );
+    } catch (e) {
+      setError(
+        e.message === "Unauthorized" || /401|Unauthorized/i.test(e.message || "")
+          ? "Generate needs the current bearer (paste under Advanced), or clear FREYA_API_TOKEN for open local/dev."
+          : e.message,
+      );
+    } finally {
+      setTokenBusy(false);
+    }
+  };
+
+  const copyGeneratedToken = async () => {
+    if (!generatedToken) return;
+    try {
+      await navigator.clipboard.writeText(generatedToken);
+      setTokenCopyMsg("Copied");
+    } catch {
+      setTokenCopyMsg("Select and copy manually");
+    }
+  };
+
+  const applyLocalWorkerDefaults = () => {
+    setUseWorkerUrlOverride(false);
+    setWorkerUrlOverride("");
+    setWorkerHost(DEFAULT_WORKER_HOST);
+    setWorkerPort(DEFAULT_WORKER_PORT);
+    setSavedMsg(
+      `Local worker endpoint set to http://${DEFAULT_WORKER_HOST}:${DEFAULT_WORKER_PORT} — Save worker to apply.`,
+    );
+  };
+
+  const persistStudioTokenLocal = () => {
+    if (studioToken.trim()) {
+      localStorage.setItem("freya.apiToken", studioToken.trim());
+    } else {
+      localStorage.removeItem("freya.apiToken");
+    }
+  };
+
+  /** Persist pasted bearer and reload OpenRouter Agent/Image catalogs immediately. */
+  const applyStudioToken = async () => {
+    persistStudioTokenLocal();
+    setError("");
+    setSavedMsg("");
+    await refresh();
+    setSavedMsg(
+      studioToken.trim()
+        ? "Studio token saved — Agent/Image model lists refreshed from /v1/models."
+        : "Studio token cleared.",
+    );
+  };
+
+  const saveWorkerEndpoint = async () => {
+    setBusy(true);
+    setError("");
+    setSavedMsg("");
+    try {
+      persistStudioTokenLocal();
+      const st = await api("/v1/settings", {
+        method: "PUT",
+        body: JSON.stringify({ diffusionWorkerUrl: composedWorkerUrl() }),
+      });
+      setSettings(st);
+      applyWorkerEndpoint(st.diffusionWorkerUrl || "");
+      await refreshWorkerStats();
+      setSavedMsg(
+        mock
+          ? "Worker endpoint saved (mock)."
+          : `Worker endpoint saved: ${st.diffusionWorkerUrl || "(cleared — OpenRouter only)"}.`,
+      );
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
   const canCloudGenerate = () => Boolean(settings?.openRouterConfigured);
 
   const pinnedPayload = () =>
     (session.pinnedLoras || []).map((l) => ({
-      name: l.name,
+      name: l.path
+        ? String(l.path).split("/").pop().replace(/\.safetensors$/i, "")
+        : l.name,
       scale: l.scale ?? 0.8,
+      path: l.path || undefined,
+      baseModel: l.baseModel || undefined,
     }));
 
   const isPinned = (item) =>
     (session.pinnedLoras || []).some((p) => loraKey(p) === loraKey(item));
 
-  const pinLora = (item) => {
+  const pinLora = (item, extra = {}) => {
     setSession((prev) => {
       if ((prev.pinnedLoras || []).some((p) => loraKey(p) === loraKey(item))) return prev;
       const next = {
@@ -847,17 +1231,27 @@ export default function App() {
         modelType: item.modelType,
         downloadUrl: item.downloadUrl,
         triggerWord: item.triggerWord || null,
+        baseModel: item.baseModel || null,
+        path: extra.path || item.path || null,
+        versionId: item.versionId || null,
         scale: 0.8,
       };
+      const baseHint = item.baseModel
+        ? ` Needs base family “${item.baseModel}” on the local worker (Worker → active base / install checkpoint).`
+        : "";
       return {
         ...prev,
         pinnedLoras: [...(prev.pinnedLoras || []), next],
         sessionNote: item.triggerWord
-          ? `Pinned “${item.name}”. Trigger word “${item.triggerWord}” is optional — Freya keeps your prompt as you wrote it.`
-          : `Pinned “${item.name}” for this session. Your prompt stays as you wrote it.`,
+          ? `Pinned “${item.name}”. Trigger word “${item.triggerWord}” is optional — Freya keeps your prompt as you wrote it.${baseHint}`
+          : `Pinned “${item.name}” for this session. Your prompt stays as you wrote it.${baseHint}`,
       };
     });
-    setSavedMsg(`Pinned ${item.name} for this session.`);
+    setSavedMsg(
+      item.baseModel
+        ? `Pinned ${item.name} (base: ${item.baseModel}) for this session.`
+        : `Pinned ${item.name} for this session.`,
+    );
   };
 
   const unpinLora = (item) => {
@@ -1112,9 +1506,12 @@ export default function App() {
         downloadUrl: item.downloadUrl,
         destPath: dest,
         name: item.name,
+        baseModel: item.baseModel || undefined,
+        versionId: item.versionId || undefined,
+        modelType: item.modelType || undefined,
       }),
     });
-    pinLora(item);
+    pinLora(item, { path: dest });
     return dest;
   };
 
@@ -1282,10 +1679,10 @@ export default function App() {
     await executeBatch(plan.batchPrompts, plan.goal);
     log.push(`Generated ${plan.batchPrompts.length} images for “${plan.goal}”.`);
     if (agentModel && agentModel !== "openrouter/auto") {
-      log.push(`Agent model: ${modelLabel(AGENT_MODELS, agentModel)}`);
+      log.push(`Agent model: ${modelLabel(agentModels, agentModel)}`);
     }
     if (imageModel && imageModel !== "auto") {
-      log.push(`Image model: ${modelLabel(IMAGE_MODELS, imageModel)}`);
+      log.push(`Image model: ${modelLabel(imageModels, imageModel)}`);
     }
     setSessionLog(log);
     setPendingPlan(null);
@@ -1373,12 +1770,8 @@ export default function App() {
     setSavedMsg("");
     try {
       // Persist studio bearer first so the PUT below authenticates when FREYA_API_TOKEN is set.
-      if (studioToken.trim()) {
-        localStorage.setItem("freya.apiToken", studioToken.trim());
-      } else {
-        localStorage.removeItem("freya.apiToken");
-      }
-      const body = { diffusionWorkerUrl: workerUrl };
+      persistStudioTokenLocal();
+      const body = {};
       if (civitaiKey.trim()) body.civitaiApiKey = civitaiKey.trim();
       if (openrouterKey.trim()) body.openrouterApiKey = openrouterKey.trim();
       const st = await api("/v1/settings", {
@@ -1388,10 +1781,12 @@ export default function App() {
       setSettings(st);
       setCivitaiKey("");
       setOpenrouterKey("");
+      // Bearer / OpenRouter key may have just been written — refresh catalogs.
+      await refresh();
       setSavedMsg(
         mock
           ? "Mock settings saved in-memory (reload resets unless you keep this tab open)."
-          : "Settings saved. Provider keys stay on the API; studio bearer stays in this browser.",
+          : "Settings saved. Provider keys stay on the API; studio bearer stays in this browser. Model lists refreshed.",
       );
     } catch (e) {
       setError(e.message);
@@ -1400,22 +1795,68 @@ export default function App() {
     }
   };
 
-  const searchCivitai = async () => {
+  const searchCivitai = async (opts = {}) => {
+    const q = String(opts.query ?? civitaiQ).trim();
+    const immediate = Boolean(opts.immediate);
+
+    if (!q) {
+      const pending = civitaiAbortRef.current;
+      civitaiAbortRef.current = null;
+      pending?.abort();
+      lastCivitaiSearchQRef.current = "";
+      setCivitaiItems([]);
+      setBusy(false);
+      return;
+    }
+    // Skip redundant debounced searches; Enter/button always re-runs.
+    if (!immediate && q === lastCivitaiSearchQRef.current) return;
+
+    civitaiAbortRef.current?.abort();
+    const ac = new AbortController();
+    civitaiAbortRef.current = ac;
+
     setBusy(true);
     setError("");
     try {
       // Default Freya types on the API; pass explicitly so mock + live stay aligned.
-      const types = "LORA,LoCon,DoRA,Checkpoint,TextualInversion,VAE";
       const data = await api(
-        `/v1/civitai/search?q=${encodeURIComponent(civitaiQ)}&limit=12&types=${encodeURIComponent(types)}`,
+        `/v1/civitai/search?q=${encodeURIComponent(q)}&limit=12&types=${encodeURIComponent(CIVITAI_SEARCH_TYPES)}`,
+        { signal: ac.signal },
       );
+      if (ac.signal.aborted) return;
       setCivitaiItems(data.items || []);
+      lastCivitaiSearchQRef.current = q;
     } catch (e) {
+      if (e?.name === "AbortError" || ac.signal.aborted) return;
       setError(e.message);
     } finally {
-      setBusy(false);
+      if (civitaiAbortRef.current === ac) {
+        civitaiAbortRef.current = null;
+        setBusy(false);
+      }
     }
   };
+
+  // Search-as-you-type on the Civitai tab (debounced; AbortController cancels in-flight).
+  useEffect(() => {
+    if (tab !== "civitai" || civitaiSubview !== "search") return;
+    const q = civitaiQ.trim();
+    if (!q) {
+      const pending = civitaiAbortRef.current;
+      civitaiAbortRef.current = null;
+      pending?.abort();
+      lastCivitaiSearchQRef.current = "";
+      setCivitaiItems([]);
+      setBusy(false);
+      return;
+    }
+    if (q === lastCivitaiSearchQRef.current) return;
+    const t = setTimeout(() => {
+      searchCivitai({ query: q });
+    }, CIVITAI_SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: debounce on query/tab only
+  }, [civitaiQ, tab, civitaiSubview]);
 
   const installCivitai = async (item) => {
     if (!item.downloadUrl) {
@@ -1557,7 +1998,7 @@ export default function App() {
             title={
               hasWorker()
                 ? "Install onto your diffusion worker"
-                : "Needs a worker URL — pin for later, or add a worker in Settings"
+                : "Needs a worker URL — pin for later, or open the Worker tab"
             }
             onClick={() => installCivitai(item)}
           >
@@ -1584,6 +2025,8 @@ export default function App() {
     id,
     label: AUTOMATION_LABELS[id],
   }));
+  const agentOptions = ensureSelectedOption(agentModels, agentModel);
+  const imageOptions = ensureSelectedOption(imageModels, imageModel);
 
   return (
     <div className="shell">
@@ -1639,16 +2082,23 @@ export default function App() {
               OpenRouter
               <span className={`status-dot ${settings.civitaiConfigured ? "on" : ""}`} />
               Civitai
-              <span
-                className={`status-dot ${
-                  workerStats?.reachable && settings.workerEnabled !== false
-                    ? "on"
-                    : settings.diffusionWorkerUrl
-                      ? "warn"
-                      : ""
-                }`}
-              />
-              Worker
+              <button
+                type="button"
+                className="tabs-status-worker"
+                onClick={() => setTab("worker")}
+                title="Open Worker tab"
+              >
+                <span
+                  className={`status-dot ${
+                    workerStats?.reachable && settings.workerEnabled !== false
+                      ? "on"
+                      : settings.diffusionWorkerUrl
+                        ? "warn"
+                        : ""
+                  }`}
+                />
+                Worker
+              </button>
             </span>
           )}
           <span className="topbar-mode">{AUTOMATION_LABELS[automationMode]}</span>
@@ -1701,7 +2151,11 @@ export default function App() {
           </ul>
         </aside>
 
-      <div className="workspace">
+      <div
+        className={`workspace${workspaceResizing ? " is-resizing" : ""}`}
+        ref={workspaceRef}
+        style={{ "--workspace-split": `${workspaceSplit}%` }}
+      >
         <section className="pane pane-left" aria-label="Prompt and session">
           <div className="timeline" aria-label="Conversation" ref={timelineRef}>
             <div className="timeline-head">
@@ -1741,6 +2195,7 @@ export default function App() {
                     <li key={loraKey(l)}>
                       <span>
                         {l.name}
+                        {l.baseModel ? ` · base ${l.baseModel}` : ""}
                         {l.triggerWord ? ` · ${l.triggerWord}` : ""}
                       </span>
                       <button type="button" className="ghost" onClick={() => unpinLora(l)}>
@@ -2064,9 +2519,9 @@ export default function App() {
                 <CompactMenu
                   label="Agent"
                   icon={<IconAgent />}
-                  title={`Agent model: ${modelLabel(AGENT_MODELS, agentModel)}`}
-                  valueLabel={modelShortLabel(AGENT_MODELS, agentModel)}
-                  options={AGENT_MODELS}
+                  title={`Agent model: ${modelLabel(agentOptions, agentModel)}`}
+                  valueLabel={modelShortLabel(agentOptions, agentModel)}
+                  options={agentOptions}
                   value={agentModel}
                   onChange={changeAgentModel}
                   open={menuOpen === "agent"}
@@ -2075,9 +2530,9 @@ export default function App() {
                 <CompactMenu
                   label="Image"
                   icon={<IconImage />}
-                  title={`Image model: ${modelLabel(IMAGE_MODELS, imageModel)}`}
-                  valueLabel={modelShortLabel(IMAGE_MODELS, imageModel)}
-                  options={IMAGE_MODELS}
+                  title={`Image model: ${modelLabel(imageOptions, imageModel)}`}
+                  valueLabel={modelShortLabel(imageOptions, imageModel)}
+                  options={imageOptions}
                   value={imageModel}
                   onChange={changeImageModel}
                   open={menuOpen === "image"}
@@ -2111,6 +2566,20 @@ export default function App() {
             </div>
           </div>
         </section>
+
+        <button
+          type="button"
+          role="separator"
+          className="workspace-split"
+          aria-orientation="vertical"
+          aria-label="Resize chat and gallery panes"
+          aria-valuemin={15}
+          aria-valuemax={85}
+          aria-valuenow={Math.round(workspaceSplit)}
+          title="Drag to resize"
+          onPointerDown={onWorkspaceSplitPointerDown}
+          onKeyDown={onWorkspaceSplitKeyDown}
+        />
 
         <section className="pane pane-right" aria-label="Gallery and results">
           {suggestedLoras.length > 0 && (
@@ -2242,7 +2711,7 @@ export default function App() {
       )}
 
       <nav className="tabs" aria-label="Studio sections">
-        {["gallery", "styles", "civitai", "settings"].map((t) => (
+        {STUDIO_TABS.map((t) => (
           <button
             key={t}
             className={tab === t ? "active" : "ghost"}
@@ -2319,9 +2788,19 @@ export default function App() {
                   style={{ flex: 1, minWidth: "12rem" }}
                   value={civitaiQ}
                   onChange={(e) => setCivitaiQ(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      searchCivitai({ immediate: true });
+                    }
+                  }}
                   placeholder="Search Civitai…"
                 />
-                <button className="primary" disabled={busy} onClick={searchCivitai}>
+                <button
+                  className="primary"
+                  disabled={busy}
+                  onClick={() => searchCivitai({ immediate: true })}
+                >
                   Search
                 </button>
               </div>
@@ -2385,30 +2864,375 @@ export default function App() {
         </section>
       )}
 
+      {tab === "worker" && (
+        <section className="panel settings worker-tab" aria-label="Diffusion worker">
+          <p className="hint">
+            Local LoRAs and custom looks need a diffusion worker. Cloud Generate via OpenRouter
+            works without one. Provider API keys live under{" "}
+            <button type="button" className="linkish" onClick={() => setTab("settings")}>
+              Settings
+            </button>
+            .
+          </p>
+
+          <div className="worker-layout">
+            <aside className="worker-setup-panel" aria-label="Setup and connect">
+              <div className="settings-block-head">
+                <strong>Setup</strong>
+                <span className="hint">how to point Studio at a worker</span>
+              </div>
+
+              <p className="hint">
+                Run a worker on this machine with <code>make run-worker</code> or Docker{" "}
+                <code>freya-local-worker</code> (binds <code>0.0.0.0:8091</code>). Models default
+                to <code>/mnt/game2/freya/models</code> (<code>FREYA_MODELS_DIR</code>). In kind,
+                Studio is <code>freya.dataknife.net</code>; the sample worker CR is{" "}
+                <code>FreyaDiffusionWorker/freya-gpu</code> in namespace <code>freya</code>.
+              </p>
+
+              <div className="worker-connect" aria-label="Connect options">
+                <strong className="worker-connect-title">Connect</strong>
+                <p className="hint">
+                  Put the worker address in Host / Port (or Advanced full URL), then Save worker.
+                  Pick the form that matches where Freya API can reach the process:
+                </p>
+                <ul className="worker-setup-steps">
+                  <li>
+                    <strong>Localhost</strong> — API and worker on the same host: Host{" "}
+                    <code>{DEFAULT_WORKER_HOST}</code> (or <code>127.0.0.1</code>), Port{" "}
+                    <code>{DEFAULT_WORKER_PORT}</code>. Use <em>Use local defaults</em>.
+                  </li>
+                  <li>
+                    <strong>Internal Kubernetes DNS</strong> — in-cluster API talking to an
+                    in-cluster worker Service:{" "}
+                    <code>freya-gpu.freya.svc.cluster.local</code> on port <code>8091</code>{" "}
+                    (operator pattern <code>{"{name}.{namespace}.svc.cluster.local"}</code>;
+                    sample name <code>freya-gpu</code>, namespace <code>freya</code>). Kind-local
+                    ExternalEndpoint example:{" "}
+                    <code>http://freya-gpu-host.freya.svc.cluster.local:8091</code>.
+                  </li>
+                  <li>
+                    <strong>External FQDN</strong> — Ingress / public endpoint:{" "}
+                    <code>https://vllm.dataknife.net</code> (sample{" "}
+                    <code>externalEndpoint</code>; health at{" "}
+                    <code>/health</code>). Prefer Advanced → full worker URL for https.
+                  </li>
+                  <li>
+                    <strong>Host IP + port</strong> — GPU box elsewhere on the LAN: put that
+                    machine&apos;s IP in Host and the worker listen port (default{" "}
+                    <code>8091</code>) in Port — same surface as{" "}
+                    <code>http://&lt;ip&gt;:8091</code>.
+                  </li>
+                </ul>
+                <p className="hint">
+                  SD/SDXL/Pony/Flux bases belong on the local GPU worker (RTX /{" "}
+                  <code>freya-local-worker</code>). Cluster <code>vllm.dataknife.net</code> is
+                  often text-only — do not treat it as a drop-in for local diffusion weights.
+                </p>
+              </div>
+            </aside>
+
+            <div className="worker-controls-panel" aria-label="Worker controls">
+              <div className="settings-block-head">
+                <strong>Controls</strong>
+                <span className="hint">endpoint, auth, runtime</span>
+              </div>
+
+              <div className="settings-block worker-auth-block" aria-label="Auth">
+                <div className="settings-block-head">
+                  <strong>Auth</strong>
+                  <span className="hint">
+                    {settings?.apiTokenConfigured
+                      ? "API auth enabled"
+                      : "API open (no token) — local/dev"}
+                  </span>
+                </div>
+                <div className="row settings-token-actions">
+                  <button
+                    type="button"
+                    className="primary"
+                    disabled={busy || tokenBusy || mock}
+                    onClick={generateApiToken}
+                    title="Create or rotate FREYA_API_TOKEN on the API"
+                  >
+                    {tokenBusy ? "Generating…" : "Generate API token"}
+                  </button>
+                </div>
+                {generatedToken && (
+                  <div className="token-once">
+                    <label>
+                      New token (copy now — shown once)
+                      <input type="text" readOnly value={generatedToken} autoComplete="off" />
+                    </label>
+                    <div className="row settings-token-actions">
+                      <button type="button" className="ghost" onClick={copyGeneratedToken}>
+                        Copy
+                      </button>
+                      {tokenCopyMsg && <span className="hint">{tokenCopyMsg}</span>}
+                    </div>
+                    <p className="hint">
+                      Treat like a password. Stored in this browser for Studio requests. Optional
+                      cluster sync: update secret <code>freya-api-token</code> then restart{" "}
+                      <code>freya-api</code> if the secrets file is not on durable storage.
+                    </p>
+                  </div>
+                )}
+                {!generatedToken && studioToken && (
+                  <p className="hint">
+                    Bearer present in this browser
+                    {settings?.apiTokenConfigured ? " · matches API auth" : ""}. Generate again to
+                    rotate.
+                  </p>
+                )}
+              </div>
+
+              <div className="worker-panel" aria-label="Diffusion worker status">
+                <div className="worker-panel-head">
+                  <span
+                    className={`status-dot ${
+                      workerStats?.reachable &&
+                      (workerStats?.enabled ?? settings?.workerEnabled) !== false
+                        ? "on"
+                        : workerStats?.configured || composedWorkerUrl()
+                          ? "warn"
+                          : ""
+                    }`}
+                  />
+                  <strong>Status</strong>
+                  <span className="hint">
+                    {mock
+                      ? "mock stats"
+                      : workerStats
+                        ? [
+                            workerStats.enabled === false ? "disabled" : "enabled",
+                            workerStats.reachable ? "up" : "down",
+                            workerStats.runtime?.kind && workerStats.runtime.kind !== "none"
+                              ? workerStats.runtime.kind
+                              : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")
+                        : "—"}
+                  </span>
+                </div>
+
+                <div className="row settings-token-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy}
+                    onClick={applyLocalWorkerDefaults}
+                  >
+                    Use local defaults
+                  </button>
+                </div>
+
+                {!useWorkerUrlOverride && (
+                  <div className="worker-endpoint-row" aria-label="Worker host and port">
+                    <label>
+                      Host
+                      <input
+                        autoComplete="off"
+                        placeholder={DEFAULT_WORKER_HOST}
+                        value={workerHost}
+                        onChange={(e) => setWorkerHost(e.target.value)}
+                      />
+                    </label>
+                    <label className="worker-port-field">
+                      Port
+                      <input
+                        autoComplete="off"
+                        inputMode="numeric"
+                        placeholder={DEFAULT_WORKER_PORT}
+                        value={workerPort}
+                        onChange={(e) => setWorkerPort(e.target.value)}
+                      />
+                    </label>
+                  </div>
+                )}
+                <p className="hint">
+                  Endpoint:{" "}
+                  <code>{composedWorkerUrl() || "(empty — OpenRouter only)"}</code>
+                  . Clear host to disable local worker URL on Save worker.
+                </p>
+
+                <button className="primary" disabled={busy} onClick={saveWorkerEndpoint}>
+                  Save worker
+                </button>
+                {savedMsg && <p className="hint">{savedMsg}</p>}
+
+                {(() => {
+                  const vram = workerStats?.vram;
+                  const used = vram?.usedMiB;
+                  const total = vram?.totalMiB;
+                  const pct =
+                    typeof used === "number" && typeof total === "number" && total > 0
+                      ? Math.min(100, Math.round((used / total) * 100))
+                      : null;
+                  const util = vram?.utilPercent;
+                  return (
+                    <div className="worker-vram">
+                      <div className="worker-vram-meta">
+                        <span>VRAM</span>
+                        <span>
+                          {pct != null
+                            ? `${used} / ${total} MiB (${pct}%)`
+                            : mock
+                              ? "— (mock)"
+                              : "n/a"}
+                          {typeof util === "number" ? ` · GPU ${util}%` : ""}
+                        </span>
+                      </div>
+                      <div
+                        className="worker-vram-bar"
+                        role="progressbar"
+                        aria-valuenow={pct ?? 0}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                      >
+                        <div className="worker-vram-fill" style={{ width: `${pct ?? 0}%` }} />
+                      </div>
+                      {(workerStats?.loras != null || workerStats?.checkpoints != null) && (
+                        <p className="hint">
+                          LoRAs {workerStats.loras ?? "—"} · checkpoints{" "}
+                          {workerStats.checkpoints ?? "—"}
+                          {workerStats.uptimeSec != null
+                            ? ` · up ${workerStats.uptimeSec}s`
+                            : ""}
+                        </p>
+                      )}
+                      {workerStats?.modelLoaded?.model && (
+                        <p className="hint">
+                          Active base: {workerStats.modelLoaded.model}
+                          {workerStats.modelLoaded.baseModel
+                            ? ` (${workerStats.modelLoaded.baseModel})`
+                            : ""}
+                          {workerStats.modelLoaded.loadedInVram === false
+                            ? " — selected on disk; GPU load needs real engine"
+                            : ""}
+                        </p>
+                      )}
+                      {workerStats?.modelsDir && (
+                        <p className="hint">Models dir: {workerStats.modelsDir}</p>
+                      )}
+                    </div>
+                  );
+                })()}
+                <WorkerBaseModelPanel
+                  busy={busy || workerCtlBusy || mock}
+                  hasWorker={hasWorker()}
+                  api={api}
+                  onSaved={(msg) => setSavedMsg(msg)}
+                  onError={(msg) => setError(msg)}
+                />
+                <div className="worker-controls">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || workerCtlBusy || mock}
+                    onClick={() => workerControl("start")}
+                    title="Start local docker/systemd worker"
+                  >
+                    ▶ Start
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || workerCtlBusy || mock}
+                    onClick={() => workerControl("stop")}
+                    title="Stop local docker/systemd worker"
+                  >
+                    ■ Stop
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || workerCtlBusy || mock}
+                    onClick={() => workerControl("enable")}
+                    title="Use configured worker for local gens"
+                  >
+                    Enable
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || workerCtlBusy || mock}
+                    onClick={() => workerControl("disable")}
+                    title="Detach worker — OpenRouter cloud path still works"
+                  >
+                    Disable
+                  </button>
+                </div>
+              </div>
+
+              <details className="settings-advanced">
+                <summary>Advanced — paste token / full worker URL</summary>
+                <label>
+                  Studio API token (paste existing)
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    placeholder="Bearer for /v1 when Freya API auth is enabled"
+                    value={studioToken}
+                    onChange={(e) => setStudioToken(e.target.value)}
+                  />
+                  <span className="hint">
+                    Stored only in this browser (<code>localStorage.freya.apiToken</code>). Prefer{" "}
+                    Generate above. Paste here to unlock Generate when the API already has a
+                    token.
+                  </span>
+                </label>
+                <div className="row settings-token-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || tokenBusy || mock}
+                    onClick={applyStudioToken}
+                    title="Save bearer to this browser and reload Agent/Image model lists"
+                  >
+                    Apply token &amp; refresh models
+                  </button>
+                </div>
+                <label className="settings-check">
+                  <input
+                    type="checkbox"
+                    checked={useWorkerUrlOverride}
+                    onChange={(e) => setUseWorkerUrlOverride(e.target.checked)}
+                  />
+                  Use full worker URL (https / remote)
+                </label>
+                {useWorkerUrlOverride && (
+                  <label>
+                    Diffusion worker URL
+                    <input
+                      placeholder="https://vllm.dataknife.net"
+                      value={workerUrlOverride}
+                      onChange={(e) => setWorkerUrlOverride(e.target.value)}
+                    />
+                    <span className="hint">
+                      Overrides host/port. Leave blank and Save worker to clear the endpoint.
+                    </span>
+                  </label>
+                )}
+              </details>
+            </div>
+          </div>
+        </section>
+      )}
+
       {tab === "settings" && (
         <section className="panel settings">
           <p className="hint">
             {mock
               ? "Mock mode: keys are fake flags in memory. Paste anything non-empty to “configure” Civitai/OpenRouter. Agent/image models live in the compose chrome (Mode · Agent · Image)."
               : "Keys stay on the Freya API (or in your Kubernetes Secrets). They are never shown back in full after save."}{" "}
-            OpenRouter alone is enough for cloud Generate — a worker is only for LoRAs and custom
-            local looks.
+            OpenRouter alone is enough for cloud Generate. Local LoRAs / GPU worker live on the{" "}
+            <button type="button" className="linkish" onClick={() => setTab("worker")}>
+              Worker
+            </button>{" "}
+            tab (token, host/port, Start/Stop, base model).
           </p>
-          <label>
-            Studio API token
-            <input
-              type="password"
-              autoComplete="off"
-              placeholder="Bearer for /v1 when Freya API auth is enabled"
-              value={studioToken}
-              onChange={(e) => setStudioToken(e.target.value)}
-            />
-            <span className="hint">
-              Stored only in this browser (localStorage). Required when the API has{" "}
-              <code>FREYA_API_TOKEN</code> / <code>apiTokenSecretRef</code> set. Leave blank for open
-              local/dev.
-            </span>
-          </label>
+
           <label>
             OpenRouter API key
             <input
@@ -2440,128 +3264,34 @@ export default function App() {
               worker.
             </span>
           </label>
-          <label>
-            Diffusion worker URL (optional — LoRAs / local custom look)
-            <input
-              placeholder="http://gpu-box.lan:8091"
-              value={workerUrl}
-              onChange={(e) => setWorkerUrl(e.target.value)}
-            />
-            <span className="hint">
-              Optional. Needed to install LoRAs and run local/custom models. Leave blank to generate
-              only via OpenRouter. Enable/Disable detaches the URL without clearing it; Start/Stop
-              controls the local docker/systemd worker when present.
-            </span>
-          </label>
-          <div className="worker-panel" aria-label="Diffusion worker status">
-            <div className="worker-panel-head">
-              <span
-                className={`status-dot ${
-                  workerStats?.reachable && (workerStats?.enabled ?? settings?.workerEnabled) !== false
-                    ? "on"
-                    : workerStats?.configured || workerUrl
-                      ? "warn"
-                      : ""
-                }`}
-              />
-              <strong>Worker</strong>
-              <span className="hint">
-                {mock
-                  ? "mock stats"
-                  : workerStats
-                    ? [
-                        workerStats.enabled === false ? "disabled" : "enabled",
-                        workerStats.reachable ? "up" : "down",
-                        workerStats.runtime?.kind && workerStats.runtime.kind !== "none"
-                          ? workerStats.runtime.kind
-                          : null,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")
-                    : "—"}
-              </span>
-            </div>
-            {(() => {
-              const vram = workerStats?.vram;
-              const used = vram?.usedMiB;
-              const total = vram?.totalMiB;
-              const pct =
-                typeof used === "number" && typeof total === "number" && total > 0
-                  ? Math.min(100, Math.round((used / total) * 100))
-                  : null;
-              const util = vram?.utilPercent;
-              return (
-                <div className="worker-vram">
-                  <div className="worker-vram-meta">
-                    <span>VRAM</span>
-                    <span>
-                      {pct != null
-                        ? `${used} / ${total} MiB (${pct}%)`
-                        : mock
-                          ? "— (mock)"
-                          : "n/a"}
-                      {typeof util === "number" ? ` · GPU ${util}%` : ""}
-                    </span>
-                  </div>
-                  <div className="worker-vram-bar" role="progressbar" aria-valuenow={pct ?? 0} aria-valuemin={0} aria-valuemax={100}>
-                    <div className="worker-vram-fill" style={{ width: `${pct ?? 0}%` }} />
-                  </div>
-                  {(workerStats?.loras != null || workerStats?.checkpoints != null) && (
-                    <p className="hint">
-                      LoRAs {workerStats.loras ?? "—"} · checkpoints {workerStats.checkpoints ?? "—"}
-                      {workerStats.uptimeSec != null ? ` · up ${workerStats.uptimeSec}s` : ""}
-                    </p>
-                  )}
-                </div>
-              );
-            })()}
-            <div className="worker-controls">
-              <button
-                type="button"
-                className="ghost"
-                disabled={busy || workerCtlBusy || mock}
-                onClick={() => workerControl("start")}
-                title="Start local docker/systemd worker"
-              >
-                ▶ Start
-              </button>
-              <button
-                type="button"
-                className="ghost"
-                disabled={busy || workerCtlBusy || mock}
-                onClick={() => workerControl("stop")}
-                title="Stop local docker/systemd worker"
-              >
-                ■ Stop
-              </button>
-              <button
-                type="button"
-                className="ghost"
-                disabled={busy || workerCtlBusy || mock}
-                onClick={() => workerControl("enable")}
-                title="Use configured worker for local gens"
-              >
-                Enable
-              </button>
-              <button
-                type="button"
-                className="ghost"
-                disabled={busy || workerCtlBusy || mock}
-                onClick={() => workerControl("disable")}
-                title="Detach worker — OpenRouter cloud path still works"
-              >
-                Disable
-              </button>
-            </div>
-          </div>
+
           <p className="hint">
-            Video (OpenRouter):{" "}
-            {videoModels.length > 0
-              ? `${videoModels.length} model(s) discovered via /v1/models → video (e.g. ${videoModels
-                  .slice(0, 3)
+            Models (OpenRouter via /v1/models): Agent picker has{" "}
+            {Math.max(0, agentModels.length - 1)} chat model
+            {agentModels.length === 2 ? "" : "s"}
+            {agentModels.length > 1
+              ? ` (e.g. ${agentModels
+                  .filter((m) => m.id !== "openrouter/auto")
+                  .slice(0, 2)
                   .map((m) => m.id)
-                  .join(", ")}). Generation is async (POST /videos + poll) and not wired in Freya UI yet.`
-              : "No video models listed yet (needs OpenRouter key). Freya discovers them on /v1/models but does not generate video yet."}
+                  .join(", ")})`
+              : " — using offline fallbacks"}
+            ; Image picker has {Math.max(0, imageModels.length - 1)} image model
+            {imageModels.length === 2 ? "" : "s"}
+            {imageModels.length > 1
+              ? ` (e.g. ${imageModels
+                  .filter((m) => m.id !== "auto")
+                  .slice(0, 2)
+                  .map((m) => m.id)
+                  .join(", ")})`
+              : ""}
+            . Video:{" "}
+            {videoModels.length > 0
+              ? `${videoModels.length} discovered (e.g. ${videoModels
+                  .slice(0, 2)
+                  .map((m) => m.id)
+                  .join(", ")}) — async gen not wired in UI yet.`
+              : "none listed yet (needs OpenRouter key)."}
           </p>
           <button className="primary" disabled={busy} onClick={saveSettings}>
             Save settings
@@ -2693,12 +3423,19 @@ export default function App() {
                   </a>
                 )}
               </div>
+              {(detailModel.needsBase || detailModel.baseModel) && (
+                <p className="hint">
+                  {detailModel.needsBase ||
+                    `LoRA base family: ${detailModel.baseModel}. Install a matching checkpoint to checkpoints/ on the local worker, then set it as active base on the Worker tab.`}
+                </p>
+              )}
               {detailRelated.length > 0 && (
                 <div className="civitai-related">
                   <h4>Needs checkpoint / related</h4>
                   <p className="hint">
                     Civitai does not expose a hard dependency graph — Freya suggests popular
-                    checkpoints for this base family so you can pin or install them too.
+                    checkpoints for this base family so you can pin or install them too. Install
+                    puts weights under FREYA_MODELS_DIR (game drive / PVC); set active base after.
                   </p>
                   <div className="lora-row">
                     {detailRelated.map((rel) => {
@@ -2717,6 +3454,133 @@ export default function App() {
             </div>
           </div>
         </div>
+      )}
+    </div>
+  );
+}
+
+/** Settings panel: list worker checkpoints + set active base for LoRA-compatible gens. */
+function WorkerBaseModelPanel({ busy, hasWorker, api, onSaved, onError }) {
+  const [checkpoints, setCheckpoints] = useState([]);
+  const [catalog, setCatalog] = useState([]);
+  const [active, setActive] = useState(null);
+  const [selected, setSelected] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const refresh = async () => {
+    if (!hasWorker) {
+      setCheckpoints([]);
+      setActive(null);
+      return;
+    }
+    setLoading(true);
+    try {
+      const [cps, base, models] = await Promise.all([
+        api("/v1/worker/checkpoints").catch(() => ({ data: [] })),
+        api("/v1/worker/base-model").catch(() => null),
+        api("/v1/base-models").catch(() => ({ items: [] })),
+      ]);
+      const list = Array.isArray(cps?.data) ? cps.data : [];
+      setCheckpoints(list);
+      setCatalog(Array.isArray(models?.items) ? models.items : []);
+      setActive(base);
+      if (base?.model) setSelected(base.model);
+      else if (list[0]?.path) setSelected(list[0].path);
+    } catch (e) {
+      onError?.(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasWorker]);
+
+  const setBase = async () => {
+    if (!selected.trim()) return;
+    setLoading(true);
+    try {
+      const match = checkpoints.find((c) => c.path === selected);
+      const catalogHit = catalog.find((c) => c.suggestedModel === selected);
+      const body = {
+        model: selected.trim(),
+        baseModel: match?.baseModel || catalogHit?.baseModel || undefined,
+      };
+      const res = await api("/v1/worker/base-model", {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      setActive(res);
+      onSaved?.(`Active base set to ${res.model || selected}`);
+      await refresh();
+    } catch (e) {
+      onError?.(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!hasWorker) {
+    return (
+      <p className="hint">
+        Set a local diffusion worker URL to host SD/SDXL/Pony/Flux checkpoints (LoRA bases). Remote
+        text vLLM usually cannot run these.
+      </p>
+    );
+  }
+
+  const options = [
+    ...checkpoints.map((c) => ({
+      value: c.path,
+      label: `${c.name || c.id}${c.baseModel ? ` (${c.baseModel})` : ""}`,
+    })),
+    ...catalog
+      .filter((c) => !checkpoints.some((x) => x.path === c.suggestedModel))
+      .map((c) => ({
+        value: c.suggestedModel,
+        label: `${c.baseModel} hint → ${c.suggestedModel}`,
+      })),
+  ];
+
+  return (
+    <div className="worker-base-panel">
+      <div className="worker-vram-meta">
+        <span>Base checkpoint</span>
+        <button type="button" className="ghost" disabled={busy || loading} onClick={refresh}>
+          Refresh
+        </button>
+      </div>
+      <p className="hint">
+        LoRAs need a matching base on the worker disk (<code>checkpoints/</code>). Select active
+        base for local generate; stub selects only — real GPU load is vLLM-Omni / engine.
+      </p>
+      <div className="worker-base-row">
+        <select
+          value={selected}
+          disabled={busy || loading || options.length === 0}
+          onChange={(e) => setSelected(e.target.value)}
+        >
+          {options.length === 0 ? (
+            <option value="">No checkpoints yet — install from Civitai</option>
+          ) : (
+            options.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))
+          )}
+        </select>
+        <button type="button" className="ghost" disabled={busy || loading || !selected} onClick={setBase}>
+          Set active
+        </button>
+      </div>
+      {active?.model && (
+        <p className="hint">
+          Current: {active.model}
+          {active.baseModel ? ` · ${active.baseModel}` : ""}
+        </p>
       )}
     </div>
   );

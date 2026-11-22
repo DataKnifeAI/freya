@@ -33,6 +33,10 @@ pub struct RuntimeSecrets {
     /// When false, API skips local gens / treats worker as unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_enabled: Option<bool>,
+    /// Studio bearer (`FREYA_API_TOKEN`). Overrides env when present so UI rotate survives restarts
+    /// when the secrets file lives on durable storage (e.g. gallery PVC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token: Option<String>,
 }
 
 impl AppState {
@@ -106,6 +110,10 @@ impl AppState {
         if let Some(enabled) = secrets.worker_enabled {
             cfg.worker_enabled = enabled;
         }
+        if let Some(tok) = secrets.api_token {
+            // Empty string clears auth (local/dev). Non-empty overrides env / previous value.
+            cfg.api_token = tok;
+        }
         drop(cfg);
         self.rebuild_worker_client().await;
     }
@@ -135,6 +143,11 @@ impl AppState {
             hf_token: Some(cfg.hf_token.clone()),
             diffusion_worker_url: cfg.diffusion_worker_url.clone(),
             worker_enabled: Some(cfg.worker_enabled),
+            api_token: if cfg.api_token.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.api_token.clone())
+            },
         };
         let raw = serde_json::to_vec_pretty(&secrets)?;
         tokio::fs::write(&cfg.secrets_file, raw).await?;

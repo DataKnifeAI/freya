@@ -14,7 +14,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
-    IngressServiceBackend, IngressSpec, ServiceBackendPort,
+    IngressServiceBackend, IngressSpec, IngressTLS, ServiceBackendPort,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -188,6 +188,12 @@ async fn ensure_api_deployment(
         EnvVar {
             name: "FREYA_GALLERY_DIR".into(),
             value: Some("/data/gallery".into()),
+            ..Default::default()
+        },
+        // Keep UI-rotated API token (+ provider keys) on the gallery PVC across pod restarts.
+        EnvVar {
+            name: "FREYA_SECRETS_FILE".into(),
+            value: Some("/data/gallery/.freya-runtime.json".into()),
             ..Default::default()
         },
         EnvVar {
@@ -452,16 +458,27 @@ async fn ensure_ingress(
         .host
         .clone()
         .unwrap_or_else(|| format!("{name}.freya.local"));
+    let tls = studio.spec.ingress.tls_secret_name.as_ref().map(|secret| {
+        vec![IngressTLS {
+            hosts: Some(vec![host.clone()]),
+            secret_name: Some(secret.clone()),
+        }]
+    });
     let ing = Ingress {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(ns.to_string()),
             labels: Some(labels(name, "ingress")),
             owner_references: Some(vec![owner.clone()]),
+            annotations: Some(BTreeMap::from([(
+                "nginx.ingress.kubernetes.io/ssl-redirect".into(),
+                "true".into(),
+            )])),
             ..Default::default()
         },
         spec: Some(IngressSpec {
             ingress_class_name: studio.spec.ingress.class_name.clone(),
+            tls,
             rules: Some(vec![IngressRule {
                 host: Some(host),
                 http: Some(HTTPIngressRuleValue {

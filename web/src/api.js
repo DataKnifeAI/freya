@@ -20,6 +20,7 @@ export async function api(path, opts) {
     return data;
   }
 
+  // Pass opts.signal through so callers can AbortController-cancel (e.g. Civitai search).
   const res = await fetch(path, {
     ...opts,
     headers: {

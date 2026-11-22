@@ -31,6 +31,10 @@ spec:
     enabled: true
     className: nginx
     host: freya.dataknife.net
+    # Fleet TLS: Let's Encrypt *.dataknife.net (same secret as Traefik/Harbor).
+    # Kind: make kind-tls  # copies kube-system/wildcard-dataknife-net-tls + sets nginx default
+    # Omit tlsSecretName to rely only on the ingress controller default cert.
+    tlsSecretName: wildcard-dataknife-net-tls
 ---
 # Create Secrets first (see README Cluster section). Env equivalents for local:
 #   OPENROUTER_API_KEY, CIVITAI_API_KEY, HF_TOKEN, FREYA_API_TOKEN, FREYA_WORKER_TOKEN
@@ -40,6 +44,7 @@ spec:
 #   freya-hf          key=token
 #   freya-api-token   key=token   (openssl rand -hex 32)
 #   freya-worker-token key=apiKey (openssl rand -hex 32)
+#   wildcard-dataknife-net-tls  (TLS; make kind-tls or gitops cert-sync)
 # Optional style pack sample: freya_v1alpha1_freyastyle.yaml (freya.png NL example)
 # Public UI: https://freya.dataknife.net — for kind, run ./scripts/kind-hosts.sh
 # (public DNS still points at prd-apps Traefik → plain-text "404 page not found")

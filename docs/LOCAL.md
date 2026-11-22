@@ -4,6 +4,17 @@
 
 Local kind maps host ports **80/443** to ingress-nginx (`kind-freya.yaml`). The FreyaStudio Ingress host is `freya.dataknife.net`.
 
+### TLS (`*.dataknife.net` wildcard)
+
+Same pattern as prd Traefik / Harbor / slashbay: Let's Encrypt secret `wildcard-dataknife-net-tls` (SANs `*.dataknife.net`, `dataknife.net`).
+
+```bash
+make kind-tls   # copies secret from ~/.kube/prd-apps-rke2.yaml → kube-system + freya;
+                # sets ingress-nginx --default-ssl-certificate; fixes freya-vllm tls
+```
+
+FreyaStudio sample sets `ingress.tlsSecretName: wildcard-dataknife-net-tls`. Without that field, HTTPS still works once nginx’s default cert is set (slashbay-style). Do **not** use a self-signed Ingress secret.
+
 **404 page not found** (plain text, `content-type: text/plain`) is **Traefik on prd-apps**, not Freya. Public DNS still CNAMEs `freya.dataknife.net` → `prd-apps-wk.dataknife.net` (192.168.14.x). Override on this machine:
 
 ```bash
@@ -86,24 +97,45 @@ Worker is optional: cloud generate uses OpenRouter; LoRA install needs `FREYA_DI
 | Path | URL / endpoint | Models |
 |------|----------------|--------|
 | **This machine (local)** | `FREYA_DIFFUSION_WORKER_URL=http://127.0.0.1:8091` (binds `0.0.0.0:8091`) | `FREYA_MODELS_DIR=/mnt/game2/freya/models` (repo `data/models` → symlink) |
-| **Cluster Studio** | `FreyaDiffusionWorker` `externalEndpoint` (e.g. `https://vllm.dataknife.net`) | Remote GPU / vLLM — do not overwrite that CR when only setting up the local worker |
+| **Cluster Studio** | `FreyaDiffusionWorker` `externalEndpoint` (e.g. `https://vllm.dataknife.net`) | Remote GPU / vLLM — **often text-only**; SD/SDXL/Pony/Flux bases belong on the **local GPU worker** (RTX 4090 / `freya-local-worker`), not a remote LLM endpoint |
+
+#### Models on disk (`FREYA_MODELS_DIR`)
+
+```
+models/
+  loras/           *.safetensors + optional *.safetensors.meta.json  (baseModel, versionId, …)
+  checkpoints/     *.safetensors + optional *.meta.json
+  embeddings/      (TextualInversion)
+  vae/
+  active-base.json   { "model": "checkpoints/….safetensors", "baseModel": "SDXL 1.0" }
+```
+
+Install from the Civitai UI writes into these folders. Sidecar `.meta.json` stores Civitai `baseModel` so generate can pick a compatible checkpoint. Only **one** active base is selected at a time (VRAM); swap via Settings or `PUT /v1/worker/base-model`.
 
 Worker health/stats:
 
 | Endpoint | Notes |
 |----------|--------|
-| Worker `GET /health` / `GET /v1/stats` | `{ ok, modelsDir, loras, checkpoints, uptimeSec, vram, host }` — VRAM from `nvidia-smi` when present (null in GPU-less containers) |
+| Worker `GET /health` / `GET /v1/stats` | `{ ok, modelsDir, loras, checkpoints, uptimeSec, vram, host, modelLoaded, layout }` — VRAM from `nvidia-smi` when present (null in GPU-less containers) |
+| Worker `GET /v1/checkpoints` | List installed checkpoints (+ `baseModel` from sidecar) |
+| Worker `GET\|PUT /v1/base-model` | Active base selection (persisted as `active-base.json`) |
 | API `GET /v1/worker/stats` | Proxies worker stats; fills host `nvidia-smi` when worker VRAM is null; includes docker/systemd runtime |
+| API `GET /v1/worker/checkpoints` | Proxies checkpoint list |
+| API `GET\|PUT /v1/worker/base-model` | Proxies active base |
+| API `GET /v1/base-models` | Static family catalog (SD 1.5 / SDXL / Pony / Flux hints) — no Civitai traffic |
 | API `POST /v1/worker/start\|stop` | Local docker (`FREYA_WORKER_CONTAINER`, default `freya-local-worker`) or systemd unit |
 | API `POST /v1/worker/enable\|disable` | Persist flag in secrets — disabled skips local gens; OpenRouter still works |
 
-Settings shows a compact VRAM bar + Start / Stop / Enable / Disable.
+**Worker tab** (not Settings): host/port (defaults `localhost`/`8091`), Generate API token, install/setup steps, VRAM bar, **active base** picker, Start / Stop / Enable / Disable.
+
+**Honest stub note:** `freya-worker` downloads/lists/selects bases and echoes `model` / `lora_request` on generate, but does **not** load weights into VRAM yet. Swap the binary for vLLM-Omni (or similar) on the same HTTP surface for real diffusion.
 
 ### Civitai in the UI
 
 - Search/Suggest returns installable types (LoRA, LoCon, DoRA, Checkpoint, TextualInversion, VAE) with thumbnails and type badges — not LoRA-only.
 - **Pin** = session-scoped (current generate). **★ Favorite** = persistent library in `localStorage` (`freya.civitaiFavorites`); Civitai tab → Favorites.
 - Click a card for details (previews, triggers, base model, related checkpoints). Related assets are Freya-derived from `baseModel` (Civitai has no hard dependency graph).
+- Install / pin now forward `baseModel` (+ `versionId` / `modelType`) to the worker; generate sends `path` + `baseModel` so the API can select a matching active base.
 - API: `GET /v1/civitai/search`, `GET /v1/civitai/models/{id}`, `POST /v1/civitai/install`.
 
 ### Video generation (OpenRouter — discovery only)
@@ -120,10 +152,14 @@ export FREYA_WORKER_TOKEN='long-random-secret'   # same value on freya-api + fre
 # optional: restrict browser origins (comma-separated)
 export FREYA_CORS_ORIGINS='https://freya.example.com,http://127.0.0.1:5173'
 # optional for Vite UI: VITE_FREYA_API_TOKEN=$FREYA_API_TOKEN
-# or paste the same value in UI Settings → Studio API token
+# or Settings → Generate API token (preferred) / Advanced paste
 ```
 
-Send `Authorization: Bearer $FREYA_API_TOKEN` on `/v1` calls. The UI forwards a token from Settings / `VITE_FREYA_API_TOKEN` / `localStorage.freya.apiToken` (nginx does not inject one). Gallery image GETs stay open so `<img src>` works; list/search/settings require the bearer when the token is set.
+**UI:** Worker tab → **Generate API token** calls `POST /v1/auth/token` (rotates in-memory + `FREYA_SECRETS_FILE`). Copy once; the browser stores it in `localStorage.freya.apiToken`. In-cluster the operator sets `FREYA_SECRETS_FILE=/data/gallery/.freya-runtime.json` on the gallery PVC so rotates survive pod restarts. Optional: still sync Secret `freya-api-token` for env-injected restarts.
+
+Send `Authorization: Bearer $FREYA_API_TOKEN` on `/v1` calls. The UI forwards a token from Worker/Settings / `VITE_FREYA_API_TOKEN` / `localStorage.freya.apiToken` (nginx does not inject one). Gallery image GETs stay open so `<img src>` works; list/search/settings require the bearer when the token is set.
+
+**Worker tab endpoint:** host + port (defaults `localhost` / `8091` via Use local defaults) composed to `http://host:port`. Full URL override is under Advanced (https / remote). Settings keeps OpenRouter/Civitai keys only.
 
 In-cluster: set `FreyaStudio.spec.apiTokenSecretRef` and `FreyaDiffusionWorker.spec.authSecretRef`. Container UI proxies via `FREYA_API_UPSTREAM` (operator sets this; see `web/nginx.conf`).
 

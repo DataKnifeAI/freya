@@ -78,11 +78,19 @@ impl DiffusionWorkerClient {
     }
 
     pub async fn list_loras(&self) -> Result<Vec<LocalAsset>> {
+        self.list_assets("/v1/loras").await
+    }
+
+    pub async fn list_checkpoints(&self) -> Result<Vec<LocalAsset>> {
+        self.list_assets("/v1/checkpoints").await
+    }
+
+    async fn list_assets(&self, path: &str) -> Result<Vec<LocalAsset>> {
         let resp = self
-            .apply_auth(self.http.get(format!("{}/v1/loras", self.base)))
+            .apply_auth(self.http.get(format!("{}{path}", self.base)))
             .send()
             .await
-            .context("list loras")?;
+            .with_context(|| format!("list assets {path}"))?;
         if !resp.status().is_success() {
             return Ok(Vec::new());
         }
@@ -107,10 +115,52 @@ impl DiffusionWorkerClient {
                         .and_then(|x| x.as_str())
                         .unwrap_or("")
                         .to_string(),
+                    base_model: a
+                        .get("baseModel")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string),
+                    name: a
+                        .get("name")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string),
                 });
             }
         }
         Ok(out)
+    }
+
+    pub async fn get_active_base(&self) -> Result<Value> {
+        let resp = self
+            .apply_auth(self.http.get(format!("{}/v1/base-model", self.base)))
+            .send()
+            .await
+            .context("get active base")?;
+        if !resp.status().is_success() {
+            let t = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("get base-model failed: {t}"));
+        }
+        Ok(resp.json().await.unwrap_or(Value::Null))
+    }
+
+    pub async fn set_active_base(&self, model: &str, base_model: Option<&str>) -> Result<Value> {
+        let mut body = serde_json::json!({ "model": model });
+        if let Some(b) = base_model.map(str::trim).filter(|s| !s.is_empty()) {
+            body["baseModel"] = Value::String(b.into());
+        }
+        let resp = self
+            .apply_auth(
+                self.http
+                    .put(format!("{}/v1/base-model", self.base))
+                    .json(&body),
+            )
+            .send()
+            .await
+            .context("set active base")?;
+        if !resp.status().is_success() {
+            let t = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("set base-model failed: {t}"));
+        }
+        Ok(resp.json().await.unwrap_or(Value::Null))
     }
 
     pub async fn generate(
@@ -174,6 +224,7 @@ impl DiffusionWorkerClient {
         url: &str,
         dest_path: &str,
         auth_token: Option<&str>,
+        meta: Option<&InstallMeta>,
     ) -> Result<()> {
         let mut body = serde_json::json!({
             "source": source,
@@ -182,6 +233,20 @@ impl DiffusionWorkerClient {
         });
         if let Some(t) = auth_token.map(str::trim).filter(|t| !t.is_empty()) {
             body["authToken"] = Value::String(t.into());
+        }
+        if let Some(m) = meta {
+            if let Some(n) = m.name.as_deref().filter(|s| !s.is_empty()) {
+                body["name"] = Value::String(n.into());
+            }
+            if let Some(b) = m.base_model.as_deref().filter(|s| !s.is_empty()) {
+                body["baseModel"] = Value::String(b.into());
+            }
+            if let Some(v) = m.version_id {
+                body["versionId"] = Value::from(v);
+            }
+            if let Some(t) = m.model_type.as_deref().filter(|s| !s.is_empty()) {
+                body["modelType"] = Value::String(t.into());
+            }
         }
         let resp = self
             .apply_auth(
@@ -200,6 +265,14 @@ impl DiffusionWorkerClient {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct InstallMeta {
+    pub name: Option<String>,
+    pub base_model: Option<String>,
+    pub version_id: Option<i64>,
+    pub model_type: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoraWeight {
     pub lora_name: String,
@@ -216,4 +289,8 @@ pub struct LocalAsset {
     pub id: String,
     pub kind: String,
     pub path: String,
+    #[serde(default)]
+    pub base_model: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
 }

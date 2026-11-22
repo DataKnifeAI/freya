@@ -4,7 +4,7 @@ VERSION ?= 0.1.0
 CARGO ?= cargo
 
 .PHONY: all help build release test fmt fmt-check lint vet ci run-api run-worker run-operator \
-	manifests install deploy up-local kind-hosts clean docker-build
+	manifests install deploy up-local kind-hosts kind-tls clean docker-build
 
 all: build
 
@@ -103,6 +103,9 @@ mock-ui: ## Interactive Freya UI mock (no API / keys required)
 
 kind-hosts: ## Map freya.dataknife.net → 127.0.0.1 for kind Ingress
 	./scripts/kind-hosts.sh
+
+kind-tls: ## Sync LE *.dataknife.net wildcard into kind + nginx default cert
+	./scripts/kind-sync-wildcard-tls.sh
 
 clean:
 	$(CARGO) clean
