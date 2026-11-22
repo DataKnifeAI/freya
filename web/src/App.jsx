@@ -3302,7 +3302,7 @@ export default function App() {
                   <MediaDownload
                     src={previewResult.url}
                     item={previewResult}
-                    className="ghost icon-btn"
+                    className="ghost icon-btn salon-dl"
                     onError={setError}
                   />
                   <button
