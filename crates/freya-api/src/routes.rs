@@ -75,14 +75,8 @@ pub async fn worker_stats(State(state): State<AppState>) -> impl IntoResponse {
         }
     }
 
-    let mut vram = worker_payload
-        .get("vram")
-        .cloned()
-        .unwrap_or(Value::Null);
-    let mut host = worker_payload
-        .get("host")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let mut vram = worker_payload.get("vram").cloned().unwrap_or(Value::Null);
+    let mut host = worker_payload.get("host").cloned().unwrap_or(Value::Null);
     if vram.is_null() {
         let host_vram = crate::gpu::collect_host_vram().await;
         if !host_vram.is_null() {
@@ -98,10 +92,7 @@ pub async fn worker_stats(State(state): State<AppState>) -> impl IntoResponse {
 
     let gallery_dir = state.config.read().await.gallery_dir.clone();
     let gallery_disk = crate::disk::collect_path_disk(&gallery_dir);
-    let models_disk = worker_payload
-        .get("disk")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let models_disk = worker_payload.get("disk").cloned().unwrap_or(Value::Null);
 
     Json(json!({
         "ok": true,
@@ -156,6 +147,25 @@ pub async fn worker_checkpoints(State(state): State<AppState>) -> ApiResult<Json
     Ok(Json(json!({
         "data": items.into_iter().map(local_asset_json).collect::<Vec<_>>(),
     })))
+}
+
+pub async fn worker_installed(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    installed_payload(&state).await.map(Json)
+}
+
+async fn installed_payload(state: &AppState) -> ApiResult<Value> {
+    let worker = state.worker.read().await;
+    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+    let loras = client.list_loras().await.map_err(ApiError::from)?;
+    let checkpoints = client.list_checkpoints().await.map_err(ApiError::from)?;
+    let embeddings = client.list_embeddings().await.unwrap_or_default();
+    let vaes = client.list_vaes().await.unwrap_or_default();
+    Ok(json!({
+        "loras": loras.into_iter().map(local_asset_json).collect::<Vec<_>>(),
+        "checkpoints": checkpoints.into_iter().map(local_asset_json).collect::<Vec<_>>(),
+        "embeddings": embeddings.into_iter().map(local_asset_json).collect::<Vec<_>>(),
+        "vaes": vaes.into_iter().map(local_asset_json).collect::<Vec<_>>(),
+    }))
 }
 
 pub async fn worker_loras(State(state): State<AppState>) -> ApiResult<Json<Value>> {
@@ -301,7 +311,10 @@ pub async fn base_models_catalog() -> Json<Value> {
 pub async fn worker_start(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let (container, unit) = {
         let cfg = state.config.read().await;
-        (cfg.worker_container.clone(), cfg.worker_systemd_unit.clone())
+        (
+            cfg.worker_container.clone(),
+            cfg.worker_systemd_unit.clone(),
+        )
     };
     let runtime = crate::worker_ctl::start(&container, &unit)
         .await
@@ -314,7 +327,10 @@ pub async fn worker_start(State(state): State<AppState>) -> ApiResult<Json<Value
 pub async fn worker_stop(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let (container, unit) = {
         let cfg = state.config.read().await;
-        (cfg.worker_container.clone(), cfg.worker_systemd_unit.clone())
+        (
+            cfg.worker_container.clone(),
+            cfg.worker_systemd_unit.clone(),
+        )
     };
     let runtime = crate::worker_ctl::stop(&container, &unit)
         .await
@@ -466,9 +482,12 @@ pub struct ChatRequest {
     pub model: Option<String>,
     #[serde(default)]
     pub image_model: Option<String>,
-    /// Composer Cloud | Local preference: `openrouter` | `local` (optional).
+    /// Composer Cloud | Local preference: `openrouter` | `local` | `cloud` (optional).
     #[serde(default)]
     pub backend: Option<String>,
+    /// Composer video model pin (`auto` or a provider/model id). Not an API key.
+    #[serde(default)]
+    pub video_model: Option<String>,
     /// When true, skip LLM planning and execute `actions` (Plan confirmation).
     #[serde(default)]
     pub confirm: bool,
@@ -485,7 +504,9 @@ struct PlannedAction {
 }
 
 fn wants_image_intent(message: &str) -> bool {
-    crate::router::infer_modality(message).modality.is_still_image()
+    crate::router::infer_modality(message)
+        .modality
+        .is_still_image()
 }
 
 fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
@@ -532,13 +553,15 @@ fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
         || m.contains("installed loras")
         || m.contains("what loras")
         || m.contains("which loras")
-        || (m.contains("lora") && (m.contains("installed") || m.contains("on the worker") || m.contains("on disk")));
+        || (m.contains("lora")
+            && (m.contains("installed") || m.contains("on the worker") || m.contains("on disk")));
     let asks_list_checkpoints = m.contains("list checkpoint")
         || m.contains("list checkpoints")
         || m.contains("available checkpoint")
         || m.contains("which checkpoints")
         || m.contains("what checkpoints")
-        || (m.contains("checkpoint") && (m.contains("list") || m.contains("show") || m.contains("available")));
+        || (m.contains("checkpoint")
+            && (m.contains("list") || m.contains("show") || m.contains("available")));
     let asks_get_base = m.contains("active base")
         || m.contains("current base")
         || m.contains("what base")
@@ -604,7 +627,10 @@ fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
         format!(
             "Happy to talk through it. Tell me when you want me to generate, search Civitai, tweak the worker base, or suggest ideas — I’ll wait until you ask."
         )
-    } else if actions.iter().any(|a| a.action_type == "generate_image" || a.action_type == "run_session") {
+    } else if actions
+        .iter()
+        .any(|a| a.action_type == "generate_image" || a.action_type == "run_session")
+    {
         "On it — I’ll make that image for you.".into()
     } else if actions.iter().any(|a| a.action_type == "search_civitai") {
         "I’ll search Civitai for matching assets.".into()
@@ -669,9 +695,24 @@ fn is_side_effect_action(ty: &str) -> bool {
         "generate_image"
             | "generate_video"
             | "install_asset"
+            | "cancel_install_job"
+            | "clear_install_jobs"
+            | "delete_installed"
             | "run_session"
             | "set_base_model"
             | "set_chat_models"
+            | "set_cost_tier"
+            | "set_alignment"
+            | "set_privacy"
+            | "set_generate_backend"
+            | "set_automation_mode"
+            | "favorite_asset"
+            | "unfavorite_asset"
+            | "pin_lora"
+            | "unpin_lora"
+            | "gallery_delete"
+            | "worker_start"
+            | "worker_stop"
     )
 }
 
@@ -780,9 +821,7 @@ fn enrich_reply_with_route(
     let preferred = preferred_backend
         .map(str::trim)
         .filter(|b| !b.is_empty() && *b != "auto");
-    let backend = preferred
-        .or(backend_from_gen.as_deref())
-        .unwrap_or("cloud");
+    let backend = preferred.or(backend_from_gen.as_deref()).unwrap_or("cloud");
     let line = format_route_visibility(&RouteFooter {
         route,
         agent: resolved_agent,
@@ -808,10 +847,7 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
     let ty = ar.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let status = ar.get("status").and_then(|s| s.as_str()).unwrap_or("");
     if status == "error" {
-        let err = ar
-            .get("error")
-            .and_then(|e| e.as_str())
-            .unwrap_or("error");
+        let err = ar.get("error").and_then(|e| e.as_str()).unwrap_or("error");
         return Some(format!("{ty} failed: {err}"));
     }
     if status == "proposed" {
@@ -852,7 +888,11 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
             })
         }
         "list_checkpoints" | "list_loras" => {
-            let key = if ty == "list_loras" { "loras" } else { "checkpoints" };
+            let key = if ty == "list_loras" {
+                "loras"
+            } else {
+                "checkpoints"
+            };
             let label = if ty == "list_loras" {
                 "LoRAs"
             } else {
@@ -876,15 +916,16 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
                 .iter()
                 .take(8)
                 .map(|c| {
-                    let name = c
-                        .get("name")
-                        .and_then(|n| n.as_str())
-                        .unwrap_or(if ty == "list_loras" { "lora" } else { "checkpoint" });
+                    let name =
+                        c.get("name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or(if ty == "list_loras" {
+                                "lora"
+                            } else {
+                                "checkpoint"
+                            });
                     let path = c.get("path").and_then(|p| p.as_str()).unwrap_or("");
-                    let base = c
-                        .get("baseModel")
-                        .and_then(|b| b.as_str())
-                        .unwrap_or("");
+                    let base = c.get("baseModel").and_then(|b| b.as_str()).unwrap_or("");
                     if base.is_empty() {
                         format!("{name} ({path})")
                     } else {
@@ -909,10 +950,7 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
                 .get("model")
                 .and_then(|m| m.as_str())
                 .unwrap_or("(none)");
-            let base = res
-                .get("baseModel")
-                .and_then(|b| b.as_str())
-                .unwrap_or("");
+            let base = res.get("baseModel").and_then(|b| b.as_str()).unwrap_or("");
             let verb = if ty == "set_base_model" {
                 "Active base set to"
             } else {
@@ -961,7 +999,9 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
                 .get("displayName")
                 .and_then(|n| n.as_str())
                 .unwrap_or(id);
-            Some(format!("Style ready: {name} (pass styleRef={id} on generate)."))
+            Some(format!(
+                "Style ready: {name} (pass styleRef={id} on generate)."
+            ))
         }
         "list_models" => {
             let chat_n = res
@@ -995,8 +1035,14 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
                 .and_then(|z| z.as_bool())
                 .unwrap_or(false);
             let chat = res.get("chatModel").and_then(|m| m.as_str()).unwrap_or("?");
-            let image = res.get("imageModel").and_then(|m| m.as_str()).unwrap_or("?");
-            let router = res.get("routerModel").and_then(|m| m.as_str()).unwrap_or("?");
+            let image = res
+                .get("imageModel")
+                .and_then(|m| m.as_str())
+                .unwrap_or("?");
+            let router = res
+                .get("routerModel")
+                .and_then(|m| m.as_str())
+                .unwrap_or("?");
             Some(format!(
                 "Settings: agent={chat}, image={image}, router={router}, ZDR={}.",
                 if zdr { "on" } else { "off" }
@@ -1021,8 +1067,14 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
         }
         "set_chat_models" => {
             let chat = res.get("chatModel").and_then(|m| m.as_str()).unwrap_or("?");
-            let image = res.get("imageModel").and_then(|m| m.as_str()).unwrap_or("?");
-            let router = res.get("routerModel").and_then(|m| m.as_str()).unwrap_or("?");
+            let image = res
+                .get("imageModel")
+                .and_then(|m| m.as_str())
+                .unwrap_or("?");
+            let router = res
+                .get("routerModel")
+                .and_then(|m| m.as_str())
+                .unwrap_or("?");
             Some(format!(
                 "Saved model prefs: agent={chat}, image={image}, router={router}."
             ))
@@ -1049,6 +1101,56 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
                 _ => "OpenRouter metrics fetched.".into(),
             })
         }
+        "gallery_delete" => {
+            let id = res.get("id").and_then(|i| i.as_str()).unwrap_or("?");
+            Some(format!("Removed gallery item {id}."))
+        }
+        "gallery_download" => {
+            let url = res.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            Some(if url.is_empty() {
+                "Gallery file is ready in the UI download control.".into()
+            } else {
+                format!("Download in the UI: {url}")
+            })
+        }
+        "list_install_jobs" => {
+            let n = res
+                .get("data")
+                .or_else(|| res.get("jobs"))
+                .and_then(|d| d.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            Some(format!("Download jobs: {n}."))
+        }
+        "cancel_install_job" => Some("Cancelled that download.".into()),
+        "list_installed" => Some("Listed installed worker assets.".into()),
+        "favorite_asset" | "unfavorite_asset" => {
+            let n = res
+                .get("favorites")
+                .and_then(|f| f.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            Some(format!("Favorites: {n}."))
+        }
+        "pin_lora" | "unpin_lora" => {
+            let n = res
+                .get("pinnedLoras")
+                .and_then(|f| f.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            Some(format!("Session LoRA pins: {n}."))
+        }
+        "set_cost_tier" => {
+            let tier = res
+                .get("autoFallbacks")
+                .and_then(|a| a.get("costTier"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("?");
+            Some(format!("Cost tier set to {tier}."))
+        }
+        "set_privacy" | "set_alignment" | "set_generate_backend" | "set_automation_mode" => {
+            Some(format!("{ty} saved."))
+        }
         "generate_image" | "generate_video" => {
             let backend = res.get("backend").and_then(|b| b.as_str()).unwrap_or("?");
             let model = res
@@ -1056,10 +1158,14 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
                 .and_then(|m| m.as_str())
                 .map(short_model_id)
                 .unwrap_or("?");
-            let modality = res
-                .get("modality")
-                .and_then(|m| m.as_str())
-                .unwrap_or(if ty == "generate_video" { "video" } else { "picture" });
+            let modality =
+                res.get("modality")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or(if ty == "generate_video" {
+                        "video"
+                    } else {
+                        "picture"
+                    });
             Some(format!("Generated {modality} via {backend} ({model})."))
         }
         _ => None,
@@ -1118,7 +1224,10 @@ async fn chat_generate_backend(
     pinned: &[LoraIn],
     preferred: Option<&str>,
 ) -> String {
-    if let Some(b) = preferred.map(str::trim).filter(|b| !b.is_empty() && *b != "auto") {
+    if let Some(b) = preferred
+        .map(str::trim)
+        .filter(|b| !b.is_empty() && *b != "auto")
+    {
         return b.to_string();
     }
     if !pinned.is_empty() && state.worker.read().await.is_some() {
@@ -1138,6 +1247,77 @@ fn resolve_action_image_model(image_model: Option<&str>, backend: &str) -> Optio
     }
     // OpenRouter path still rejects non-image prose via resolve_image_model later.
     Some(m.to_string())
+}
+
+fn action_error(ty: &str, args: &Value, error: impl Into<String>) -> Value {
+    json!({
+        "type": ty,
+        "status": "error",
+        "args": args,
+        "error": error.into()
+    })
+}
+
+fn action_ok(ty: &str, args: &Value, result: Value) -> Value {
+    json!({
+        "type": ty,
+        "status": "executed",
+        "args": args,
+        "result": result
+    })
+}
+
+fn api_err_msg(e: ApiError) -> String {
+    match e {
+        ApiError::Msg(m) => m,
+        ApiError::Unauthorized(m) | ApiError::Unavailable(m) => m,
+        ApiError::NoWorker => "No diffusion worker configured".into(),
+        ApiError::NotFound => "not found".into(),
+    }
+}
+
+/// Refuse args whose names look like credentials. Values are never echoed.
+fn reject_secret_fields(args: &Value) -> Option<String> {
+    let obj = args.as_object()?;
+    for key in obj.keys() {
+        let l = key.to_ascii_lowercase().replace(['_', '-'], "");
+        if l.contains("apikey")
+            || l.contains("apitoken")
+            || l.contains("password")
+            || l.contains("secret")
+            || l == "token"
+            || l.contains("admintoken")
+            || l.contains("bearertoken")
+            || l.contains("hftoken")
+            || l.contains("workertoken")
+        {
+            return Some(format!("refusing to read or set {key}"));
+        }
+    }
+    None
+}
+
+fn with_gallery_url(meta: &ArtifactMeta) -> Value {
+    let mut v = serde_json::to_value(meta).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "url".into(),
+            json!(format!("/v1/gallery/{}/image", meta.id)),
+        );
+    }
+    v
+}
+
+async fn persist_prefs(state: &AppState) -> bool {
+    let persisted = state.persist_secrets().await.is_ok();
+    let cfg = state.config.read().await;
+    let mut or = state.openrouter.write().await;
+    *or = crate::openrouter::OpenRouterClient::new(&cfg);
+    persisted
+}
+
+async fn settings_value(state: &AppState) -> Value {
+    serde_json::to_value(settings_public_from_state(state).await).unwrap_or(json!({}))
 }
 
 async fn execute_chat_action(
@@ -1178,7 +1358,13 @@ async fn execute_chat_action(
                     if ideas.is_empty() {
                         ideas = text
                             .lines()
-                            .map(|l| l.trim().trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ')').trim())
+                            .map(|l| {
+                                l.trim()
+                                    .trim_start_matches(|c: char| {
+                                        c.is_ascii_digit() || c == '.' || c == ')'
+                                    })
+                                    .trim()
+                            })
                             .filter(|l| !l.is_empty())
                             .take(5)
                             .map(str::to_string)
@@ -1677,10 +1863,7 @@ async fn execute_chat_action(
                     "error": "No diffusion worker configured"
                 });
             };
-            match client
-                .set_active_base(model, base_model.as_deref())
-                .await
-            {
+            match client.set_active_base(model, base_model.as_deref()).await {
                 Ok(v) => json!({
                     "type": ty,
                     "status": "executed",
@@ -1720,11 +1903,12 @@ async fn execute_chat_action(
                             .collect(),
                         None => items.into_iter().take(24).collect(),
                     };
+                    let items: Vec<Value> = filtered.iter().map(with_gallery_url).collect();
                     json!({
                         "type": ty,
                         "status": "executed",
                         "args": action.args,
-                        "result": { "items": filtered, "query": query }
+                        "result": { "items": items, "query": query }
                     })
                 }
                 Err(e) => json!({
@@ -1755,7 +1939,7 @@ async fn execute_chat_action(
                     "type": ty,
                     "status": "executed",
                     "args": action.args,
-                    "result": meta
+                    "result": with_gallery_url(&meta)
                 }),
                 Ok(None) => json!({
                     "type": ty,
@@ -1934,7 +2118,7 @@ async fn execute_chat_action(
                     "notes": [
                         "Pin agent/image/router with set_chat_models (persists to Settings).",
                         "Cloud vs Local is the Studio composer switch (backend), not a chat model pref.",
-                        "Video Auto follows Privacy/Alignment-aware defaults; composer video pin is per-request.",
+                        "Pin video with set_chat_models videoModel (id only). Cloud vs Local is set_generate_backend.",
                         "Configure Auto fallbacks on the Models tab when the router does not pin a model.",
                     ],
                 }
@@ -1963,14 +2147,31 @@ async fn execute_chat_action(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            if chat.is_none() && image.is_none() && router.is_none() {
-                return json!({
-                    "type": ty,
-                    "status": "error",
-                    "args": action.args,
-                    "error": "provide chatModel and/or imageModel and/or routerModel"
-                });
+            let video = action
+                .args
+                .get("videoModel")
+                .and_then(|m| m.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            if chat.is_none() && image.is_none() && router.is_none() && video.is_none() {
+                return action_error(
+                    ty,
+                    &action.args,
+                    "provide chatModel, imageModel, routerModel, and/or videoModel",
+                );
             }
+            if let Some(msg) = reject_secret_fields(&action.args) {
+                return action_error(ty, &action.args, msg);
+            }
+            let video_norm = if let Some(v) = video.as_deref() {
+                match crate::studio::normalize_video_model(v) {
+                    Ok(id) => Some(id),
+                    Err(e) => return action_error(ty, &action.args, e),
+                }
+            } else {
+                None
+            };
             {
                 let mut cfg = state.config.write().await;
                 if let Some(m) = chat {
@@ -1981,6 +2182,9 @@ async fn execute_chat_action(
                 }
                 if let Some(m) = router {
                     cfg.router_model = m;
+                }
+                if let Some(v) = video_norm {
+                    cfg.studio.video_model = v;
                 }
             }
             let persisted = state.persist_secrets().await.is_ok();
@@ -2023,6 +2227,390 @@ async fn execute_chat_action(
                 })
             }
         },
+        "list_install_jobs" => {
+            let worker = state.worker.read().await;
+            let Some(client) = worker.as_ref() else {
+                return action_error(ty, &action.args, "No diffusion worker configured");
+            };
+            match client.list_install_jobs().await {
+                Ok(v) => action_ok(ty, &action.args, v),
+                Err(e) => action_error(ty, &action.args, e.to_string()),
+            }
+        }
+        "cancel_install_job" => {
+            let id = action
+                .args
+                .get("jobId")
+                .or_else(|| action.args.get("id"))
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if id.is_empty() {
+                return action_error(ty, &action.args, "missing jobId");
+            }
+            let worker = state.worker.read().await;
+            let Some(client) = worker.as_ref() else {
+                return action_error(ty, &action.args, "No diffusion worker configured");
+            };
+            match client.cancel_install_job(&id).await {
+                Ok(v) => action_ok(ty, &action.args, v),
+                Err(e) => action_error(ty, &action.args, e.to_string()),
+            }
+        }
+        "clear_install_jobs" => {
+            let include_queued = action
+                .args
+                .get("includeQueued")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let worker = state.worker.read().await;
+            let Some(client) = worker.as_ref() else {
+                return action_error(ty, &action.args, "No diffusion worker configured");
+            };
+            match client.clear_install_jobs(include_queued).await {
+                Ok(v) => action_ok(ty, &action.args, v),
+                Err(e) => action_error(ty, &action.args, e.to_string()),
+            }
+        }
+        "list_installed" => match installed_payload(state).await {
+            Ok(v) => action_ok(ty, &action.args, v),
+            Err(e) => action_error(ty, &action.args, api_err_msg(e)),
+        },
+        "delete_installed" => {
+            let path = action
+                .args
+                .get("path")
+                .and_then(|p| p.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if path.is_empty() || path.contains("..") {
+                return action_error(ty, &action.args, "missing worker path");
+            }
+            let worker = state.worker.read().await;
+            let Some(client) = worker.as_ref() else {
+                return action_error(ty, &action.args, "No diffusion worker configured");
+            };
+            match client.delete_asset(&path).await {
+                Ok(v) => action_ok(ty, &action.args, v),
+                Err(e) => action_error(ty, &action.args, e.to_string()),
+            }
+        }
+        "favorite_asset" => {
+            if let Some(msg) = reject_secret_fields(&action.args) {
+                return action_error(ty, &action.args, msg);
+            }
+            let card = crate::studio::asset_from_action_args(&action.args);
+            let mut saved = None;
+            let mut err = None;
+            {
+                let mut cfg = state.config.write().await;
+                match crate::studio::favorite_add(&mut cfg.studio, &card) {
+                    Ok(c) => saved = Some(c),
+                    Err(e) => err = Some(e),
+                }
+            }
+            if let Some(e) = err {
+                return action_error(ty, &action.args, e);
+            }
+            let persisted = state.persist_secrets().await.is_ok();
+            let favorites = state.config.read().await.studio.favorites.clone();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "favorites": favorites, "favorite": saved, "persisted": persisted }),
+            )
+        }
+        "unfavorite_asset" => {
+            let card = crate::studio::asset_from_action_args(&action.args);
+            let removed = {
+                let mut cfg = state.config.write().await;
+                crate::studio::favorite_remove(&mut cfg.studio, &card)
+            };
+            let persisted = state.persist_secrets().await.is_ok();
+            let favorites = state.config.read().await.studio.favorites.clone();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "favorites": favorites, "removed": removed, "persisted": persisted }),
+            )
+        }
+        "list_favorites" => {
+            let favorites = state.config.read().await.studio.favorites.clone();
+            action_ok(ty, &action.args, json!({ "favorites": favorites }))
+        }
+        "pin_lora" => {
+            if let Some(msg) = reject_secret_fields(&action.args) {
+                return action_error(ty, &action.args, msg);
+            }
+            let card = crate::studio::asset_from_action_args(&action.args);
+            let mut err = None;
+            {
+                let mut cfg = state.config.write().await;
+                if let Err(e) = crate::studio::pin_add(&mut cfg.studio, &card) {
+                    err = Some(e);
+                }
+            }
+            if let Some(e) = err {
+                return action_error(ty, &action.args, e);
+            }
+            let persisted = state.persist_secrets().await.is_ok();
+            let pins = state.config.read().await.studio.pinned_loras.clone();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "pinnedLoras": pins, "persisted": persisted }),
+            )
+        }
+        "unpin_lora" => {
+            let card = crate::studio::asset_from_action_args(&action.args);
+            {
+                let mut cfg = state.config.write().await;
+                crate::studio::pin_remove(&mut cfg.studio, &card);
+            }
+            let persisted = state.persist_secrets().await.is_ok();
+            let pins = state.config.read().await.studio.pinned_loras.clone();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "pinnedLoras": pins, "persisted": persisted }),
+            )
+        }
+        "list_pins" => {
+            let pins = state.config.read().await.studio.pinned_loras.clone();
+            action_ok(ty, &action.args, json!({ "pinnedLoras": pins }))
+        }
+        "set_cost_tier" => {
+            let tier = action
+                .args
+                .get("costTier")
+                .or_else(|| action.args.get("tier"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if tier.is_empty() {
+                return action_error(ty, &action.args, "missing costTier (low|medium|high|max)");
+            }
+            {
+                let mut cfg = state.config.write().await;
+                let mut prefs = cfg.auto_fallbacks_prefs();
+                prefs.cost_tier = tier;
+                cfg.apply_auto_fallbacks(prefs);
+            }
+            let persisted = persist_prefs(state).await;
+            let mut out = settings_value(state).await;
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("persisted".into(), json!(persisted));
+            }
+            action_ok(ty, &action.args, out)
+        }
+        "set_privacy" => {
+            if let Some(msg) = reject_secret_fields(&action.args) {
+                return action_error(ty, &action.args, msg);
+            }
+            let zdr = action
+                .args
+                .get("zeroDataRetention")
+                .and_then(|v| v.as_bool());
+            let data_collection = action
+                .args
+                .get("dataCollection")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if zdr.is_none() && data_collection.is_none() {
+                return action_error(
+                    ty,
+                    &action.args,
+                    "provide zeroDataRetention and/or dataCollection (allow|deny)",
+                );
+            }
+            {
+                let mut cfg = state.config.write().await;
+                let mut prefs = cfg.privacy_prefs();
+                if let Some(z) = zdr {
+                    prefs.zero_data_retention = z;
+                }
+                if let Some(dc) = data_collection {
+                    prefs.data_collection = dc;
+                }
+                cfg.apply_privacy(prefs);
+            }
+            let persisted = persist_prefs(state).await;
+            let mut out = settings_value(state).await;
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("persisted".into(), json!(persisted));
+            }
+            action_ok(ty, &action.args, out)
+        }
+        "set_alignment" => {
+            if let Some(msg) = reject_secret_fields(&action.args) {
+                return action_error(ty, &action.args, msg);
+            }
+            let alignment = action
+                .args
+                .get("modelAlignment")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let nsfw = action
+                .args
+                .get("allowNsfwLocal")
+                .or_else(|| action.args.get("showNsfw"))
+                .and_then(|v| v.as_bool());
+            let tone = action
+                .args
+                .get("instructionTone")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            if alignment.is_none() && nsfw.is_none() && tone.is_none() {
+                return action_error(
+                    ty,
+                    &action.args,
+                    "provide modelAlignment, allowNsfwLocal, and/or instructionTone",
+                );
+            }
+            {
+                let mut cfg = state.config.write().await;
+                let mut prefs = cfg.alignment_prefs();
+                if let Some(a) = alignment {
+                    prefs.model_alignment = a;
+                }
+                if let Some(n) = nsfw {
+                    prefs.allow_nsfw_local = n;
+                }
+                if let Some(t) = tone {
+                    prefs.instruction_tone = t;
+                }
+                cfg.apply_alignment(prefs);
+            }
+            let persisted = persist_prefs(state).await;
+            let mut out = settings_value(state).await;
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("persisted".into(), json!(persisted));
+            }
+            action_ok(ty, &action.args, out)
+        }
+        "set_generate_backend" => {
+            let raw = action
+                .args
+                .get("backend")
+                .and_then(|b| b.as_str())
+                .unwrap_or("");
+            let backend = match crate::studio::normalize_backend(raw) {
+                Ok(b) => b,
+                Err(e) => return action_error(ty, &action.args, e),
+            };
+            {
+                let mut cfg = state.config.write().await;
+                cfg.studio.generate_backend = backend.clone();
+            }
+            let persisted = state.persist_secrets().await.is_ok();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "backend": backend, "persisted": persisted }),
+            )
+        }
+        "set_automation_mode" => {
+            let raw = action
+                .args
+                .get("mode")
+                .or_else(|| action.args.get("automationMode"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("");
+            let mode = match crate::studio::normalize_mode(raw) {
+                Ok(m) => m,
+                Err(e) => return action_error(ty, &action.args, e),
+            };
+            {
+                let mut cfg = state.config.write().await;
+                cfg.studio.automation_mode = mode.clone();
+            }
+            let persisted = state.persist_secrets().await.is_ok();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "automationMode": mode, "persisted": persisted }),
+            )
+        }
+        "gallery_delete" => {
+            let id = action
+                .args
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if id.is_empty() {
+                return action_error(ty, &action.args, "missing id");
+            }
+            match state.gallery.delete(&id).await {
+                Ok(true) => action_ok(ty, &action.args, json!({ "ok": true, "id": id })),
+                Ok(false) => action_error(ty, &action.args, "not found"),
+                Err(e) => action_error(ty, &action.args, e.to_string()),
+            }
+        }
+        "gallery_download" => {
+            let id = action
+                .args
+                .get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if id.is_empty() {
+                return action_error(ty, &action.args, "missing id");
+            }
+            match state.gallery.get(&id).await {
+                Ok(Some(meta)) => {
+                    let mut item = with_gallery_url(&meta);
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.insert(
+                            "note".into(),
+                            json!("Client downloads this url. Bytes are not returned here."),
+                        );
+                    }
+                    action_ok(ty, &action.args, item)
+                }
+                Ok(None) => action_error(ty, &action.args, "not found"),
+                Err(e) => action_error(ty, &action.args, e.to_string()),
+            }
+        }
+        "worker_start" => {
+            let (container, unit) = {
+                let cfg = state.config.read().await;
+                (
+                    cfg.worker_container.clone(),
+                    cfg.worker_systemd_unit.clone(),
+                )
+            };
+            match crate::worker_ctl::start(&container, &unit).await {
+                Ok(runtime) => action_ok(
+                    ty,
+                    &action.args,
+                    json!({ "ok": true, "runtime": runtime.to_json() }),
+                ),
+                Err(e) => action_error(ty, &action.args, e),
+            }
+        }
+        "worker_stop" => {
+            let (container, unit) = {
+                let cfg = state.config.read().await;
+                (
+                    cfg.worker_container.clone(),
+                    cfg.worker_systemd_unit.clone(),
+                )
+            };
+            match crate::worker_ctl::stop(&container, &unit).await {
+                Ok(runtime) => action_ok(
+                    ty,
+                    &action.args,
+                    json!({ "ok": true, "runtime": runtime.to_json() }),
+                ),
+                Err(e) => action_error(ty, &action.args, e),
+            }
+        }
         other => json!({
             "type": other,
             "status": "error",
@@ -2046,9 +2634,9 @@ async fn civitai_install_inner(
 
     // Prefer client URL; otherwise resolve from versionId (+ optional fileId).
     if req.download_url.trim().is_empty() {
-        let version_id = req.version_id.ok_or_else(|| {
-            ApiError::Msg("downloadUrl or versionId required to install".into())
-        })?;
+        let version_id = req
+            .version_id
+            .ok_or_else(|| ApiError::Msg("downloadUrl or versionId required to install".into()))?;
         let civ = state.civitai.read().await;
         let resolved = civ
             .resolve_version_download(version_id, req.file_id)
@@ -2167,6 +2755,92 @@ async fn civitai_install_inner(
     }))
 }
 
+struct ActionRun {
+    loras: Vec<LoraIn>,
+    image_model: Option<String>,
+    video_model: Option<String>,
+    backend: Option<String>,
+}
+
+impl ActionRun {
+    async fn exec(&mut self, state: &AppState, action: &PlannedAction) -> Value {
+        let v = execute_chat_action(
+            state,
+            action,
+            &self.loras,
+            self.image_model.as_deref(),
+            self.video_model.as_deref(),
+            self.backend.as_deref(),
+        )
+        .await;
+        self.absorb(&v);
+        v
+    }
+
+    fn absorb(&mut self, v: &Value) {
+        if v.get("status").and_then(|s| s.as_str()) != Some("executed") {
+            return;
+        }
+        let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let Some(res) = v.get("result") else {
+            return;
+        };
+        match ty {
+            "set_chat_models" => {
+                if let Some(m) = res.get("imageModel").and_then(|m| m.as_str()) {
+                    if !m.is_empty() {
+                        self.image_model = Some(m.to_string());
+                    }
+                }
+                let video = res.get("videoModel").and_then(|m| m.as_str()).or_else(|| {
+                    res.get("studio")
+                        .and_then(|s| s.get("videoModel"))
+                        .and_then(|m| m.as_str())
+                });
+                if let Some(m) = video {
+                    if !m.is_empty() {
+                        self.video_model = Some(m.to_string());
+                    }
+                }
+            }
+            "set_generate_backend" => {
+                if let Some(b) = res.get("backend").and_then(|b| b.as_str()) {
+                    self.backend = Some(if b == "local" {
+                        "local".into()
+                    } else {
+                        "cloud".into()
+                    });
+                }
+            }
+            "pin_lora" | "unpin_lora" => {
+                if let Some(arr) = res.get("pinnedLoras").and_then(|a| a.as_array()) {
+                    self.loras = arr.iter().filter_map(lora_from_pin_value).collect();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn lora_from_pin_value(v: &Value) -> Option<LoraIn> {
+    if !crate::studio::is_pinnable(v) {
+        return None;
+    }
+    let name = v.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(LoraIn {
+        name: name.to_string(),
+        scale: v.get("scale").and_then(|s| s.as_f64()).unwrap_or(0.8) as f32,
+        path: v.get("path").and_then(|p| p.as_str()).map(str::to_string),
+        base_model: v
+            .get("baseModel")
+            .and_then(|b| b.as_str())
+            .map(str::to_string),
+    })
+}
+
 pub async fn chat(
     State(state): State<AppState>,
     Json(mut req): Json<ChatRequest>,
@@ -2257,8 +2931,24 @@ pub async fn chat(
         &alignment,
         &auto_fallbacks,
     );
+    let stored_video = {
+        let cfg = state.config.read().await;
+        let v = cfg.studio.video_model.trim().to_string();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    };
+    let video_pin = req
+        .video_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or(stored_video);
     let resolved_video = crate::router::resolve_video_model_choice_prefs(
-        req.image_model.as_deref(),
+        video_pin.as_deref(),
         &route,
         &video_default,
         &privacy,
@@ -2420,9 +3110,12 @@ pub async fn chat(
     };
 
     // Prefer router-resolved image model when executing generates under Auto.
-    let image_model_for_actions = Some(resolved_image.as_str());
-    let video_model_for_actions = Some(resolved_video.as_str());
-    let backend_for_actions = req.backend.as_deref();
+    let mut env = ActionRun {
+        loras: req.loras.clone(),
+        image_model: Some(resolved_image.clone()),
+        video_model: Some(resolved_video.clone()),
+        backend: req.backend.clone(),
+    };
 
     let side_effects: Vec<_> = planned
         .iter()
@@ -2444,21 +3137,12 @@ pub async fn chat(
                     "args": a.args,
                 }));
             } else {
-                action_results.push(
-                    execute_chat_action(
-                        &state,
-                        a,
-                        &req.loras,
-                        image_model_for_actions,
-                        video_model_for_actions,
-                        backend_for_actions,
-                    )
-                    .await,
-                );
+                action_results.push(env.exec(&state, a).await);
             }
         }
         if reply.is_empty() {
-            reply = "Here’s what I’d do — confirm to run generate/install, or keep chatting.".into();
+            reply =
+                "Here’s what I’d do — confirm to run generate/install, or keep chatting.".into();
         }
     } else if mode == "auto" && !req.confirm {
         let install_count = planned
@@ -2479,17 +3163,7 @@ pub async fn chat(
                     "proposed"
                 } else {
                     // execute discovery
-                    action_results.push(
-                        execute_chat_action(
-                        &state,
-                        a,
-                        &req.loras,
-                        image_model_for_actions,
-                        video_model_for_actions,
-                        backend_for_actions,
-                    )
-                    .await,
-                    );
+                    action_results.push(env.exec(&state, a).await);
                     continue;
                 };
                 action_results.push(json!({
@@ -2500,18 +3174,7 @@ pub async fn chat(
             }
         } else {
             for a in &planned {
-                action_results
-                    .push(
-                        execute_chat_action(
-                            &state,
-                            a,
-                            &req.loras,
-                            image_model_for_actions,
-                            video_model_for_actions,
-                            backend_for_actions,
-                        )
-                        .await,
-                    );
+                action_results.push(env.exec(&state, a).await);
             }
         }
     } else {
@@ -2525,18 +3188,7 @@ pub async fn chat(
                 }));
                 pending_confirmation = true;
             } else {
-                action_results
-                    .push(
-                        execute_chat_action(
-                            &state,
-                            a,
-                            &req.loras,
-                            image_model_for_actions,
-                            video_model_for_actions,
-                            backend_for_actions,
-                        )
-                        .await,
-                    );
+                action_results.push(env.exec(&state, a).await);
             }
         }
     }
@@ -2575,17 +3227,15 @@ pub async fn chat(
 
     // Tool results arrive after the LLM reply — fold worker summaries into reply.
     let reply = enrich_reply_with_worker_results(&reply, &action_results);
-    let local_backend = req
-        .backend
-        .as_deref()
-        .is_some_and(|b| b.eq_ignore_ascii_case("local"));
+    let effective_backend = env.backend.as_deref().or(req.backend.as_deref());
+    let local_backend = effective_backend.is_some_and(|b| b.eq_ignore_ascii_case("local"));
     let base_name = if local_backend {
         local_base_display(&state).await
     } else {
         String::new()
     };
     let lora_line = if local_backend {
-        pinned_lora_footer(&req.loras)
+        pinned_lora_footer(&env.loras)
     } else {
         String::new()
     };
@@ -2597,7 +3247,7 @@ pub async fn chat(
         &resolved_image,
         &resolved_video,
         &action_results,
-        req.backend.as_deref(),
+        effective_backend,
         &base_name,
         &lora_line,
         &mode,
@@ -2760,6 +3410,48 @@ pub async fn generate(
     Json(req): Json<GenerateRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     run_generate(&state, req).await.map(Json)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesRequest {
+    pub goal: String,
+    #[serde(default)]
+    pub style_ref: Option<String>,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub loras: Vec<LoraIn>,
+}
+
+/// Short still series — same planner as the chat `run_session` action.
+pub async fn generate_series(
+    State(state): State<AppState>,
+    Json(req): Json<SeriesRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let goal = req.goal.trim();
+    if goal.is_empty() {
+        return Err(ApiError::Msg("missing goal".into()));
+    }
+    let image = state.config.read().await.image_model.clone();
+    let action = PlannedAction {
+        action_type: "run_session".into(),
+        args: json!({
+            "goal": goal,
+            "styleRef": req.style_ref,
+        }),
+    };
+    let pins = session_lora_pins(req.loras);
+    let v = execute_chat_action(
+        &state,
+        &action,
+        &pins,
+        Some(image.as_str()),
+        None,
+        req.backend.as_deref(),
+    )
+    .await;
+    Ok(Json(v))
 }
 
 pub async fn run(
@@ -2952,7 +3644,12 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
         // Never forward Auto / OpenRouter cloud ids / router prose as Diffusers repo ids.
         let mut model = crate::base_models::filter_local_model(req.model.as_deref());
         if model.is_none() {
-            if let Some(raw) = req.model.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(raw) = req
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 tracing::debug!(
                     ignored_model = %raw,
                     "local generate ignored non-checkpoint model; using worker active base"
@@ -3151,10 +3848,7 @@ async fn run_motion_generate(
         &auto_fallbacks,
     );
     let duration = req.duration.or(if want_gif { Some(4) } else { Some(5) });
-    let aspect = req
-        .size
-        .as_deref()
-        .and_then(size_to_video_aspect);
+    let aspect = req.size.as_deref().and_then(size_to_video_aspect);
     let vid = or
         .generate_video(final_prompt, Some(&model), duration, aspect)
         .await
@@ -3228,31 +3922,28 @@ async fn mp4_to_gif(mp4: &[u8]) -> Result<Vec<u8>, String> {
 
 pub async fn gallery_list(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let items = state.gallery.list().await.map_err(ApiError::from)?;
+    let items: Vec<Value> = items.iter().map(with_gallery_url).collect();
     Ok(Json(json!({ "items": items })))
 }
 
 pub async fn gallery_get(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<ArtifactMeta>> {
+) -> ApiResult<Json<Value>> {
     let meta = state
         .gallery
         .get(&id)
         .await
         .map_err(ApiError::from)?
         .ok_or(ApiError::NotFound)?;
-    Ok(Json(meta))
+    Ok(Json(with_gallery_url(&meta)))
 }
 
 pub async fn gallery_delete(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let removed = state
-        .gallery
-        .delete(&id)
-        .await
-        .map_err(ApiError::from)?;
+    let removed = state.gallery.delete(&id).await.map_err(ApiError::from)?;
     if !removed {
         return Err(ApiError::NotFound);
     }
@@ -3603,6 +4294,8 @@ pub struct SettingsPublic {
     pub auto_fallbacks: AutoFallbacksPrefs,
     /// Editable system prompts (packs defaults + Settings overrides).
     pub instructions: Vec<InstructionSetting>,
+    /// Favorites, LoRA pins, composer backend, video pin. No secrets.
+    pub studio: crate::studio::StudioPrefs,
 }
 
 #[derive(Debug, Serialize)]
@@ -3634,6 +4327,7 @@ async fn settings_public_from_state(state: &AppState) -> SettingsPublic {
                 alignment: cfg.alignment_prefs(),
                 auto_fallbacks: cfg.auto_fallbacks_prefs(),
                 instructions: Vec::new(),
+                studio: cfg.studio.clone(),
             },
             cfg.instruction_overrides.clone(),
         )
@@ -3646,7 +4340,10 @@ async fn settings_public_from_state(state: &AppState) -> SettingsPublic {
             .map(|t| !t.trim().is_empty())
             .unwrap_or(false);
         let text = if overridden {
-            overrides.get(*id).cloned().unwrap_or_else(|| default_text.clone())
+            overrides
+                .get(*id)
+                .cloned()
+                .unwrap_or_else(|| default_text.clone())
         } else {
             default_text.clone()
         };
@@ -3792,6 +4489,23 @@ pub async fn settings_get(State(state): State<AppState>) -> Json<SettingsPublic>
     Json(settings_public_from_state(&state).await)
 }
 
+pub async fn studio_get(State(state): State<AppState>) -> Json<crate::studio::StudioPrefs> {
+    Json(state.config.read().await.studio.clone())
+}
+
+pub async fn studio_put(
+    State(state): State<AppState>,
+    Json(patch): Json<crate::studio::StudioPatch>,
+) -> ApiResult<Json<serde_json::Value>> {
+    {
+        let mut cfg = state.config.write().await;
+        crate::studio::apply_patch(&mut cfg.studio, patch).map_err(ApiError::Msg)?;
+    }
+    let persisted = state.persist_secrets().await.is_ok();
+    let studio = state.config.read().await.studio.clone();
+    Ok(Json(json!({ "studio": studio, "persisted": persisted })))
+}
+
 /// OpenRouter usage / credits snapshot for the Metrics UI.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -3870,7 +4584,9 @@ pub struct AuthTokenResponse {
     pub sync_commands: Option<Vec<String>>,
 }
 
-pub async fn auth_token_create(State(state): State<AppState>) -> ApiResult<Json<AuthTokenResponse>> {
+pub async fn auth_token_create(
+    State(state): State<AppState>,
+) -> ApiResult<Json<AuthTokenResponse>> {
     let token = generate_api_token();
     let (had_token, secret_name, secret_key, ns_hint) = {
         let cfg = state.config.read().await;
@@ -3899,11 +4615,9 @@ pub async fn auth_token_create(State(state): State<AppState>) -> ApiResult<Json<
         secret_key
     };
     let sync_commands = if secret_synced {
-        Some(vec![
-            format!(
-                "kubectl -n {ns_hint} rollout restart deploy/freya-mcp  # pick up Secret {sec}"
-            ),
-        ])
+        Some(vec![format!(
+            "kubectl -n {ns_hint} rollout restart deploy/freya-mcp  # pick up Secret {sec}"
+        )])
     } else {
         Some(vec![
             format!(
@@ -3915,7 +4629,9 @@ pub async fn auth_token_create(State(state): State<AppState>) -> ApiResult<Json<
     };
     let note = match (persisted, secret_synced) {
         (true, true) => "Machine API token rotated and synced.".into(),
-        (true, false) => "Machine API token rotated (secrets file). Sync freya-api-token if MCP needs it.".into(),
+        (true, false) => {
+            "Machine API token rotated (secrets file). Sync freya-api-token if MCP needs it.".into()
+        }
         (false, true) => "Machine API token rotated (in-memory + Secret).".into(),
         (false, false) => "Machine API token rotated (in-memory only) — copy it now.".into(),
     };
@@ -4034,6 +4750,7 @@ pub async fn settings_put(
         auto_fallbacks: None,
         legacy_upstream_auto_migrated: false,
         instruction_overrides: None, // persist_secrets writes full snapshot from cfg
+        studio: None,
     };
     state.apply_secrets(secrets).await;
     state.rebuild_worker_client().await;

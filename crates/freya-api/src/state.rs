@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::gallery::Gallery;
 use crate::openrouter::OpenRouterClient;
 use crate::prefs::{AlignmentPrefs, AutoFallbacksPrefs, PrivacyPrefs};
+use crate::studio::StudioPrefs;
 use crate::worker::DiffusionWorkerClient;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -61,6 +62,9 @@ pub struct RuntimeSecrets {
     /// Per-mode system prompt overrides (non-empty values only). Empty map omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction_overrides: Option<HashMap<String, String>>,
+    /// Studio UI prefs (favorites, pins, backend, video model). Never includes secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub studio: Option<StudioPrefs>,
 }
 
 impl AppState {
@@ -108,7 +112,11 @@ impl AppState {
 
     async fn apply_secrets_inner(&self, secrets: RuntimeSecrets, from_disk: bool) {
         let mut cfg = self.config.write().await;
-        if assign_secret(&mut cfg.openrouter_api_key, secrets.openrouter_api_key, from_disk) {
+        if assign_secret(
+            &mut cfg.openrouter_api_key,
+            secrets.openrouter_api_key,
+            from_disk,
+        ) {
             let key = cfg.openrouter_api_key.clone();
             let mut or = self.openrouter.write().await;
             *or = OpenRouterClient::new(&cfg).with_key(key);
@@ -171,6 +179,9 @@ impl AppState {
         if let Some(overrides) = secrets.instruction_overrides {
             cfg.instruction_overrides = normalize_instruction_overrides(overrides);
         }
+        if let Some(studio) = secrets.studio {
+            cfg.studio = studio;
+        }
         if models_changed || prefs_changed {
             let key = cfg.openrouter_api_key.clone();
             let mut or = self.openrouter.write().await;
@@ -187,7 +198,11 @@ impl AppState {
             if cfg.legacy_upstream_auto_migrated {
                 false
             } else {
-                if cfg.chat_model.trim().eq_ignore_ascii_case("openrouter/auto") {
+                if cfg
+                    .chat_model
+                    .trim()
+                    .eq_ignore_ascii_case("openrouter/auto")
+                {
                     cfg.chat_model = "auto".into();
                 }
                 cfg.legacy_upstream_auto_migrated = true;
@@ -251,6 +266,7 @@ impl AppState {
             } else {
                 Some(cfg.instruction_overrides.clone())
             },
+            studio: Some(cfg.studio.clone()),
         };
         let raw = serde_json::to_vec_pretty(&secrets)?;
         tokio::fs::write(&cfg.secrets_file, raw).await?;

@@ -1,4 +1,5 @@
 use crate::prefs::{AlignmentPrefs, AutoFallbacksPrefs, ChatProvidersPrefs, PrivacyPrefs};
+use crate::studio::StudioPrefs;
 use clap::Parser;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -90,11 +91,19 @@ pub struct Config {
     pub worker_tls_insecure: bool,
 
     /// Docker container name for local start/stop (`docker start|stop`).
-    #[arg(long, env = "FREYA_WORKER_CONTAINER", default_value = "freya-local-worker")]
+    #[arg(
+        long,
+        env = "FREYA_WORKER_CONTAINER",
+        default_value = "freya-local-worker"
+    )]
     pub worker_container: String,
 
     /// Optional systemd unit name if the worker is not a docker container.
-    #[arg(long, env = "FREYA_WORKER_SYSTEMD_UNIT", default_value = "freya-worker.service")]
+    #[arg(
+        long,
+        env = "FREYA_WORKER_SYSTEMD_UNIT",
+        default_value = "freya-worker.service"
+    )]
     pub worker_systemd_unit: String,
 
     /// When false, API treats the worker as unavailable (OpenRouter still works).
@@ -112,7 +121,11 @@ pub struct Config {
     pub openrouter_zdr: bool,
 
     /// OpenRouter `provider.data_collection`: allow|deny.
-    #[arg(long, env = "FREYA_OPENROUTER_DATA_COLLECTION", default_value = "allow")]
+    #[arg(
+        long,
+        env = "FREYA_OPENROUTER_DATA_COLLECTION",
+        default_value = "allow"
+    )]
     pub openrouter_data_collection: String,
 
     /// Comma-separated chat vendors unchecked in Settings (Freya catalog filter).
@@ -153,6 +166,11 @@ pub struct Config {
     /// After this is set, an explicit upstream selection is kept.
     #[arg(skip)]
     pub legacy_upstream_auto_migrated: bool,
+
+    /// Favorites, LoRA pins, composer backend, video pin, automation mode.
+    /// Not a CLI flag — loaded from `FREYA_SECRETS_FILE`. No API keys.
+    #[arg(skip)]
+    pub studio: StudioPrefs,
 }
 
 impl Config {

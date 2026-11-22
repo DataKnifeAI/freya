@@ -1044,6 +1044,58 @@ function persistGenerateBackend(value) {
   }
 }
 
+function artifactExt(item, src) {
+  const named = String(item?.filename || "");
+  const fromName = named.match(/\.([a-z0-9]{2,5})$/i);
+  if (fromName) return fromName[1].toLowerCase();
+  const m = String(artifactMime(item) || "").toLowerCase();
+  if (m.includes("webp")) return "webp";
+  if (m.includes("gif")) return "gif";
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  if (m.includes("webm")) return "webm";
+  if (m.includes("mp4") || m.includes("video")) return "mp4";
+  if (m.includes("png")) return "png";
+  const s = String(src || "").toLowerCase();
+  if (s.includes(".webp")) return "webp";
+  if (s.includes(".gif")) return "gif";
+  if (s.includes(".mp4")) return "mp4";
+  if (s.includes(".webm")) return "webm";
+  if (isVideoArtifact(item)) return "mp4";
+  if (isGifArtifact(item)) return "gif";
+  return "png";
+}
+
+function artifactFilename(item, src) {
+  const existing = String(item?.filename || "");
+  if (existing && !existing.includes("/") && !existing.includes("\\")) return existing;
+  const id =
+    String(item?.id || item?.artifactId || "image")
+      .replace(/[^a-z0-9-]/gi, "")
+      .slice(0, 8) || "image";
+  const slug = String(item?.prompt || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 32);
+  return `${slug ? `freya-${slug}-${id}` : `freya-${id}`}.${artifactExt(item, src)}`;
+}
+
+/** Save the gallery/artifact bytes. Does not open a tab. */
+async function downloadArtifact(src, item) {
+  const filename = artifactFilename(item, src);
+  const res = await fetch(src);
+  if (!res.ok) throw new Error(`Download failed (${res.status})`);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+
 function installableLoras(loras = []) {
   return (loras || []).filter((l) => l.downloadUrl || l.versionId);
 }
@@ -1244,6 +1296,26 @@ const IconTrash = () => (
     <path d="M10 11v6M14 11v6" />
   </Svg>
 );
+function MediaDownload({ src, item, className, onError }) {
+  if (!src) return null;
+  return (
+    <button
+      type="button"
+      className={className || "ghost icon-btn"}
+      title="Download"
+      aria-label="Download file"
+      onClick={(e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        downloadArtifact(src, item).catch((err) =>
+          onError?.(err?.message || "Download failed"),
+        );
+      }}
+    >
+      <IconDownload />
+    </button>
+  );
+}
 const IconSessions = () => (
   <Svg>
     <rect x="3" y="4" width="18" height="16" rx="2" />
@@ -2211,14 +2283,22 @@ export default function App() {
       setSettings(st);
       applyPrivacyAlignmentFromSettings(st);
       applyInstructionsFromSettings(st);
+      if (typeof st.chatModel === "string" && st.chatModel.trim()) {
+        setAgentModel(st.chatModel.trim());
+      }
+      if (typeof st.imageModel === "string" && st.imageModel.trim()) {
+        setImageModel(st.imageModel.trim());
+      }
       if (typeof st.routerModel === "string" && st.routerModel.trim()) {
         setRouterModel(st.routerModel.trim());
-        persistModels(
-          agentModel,
-          imageModel,
-          st.routerModel.trim(),
-        );
       }
+      persistModels(
+        st.chatModel || agentModel,
+        st.imageModel || imageModel,
+        st.routerModel || routerModel,
+        st.studio?.videoModel || videoModel,
+      );
+      applyStudioFromSettings(st);
       {
         const ep = parseWorkerEndpoint(st.diffusionWorkerUrl || "");
         setWorkerHost(ep.host);
@@ -2307,6 +2387,7 @@ export default function App() {
             ...prev,
           ].slice(0, 200);
       writeFavorites(next);
+      void persistStudio({ favorites: next });
       return next;
     });
   };
@@ -2537,6 +2618,71 @@ export default function App() {
     }
   };
 
+  const persistModelPins = async (patch) => {
+    if (mock) return;
+    try {
+      const st = await api("/v1/settings", {
+        method: "PUT",
+        body: JSON.stringify(patch),
+      });
+      setSettings(st);
+    } catch {
+      /* localStorage still holds the pick */
+    }
+  };
+
+  const persistStudio = async (patch) => {
+    if (mock) return;
+    try {
+      await api("/v1/studio", {
+        method: "PUT",
+        body: JSON.stringify(patch),
+      });
+    } catch {
+      /* local state still applies */
+    }
+  };
+
+  const applyStudioFromSettings = (st) => {
+    const s = st?.studio;
+    if (!s || typeof s !== "object") return;
+    if (Array.isArray(s.favorites)) {
+      if (s.favorites.length) {
+        setFavorites(s.favorites);
+        writeFavorites(s.favorites);
+      } else {
+        const local = readFavorites();
+        if (local.length) void persistStudio({ favorites: local });
+      }
+    }
+    if (Array.isArray(s.pinnedLoras) && s.pinnedLoras.length) {
+      setSession((prev) => ({
+        ...prev,
+        pinnedLoras: s.pinnedLoras.filter(isPinnableAsset),
+      }));
+    } else if (Array.isArray(s.pinnedLoras)) {
+      const localPins = (session.pinnedLoras || []).filter(isPinnableAsset);
+      if (localPins.length) void persistStudio({ pinnedLoras: localPins });
+    }
+    if (s.generateBackend === "local" || s.generateBackend === "cloud") {
+      setGenerateBackend(s.generateBackend);
+      persistGenerateBackend(s.generateBackend);
+    }
+    if (typeof s.videoModel === "string" && s.videoModel.trim()) {
+      const video = s.videoModel.trim();
+      setVideoModel(video);
+      persistModels(agentModel, imageModel, routerModel, video);
+    }
+    if (s.automationMode === "plan" || s.automationMode === "auto" || s.automationMode === "yolo") {
+      setAutomationMode(s.automationMode);
+      try {
+        localStorage.setItem(AUTOMATION_STORAGE_KEY, s.automationMode);
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+
   const setMode = (mode) => {
     if (!AUTOMATION_MODES.includes(mode)) return;
     setAutomationMode(mode);
@@ -2545,6 +2691,7 @@ export default function App() {
     } catch {
       /* ignore */
     }
+    void persistStudio({ automationMode: mode });
   };
 
   const changeAgentModel = (id) => {
@@ -2552,18 +2699,21 @@ export default function App() {
     if (!modelsCatalogReady && id === AUTO_AGENT.id) return;
     setAgentModel(id);
     persistModels(id, imageModel, routerModel, videoModel);
+    void persistModelPins({ chatModel: id });
   };
 
   const changeImageModel = (id) => {
     if (!modelsCatalogReady && id === AUTO_IMAGE.id) return;
     setImageModel(id);
     persistModels(agentModel, id, routerModel, videoModel);
+    void persistModelPins({ imageModel: id });
   };
 
   const changeVideoModel = (id) => {
     if (!modelsCatalogReady && id === AUTO_VIDEO.id) return;
     setVideoModel(id);
     persistModels(agentModel, imageModel, routerModel, id);
+    void persistStudio({ videoModel: id });
   };
 
   const changeRouterModel = (id) => {
@@ -2590,6 +2740,7 @@ export default function App() {
     if (next === "local" && !localBackendOk) return;
     setGenerateBackend(next);
     persistGenerateBackend(next);
+    void persistStudio({ generateBackend: next });
     if (menuOpen === "gen-bundle") setMenuOpen(null);
   };
   const canAutoInstall = () => Boolean(settings?.civitaiConfigured && hasWorker());
@@ -2823,9 +2974,11 @@ export default function App() {
       const baseHint = item.baseModel
         ? ` Needs base family “${item.baseModel}” on the local worker (Worker → active base / install checkpoint).`
         : "";
+      const pinnedLoras = [...(prev.pinnedLoras || []).filter(isPinnableAsset), next];
+      void persistStudio({ pinnedLoras });
       return {
         ...prev,
-        pinnedLoras: [...(prev.pinnedLoras || []).filter(isPinnableAsset), next],
+        pinnedLoras,
         sessionNote: item.triggerWord
           ? `Pinned “${item.name}”. Trigger word “${item.triggerWord}” is optional — Freya keeps your prompt as you wrote it.${baseHint}`
           : `Pinned “${item.name}” for this session. Your prompt stays as you wrote it.${baseHint}`,
@@ -2834,10 +2987,11 @@ export default function App() {
   };
 
   const unpinLora = (item) => {
-    setSession((prev) => ({
-      ...prev,
-      pinnedLoras: (prev.pinnedLoras || []).filter((p) => loraKey(p) !== loraKey(item)),
-    }));
+    setSession((prev) => {
+      const pinnedLoras = (prev.pinnedLoras || []).filter((p) => loraKey(p) !== loraKey(item));
+      void persistStudio({ pinnedLoras });
+      return { ...prev, pinnedLoras };
+    });
   };
 
   const pushTurn = (text, artifactIds = []) => {
@@ -2986,6 +3140,62 @@ export default function App() {
       .filter(Boolean);
     if (toolLines.length) setSessionLog(toolLines);
 
+    for (const a of actions) {
+      if (a.status !== "executed") continue;
+      if (
+        (a.type === "favorite_asset" || a.type === "unfavorite_asset" || a.type === "list_favorites") &&
+        Array.isArray(a.result?.favorites)
+      ) {
+        setFavorites(a.result.favorites);
+        writeFavorites(a.result.favorites);
+      }
+      if (
+        (a.type === "pin_lora" || a.type === "unpin_lora" || a.type === "list_pins") &&
+        Array.isArray(a.result?.pinnedLoras)
+      ) {
+        const pins = a.result.pinnedLoras.filter(isPinnableAsset);
+        setSession((prev) => ({ ...prev, pinnedLoras: pins }));
+      }
+      if (a.type === "set_generate_backend" && (a.result?.backend === "local" || a.result?.backend === "cloud")) {
+        setGenerateBackend(a.result.backend);
+        persistGenerateBackend(a.result.backend);
+      }
+      if (
+        a.type === "set_automation_mode" &&
+        ["plan", "auto", "yolo"].includes(a.result?.automationMode)
+      ) {
+        setAutomationMode(a.result.automationMode);
+        try {
+          localStorage.setItem(AUTOMATION_STORAGE_KEY, a.result.automationMode);
+        } catch {
+          /* ignore */
+        }
+      }
+      if (a.type === "set_chat_models") {
+        const chat = a.result?.chatModel;
+        const image = a.result?.imageModel;
+        const routerM = a.result?.routerModel;
+        const video = a.result?.studio?.videoModel;
+        if (typeof chat === "string" && chat) setAgentModel(chat);
+        if (typeof image === "string" && image) setImageModel(image);
+        if (typeof routerM === "string" && routerM) setRouterModel(routerM);
+        if (typeof video === "string" && video) setVideoModel(video);
+        persistModels(chat || agentModel, image || imageModel, routerM || routerModel, video || videoModel);
+        setSettings((prev) => ({ ...(prev || {}), ...a.result }));
+      }
+      if (a.type === "set_privacy" || a.type === "set_alignment" || a.type === "set_cost_tier") {
+        applyPrivacyAlignmentFromSettings(a.result);
+        setSettings((prev) => ({ ...(prev || {}), ...a.result }));
+      }
+      if (a.type === "set_base_model" && a.result?.model) setActiveBasePath(a.result.model);
+      if (a.type === "gallery_delete" && a.result?.id) {
+        const id = a.result.id;
+        setGallery((prev) => prev.filter((g) => g.id !== id && g.artifactId !== id));
+        setBatchResults((prev) => prev.filter((r) => r.artifactId !== id));
+        setResult((prev) => (prev?.artifactId === id ? null : prev));
+      }
+    }
+
     const zdrErr = actions.find(
       (a) =>
         a.status === "error" &&
@@ -3058,6 +3268,7 @@ export default function App() {
       loras: pinnedPayload(),
       ...extra,
     };
+    body.videoModel = videoModel || AUTO_VIDEO.id;
     if (agentModel && agentModel !== AUTO_AGENT.id) body.model = agentModel;
     if (
       generateBackend !== "local" &&
@@ -4853,21 +5064,29 @@ export default function App() {
                         (result?.artifactId === id ? result : null) ||
                         gallery.find((g) => g.id === id);
                       const src = art?.url || (art ? gallerySrc(art) : `/v1/gallery/${id}/image`);
+                      const file = art || { id, artifactId: id };
                       return (
-                        <button
-                          key={id}
-                          type="button"
-                          className="t-thumb"
-                          onClick={() => {
-                            if (art) selectGalleryPreview(art);
-                          }}
-                        >
-                          {isVideoArtifact(art) ? (
-                            <video src={src} muted playsInline preload="metadata" />
-                          ) : (
-                            <img src={src} alt="" />
-                          )}
-                        </button>
+                        <div className="t-thumb-wrap" key={id}>
+                          <button
+                            type="button"
+                            className="t-thumb"
+                            onClick={() => {
+                              if (art) selectGalleryPreview(art);
+                            }}
+                          >
+                            {isVideoArtifact(art) ? (
+                              <video src={src} muted playsInline preload="metadata" />
+                            ) : (
+                              <img src={src} alt="" />
+                            )}
+                          </button>
+                          <MediaDownload
+                            src={src}
+                            item={file}
+                            className="ghost icon-btn t-thumb-dl"
+                            onError={setError}
+                          />
+                        </div>
                       );
                     })}
                   </div>
@@ -5431,6 +5650,14 @@ export default function App() {
                   if (r.prompt) setPrompt(r.prompt);
                 }}
               >
+                {r.url ? (
+                  <MediaDownload
+                    src={r.url}
+                    item={r}
+                    className="ghost icon-btn salon-work-dl"
+                    onError={setError}
+                  />
+                ) : null}
                 {r.artifactId ? (
                   <button
                     type="button"
@@ -5509,6 +5736,12 @@ export default function App() {
               </span>
               {previewResult.artifactId && (
                 <div className="salon-actions">
+                  <MediaDownload
+                    src={previewResult.url}
+                    item={previewResult}
+                    className="ghost icon-btn"
+                    onError={setError}
+                  />
                   <button
                     type="button"
                     className="ghost remix-btn"
@@ -5847,6 +6080,12 @@ export default function App() {
                 className={`salon-work${previewResult?.artifactId === g.id ? " selected" : ""}`}
                 onClick={() => selectGalleryPreview(g)}
               >
+                <MediaDownload
+                  src={gallerySrc(g)}
+                  item={g}
+                  className="ghost icon-btn salon-work-dl"
+                  onError={setError}
+                />
                 <button
                   type="button"
                   className="ghost salon-work-del"
