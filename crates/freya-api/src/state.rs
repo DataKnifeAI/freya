@@ -65,6 +65,7 @@ pub struct RuntimeSecrets {
 
 impl AppState {
     pub async fn from_config(cfg: Config) -> anyhow::Result<Self> {
+        crate::auto_matrix::init(&cfg.packs_dir);
         let gallery = Gallery::open(cfg.gallery_dir.clone()).await?;
         let openrouter = OpenRouterClient::new(&cfg);
         let civitai = CivitaiClient::new(cfg.civitai_api_key.clone());

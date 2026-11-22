@@ -18,145 +18,49 @@ pub const AUTO_ROUTER: &str = "auto";
 /// Explicit opt-in for OpenRouter's upstream router. Never an Auto sentinel.
 pub const UPSTREAM_ROUTER: &str = "openrouter/auto";
 
-/// Medium + balanced + ZDR off. These are the default column of `builtin_auto_fallback`.
-/// Router: Llama 3.3 70B (tools + structured JSON, on the ZDR catalog). 8B is the low tier.
-pub const DEFAULT_ROUTER_MODEL: &str = "meta-llama/llama-3.3-70b-instruct";
-/// Picture Auto medium: Flux Pro (Klein 4B is the low tier).
-pub const DEFAULT_AUTO_IMAGE_MODEL: &str = "black-forest-labs/flux.2-pro";
-/// Picture Auto when Freya ZDR is on — this Google image id is on the ZDR catalog.
-pub const DEFAULT_AUTO_IMAGE_MODEL_ZDR: &str = "google/gemini-2.5-flash-image";
+/// Medium + balanced. Cells live in `packs/auto-models.json` (ZDR off and ZDR on match for chat).
+/// Router / agent: DeepSeek V4 Pro (tools + JSON, not an uncensored specialist, not Claude/GPT).
+pub const DEFAULT_ROUTER_MODEL: &str = "deepseek/deepseek-v4-pro";
+/// Picture Auto medium, ZDR off: Seedream 4.5 (capable default; Flux is the uncensored row).
+pub const DEFAULT_AUTO_IMAGE_MODEL: &str = "bytedance-seed/seedream-4.5";
+/// Picture Auto medium when ZDR is on. Microsoft MAI is on the ZDR image catalog; Flux is not.
+pub const DEFAULT_AUTO_IMAGE_MODEL_ZDR: &str = "microsoft/mai-image-2.7";
 /// Agent Auto medium: tool-calling chat. Not `openrouter/auto`.
-pub const DEFAULT_AUTO_AGENT_MODEL: &str = "openai/gpt-4.1-mini";
-/// Same id: gpt-4.1-mini is on the ZDR catalog (gemini-2.5-flash is not).
-pub const DEFAULT_AUTO_AGENT_MODEL_ZDR: &str = "openai/gpt-4.1-mini";
-pub const DEFAULT_AUTO_AGENT_MODEL_SAFETY: &str = "openai/gpt-4.1-mini";
-/// Dolphin Venice has JSON but no tools, so it cannot be the agent. 70B is tool-capable and unmoderated.
-pub const DEFAULT_AUTO_AGENT_MODEL_UNCENSORED: &str = "meta-llama/llama-3.3-70b-instruct";
-pub const DEFAULT_ROUTER_MODEL_ZDR: &str = "meta-llama/llama-3.3-70b-instruct";
-pub const DEFAULT_ROUTER_MODEL_SAFETY: &str = "openai/gpt-4.1-mini";
+pub const DEFAULT_AUTO_AGENT_MODEL: &str = "deepseek/deepseek-v4-pro";
+/// Same id: DeepSeek V4 Pro is on the ZDR chat catalog.
+pub const DEFAULT_AUTO_AGENT_MODEL_ZDR: &str = "deepseek/deepseek-v4-pro";
+pub const DEFAULT_AUTO_AGENT_MODEL_SAFETY: &str = "openai/gpt-5-mini";
+/// Cydonia's description is uncensored. It has JSON, not tools. Tool calls may be weaker.
+pub const DEFAULT_AUTO_AGENT_MODEL_UNCENSORED: &str = "thedrummer/cydonia-24b-v4.1";
+pub const DEFAULT_ROUTER_MODEL_ZDR: &str = "deepseek/deepseek-v4-pro";
+pub const DEFAULT_ROUTER_MODEL_SAFETY: &str = "openai/gpt-5-mini";
 
 /// Whether routing must prefer ZDR / no-collection endpoints.
 pub fn privacy_requires_strict(privacy: &PrivacyPrefs) -> bool {
     privacy.zero_data_retention || privacy.data_collection.eq_ignore_ascii_case("deny")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CostTier {
-    Low,
-    Medium,
-    High,
-    Max,
-}
-
-fn parse_cost_tier(raw: &str) -> CostTier {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "low" | "cheap" => CostTier::Low,
-        "high" => CostTier::High,
-        "max" | "maximum" => CostTier::Max,
-        _ => CostTier::Medium,
-    }
-}
-
 /// Built-in Auto matrix: role × privacy × alignment × cost.
-/// User overrides in `AutoFallbacksPrefs` win one cell. Ids were checked against
-/// OpenRouter `GET /models` (and `?zdr=true` / image / video catalogs).
+/// User overrides in `AutoFallbacksPrefs` win one cell. Ids come from
+/// `packs/auto-models.json` (researched against OpenRouter). A missing file
+/// uses the small fallback in `auto_matrix` so the API still boots.
 ///
-/// Video: the ZDR catalog lists **no** video-output models. Strict video cells
-/// still name Google Veo (the only Google-class T2V Freya can call) and OpenRouter may reject them.
+/// Video: `GET /models?output_modalities=video&zdr=true` lists no models.
+/// ZDR video cells repeat the non-ZDR picks and OpenRouter may reject them.
 pub fn builtin_auto_fallback(
     kind: AutoFallbackKind,
     privacy: &PrivacyPrefs,
     alignment: &AlignmentPrefs,
     cost: &str,
-) -> &'static str {
+) -> String {
     let strict = privacy_requires_strict(privacy);
-    let align = alignment.model_alignment.as_str();
-    let cost = parse_cost_tier(cost);
-    match kind {
-        AutoFallbackKind::Router => router_default(align, cost),
-        AutoFallbackKind::Agent => agent_default(align, cost),
-        AutoFallbackKind::Image => image_default(strict, align, cost),
-        AutoFallbackKind::Video => video_default(strict, align, cost),
-    }
-}
-
-/// Every router id below is on the ZDR catalog, so privacy does not change the cell.
-fn router_default(align: &str, cost: CostTier) -> &'static str {
-    match (align, cost) {
-        ("safety", CostTier::Low) => "openai/gpt-4o-mini",
-        ("safety", CostTier::Medium) => DEFAULT_ROUTER_MODEL_SAFETY,
-        ("safety", CostTier::High) => "anthropic/claude-sonnet-5.5",
-        ("safety", CostTier::Max) => "anthropic/claude-opus-5.5",
-        // Dolphin Venice: response_format, no tools. Router-ok, not an agent.
-        ("uncensored", CostTier::Low) => "cognitivecomputations/dolphin-mistral-24b-venice-edition",
-        ("uncensored", CostTier::Medium) => "meta-llama/llama-3.3-70b-instruct",
-        ("uncensored", CostTier::High) => "google/gemini-4-neon",
-        ("uncensored", CostTier::Max) => "meta/muse-wonder",
-        (_, CostTier::Low) => "meta-llama/llama-3.1-8b-instruct",
-        (_, CostTier::Medium) => DEFAULT_ROUTER_MODEL,
-        (_, CostTier::High) => "anthropic/claude-sonnet-5.5",
-        (_, CostTier::Max) => "anthropic/claude-opus-5.5",
-    }
-}
-
-/// Tool-calling chat. Dolphin has no `tools`/`tool_choice`, so uncensored uses unmoderated Llama.
-/// Every id here is on the ZDR catalog.
-fn agent_default(align: &str, cost: CostTier) -> &'static str {
-    match (align, cost) {
-        ("safety", CostTier::Low) => "openai/gpt-4o-mini",
-        ("safety", CostTier::Medium) => DEFAULT_AUTO_AGENT_MODEL_SAFETY,
-        ("safety", CostTier::High) => "anthropic/claude-sonnet-5.5",
-        ("safety", CostTier::Max) => "anthropic/claude-opus-5.5",
-        ("uncensored", CostTier::Low) => "meta-llama/llama-3.1-8b-instruct",
-        ("uncensored", CostTier::Medium) => DEFAULT_AUTO_AGENT_MODEL_UNCENSORED,
-        ("uncensored", CostTier::High) => "google/gemini-4-neon",
-        ("uncensored", CostTier::Max) => "meta/muse-wonder",
-        (_, CostTier::Low) => "meta-llama/llama-3.1-8b-instruct",
-        (_, CostTier::Medium) => DEFAULT_AUTO_AGENT_MODEL,
-        (_, CostTier::High) => "anthropic/claude-sonnet-5.5",
-        (_, CostTier::Max) => "anthropic/claude-opus-5.5",
-    }
-}
-
-fn image_default(strict: bool, align: &str, cost: CostTier) -> &'static str {
-    // Flux and GPT Image are not on the ZDR image catalog. Strict → Google image ids that are.
-    if strict {
-        return match cost {
-            CostTier::Low => "google/gemini-3.1-flash-lite-image",
-            CostTier::Medium => DEFAULT_AUTO_IMAGE_MODEL_ZDR,
-            CostTier::High => "google/gemini-3.1-flash-image",
-            CostTier::Max => "google/gemini-3-pro-image",
-        };
-    }
-    match (align, cost) {
-        ("safety", CostTier::Low) => "openai/gpt-image-1-mini",
-        ("safety", CostTier::Medium) => "openai/gpt-image-1",
-        ("safety", CostTier::High) => "openai/gpt-5-image-mini",
-        ("safety", CostTier::Max) => "openai/gpt-5-image",
-        (_, CostTier::Low) => "black-forest-labs/flux.2-klein-4b",
-        (_, CostTier::Medium) => DEFAULT_AUTO_IMAGE_MODEL,
-        (_, CostTier::High) => "black-forest-labs/flux.2-max",
-        (_, CostTier::Max) => "black-forest-labs/flux-3-image",
-    }
-}
-
-fn video_default(strict: bool, align: &str, cost: CostTier) -> &'static str {
-    // Safety prefers Google Veo. Strict privacy has no ZDR video id; Veo is the attempt.
-    if strict || align == "safety" {
-        return match cost {
-            CostTier::Low => "google/veo-3.1-lite",
-            CostTier::Medium => "google/veo-3.1-fast",
-            CostTier::High | CostTier::Max => DEFAULT_AUTO_VIDEO_MODEL_ZDR,
-        };
-    }
-    match (align, cost) {
-        ("uncensored", CostTier::High) => "black-forest-labs/flux-3-video",
-        ("uncensored", CostTier::Max) => "minimax/hailuo-3-max",
-        (_, CostTier::Low) => "bytedance/seedance-2.5-flash",
-        (_, CostTier::Medium) => DEFAULT_AUTO_VIDEO_MODEL,
-        (_, CostTier::High) => "google/veo-3.1",
-        (_, CostTier::Max) => "minimax/hailuo-3-max",
-    }
+    let role = match kind {
+        AutoFallbackKind::Router => "router",
+        AutoFallbackKind::Agent => "agent",
+        AutoFallbackKind::Image => "image",
+        AutoFallbackKind::Video => "video",
+    };
+    crate::auto_matrix::model_for(role, strict, alignment.model_alignment.as_str(), cost)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,10 +201,10 @@ impl RouteDecision {
     }
 }
 
-/// Default Auto video model (OpenRouter T2V).
+/// Default Auto video model (balanced medium). No video id is on the ZDR catalog,
+/// so the ZDR balanced-medium cell is the same id.
 pub const DEFAULT_AUTO_VIDEO_MODEL: &str = crate::openrouter::DEFAULT_AUTO_VIDEO_MODEL;
-/// Video Auto when Freya ZDR is on (Google Veo family typically offers ZDR/safety retention).
-pub const DEFAULT_AUTO_VIDEO_MODEL_ZDR: &str = "google/veo-3.1";
+pub const DEFAULT_AUTO_VIDEO_MODEL_ZDR: &str = "bytedance/seedance-2.5-flash";
 
 pub fn default_auto_video_model(zdr: bool) -> &'static str {
     if zdr {
@@ -377,7 +281,11 @@ pub fn resolve_video_model_choice_prefs(
             || sug_l.contains("/kling")
             || (sug_l.starts_with("minimax/") && sug_l.contains("hailuo"))
             || sug_l.contains("wan-")
-            || sug_l.contains("/ltx");
+            || sug_l.contains("/ltx")
+            || sug_l.starts_with("x-ai/grok-imagine-video")
+            || sug_l.starts_with("black-forest-labs/flux-3-video")
+            || sug_l.starts_with("black-forest-labs/flux-video")
+            || sug_l.starts_with("runway/gen-");
         if known_video {
             if privacy_requires_strict(privacy)
                 && !sug.starts_with("google/")
@@ -1067,7 +975,7 @@ fn parse_route_json(text: &str) -> Option<RouteDecision> {
 /// Context injected into the router user blob so Auto picks respect Privacy/Alignment.
 pub fn router_prefs_context(privacy: &PrivacyPrefs, alignment: &AlignmentPrefs) -> String {
     format!(
-        "Privacy: ZDR={} data_collection={}. Alignment: {}. Prefer concrete OpenRouter model ids that satisfy these. When ZDR or deny-collection is on, prefer Google media/chat endpoints. For safety alignment prefer moderated major vendors; for uncensored prefer low-moderation / open-weight chat (still Google for media under ZDR).",
+        "Privacy: ZDR={} data_collection={}. Alignment: {}. Prefer concrete OpenRouter model ids that satisfy these. Safety: moderated high-refusal models (GPT, Claude, Cohere; GPT Image or Google image; Veo for video). Balanced: a capable default, not an uncensored specialist and not the strictest safety model. Uncensored: models whose name or description is uncensored (Dolphin, Venice, Cydonia) or, for image and video, the least-moderated catalog option (Flux, Krea, Grok). Do not suggest Llama-instruct, Claude, or GPT as uncensored. When ZDR or deny-collection is on, stay on ids from the ZDR catalog. No video model is on that catalog.",
         if privacy.zero_data_retention {
             "on"
         } else {
@@ -1350,6 +1258,52 @@ mod tests {
             resolve_auto_fallback(AutoFallbackKind::Agent, &privacy, &alignment, &fb),
             DEFAULT_AUTO_AGENT_MODEL_SAFETY
         );
+        assert_eq!(
+            resolve_auto_fallback(AutoFallbackKind::Router, &privacy, &alignment, &fb),
+            DEFAULT_ROUTER_MODEL_SAFETY
+        );
+        assert_eq!(DEFAULT_AUTO_AGENT_MODEL_SAFETY, "openai/gpt-5-mini");
+        assert_eq!(DEFAULT_ROUTER_MODEL_SAFETY, "openai/gpt-5-mini");
+        let uncensored = AlignmentPrefs {
+            model_alignment: "uncensored".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_auto_fallback(AutoFallbackKind::Agent, &privacy, &uncensored, &fb),
+            "thedrummer/cydonia-24b-v4.1"
+        );
+        assert_eq!(
+            resolve_auto_fallback(AutoFallbackKind::Router, &privacy, &uncensored, &fb),
+            "thedrummer/cydonia-24b-v4.1"
+        );
+        let low = AutoFallbacksPrefs {
+            cost_tier: "low".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_auto_fallback(AutoFallbackKind::Agent, &privacy, &uncensored, &low),
+            "cognitivecomputations/dolphin-mistral-24b-venice-edition"
+        );
+        let deny = PrivacyPrefs {
+            data_collection: "deny".into(),
+            ..Default::default()
+        };
+        let balanced = AlignmentPrefs::default();
+        assert_eq!(
+            resolve_auto_fallback(AutoFallbackKind::Image, &deny, &balanced, &fb),
+            DEFAULT_AUTO_IMAGE_MODEL_ZDR
+        );
+        assert_eq!(
+            resolve_auto_fallback(AutoFallbackKind::Image, &deny, &alignment, &fb),
+            "google/gemini-2.5-flash-image"
+        );
+        assert_eq!(
+            resolve_auto_fallback(AutoFallbackKind::Video, &deny, &balanced, &fb),
+            DEFAULT_AUTO_VIDEO_MODEL_ZDR
+        );
+        assert!(
+            !resolve_auto_fallback(AutoFallbackKind::Video, &deny, &uncensored, &fb).is_empty()
+        );
     }
 
     #[test]
@@ -1399,7 +1353,7 @@ mod tests {
         let fb = AutoFallbacksPrefs::default();
         assert_eq!(
             resolve_auto_fallback(AutoFallbackKind::Router, &privacy, &alignment, &fb),
-            "meta-llama/llama-3.3-70b-instruct"
+            DEFAULT_ROUTER_MODEL
         );
         assert_ne!(
             resolve_auto_fallback(AutoFallbackKind::Agent, &privacy, &alignment, &fb),
@@ -1415,7 +1369,7 @@ mod tests {
         );
         assert_eq!(
             resolve_auto_fallback(AutoFallbackKind::Image, &privacy, &alignment, &low),
-            "black-forest-labs/flux.2-klein-4b"
+            "bytedance-seed/seedream-5-0-flash"
         );
         let route = RouteDecision {
             modality: Modality::Chat,
@@ -1439,7 +1393,7 @@ mod tests {
         };
         assert_eq!(
             resolve_auto_fallback(AutoFallbackKind::Agent, &strict, &alignment, &fb),
-            "openai/gpt-4.1-mini"
+            DEFAULT_AUTO_AGENT_MODEL_ZDR
         );
         assert_eq!(
             resolve_auto_fallback(AutoFallbackKind::Image, &strict, &alignment, &fb),

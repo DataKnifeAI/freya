@@ -710,7 +710,7 @@ impl OpenRouterClient {
 }
 
 /// Default OpenRouter T2V model (text-to-video; not avatar/lip-sync).
-pub const DEFAULT_AUTO_VIDEO_MODEL: &str = "bytedance/seedance-2.5";
+pub const DEFAULT_AUTO_VIDEO_MODEL: &str = "bytedance/seedance-2.5-flash";
 
 pub fn resolve_video_model(requested: &str, default_video: &str) -> String {
     let m = requested.trim();
