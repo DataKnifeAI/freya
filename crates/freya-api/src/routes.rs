@@ -2400,8 +2400,8 @@ pub async fn chat(
         }
     };
 
-    // Safety net: still-image tools only for picture modality (or confirmed plan).
-    // Motion uses generate_video — keep those. Drop still generate on pure chat.
+    // Obvious guidance never renders. A scene or outfit does not need
+    // generate/draw/make — the router or the converse agent decides.
     let planned: Vec<PlannedAction> = if req.confirm {
         planned
     } else {
@@ -2411,13 +2411,7 @@ pub async fn chat(
                 if matches!(a.action_type.as_str(), "generate_video") {
                     true
                 } else if matches!(a.action_type.as_str(), "generate_image" | "run_session") {
-                    route.modality.is_still_image()
-                        || wants_image_intent(&req.message)
-                        || a.args
-                            .get("prompt")
-                            .and_then(|p| p.as_str())
-                            .map(|p| wants_image_intent(p))
-                            .unwrap_or(false)
+                    !crate::router::message_is_chat_not_media(&req.message)
                 } else {
                     true
                 }
