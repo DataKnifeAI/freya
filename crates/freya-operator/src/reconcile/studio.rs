@@ -384,6 +384,100 @@ async fn ensure_ui_deployment(
     Ok(())
 }
 
+/// Stateless MCP proxy: Streamable HTTP at `/mcp`, talks to in-cluster API.
+async fn ensure_mcp_deployment(
+    ctx: &Ctx,
+    ns: &str,
+    name: &str,
+    studio: &FreyaStudio,
+    owner: &OwnerReference,
+    api_tok: Option<&freya_crd::SecretKeyRef>,
+) -> Result<(), Error> {
+    let (repo, tag, pull) = image_parts(&studio.spec.mcp_image, default_mcp_image());
+    let image = format!("{repo}:{tag}");
+    let dep_name = format!("{name}-mcp");
+
+    // Host allowlist is the Ingress host when one is set. Callers still need the API bearer.
+    let mut env = vec![
+        EnvVar {
+            name: "FREYA_API_URL".into(),
+            value: Some(format!("http://{name}-api:8080")),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "FREYA_MCP_BIND".into(),
+            value: Some("0.0.0.0:8090".into()),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "FREYA_MCP_ALLOWED_HOSTS".into(),
+            value: Some(
+                studio
+                    .spec
+                    .ingress
+                    .host
+                    .clone()
+                    .filter(|h| !h.trim().is_empty())
+                    .unwrap_or_default(),
+            ),
+            ..Default::default()
+        },
+    ];
+    if let Some(api_tok) = api_tok {
+        env.push(secret_env("FREYA_API_TOKEN", api_tok, false));
+    }
+
+    let dep = Deployment {
+        metadata: ObjectMeta {
+            name: Some(dep_name.clone()),
+            namespace: Some(ns.to_string()),
+            labels: Some(labels(name, "mcp")),
+            owner_references: Some(vec![owner.clone()]),
+            ..Default::default()
+        },
+        spec: Some(DeploymentSpec {
+            replicas: Some(studio.spec.replicas),
+            selector: LabelSelector {
+                match_labels: Some(labels(name, "mcp")),
+                ..Default::default()
+            },
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(labels(name, "mcp")),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    containers: vec![Container {
+                        name: "mcp".into(),
+                        image: Some(image),
+                        image_pull_policy: Some(pull),
+                        ports: Some(vec![ContainerPort {
+                            container_port: 8090,
+                            name: Some("http".into()),
+                            ..Default::default()
+                        }]),
+                        env: Some(env),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let api: Api<Deployment> = Api::namespaced(ctx.client.clone(), ns);
+    api.patch(
+        &dep_name,
+        &PatchParams::apply(MANAGED_BY).force(),
+        &Patch::Apply(&dep),
+    )
+    .await
+    .map_err(Error::Kube)?;
+    Ok(())
+}
+
 async fn ensure_service(
     ctx: &Ctx,
     ns: &str,

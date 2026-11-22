@@ -77,6 +77,244 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn load_active_base(models_dir: &Path, env_model: &str) -> ActiveBase {
+    let path = models_dir.join("active-base.json");
+    if let Ok(bytes) = fs::read(&path).await {
+        if let Ok(mut a) = serde_json::from_slice::<ActiveBase>(&bytes) {
+            if a.model.is_empty() && !env_model.is_empty() {
+                a.model = env_model.to_string();
+            }
+            return a;
+        }
+    }
+    ActiveBase {
+        model: env_model.to_string(),
+        base_model: None,
+    }
+}
+
+async fn persist_active_base(models_dir: &Path, active: &ActiveBase) -> Result<(), String> {
+    let path = models_dir.join("active-base.json");
+    let bytes = serde_json::to_vec_pretty(active).map_err(|e| e.to_string())?;
+    fs::write(&path, bytes)
+        .await
+        .map_err(|e| format!("write active-base.json: {e}"))
+}
+
+/// Health for local ops. Includes GPU/VRAM when `nvidia-smi` is available
+/// (null inside GPU-less containers — freya-api may enrich from the host).
+async fn health() -> Json<Value> {
+    Json(serde_json::json!({ "ok": true, "service": "freya-worker" }))
+}
+
+/// GPU, disk, and model inventory. Requires the worker token when one is set.
+async fn stats(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(build_stats(&app).await)
+}
+
+async fn build_stats(app: &App) -> Value {
+    let loras = count_weight_files(&app.models_dir.join("loras")).await;
+    let checkpoints = count_weight_files(&app.models_dir.join("checkpoints")).await;
+    let (vram, host) = collect_gpu_stats().await;
+    let active = app.active.read().await.clone();
+    let engine = engine_health(app).await;
+    let (loaded_in_vram, engine_name) = match &engine {
+        Some(e) => (
+            e.get("loadedInVram").and_then(|v| v.as_bool()).unwrap_or(false),
+            e.get("engine")
+                .and_then(|v| v.as_str())
+                .unwrap_or("diffusers")
+                .to_string(),
+        ),
+        None if !app.engine_url.is_empty() => (false, "diffusers-unreachable".into()),
+        None => (false, "stub".into()),
+    };
+    let model_loaded = if active.model.is_empty() {
+        Value::Null
+    } else {
+        json!({
+            "model": active.model,
+            "baseModel": active.base_model,
+            "loadedInVram": loaded_in_vram,
+            "engine": engine_name,
+        })
+    };
+    let disk = collect_path_disk(&app.models_dir);
+    json!({
+        "ok": true,
+        "modelsDir": app.models_dir.display().to_string(),
+        "modelsDirHost": app.models_dir_host.clone(),
+        "loras": loras,
+        "checkpoints": checkpoints,
+        "uptimeSec": app.started.elapsed().as_secs(),
+        "modelLoaded": model_loaded,
+        "engine": engine,
+        "vram": vram,
+        "host": host,
+        "disk": disk,
+        "layout": {
+            "loras": "loras/*.safetensors (+ optional *.safetensors.meta.json)",
+            "checkpoints": "checkpoints/*.safetensors (+ optional *.meta.json)",
+            "activeBase": "active-base.json",
+        },
+        "vramBehavior": "on-demand load during generate; unload after unless FREYA_ENGINE_KEEP_LOADED=1",
+    })
+}
+
+/// df-style capacity for `FREYA_MODELS_DIR` via statvfs.
+fn collect_path_disk(path: &Path) -> Value {
+    use std::ffi::CString;
+    let probe = if path.exists() {
+        path.to_path_buf()
+    } else if let Some(parent) = path.parent() {
+        parent.to_path_buf()
+    } else {
+        return Value::Null;
+    };
+    let Some(s) = probe.to_str() else {
+        return Value::Null;
+    };
+    let Ok(c_path) = CString::new(s) else {
+        return Value::Null;
+    };
+    unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c_path.as_ptr(), &mut st) != 0 {
+            return Value::Null;
+        }
+        let bsize = st.f_frsize as u64;
+        if bsize == 0 {
+            return Value::Null;
+        }
+        let total = (st.f_blocks as u64).saturating_mul(bsize);
+        let free = (st.f_bavail as u64).saturating_mul(bsize);
+        let free_root = (st.f_bfree as u64).saturating_mul(bsize);
+        let used = total.saturating_sub(free_root);
+        let pct = if total > 0 {
+            ((used as f64 / total as f64) * 100.0).round() as u64
+        } else {
+            0
+        };
+        json!({
+            "path": path.display().to_string(),
+            "usedBytes": used,
+            "freeBytes": free,
+            "totalBytes": total,
+            "usedPercent": pct.min(100),
+        })
+    }
+}
+
+async fn engine_health(app: &App) -> Option<Value> {
+    if app.engine_url.is_empty() {
+        return None;
+    }
+    let url = format!("{}/health", app.engine_url);
+    match app.http.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => resp.json::<Value>().await.ok(),
+        _ => None,
+    }
+}
+
+/// Query NVIDIA GPUs via `nvidia-smi`. Returns `(vram, host)` JSON values (null if unavailable).
+async fn collect_gpu_stats() -> (Value, Value) {
+    let out = Command::new("nvidia-smi")
+        .args([
+            "--query-gpu=index,name,memory.used,memory.total,utilization.gpu",
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .await;
+    let Ok(out) = out else {
+        return (Value::Null, Value::Null);
+    };
+    if !out.status.success() {
+        return (Value::Null, Value::Null);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut gpus = Vec::new();
+    let mut used_total = 0u64;
+    let mut mem_total = 0u64;
+    let mut util_sum = 0u64;
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        let index: u64 = parts[0].parse().unwrap_or(0);
+        let name = parts[1].to_string();
+        let used: u64 = parts[2].parse().unwrap_or(0);
+        let total: u64 = parts[3].parse().unwrap_or(0);
+        let util: u64 = parts[4].parse().unwrap_or(0);
+        used_total += used;
+        mem_total += total;
+        util_sum += util;
+        gpus.push(json!({
+            "index": index,
+            "name": name,
+            "usedMiB": used,
+            "totalMiB": total,
+            "utilPercent": util,
+        }));
+    }
+    if gpus.is_empty() {
+        return (Value::Null, Value::Null);
+    }
+    let n = gpus.len() as u64;
+    let hostname = hostname_string();
+    (
+        json!({
+            "usedMiB": used_total,
+            "totalMiB": mem_total,
+            "utilPercent": util_sum / n.max(1),
+            "gpus": gpus,
+        }),
+        json!({
+            "hostname": hostname,
+            "source": "nvidia-smi",
+        }),
+    )
+}
+
+fn hostname_string() -> String {
+    std::fs::read_to_string("/etc/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+async fn count_weight_files(dir: &Path) -> usize {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || count_weight_files_depth(&dir, 0))
+        .await
+        .unwrap_or(0)
+}
+
+fn count_weight_files_depth(dir: &Path, depth: u32) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut n = 0usize;
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().to_string();
+        if name.ends_with(".meta.json") || name.starts_with('.') {
+            continue;
+        }
+        let Ok(ft) = ent.file_type() else {
+            continue;
+        };
+        if ft.is_file() {
+            n += 1;
+        } else if ft.is_dir() && depth < 2 {
+            // e.g. checkpoints/swarmui/ from optional SwarmUI bind-mount
+            n += count_weight_files_depth(&ent.path(), depth + 1);
+        }
+    }
+    n
+}
+
 async fn require_worker_token(
     State(app): State<Arc<App>>,
     req: Request,

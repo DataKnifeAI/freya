@@ -4,6 +4,11 @@ mod api;
 mod tools;
 
 use anyhow::Context;
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{header, Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::Response;
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
@@ -80,9 +85,15 @@ async fn main() -> anyhow::Result<()> {
         config,
     );
 
+    let mcp_auth = McpAuth {
+        token: args.api_token.clone(),
+    };
+    let protected = Router::new()
+        .nest_service("/mcp", mcp)
+        .layer(middleware::from_fn_with_state(mcp_auth, require_mcp_token));
     let app = Router::new()
         .route("/healthz", get(healthz))
-        .nest_service("/mcp", mcp);
+        .merge(protected);
 
     let addr: SocketAddr = args
         .bind
@@ -103,6 +114,33 @@ async fn main() -> anyhow::Result<()> {
         })
         .await?;
     Ok(())
+}
+
+#[derive(Clone)]
+struct McpAuth {
+    token: String,
+}
+
+async fn require_mcp_token(
+    State(auth): State<McpAuth>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if auth.token.is_empty() {
+        tracing::warn!("FREYA_API_TOKEN is empty; /mcp is accepting unauthenticated calls");
+        return Ok(next.run(req).await);
+    }
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if presented == auth.token {
+        Ok(next.run(req).await)
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
 }
 
 async fn healthz() -> Json<serde_json::Value> {

@@ -47,7 +47,7 @@ spec:
                 nullable: true
                 properties:
                   key:
-                    default: apiKey
+                    default: token
                     type: string
                   name:
                     type: string
@@ -134,8 +134,8 @@ spec:
                     default: https://openrouter.ai/api/v1
                     type: string
                   chatModel:
-                    default: openrouter/auto
-                    description: Default chat / plan model id (OpenRouter).
+                    default: auto
+                    description: Default chat / plan model id. `auto` = Freya internal Auto (not `openrouter/auto`).
                     type: string
                   imageModel:
                     default: black-forest-labs/flux.2-klein-4b

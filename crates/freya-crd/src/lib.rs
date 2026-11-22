@@ -32,6 +32,28 @@ fn default_api_key_key() -> String {
     "apiKey".into()
 }
 
+fn default_api_token_key() -> String {
+    "token".into()
+}
+
+/// Secret key for the machine API bearer. Defaults to `token`, matching the generated Secret.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiTokenSecretRef {
+    pub name: String,
+    #[serde(default = "default_api_token_key")]
+    pub key: String,
+}
+
+impl From<ApiTokenSecretRef> for SecretKeyRef {
+    fn from(v: ApiTokenSecretRef) -> Self {
+        Self {
+            name: v.name,
+            key: v.key,
+        }
+    }
+}
+
 /// Default Secret key name for Civitai tokens.
 pub fn default_civitai_key() -> String {
     "apiKey".into()
@@ -182,7 +204,15 @@ pub struct FreyaStudioSpec {
     pub diffusion_worker_ref: Option<String>,
     /// Secret holding `FREYA_API_TOKEN` for the API. Set for non-dev / Ingress; UI sends the bearer from Settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_token_secret_ref: Option<SecretKeyRef>,
+    pub api_token_secret_ref: Option<ApiTokenSecretRef>,
+    /// Game-operator style: ensure an admin login Secret (`username` + `admin-password`)
+    /// and, when `apiTokenSecretRef` is unset, an API bearer Secret. Default true.
+    #[serde(default = "default_generate_admin_secrets")]
+    pub generate_admin_secrets: bool,
+    /// BYO admin credentials Secret (keys: `admin-password` required, `username` optional → `admin`).
+    /// Used when `generateAdminSecrets` is false, or as the target name when generating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admin_credentials_secret_ref: Option<LocalObjectRef>,
     #[serde(default = "default_replicas")]
     pub replicas: i32,
 }
