@@ -14,6 +14,74 @@ pub const DEFAULT_SEARCH_TYPES: &[&str] = &[
     "VAE",
 ];
 
+/// One Civitai model type per agent search. `Model` is a file role / Styles bucket, not a type.
+pub const AGENT_SEARCH_TYPES: &[&str] = &[
+    "LORA",
+    "LoCon",
+    "DoRA",
+    "LyCORIS",
+    "Checkpoint",
+    "TextualInversion",
+    "VAE",
+];
+
+pub const AGENT_SEARCH_TYPES_LABEL: &str =
+    "LORA, LoCon, DoRA, LyCORIS, Checkpoint, TextualInversion, VAE";
+
+/// Map a tool/UI type word onto one Civitai `types=` value.
+/// Embedding is TextualInversion. Model is rejected (not a model type).
+pub fn canonical_search_type(raw: &str) -> Result<&'static str, String> {
+    if raw.contains(',') {
+        return Err(format!(
+            "search one type per call. type is one of {AGENT_SEARCH_TYPES_LABEL}. Embedding is TextualInversion. Model is not a Civitai type."
+        ));
+    }
+    let key: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    if key.is_empty() {
+        return Err(format!(
+            "type is required, one of {AGENT_SEARCH_TYPES_LABEL}. Embedding is TextualInversion. Model is not a Civitai type. Call once per type. Does not pin or download."
+        ));
+    }
+    if key == "model" || key == "models" {
+        return Err(
+            "Model is not a Civitai model type (file role Model is the weight file; Styles uses Model for untyped files). Search Checkpoint for a base, or one of LORA, LoCon, DoRA, LyCORIS, TextualInversion, VAE."
+                .into(),
+        );
+    }
+    let canon = match key.as_str() {
+        "lora" | "loras" => "LORA",
+        "locon" => "LoCon",
+        "dora" => "DoRA",
+        "lycoris" | "lyco" => "LyCORIS",
+        "checkpoint" | "checkpoints" => "Checkpoint",
+        "textualinversion" | "embedding" | "embeddings" => "TextualInversion",
+        "vae" | "vaes" => "VAE",
+        _ => {
+            return Err(format!(
+                "unknown Civitai type {raw:?}. Search one of {AGENT_SEARCH_TYPES_LABEL}. Embedding is TextualInversion."
+            ));
+        }
+    };
+    if !AGENT_SEARCH_TYPES.contains(&canon) {
+        return Err(format!(
+            "unknown Civitai type {raw:?}. Search one of {AGENT_SEARCH_TYPES_LABEL}."
+        ));
+    }
+    Ok(canon)
+}
+
+/// True when a Civitai card `type` is the requested agent search type.
+pub fn same_search_type(model_type: &str, canon: &str) -> bool {
+    match canonical_search_type(model_type) {
+        Ok(got) => got == canon,
+        Err(_) => false,
+    }
+}
+
 /// True when `model_type` is a Freya-supported installable asset.
 pub fn is_freya_asset_type(model_type: &str) -> bool {
     let t = model_type.trim();
@@ -122,10 +190,8 @@ impl CivitaiClient {
             {
                 match self.related_checkpoints(base, 4).await {
                     Ok(related) => {
-                        detail.related = related
-                            .into_iter()
-                            .filter(|c| c.id != detail.id)
-                            .collect();
+                        detail.related =
+                            related.into_iter().filter(|c| c.id != detail.id).collect();
                         if detail.needs_base.is_none() {
                             detail.needs_base = Some(format!("Needs base model family: {base}"));
                         }
@@ -139,13 +205,20 @@ impl CivitaiClient {
         Ok(detail)
     }
 
-    async fn related_checkpoints(&self, base_model: &str, limit: u32) -> Result<Vec<CivitaiModelCard>> {
+    async fn related_checkpoints(
+        &self,
+        base_model: &str,
+        limit: u32,
+    ) -> Result<Vec<CivitaiModelCard>> {
         let url = format!(
             "https://civitai.com/api/v1/models?limit={limit}&types=Checkpoint&baseModels={}&sort={}",
             urlencoding_lite(base_model),
             urlencoding_lite("Most Downloaded")
         );
-        let v = self.get_json(&url).await.context("civitai related checkpoints")?;
+        let v = self
+            .get_json(&url)
+            .await
+            .context("civitai related checkpoints")?;
         let mut out = Vec::new();
         if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
             for item in items {
@@ -192,10 +265,9 @@ impl CivitaiClient {
             pick_primary_file(&version.files)
         }
         .ok_or_else(|| anyhow!("civitai model version {version_id}: no files"))?;
-        let download_url = file
-            .download_url
-            .clone()
-            .ok_or_else(|| anyhow!("civitai model version {version_id}: file has no downloadUrl"))?;
+        let download_url = file.download_url.clone().ok_or_else(|| {
+            anyhow!("civitai model version {version_id}: file has no downloadUrl")
+        })?;
         Ok(ResolvedDownload {
             download_url,
             version_id: version.id,
@@ -239,11 +311,7 @@ impl CivitaiClient {
             .ok_or_else(|| anyhow!("civitai model version {version_id}: missing modelId"))?;
         let mut detail = self.get_model(model_id).await?;
         // Prefer the installed version when present on the model.
-        if detail
-            .model_versions
-            .iter()
-            .any(|ver| ver.id == version_id)
-        {
+        if detail.model_versions.iter().any(|ver| ver.id == version_id) {
             if let Some(ver) = detail
                 .model_versions
                 .iter()
@@ -413,10 +481,7 @@ fn parse_model_version(ver: &Value, image_limit: usize) -> CivitaiModelVersion {
 }
 
 fn pick_primary_file(files: &[CivitaiModelFile]) -> Option<&CivitaiModelFile> {
-    files
-        .iter()
-        .find(|f| f.primary)
-        .or_else(|| files.first())
+    files.iter().find(|f| f.primary).or_else(|| files.first())
 }
 
 fn parse_model_card(item: &Value, detailed: bool) -> CivitaiModelCard {
@@ -630,6 +695,37 @@ fn urlencoding_lite(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn canonical_search_type_is_one_enum_value() {
+        assert!(AGENT_SEARCH_TYPES.contains(&"LORA"));
+        assert_eq!(AGENT_SEARCH_TYPES.len(), 7);
+        assert_eq!(canonical_search_type("LORA").unwrap(), "LORA");
+        assert_eq!(canonical_search_type("lora").unwrap(), "LORA");
+        assert_eq!(canonical_search_type("LoCon").unwrap(), "LoCon");
+        assert_eq!(canonical_search_type("dora").unwrap(), "DoRA");
+        assert_eq!(canonical_search_type("lycoris").unwrap(), "LyCORIS");
+        assert_eq!(canonical_search_type("checkpoint").unwrap(), "Checkpoint");
+        assert_eq!(
+            canonical_search_type("embedding").unwrap(),
+            "TextualInversion"
+        );
+        assert_eq!(
+            canonical_search_type("TextualInversion").unwrap(),
+            "TextualInversion"
+        );
+        assert_eq!(canonical_search_type("vae").unwrap(), "VAE");
+        assert!(canonical_search_type("").unwrap_err().contains("required"));
+        assert!(canonical_search_type("Model")
+            .unwrap_err()
+            .contains("not a Civitai"));
+        assert!(canonical_search_type("LORA,VAE")
+            .unwrap_err()
+            .contains("one type"));
+        assert!(canonical_search_type("Upscaler").is_err());
+        assert!(same_search_type("Embedding", "TextualInversion"));
+        assert!(!same_search_type("Checkpoint", "LORA"));
+    }
 
     #[test]
     fn parse_card_defaults_to_first_version_primary_file() {

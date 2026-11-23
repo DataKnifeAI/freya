@@ -3548,8 +3548,11 @@ export default function App() {
         if (a.type === "generate_image") return `Generated image`;
         if (a.type === "run_session")
           return `Generated ${(a.result?.results || []).length || "a"} variation(s)`;
-        if (a.type === "search_civitai")
-          return `Searched Civitai for “${a.result?.query || a.args?.query || "…"}”`;
+        if (a.type === "search_civitai") {
+          const searchedType = a.result?.type || a.args?.type;
+          const typeLabel = searchedType ? `${searchedType} ` : "";
+          return `Searched Civitai ${typeLabel}for “${a.result?.query || a.args?.query || "…"}”`;
+        }
         if (a.type === "suggest_ideas")
           return `Suggested ${(a.result?.ideas || []).length || "some"} ideas`;
         if (a.type === "install_asset") {

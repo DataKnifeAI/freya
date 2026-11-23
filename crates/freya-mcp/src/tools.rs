@@ -57,16 +57,70 @@ pub struct GalleryGetArgs {
     pub id: String,
 }
 
+/// One Civitai model type. Call `civitai_search` again to search a different type.
+/// `Model` is not a Civitai type (use `Checkpoint` for a base). Embedding is `TextualInversion`.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+pub enum CivitaiAssetType {
+    #[serde(rename = "LORA", alias = "lora", alias = "LoRA", alias = "Lora")]
+    #[schemars(rename = "LORA")]
+    Lora,
+    #[serde(rename = "LoCon", alias = "locon", alias = "LoCON")]
+    #[schemars(rename = "LoCon")]
+    LoCon,
+    #[serde(rename = "DoRA", alias = "dora", alias = "DORA")]
+    #[schemars(rename = "DoRA")]
+    DoRA,
+    #[serde(
+        rename = "LyCORIS",
+        alias = "lycoris",
+        alias = "Lycoris",
+        alias = "lyco"
+    )]
+    #[schemars(rename = "LyCORIS")]
+    LyCORIS,
+    #[serde(rename = "Checkpoint", alias = "checkpoint", alias = "checkpoints")]
+    #[schemars(rename = "Checkpoint")]
+    Checkpoint,
+    #[serde(
+        rename = "TextualInversion",
+        alias = "textualinversion",
+        alias = "embedding",
+        alias = "embeddings",
+        alias = "Embedding"
+    )]
+    #[schemars(rename = "TextualInversion")]
+    TextualInversion,
+    #[serde(rename = "VAE", alias = "vae", alias = "vaes")]
+    #[schemars(rename = "VAE")]
+    Vae,
+}
+
+impl CivitaiAssetType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lora => "LORA",
+            Self::LoCon => "LoCon",
+            Self::DoRA => "DoRA",
+            Self::LyCORIS => "LyCORIS",
+            Self::Checkpoint => "Checkpoint",
+            Self::TextualInversion => "TextualInversion",
+            Self::Vae => "VAE",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CivitaiSearchArgs {
     /// Search query.
     pub q: String,
+    /// Required. Exactly one of `LORA`, `LoCon`, `DoRA`, `LyCORIS`, `Checkpoint`, `TextualInversion`, `VAE`.
+    /// Embedding is `TextualInversion`. Model is not a Civitai type.
+    /// One call searches that type only; call again for a different type. Does not pin or download.
+    #[serde(rename = "type")]
+    pub asset_type: CivitaiAssetType,
     #[serde(default)]
     pub limit: Option<u32>,
-    /// Comma-separated types, e.g. `LORA,Checkpoint`.
-    #[serde(default)]
-    pub types: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -338,21 +392,23 @@ impl FreyaMcp {
         json_ok(v)
     }
 
-    #[tool(description = "Search Civitai models/LoRAs via Freya API")]
+    #[tool(
+        description = "Search one Civitai asset type. Required type is exactly one of LORA, LoCon, DoRA, LyCORIS, Checkpoint, TextualInversion (embedding), VAE. Call again to search a different type. Model is not a Civitai type (use Checkpoint for a base). Installed matches come first, then other Civitai hits. Does not pin or download."
+    )]
     async fn civitai_search(
         &self,
         Parameters(args): Parameters<CivitaiSearchArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mut q = vec![("q".into(), args.q)];
+        let mut q = vec![
+            ("q".into(), args.q),
+            ("type".into(), args.asset_type.as_str().to_string()),
+        ];
         if let Some(limit) = args.limit {
             q.push(("limit".into(), limit.to_string()));
         }
-        if let Some(types) = args.types {
-            q.push(("types".into(), types));
-        }
         let v = self
             .api
-            .get_json_query("/v1/civitai/search", &q)
+            .get_json_query("/v1/civitai/lookup", &q)
             .await
             .map_err(map_err)?;
         json_ok(v)

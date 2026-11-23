@@ -153,10 +153,77 @@ const FREYA_ASSET_TYPES = new Set([
   "lora",
   "locon",
   "dora",
+  "lycoris",
   "checkpoint",
   "textualinversion",
   "vae",
 ]);
+
+/** Agent search enum. Model is not a Civitai type. Embedding is TextualInversion. */
+const AGENT_SEARCH_TYPES = [
+  "LORA",
+  "LoCon",
+  "DoRA",
+  "LyCORIS",
+  "Checkpoint",
+  "TextualInversion",
+  "VAE",
+];
+
+function canonicalSearchType(raw) {
+  const text = String(raw || "");
+  if (text.includes(",")) {
+    return {
+      error: `search one type per call. type is one of ${AGENT_SEARCH_TYPES.join(", ")}. Embedding is TextualInversion. Model is not a Civitai type.`,
+    };
+  }
+  const key = text.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const map = {
+    lora: "LORA",
+    loras: "LORA",
+    locon: "LoCon",
+    dora: "DoRA",
+    lycoris: "LyCORIS",
+    lyco: "LyCORIS",
+    checkpoint: "Checkpoint",
+    checkpoints: "Checkpoint",
+    textualinversion: "TextualInversion",
+    embedding: "TextualInversion",
+    embeddings: "TextualInversion",
+    vae: "VAE",
+    vaes: "VAE",
+  };
+  if (key === "model" || key === "models") {
+    return {
+      error:
+        "Model is not a Civitai model type. Search Checkpoint for a base, or one of LORA, LoCon, DoRA, LyCORIS, TextualInversion, VAE.",
+    };
+  }
+  if (!map[key]) {
+    return {
+      error: `type is required, one of ${AGENT_SEARCH_TYPES.join(", ")}. Embedding is TextualInversion. Call once per type. Does not pin or download.`,
+    };
+  }
+  return { type: map[key] };
+}
+
+function mockInstalledMatchesType(asset, canon) {
+  const mt = String(asset?.modelType || "").trim();
+  if (mt) return canonicalSearchType(mt).type === canon;
+  const kind = String(asset?.kind || "").trim();
+  if (kind) {
+    const got = canonicalSearchType(kind).type;
+    const adapters = ["LORA", "LoCon", "DoRA", "LyCORIS"];
+    if (got && adapters.includes(canon) && adapters.includes(got)) return true;
+    if (got) return got === canon;
+  }
+  const path = String(asset?.path || "");
+  if (["LORA", "LoCon", "DoRA", "LyCORIS"].includes(canon)) return path.startsWith("loras/");
+  if (canon === "Checkpoint") return path.startsWith("checkpoints/");
+  if (canon === "TextualInversion") return path.startsWith("embeddings/");
+  if (canon === "VAE") return path.startsWith("vae/");
+  return false;
+}
 
 function isFreyaAssetType(modelType) {
   return FREYA_ASSET_TYPES.has(String(modelType || "").toLowerCase());
@@ -164,7 +231,7 @@ function isFreyaAssetType(modelType) {
 
 function assetTypeRank(modelType) {
   const t = String(modelType || "").toLowerCase();
-  if (t === "lora" || t === "locon" || t === "dora" || t.includes("lora")) return 0;
+  if (t === "lora" || t === "locon" || t === "dora" || t === "lycoris" || t.includes("lora")) return 0;
   if (t === "checkpoint") return 1;
   if (t === "textualinversion") return 2;
   if (t === "vae") return 3;
@@ -676,8 +743,10 @@ function mockSameAsset(local, search) {
 }
 
 /** Installed name/version first, then Civitai hits that are not that file. */
-function orderMockLookup(query, searchCards) {
-  const installed = state.localAssets || [];
+function orderMockLookup(query, searchCards, assetType) {
+  const installed = (state.localAssets || []).filter((a) =>
+    assetType ? mockInstalledMatchesType(a, assetType) : true,
+  );
   const search = Array.isArray(searchCards) ? searchCards : [];
   const used = new Set();
   const consumed = new Set();
@@ -1184,7 +1253,17 @@ function planChatActions(message, body) {
   ) {
     const q =
       (message.split(/\bfor\b/i)[1] || message).trim().slice(0, 80) || BEGINNER_CIVITAI_QUERY;
-    actions.push({ type: "search_civitai", args: { query: q } });
+    const words = m.split(/[^a-z0-9]+/).filter(Boolean);
+    const has = (w) => words.includes(w);
+    let searchType = "LORA";
+    if (has("embedding") || has("embeddings") || m.includes("textual inversion")) {
+      searchType = "TextualInversion";
+    } else if (has("lycoris") || has("lyco")) searchType = "LyCORIS";
+    else if (has("locon")) searchType = "LoCon";
+    else if (has("dora")) searchType = "DoRA";
+    else if (has("vae") || has("vaes")) searchType = "VAE";
+    else if (has("checkpoint") || has("checkpoints")) searchType = "Checkpoint";
+    actions.push({ type: "search_civitai", args: { query: q, type: searchType } });
   }
   const asksSetBase =
     m.includes("set base") ||
@@ -1275,12 +1354,17 @@ async function executeMockChatAction(action, body) {
   }
   if (ty === "search_civitai") {
     const q = (args.query || "").trim() || BEGINNER_CIVITAI_QUERY;
+    const parsed = canonicalSearchType(args.type || args.modelType || args.types || "");
+    if (parsed.error) {
+      return { type: ty, status: "error", args, error: parsed.error };
+    }
     const { loras } = lorasForAssist(q);
+    const typed = loras.filter((c) => canonicalSearchType(c.modelType).type === parsed.type);
     return {
       type: ty,
       status: "executed",
-      args: { ...args, query: q },
-      result: { query: q, loras: orderMockLookup(q, loras) },
+      args: { ...args, query: q, type: parsed.type },
+      result: { query: q, type: parsed.type, loras: orderMockLookup(q, typed, parsed.type) },
     };
   }
   if (ty === "list_loras" || ty === "list_installed") {
