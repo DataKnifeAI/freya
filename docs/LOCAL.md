@@ -138,6 +138,79 @@ make run-worker
 # Settings → paste Civitai API key → Civitai tab → Install to worker
 ```
 
+In the UI, session automation modes:
+
+| Mode | Behavior |
+|------|----------|
+| **Plan** | Steps, Civitai query, LoRAs, batch prompts only — no generate/install |
+| **Auto** | Runs the plan; pauses on ambiguous / high-impact choices |
+| **YOLO** | Full auto — search, install when a worker is set, else generate via OpenRouter |
+
+Worker is optional: cloud generate uses OpenRouter; LoRA install needs `FREYA_DIFFUSION_WORKER_URL` + Civitai.
+
+### Local GPU worker (recommended) vs optional in-cluster GPU
+
+| Path | URL / endpoint | Models |
+|------|----------------|--------|
+| **This machine (recommended)** | `make run-worker` / `freya-local-worker` → `http://127.0.0.1:8091` (binds `0.0.0.0:8091`); from in-cluster Studio use LAN IP, FQDN (`https://vllm.dataknife.net` on this lab), or ExternalName | `FREYA_MODELS_DIR=/mnt/game2/freya/models` (repo `data/models` → symlink); SD/SDXL/Pony/Flux live here |
+| **Cluster Studio → external worker** | `FreyaDiffusionWorker` `placement: external` + `externalEndpoint` (sample YAML) — same URL the Worker tab saves | Operator sets `FREYA_DIFFUSION_WORKER_URL` from the CR; no in-cluster GPU required |
+| **Optional in-cluster GPU** | `placement: incluster` sample — only when the cluster has `nvidia.com/gpu` | Operator Deployment + models PVC; **not** the default story |
+
+#### Models on disk (`FREYA_MODELS_DIR`)
+
+```
+models/
+  loras/           *.safetensors + optional *.safetensors.meta.json  (baseModel, versionId, …)
+  checkpoints/     *.safetensors + optional *.meta.json
+                   (recommended Pony: checkpoints/pony-diffusion-v6-xl.safetensors)
+  embeddings/      (TextualInversion)
+  vae/
+  active-base.json   { "model": "checkpoints/pony-diffusion-v6-xl.safetensors", "baseModel": "Pony" }
+```
+
+Install from the Civitai UI writes into these folders. Sidecar `.meta.json` stores Civitai `baseModel` so generate can pick a compatible checkpoint. Only **one** active base is selected at a time (VRAM); swap via Settings or `PUT /v1/worker/base-model`.
+
+Worker health/stats:
+
+| Endpoint | Notes |
+|----------|--------|
+| Worker `GET /health` | Liveness only: `{ ok, service }`. No GPU, disk, or inventory |
+| Worker `GET /v1/stats` | Authenticated inventory: `{ ok, modelsDir, loras, checkpoints, uptimeSec, vram, host, disk, modelLoaded, layout }` — VRAM from `nvidia-smi` when present (null in GPU-less containers) |
+| Worker `GET /v1/checkpoints` | List installed checkpoints (+ `baseModel` from sidecar) |
+| Worker `GET\|PUT /v1/base-model` | Active base selection (persisted as `active-base.json`) |
+| API `GET /v1/worker/stats` | Proxies `/v1/stats`. A failed stats call is reachability via `/health` only and does not borrow host `nvidia-smi`. Host VRAM fills in only when stats returned null VRAM |
+| API `GET /v1/worker/checkpoints` | Proxies checkpoint list |
+| API `GET\|PUT /v1/worker/base-model` | Proxies active base |
+| API `GET /v1/base-models` | Static family catalog (SD 1.5 / SDXL / Pony / Flux hints) — no Civitai traffic |
+| API `POST /v1/worker/start\|stop` | Local docker (`FREYA_WORKER_CONTAINER`, default `freya-local-worker`) or systemd unit |
+| API `POST /v1/worker/enable\|disable` | Persist flag in secrets — disabled skips local gens; OpenRouter still works |
+
+**Worker tab** (not Settings): host/port (defaults `localhost`/`8091`), Setup copy for LAN / FQDN / k8s DNS bridge, Generate API token, VRAM bar, **active base** picker, Start / Stop / Enable / Disable. Settings keeps OpenRouter/Civitai keys only — the diffusion URL lives on Worker.
+
+**GPU engine (this host):** `./scripts/run-local-worker.sh` (or `make run-local-worker`) builds `Dockerfile.worker` and runs Docker `freya-local-worker` with `--gpus all`. Inside the container, freya-worker proxies generate to a **Diffusers** sidecar (`FREYA_ENGINE_URL=http://127.0.0.1:8092`). Checkpoints + Civitai LoRAs under `FREYA_MODELS_DIR` load **on demand** into VRAM and unload after each generate unless `FREYA_ENGINE_KEEP_LOADED=1`. Stats `modelLoaded.loadedInVram` reflects the engine; `nvidia-smi` VRAM appears when the container has GPU access. Compose: `make compose-up-gpu`. Without `FREYA_ENGINE_URL`, generate still returns a stub PNG for wiring tests. CRD `engine: vllm-omni` remains the label for swapping to vLLM-Omni on the same HTTP surface.
+
+### Civitai in the UI
+
+- Search/Suggest returns installable types (LoRA, LoCon, DoRA, Checkpoint, TextualInversion, VAE) with thumbnails and type badges — not LoRA-only.
+- **Pin** = session-scoped (current generate). **★ Favorite** = persistent library in `localStorage` (`freya.civitaiFavorites`); Civitai tab → Favorites.
+- Click a card for details (previews, triggers, base model, related checkpoints). Related assets are Freya-derived from `baseModel` (Civitai has no hard dependency graph).
+- Install / pin now forward `baseModel` (+ `versionId` / `modelType`) to the worker; generate sends `path` + `baseModel` so the API can select a matching active base.
+- API: `GET /v1/civitai/search`, `GET /v1/civitai/models/{id}`, `POST /v1/civitai/install`.
+
+### Intent router (picture / gif / video / chat)
+
+`POST /v1/chat`, `/v1/run`, and `/v1/generate` run Freya’s light router first (`packs/instructions/route.txt`). Defaults: Agent / Image / Video / Router pickers **Auto**. Router Auto → `meta-llama/llama-3.1-8b-instruct`; Image Auto → Flux NL; Video Auto → `bytedance/seedance-2.5-flash`. GIF/video asks **execute** (OpenRouter T2V and/or local Diffusers GIF) — they no longer hard-reject. See [CONCEPTS.md](CONCEPTS.md) and [OPENROUTER.md](OPENROUTER.md).
+
+### Video / GIF
+
+| Path | Behavior |
+|------|----------|
+| **OpenRouter video** | `POST /videos` → poll → gallery `video/mp4` (UI `<video>`); gif modality may convert with host `ffmpeg` |
+| **Local GIF** | GPU worker `POST /v1/videos/generations` `format=gif` — multi-frame Diffusers animation under `FREYA_MODELS_DIR` |
+| **VRAM** | Stills/GIF: on-demand load into VRAM, unload after generate unless `FREYA_ENGINE_KEEP_LOADED=1`. OpenRouter video uses cloud GPUs (no local VRAM). |
+
+UI: gallery + chat show video players / animated GIFs; chrome **Video** picker lists catalog models (avatar/lip-sync ids filtered from Auto).
+
 ### API / worker auth (non-dev)
 
 By default `FREYA_API_TOKEN` / `FREYA_WORKER_TOKEN` are empty and `/v1` routes are open — both binaries log a warning (local/dev). For anything exposed beyond localhost:
