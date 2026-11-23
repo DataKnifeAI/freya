@@ -899,6 +899,25 @@ button.linkish:hover { text-decoration-color: var(--ember); }
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--mist-light);
+  background-image: linear-gradient(
+    100deg,
+    var(--mist-light) 0%,
+    var(--mist-light) 32%,
+    var(--apricot) 48%,
+    var(--mist) 62%,
+    var(--mist-light) 78%,
+    var(--mist-light) 100%
+  );
+  background-size: 220% 100%;
+  background-position: 100% 50%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: status-word-sweep 1.6s linear infinite;
+}
+@keyframes status-word-sweep {
+  0% { background-position: 100% 50%; }
+  100% { background-position: -120% 50%; }
 }
 html.chat-busy, html.chat-busy * { cursor: none !important; }
 .chat-pointer {
@@ -1118,6 +1137,18 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
 }
 .lora-card-actions button,
 .lora-card-actions a.ghost { padding: 0.3rem 0.6rem; font-size: 0.72rem; text-decoration: none; }
+a.civitai-open-link.civitai-link-nsfw {
+  color: var(--ember) !important;
+  border-color: color-mix(in srgb, var(--ember) 72%, transparent) !important;
+}
+a.civitai-open-link.civitai-link-sfw {
+  color: #2f6fdb !important;
+  border-color: rgba(47, 111, 219, 0.55) !important;
+}
+:root[data-theme="light"] a.civitai-open-link.civitai-link-sfw {
+  color: #1d4e9e !important;
+  border-color: rgba(29, 78, 158, 0.45) !important;
+}
 .lora-card-actions .icon-btn {
   width: 2rem; height: 2rem; padding: 0;
   display: inline-flex; align-items: center; justify-content: center; flex: none;
@@ -1234,6 +1265,22 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
   position: static; display: inline-block; margin-bottom: 0.15rem;
 }
 .row { display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: center; }
+.gen-meta { display: flex; flex-direction: column; gap: 0.75rem; }
+.gen-meta-source { margin: 0; }
+.gen-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+  gap: 0.65rem 0.85rem;
+}
+.gen-meta label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.02em;
+}
+.gen-meta-wide { grid-column: 1 / -1; }
+.gen-meta textarea { min-height: 4.5rem; resize: vertical; }
 
 /* Gallery / salon — warm bone mats in both themes */
 .salon { animation: fade 300ms ease both; }

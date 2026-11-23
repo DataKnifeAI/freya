@@ -48,6 +48,45 @@ pub struct GenerateArgs {
     pub size: Option<String>,
     #[serde(default)]
     pub seed: Option<i64>,
+    #[serde(default)]
+    pub steps: Option<u32>,
+    #[serde(default)]
+    pub cfg: Option<f64>,
+    #[serde(default)]
+    pub sampler: Option<String>,
+    #[serde(default)]
+    pub clip_skip: Option<u32>,
+    #[serde(default)]
+    pub quantity: Option<u32>,
+    /// Use the last gallery sidecar (sampler, cfg, steps, clip skip, seed).
+    #[serde(default)]
+    pub reuse_meta: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationMetaArgs {
+    /// Sampler name, such as `Euler a`, `Euler`, or `DPM++ 2M Karras`.
+    #[serde(default)]
+    pub sampler: Option<String>,
+    #[serde(default)]
+    pub cfg: Option<f64>,
+    #[serde(default)]
+    pub steps: Option<u32>,
+    #[serde(default)]
+    pub clip_skip: Option<u32>,
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+    /// Omit to leave the stored seed. Null is not representable here; pass clearSeed.
+    #[serde(default)]
+    pub seed: Option<i64>,
+    /// Next generate picks a new seed.
+    #[serde(default)]
+    pub clear_seed: Option<bool>,
+    #[serde(default)]
+    pub size: Option<String>,
+    #[serde(default)]
+    pub quantity: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -383,6 +422,19 @@ impl FreyaMcp {
             "styleRef": args.style_ref,
             "size": args.size,
             "seed": args.seed,
+            "steps": args.steps,
+            "cfg": args.cfg,
+            "sampler": args.sampler,
+            "clipSkip": args.clip_skip,
+            "quantity": args.quantity,
+            "reuseMeta": args.reuse_meta,
+            "persistMeta": args.sampler.is_some()
+                || args.cfg.is_some()
+                || args.steps.is_some()
+                || args.clip_skip.is_some()
+                || args.quantity.is_some()
+                || args.negative_prompt.is_some()
+                || args.seed.is_some(),
         });
         let v = self
             .api
@@ -772,6 +824,72 @@ impl FreyaMcp {
         json_ok(v)
     }
 
+    #[tool(
+        description = "Read generation meta (sampler, cfg, steps, clip skip, negative, seed, size, quantity). No secrets. Fills a recommendation from the selected Civitai example when the store is empty."
+    )]
+    async fn get_generation_meta(&self) -> Result<CallToolResult, McpError> {
+        let v = self
+            .api
+            .get_json("/v1/generation-meta")
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Set generation meta used by the next local generate and shown on Agent → Meta. No secrets. Seed omitted stays as stored; clearSeed true makes the next seed random."
+    )]
+    async fn set_generation_meta(
+        &self,
+        Parameters(args): Parameters<GenerationMetaArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut body = serde_json::Map::new();
+        if let Some(s) = args.sampler {
+            body.insert("sampler".into(), json!(s));
+        }
+        if let Some(n) = args.cfg {
+            body.insert("cfg".into(), json!(n));
+        }
+        if let Some(n) = args.steps {
+            body.insert("steps".into(), json!(n));
+        }
+        if let Some(n) = args.clip_skip {
+            body.insert("clipSkip".into(), json!(n));
+        }
+        if let Some(s) = args.negative_prompt {
+            body.insert("negativePrompt".into(), json!(s));
+        }
+        if args.clear_seed.unwrap_or(false) {
+            body.insert("clearSeed".into(), json!(true));
+        } else if let Some(seed) = args.seed {
+            body.insert("seed".into(), json!(seed));
+        }
+        if let Some(s) = args.size {
+            body.insert("size".into(), json!(s));
+        }
+        if let Some(n) = args.quantity {
+            body.insert("quantity".into(), json!(n));
+        }
+        let v = self
+            .api
+            .put_json("/v1/generation-meta", &Value::Object(body))
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Replace generation meta with the selected version's Civitai example image (sampler, cfg, steps, clip skip, negative) or the small family default when that meta is missing."
+    )]
+    async fn recommend_generation_meta(&self) -> Result<CallToolResult, McpError> {
+        let v = self
+            .api
+            .post_json("/v1/generation-meta/recommend", &json!({}))
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
     #[tool(description = "Set the composer backend to cloud or local")]
     async fn set_generate_backend(
         &self,
@@ -989,7 +1107,8 @@ impl ServerHandler for FreyaMcp {
         .with_instructions(
             "Freya image studio MCP. Tools proxy freya-api for generate, gallery, Civitai \
              install/jobs, installed assets, favorites, LoRA pins, cost/privacy/alignment, \
-             cloud vs local, and model id pins. Never read or set API keys, tokens, or passwords. \
+             cloud vs local, generation meta (sampler/cfg/steps/clip skip/seed), and model id pins. \
+             Never read or set API keys, tokens, or passwords. \
              gallery_download returns the URL the UI saves; it does not return image bytes. \
              Pin LoRAs only — checkpoints use worker_set_base_model. Do not change the worker host URL."
                 .to_string(),

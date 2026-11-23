@@ -4,6 +4,7 @@ mod civitai;
 mod config;
 mod disk;
 mod gallery;
+mod genmeta;
 mod gpu;
 mod k8s_secret;
 mod openrouter;
@@ -96,6 +97,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/studio",
             get(routes::studio_get).put(routes::studio_put),
+        )
+        .route(
+            "/v1/generation-meta",
+            get(routes::generation_meta_get).put(routes::generation_meta_put),
+        )
+        .route(
+            "/v1/generation-meta/recommend",
+            post(routes::generation_meta_recommend),
         )
         .route("/v1/metrics/openrouter", get(routes::openrouter_metrics))
         .route("/v1/auth/token", post(routes::auth_token_create))

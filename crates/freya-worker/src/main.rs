@@ -194,10 +194,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/checkpoints", get(list_checkpoints))
         .route("/v1/embeddings", get(list_embeddings))
         .route("/v1/vae", get(list_vaes))
-        .route(
-            "/v1/base-model",
-            get(get_base_model).put(put_base_model),
-        )
+        .route("/v1/base-model", get(get_base_model).put(put_base_model))
         .route("/v1/stats", get(stats))
         .route("/v1/images/generations", post(generate))
         .route("/v1/videos/generations", post(generate_video))
@@ -270,7 +267,9 @@ async fn build_stats(app: &App) -> Value {
     let engine = engine_health(app).await;
     let (loaded_in_vram, engine_name) = match &engine {
         Some(e) => (
-            e.get("loadedInVram").and_then(|v| v.as_bool()).unwrap_or(false),
+            e.get("loadedInVram")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             e.get("engine")
                 .and_then(|v| v.as_str())
                 .unwrap_or("diffusers")
@@ -667,6 +666,16 @@ struct GenReq {
     seed: Option<i64>,
     #[serde(default)]
     negative_prompt: Option<String>,
+    #[serde(default)]
+    steps: Option<u32>,
+    #[serde(default, alias = "cfg", alias = "guidance")]
+    guidance_scale: Option<f64>,
+    #[serde(default)]
+    sampler: Option<String>,
+    #[serde(default)]
+    clip_skip: Option<u32>,
+    #[serde(default, alias = "n")]
+    quantity: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -685,6 +694,14 @@ struct VideoGenReq {
     format: Option<String>,
     #[serde(default)]
     frames: Option<u32>,
+    #[serde(default)]
+    steps: Option<u32>,
+    #[serde(default, alias = "cfg", alias = "guidance")]
+    guidance_scale: Option<f64>,
+    #[serde(default)]
+    sampler: Option<String>,
+    #[serde(default)]
+    clip_skip: Option<u32>,
 }
 
 /// Local motion: multi-frame GIF via Diffusers. True T2V (Wan/LTX) is OpenRouter / SwarmUI.
@@ -692,11 +709,7 @@ async fn generate_video(
     State(app): State<Arc<App>>,
     Json(req): Json<VideoGenReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let fmt = req
-        .format
-        .as_deref()
-        .unwrap_or("gif")
-        .to_ascii_lowercase();
+    let fmt = req.format.as_deref().unwrap_or("gif").to_ascii_lowercase();
     if fmt != "gif" {
         return Err((
             StatusCode::NOT_IMPLEMENTED,
@@ -741,20 +754,18 @@ async fn generate_video(
         "negative_prompt": req.negative_prompt,
         "frames": req.frames.unwrap_or(6),
         "format": "gif",
+        "steps": req.steps,
+        "guidance_scale": req.guidance_scale,
+        "sampler": req.sampler,
+        "clipSkip": req.clip_skip,
     });
     info!(model = %model, frames = ?req.frames, "engine gif generate");
-    let resp = app
-        .http
-        .post(&url)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(json!({ "error": format!("engine unreachable: {e}") })),
-            )
-        })?;
+    let resp = app.http.post(&url).json(&body).send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("engine unreachable: {e}") })),
+        )
+    })?;
     let status = resp.status();
     let mut payload: Value = resp.json().await.map_err(|e| {
         (
@@ -831,6 +842,12 @@ async fn generate(
             "size": req.size,
             "seed": req.seed,
             "negative_prompt": req.negative_prompt,
+            "steps": req.steps,
+            "guidance_scale": req.guidance_scale,
+            "sampler": req.sampler,
+            "clipSkip": req.clip_skip,
+            "quantity": req.quantity.unwrap_or(1).clamp(1, 4),
+            "n": req.quantity.unwrap_or(1).clamp(1, 4),
         });
         info!(
             model = %model,
@@ -839,18 +856,12 @@ async fn generate(
             seed = ?req.seed,
             "engine generate"
         );
-        let resp = app
-            .http
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({ "error": format!("engine unreachable: {e}") })),
-                )
-            })?;
+        let resp = app.http.post(&url).json(&body).send().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("engine unreachable: {e}") })),
+            )
+        })?;
         let status = resp.status();
         let mut payload: Value = resp.json().await.map_err(|e| {
             (
@@ -881,19 +892,77 @@ async fn generate(
         loras = ?lora_names,
         size = ?req.size,
         seed = ?req.seed,
+        steps = ?req.steps,
         "stub generate (weights not applied)"
     );
     // Visible stub PNG (no GPU) so gallery / local Generate can be smoke-tested.
-    let png = stub_png_from_prompt(&req.prompt, 256, 256);
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+    let n = req.quantity.unwrap_or(1).clamp(1, 4);
+    let base_seed = req
+        .seed
+        .unwrap_or_else(|| (Uuid::new_v4().as_u128() as u64 % 2_147_483_646) as i64);
+    let plan = stub_scheduler_note(req.sampler.as_deref());
+    let mut data = Vec::new();
+    for i in 0..n {
+        let seed = base_seed.wrapping_add(i as i64);
+        let png = stub_png_from_prompt(&format!("{}#{seed}", req.prompt), 256, 256);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        data.push(json!({ "b64_json": b64, "seed": seed }));
+    }
     Ok(Json(json!({
-        "data": [{ "b64_json": b64 }],
+        "data": data,
         "model": model,
         "baseModel": active.base_model,
         "loras": lora_names,
         "negativePrompt": req.negative_prompt,
         "stub": true,
+        "steps": req.steps,
+        "guidance_scale": req.guidance_scale,
+        "cfg": req.guidance_scale,
+        "sampler": req.sampler,
+        "scheduler": plan.0,
+        "samplerNote": plan.1,
+        "clipSkip": req.clip_skip,
+        "clipSkipApplied": false,
+        "quantity": n,
+        "seed": base_seed,
     })))
+}
+
+/// Stub has no Diffusers scheduler. Record the closest name the engine would load.
+fn stub_scheduler_note(sampler: Option<&str>) -> (Option<String>, String) {
+    let Some(name) = sampler.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (None, "stub engine; no sampler requested".into());
+    };
+    let key = name.to_ascii_lowercase();
+    let (applied, sched) = if key.contains("euler")
+        && (key.contains("ancestral") || key.ends_with(" a") || key == "euler a")
+    {
+        ("Euler a", "EulerAncestralDiscreteScheduler")
+    } else if key == "euler" {
+        ("Euler", "EulerDiscreteScheduler")
+    } else if key.contains("dpm")
+        && key.contains("2m")
+        && key.contains("karras")
+        && !key.contains("sde")
+    {
+        ("DPM++ 2M Karras", "DPMSolverMultistepScheduler")
+    } else if key.contains("dpm") || key.contains("karras") {
+        ("DPM++ 2M Karras", "DPMSolverMultistepScheduler")
+    } else if key.contains("euler") {
+        ("Euler", "EulerDiscreteScheduler")
+    } else {
+        ("Euler a", "EulerAncestralDiscreteScheduler")
+    };
+    let exact = key == "euler a"
+        || key == "euler"
+        || key.replace(' ', "") == "eulera"
+        || key == "dpm++ 2m karras";
+    let note = if exact {
+        format!("stub engine; would apply {applied} ({sched})")
+    } else {
+        format!("requested {name}; stub engine would apply {applied} ({sched})")
+    };
+    (Some(sched.into()), note)
 }
 
 /// Build a valid RGB PNG whose colors derive from the prompt (deterministic stub).
@@ -1134,12 +1203,8 @@ fn download_request_err(e: reqwest::Error) -> String {
 }
 
 fn validate_install(app: &App, req: &InstallReq) -> Result<PathBuf, (StatusCode, Json<Value>)> {
-    let dest = resolve_dest(&app.models_dir, &req.dest_path).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e })),
-        )
-    })?;
+    let dest = resolve_dest(&app.models_dir, &req.dest_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
     if !install_url_ok(&req.url) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1221,10 +1286,7 @@ async fn enqueue_job(app: &App, req: InstallReq) -> Result<InstallJob, (StatusCo
         while store.recent.len() > JOB_HISTORY_CAP {
             if let Some(old) = store.recent.pop_back() {
                 if let Some(e) = store.jobs.get(&old) {
-                    if matches!(
-                        e.job.status.as_str(),
-                        "succeeded" | "failed" | "cancelled"
-                    ) {
+                    if matches!(e.job.status.as_str(), "succeeded" | "failed" | "cancelled") {
                         store.jobs.remove(&old);
                     } else {
                         store.recent.push_back(old);
@@ -1381,10 +1443,7 @@ async fn cancel_job(
 }
 
 /// Drop finished (and optionally idle queued) jobs from the recent list. Never touches in-flight downloads.
-async fn clear_jobs(
-    State(app): State<Arc<App>>,
-    body: Option<Json<ClearJobsReq>>,
-) -> Json<Value> {
+async fn clear_jobs(State(app): State<Arc<App>>, body: Option<Json<ClearJobsReq>>) -> Json<Value> {
     let include_queued = body.map(|Json(b)| b.include_queued).unwrap_or(false);
     let mut store = app.jobs.lock().await;
     let mut drop_ids: Vec<String> = Vec::new();
@@ -1419,12 +1478,8 @@ async fn delete_asset(
     State(app): State<Arc<App>>,
     Json(req): Json<DeleteAssetReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let dest = resolve_dest(&app.models_dir, &req.path).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e })),
-        )
-    })?;
+    let dest = resolve_dest(&app.models_dir, &req.path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
     if !dest.exists() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -1606,10 +1661,7 @@ async fn run_download(
     if let Some(token) = auth_token.map(str::trim).filter(|t| !t.is_empty()) {
         req_builder = req_builder.bearer_auth(token);
     }
-    let mut resp = req_builder
-        .send()
-        .await
-        .map_err(download_request_err)?;
+    let mut resp = req_builder.send().await.map_err(download_request_err)?;
     if !resp.status().is_success() {
         return Err(format!("download failed with HTTP {}", resp.status()));
     }
@@ -1778,10 +1830,8 @@ mod tests {
             "evil-delivery.abc.r2.cloudflarestorage.com"
         ));
         assert!(!redirect_host_ok(r2, &[]));
-        let from_civitai = vec![reqwest::Url::parse(
-            "https://civitai.com/api/download/models/1"
-        )
-        .unwrap()];
+        let from_civitai =
+            vec![reqwest::Url::parse("https://civitai.com/api/download/models/1").unwrap()];
         assert!(redirect_host_ok(r2, &from_civitai));
         assert!(redirect_host_ok("b2.civitai.com", &from_civitai));
         let from_evil = vec![reqwest::Url::parse("https://evil.example/x").unwrap()];

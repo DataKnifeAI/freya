@@ -33,7 +33,10 @@ Reply with JSON only (no markdown fences):
     {"type": "list_checkpoints", "args": {}},
     {"type": "list_loras", "args": {}},
     {"type": "get_base_model", "args": {}},
-    {"type": "set_base_model", "args": {"model": "checkpoints/….safetensors", "baseModel": "SDXL 1.0"}}
+    {"type": "set_base_model", "args": {"model": "checkpoints/….safetensors", "baseModel": "SDXL 1.0"}},
+    {"type": "set_generation_meta", "args": {"sampler": "Euler a", "cfg": 7, "steps": 28, "clipSkip": 2, "negativePrompt": "", "seed": null, "size": "1024x1024", "quantity": 1}},
+    {"type": "recommend_generation_meta", "args": {}},
+    {"type": "get_generation_meta", "args": {}}
   ]
 }
 
@@ -58,6 +61,7 @@ Action types (use only when needed):
 - list_loras — list local LoRAs on the worker disk (Installed adapters)
 - get_base_model — read the active base checkpoint / base model family
 - set_base_model — set active base; args.model is a worker path like checkpoints/foo.safetensors (from list_checkpoints). Optional baseModel family label (SDXL 1.0, Pony, …)
+- get_generation_meta / recommend_generation_meta / set_generation_meta — the Agent → Meta sampler, cfg, steps, clipSkip, negativePrompt, seed, size, and quantity. Same store as a hand edit. No secrets. recommend fills from the selected version's Civitai example image when it has steps or a sampler, otherwise the small family default. Seed omitted or null means random. generate_image may also pass those fields, plus reuse:true when they want the last image's settings (redo, same settings, same seed).
 - list_installed / list_install_jobs / cancel_install_job {jobId} / clear_install_jobs — Civitai downloads and installed files. delete_installed {path} only when they ask to remove that file.
 - favorite_asset / unfavorite_asset / list_favorites — asset card (name, id, modelType, path, downloadUrl). Never include API keys or tokens.
 - pin_lora / unpin_lora / list_pins — LoRA or embedding only. Never pin a checkpoint; use set_base_model.
@@ -90,6 +94,7 @@ Rules:
 - When they ask about styles → list_styles (actions with no generate). Pass styleRef on generate_image when they want that still now (apply_style only to confirm details).
 - When they ask what models exist, credits/spend, or settings/privacy/ZDR → list_models / openrouter_metrics / get_settings.
 - When they ask how routing works, what Auto resolves to, or want to pin agent/image/router/video models → get_route_defaults and/or set_chat_models (ids only).
+- When they ask to change sampler, cfg, steps, clip skip, negative prompt, seed, size, or how many images → set_generation_meta. When they ask what settings to use, or to use the example / recommended settings → recommend_generation_meta. When they say redo, same settings, or same seed → generate_image with reuse:true (keep their new scene if they added one). Do not invent a sampler table.
 - Favorites, LoRA pins, cost tier, ZDR / data collection, Show NSFW, Cloud vs Local, and Plan/Auto/YOLO are tools above. Never read or write API keys, tokens, or the admin password.
 - Download is the UI button. gallery_download only returns the artifact url and id. gallery_delete only after they ask to remove that image.
 - If they ask to enable/disable the worker, explain that Freya uses Cloud | Local on the composer and Start/Stop on the Worker tab — there is no separate enable flag.

@@ -190,34 +190,40 @@ impl DiffusionWorkerClient {
         Ok(resp.json().await.unwrap_or(Value::Null))
     }
 
-    pub async fn generate(
-        &self,
-        prompt: &str,
-        model: Option<&str>,
-        loras: &[LoraWeight],
-        size: Option<&str>,
-        seed: Option<i64>,
-        negative: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    pub async fn generate(&self, call: &GenCall) -> Result<WorkerGenResult> {
         let mut body = serde_json::json!({
-            "prompt": prompt,
-            "n": 1,
+            "prompt": call.prompt,
+            "n": call.quantity.unwrap_or(1),
+            "quantity": call.quantity.unwrap_or(1),
             "response_format": "b64_json",
         });
-        if let Some(m) = model {
+        if let Some(m) = call.model.as_deref() {
             body["model"] = Value::String(m.into());
         }
-        if let Some(s) = size {
+        if let Some(s) = call.size.as_deref() {
             body["size"] = Value::String(s.into());
         }
-        if let Some(seed) = seed {
+        if let Some(seed) = call.seed {
             body["seed"] = Value::from(seed);
         }
-        if let Some(neg) = negative {
+        if let Some(neg) = call.negative.as_deref().filter(|s| !s.is_empty()) {
             body["negative_prompt"] = Value::String(neg.into());
         }
-        if !loras.is_empty() {
-            body["lora_request"] = serde_json::to_value(loras)?;
+        if let Some(steps) = call.steps {
+            body["steps"] = Value::from(steps);
+        }
+        if let Some(g) = call.guidance {
+            body["guidance_scale"] = Value::from(g);
+            body["cfg"] = Value::from(g);
+        }
+        if let Some(sampler) = call.sampler.as_deref().filter(|s| !s.is_empty()) {
+            body["sampler"] = Value::String(sampler.into());
+        }
+        if let Some(clip) = call.clip_skip {
+            body["clipSkip"] = Value::from(clip);
+        }
+        if !call.loras.is_empty() {
+            body["lora_request"] = serde_json::to_value(&call.loras)?;
         }
 
         let resp = self
@@ -235,41 +241,39 @@ impl DiffusionWorkerClient {
             return Err(anyhow!("worker {status}: {text}"));
         }
         let v: Value = serde_json::from_str(&text)?;
-        let b64 = v
-            .pointer("/data/0/b64_json")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| anyhow!("worker missing b64_json"))?;
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .context("decode worker image")
+        parse_worker_gen(&v)
     }
 
     /// Local multi-frame GIF via Diffusers engine (`POST /v1/videos/generations` format=gif).
-    pub async fn generate_gif(
-        &self,
-        prompt: &str,
-        model: Option<&str>,
-        size: Option<&str>,
-        seed: Option<i64>,
-        negative: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    pub async fn generate_gif(&self, call: &GenCall) -> Result<WorkerGenResult> {
         let mut body = serde_json::json!({
-            "prompt": prompt,
+            "prompt": call.prompt,
             "format": "gif",
             "frames": 6,
         });
-        if let Some(m) = model {
+        if let Some(m) = call.model.as_deref() {
             body["model"] = Value::String(m.into());
         }
-        if let Some(s) = size {
+        if let Some(s) = call.size.as_deref() {
             body["size"] = Value::String(s.into());
         }
-        if let Some(seed) = seed {
+        if let Some(seed) = call.seed {
             body["seed"] = Value::from(seed);
         }
-        if let Some(neg) = negative {
+        if let Some(neg) = call.negative.as_deref().filter(|s| !s.is_empty()) {
             body["negative_prompt"] = Value::String(neg.into());
+        }
+        if let Some(steps) = call.steps {
+            body["steps"] = Value::from(steps);
+        }
+        if let Some(g) = call.guidance {
+            body["guidance_scale"] = Value::from(g);
+        }
+        if let Some(sampler) = call.sampler.as_deref().filter(|s| !s.is_empty()) {
+            body["sampler"] = Value::String(sampler.into());
+        }
+        if let Some(clip) = call.clip_skip {
+            body["clipSkip"] = Value::from(clip);
         }
         let resp = self
             .apply_auth(
@@ -286,14 +290,7 @@ impl DiffusionWorkerClient {
             return Err(anyhow!("worker gif {status}: {text}"));
         }
         let v: Value = serde_json::from_str(&text)?;
-        let b64 = v
-            .pointer("/data/0/b64_json")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| anyhow!("worker gif missing b64_json"))?;
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .context("decode worker gif")
+        parse_worker_gen(&v)
     }
 
     fn install_body(
@@ -484,6 +481,113 @@ pub struct InstallMeta {
     pub model_id: Option<i64>,
     pub model_type: Option<String>,
     pub thumbnail_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GenCall {
+    pub prompt: String,
+    pub model: Option<String>,
+    pub loras: Vec<LoraWeight>,
+    pub size: Option<String>,
+    pub seed: Option<i64>,
+    pub negative: Option<String>,
+    pub steps: Option<u32>,
+    pub guidance: Option<f64>,
+    pub sampler: Option<String>,
+    pub clip_skip: Option<u32>,
+    pub quantity: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerImage {
+    pub bytes: Vec<u8>,
+    pub seed: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct WorkerGenResult {
+    pub images: Vec<WorkerImage>,
+    pub steps: Option<u32>,
+    pub guidance: Option<f64>,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub sampler_note: Option<String>,
+    pub clip_skip: Option<u32>,
+    pub clip_skip_applied: Option<bool>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub quantity: Option<u32>,
+    pub negative_prompt: Option<String>,
+    pub stub: bool,
+}
+
+fn parse_worker_gen(v: &Value) -> Result<WorkerGenResult> {
+    use base64::Engine;
+    let items = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| anyhow!("worker missing data"))?;
+    let mut images = Vec::new();
+    for item in items {
+        let b64 = item
+            .get("b64_json")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("worker missing b64_json"))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .context("decode worker image")?;
+        let seed = item
+            .get("seed")
+            .and_then(|s| s.as_i64())
+            .or_else(|| v.get("seed").and_then(|s| s.as_i64()));
+        images.push(WorkerImage { bytes, seed });
+    }
+    if images.is_empty() {
+        return Err(anyhow!("worker returned no images"));
+    }
+    let num = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_u64())
+            .map(|n| n as u32)
+            .or_else(|| {
+                v.get(k)
+                    .and_then(|x| x.as_i64())
+                    .filter(|n| *n >= 0)
+                    .map(|n| n as u32)
+            })
+    };
+    Ok(WorkerGenResult {
+        images,
+        steps: num("steps"),
+        guidance: v
+            .get("guidance_scale")
+            .or_else(|| v.get("cfg"))
+            .and_then(|x| x.as_f64()),
+        sampler: v
+            .get("sampler")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        scheduler: v
+            .get("scheduler")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        sampler_note: v
+            .get("samplerNote")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        clip_skip: num("clipSkip"),
+        clip_skip_applied: v.get("clipSkipApplied").and_then(|x| x.as_bool()),
+        width: num("width"),
+        height: num("height"),
+        quantity: num("quantity").or_else(|| num("n")),
+        negative_prompt: v
+            .get("negativePrompt")
+            .or_else(|| v.get("negative_prompt"))
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        stub: v.get("stub").and_then(|x| x.as_bool()).unwrap_or(false),
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

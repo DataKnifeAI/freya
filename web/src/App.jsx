@@ -1072,6 +1072,63 @@ function resolveCivitaiModelId(item) {
   return null;
 }
 
+/** NSFW model pages open on civitai.red. SFW pages stay on civitai.com. */
+function modelPageIsNsfw(item, version) {
+  if (!item && !version) return false;
+  if (item?.nsfw === true || version?.nsfw === true) return true;
+  return [item?.nsfwLevel, version?.nsfwLevel].some((level) => {
+    const n = Number(level);
+    return Number.isFinite(n) && n > 1;
+  });
+}
+
+/** Model page URL, including modelVersionId when we have a version id. */
+function civitaiModelPageUrl(item, versionId) {
+  if (!item) return null;
+  const id = resolveCivitaiModelId(item);
+  const vid = versionId ?? item.versionId ?? item.modelVersionId;
+  const hasVid = vid != null && vid !== "" && Number(vid) > 0;
+  const nsfw = modelPageIsNsfw(item);
+  const host = nsfw ? "https://civitai.red" : "https://civitai.com";
+  if (id == null) {
+    const raw = item.civitaiUrl;
+    if (!raw) return null;
+    try {
+      const u = new URL(raw);
+      const hostName = u.hostname.toLowerCase();
+      const civitaiHost =
+        hostName === "civitai.com" ||
+        hostName === "civitai.red" ||
+        hostName.endsWith(".civitai.com") ||
+        hostName.endsWith(".civitai.red");
+      if (!civitaiHost) return raw;
+      u.protocol = "https:";
+      u.hostname = nsfw ? "civitai.red" : "civitai.com";
+      if (hasVid) u.searchParams.set("modelVersionId", String(vid));
+      return u.toString();
+    } catch {
+      return raw;
+    }
+  }
+  let url = `${host}/models/${id}`;
+  if (hasVid) url += `?modelVersionId=${encodeURIComponent(vid)}`;
+  return url;
+}
+
+function recommendedResourceCard(rec) {
+  if (!rec || rec.id == null || rec.id === "") return null;
+  return {
+    id: rec.id,
+    modelId: rec.modelId ?? rec.id,
+    name: rec.name,
+    modelType: rec.type || rec.modelType || "Checkpoint",
+    versionId: rec.modelVersionId ?? rec.versionId ?? null,
+    baseModel: rec.baseModel || null,
+    nsfw: rec.nsfw === true,
+    nsfwLevel: rec.nsfwLevel,
+  };
+}
+
 function readStoredMode() {
   try {
     const v = localStorage.getItem(AUTOMATION_STORAGE_KEY);
@@ -2316,8 +2373,28 @@ export default function App() {
   const lastSucceededJobIdsRef = useRef(new Set());
   const [civitaiItems, setCivitaiItems] = useState([]);
   const [civitaiSubview, setCivitaiSubviewState] = useState(readStoredCivitaiSubview);
-  /** Agent tab: suggestions table, or a Civitai library subview (search stays typed). */
+  /** Agent tab: suggestions table, Meta, or a Civitai library subview (search stays typed). */
   const [agentFocus, setAgentFocus] = useState("suggestions");
+  const [genMeta, setGenMeta] = useState({
+    sampler: "",
+    cfg: "",
+    steps: "",
+    clipSkip: "",
+    negativePrompt: "",
+    seed: "",
+    size: "",
+    quantity: 1,
+    source: "",
+    sourceLabel: "",
+    locked: false,
+    lastSeed: null,
+    samplerApplied: "",
+    samplerNote: "",
+    clipSkipApplied: null,
+  });
+  const genMetaRef = useRef(genMeta);
+  genMetaRef.current = genMeta;
+  const genMetaDirtyRef = useRef(false);
   const setCivitaiSubview = (next) => {
     setCivitaiSubviewState(next);
     persistCivitaiSubview(next);
@@ -2888,10 +2965,93 @@ export default function App() {
       setGallery(g.items || []);
       setError("");
       setAuthCta("");
+      void refreshGenMeta();
     } catch (e) {
       setError(e.message);
     }
     await refreshModels();
+  };
+
+  const applyGenMeta = (data) => {
+    const s = data?.settings || data || {};
+    const next = {
+      sampler: s.sampler || "",
+      cfg: s.cfg ?? "",
+      steps: s.steps ?? "",
+      clipSkip: s.clipSkip ?? "",
+      negativePrompt: s.negativePrompt || "",
+      seed: s.seed ?? "",
+      size: s.size || "",
+      quantity: s.quantity || 1,
+      source: s.source || "",
+      sourceLabel: s.sourceLabel || "",
+      locked: Boolean(s.locked),
+      lastSeed: s.lastSeed ?? null,
+      samplerApplied: s.samplerApplied || "",
+      samplerNote: s.samplerNote || "",
+      clipSkipApplied: s.clipSkipApplied ?? null,
+    };
+    genMetaDirtyRef.current = false;
+    genMetaRef.current = next;
+    setGenMeta(next);
+  };
+
+  const refreshGenMeta = async () => {
+    try {
+      applyGenMeta(await api("/v1/generation-meta"));
+    } catch {
+      /* panel keeps the last values */
+    }
+  };
+
+  const genMetaBody = (form) => {
+    const num = (v) => (v === "" || v == null || Number.isNaN(Number(v)) ? null : Number(v));
+    return {
+      sampler: form.sampler || null,
+      cfg: num(form.cfg),
+      steps: num(form.steps),
+      clipSkip: num(form.clipSkip),
+      negativePrompt: form.negativePrompt || "",
+      seed: form.seed === "" || form.seed == null ? null : num(form.seed),
+      clearSeed: form.seed === "" || form.seed == null,
+      size: form.size || null,
+      quantity: num(form.quantity) || 1,
+    };
+  };
+
+  const saveGenMeta = async (form) => {
+    const data = await api("/v1/generation-meta", {
+      method: "PUT",
+      body: JSON.stringify(genMetaBody(form)),
+    });
+    applyGenMeta(data);
+    return data;
+  };
+
+  const flushGenMeta = async () => {
+    if (!genMetaDirtyRef.current) return;
+    try {
+      await saveGenMeta(genMetaRef.current);
+    } catch {
+      /* the next generate still sends the form fields */
+    }
+  };
+
+  const patchGenMeta = (partial) => {
+    genMetaDirtyRef.current = true;
+    setGenMeta((prev) => {
+      const next = { ...prev, ...partial, source: "user", sourceLabel: "Hand edit", locked: true };
+      genMetaRef.current = next;
+      return next;
+    });
+  };
+
+  const useExampleMeta = async () => {
+    try {
+      applyGenMeta(await api("/v1/generation-meta/recommend", { method: "POST", body: "{}" }));
+    } catch (e) {
+      setError(e.message);
+    }
   };
 
   const submitLogin = async (e) => {
@@ -3519,6 +3679,8 @@ export default function App() {
         scale: l.scale ?? 0.8,
         path: l.path || undefined,
         baseModel: l.baseModel || undefined,
+        versionId: l.versionId || undefined,
+        modelId: l.modelId || l.id || undefined,
       }));
 
   const isPinned = (item) =>
@@ -3856,6 +4018,16 @@ export default function App() {
       }));
     }
 
+    if (
+      actions.some((a) =>
+        ["set_generation_meta", "recommend_generation_meta", "get_generation_meta", "generate_image", "generate_video", "run_session"].includes(
+          a.type,
+        ),
+      )
+    ) {
+      void refreshGenMeta();
+    }
+
     return artifacts;
   };
 
@@ -3891,6 +4063,7 @@ export default function App() {
 
   /** Primary composer action — send a chat message; tools run per Plan/Auto/YOLO. */
   const submitChat = async (overrideText, extra = {}) => {
+    await flushGenMeta();
     const text = (overrideText ?? prompt).trim();
     if (!text && !extra.confirm) return;
     if (generateBackend === "local" && !localBackendOk) {
@@ -3970,6 +4143,15 @@ export default function App() {
     } else if (!wantLocal && imageModel && imageModel !== AUTO_IMAGE.id) {
       body.model = imageModel;
     }
+    const form = genMetaRef.current;
+    if (form?.sampler) body.sampler = form.sampler;
+    if (form?.cfg !== "" && form?.cfg != null) body.cfg = Number(form.cfg);
+    if (form?.steps !== "" && form?.steps != null) body.steps = Number(form.steps);
+    if (form?.clipSkip !== "" && form?.clipSkip != null) body.clipSkip = Number(form.clipSkip);
+    if (form?.negativePrompt) body.negativePrompt = form.negativePrompt;
+    if (form?.seed !== "" && form?.seed != null) body.seed = Number(form.seed);
+    if (form?.size) body.size = form.size;
+    if (form?.quantity) body.quantity = Number(form.quantity) || 1;
     return body;
   };
 
@@ -3989,6 +4171,7 @@ export default function App() {
   };
 
   const runOne = async (nlPrompt) => {
+    await flushGenMeta();
     const data = await api("/v1/run", {
       method: "POST",
       body: JSON.stringify(runBody(nlPrompt)),
@@ -5468,6 +5651,30 @@ export default function App() {
           ? [detailModel.thumbnailUrl]
           : []) || [];
   const detailRelated = civitaiDetail?.related || [];
+  const detailRecommendedRaw =
+    (detailSelectedVersion?.recommendedResources?.length
+      ? detailSelectedVersion.recommendedResources
+      : detailModel?.recommendedResources) || [];
+  const detailRecommendedCards = detailRecommendedRaw
+    .map(recommendedResourceCard)
+    .filter(Boolean);
+  const detailCheckpointRecs = detailRecommendedCards.filter(
+    (card) =>
+      String(card.modelType || "")
+        .toLowerCase()
+        .replace(/[\s_-]/g, "") === "checkpoint",
+  );
+  const detailSuggestionSource = detailCheckpointRecs.length
+    ? detailCheckpointRecs
+    : detailRecommendedCards;
+  const detailSuggestions = detailSuggestionSource.length
+    ? detailSuggestionSource.map((model) => ({
+        model,
+        note: "Recommended base checkpoint",
+        relation: "recommended_checkpoint",
+      }))
+    : detailRelated;
+  const detailSuggestionsAreRecommended = detailSuggestionSource.length > 0;
 
   const chatLookup = presentLookup(suggestedLoras, installedAssets, civitaiQuery || "");
   const chatLookupCount = chatLookup.existing.length + chatLookup.fresh.length;
@@ -5486,6 +5693,17 @@ export default function App() {
         onClick={() => setAgentFocus("suggestions")}
       >
         Suggestions
+      </button>
+      <button
+        type="button"
+        className={agentFocus === "meta" ? "primary" : "ghost"}
+        aria-pressed={agentFocus === "meta"}
+        onClick={() => {
+          setAgentFocus("meta");
+          if (!genMetaDirtyRef.current) void refreshGenMeta();
+        }}
+      >
+        Meta
       </button>
       {CIVITAI_SUBNAV.filter((s) => !s.end).map(({ id, label }) => {
         const count =
@@ -6652,6 +6870,118 @@ export default function App() {
           </button>
         ))}
       </nav>
+
+      {tab === "agent" && agentFocus === "meta" && (
+        <section className="panel gen-meta" aria-label="Generation meta">
+          <p className="hint gen-meta-source">
+            {genMeta.sourceLabel ||
+              (genMeta.source === "user"
+                ? "Hand edit"
+                : genMeta.source === "agent"
+                  ? "Set from chat"
+                  : "Sampler, CFG, steps, and clip skip for the next local generate.")}
+            {genMeta.locked ? " · kept until you use the example again" : ""}
+          </p>
+          <div className="gen-meta-grid">
+            <label>
+              Sampler
+              <input
+                value={genMeta.sampler}
+                onChange={(e) => patchGenMeta({ sampler: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label>
+              CFG
+              <input
+                type="number"
+                min="0"
+                max="30"
+                step="0.5"
+                value={genMeta.cfg}
+                onChange={(e) => patchGenMeta({ cfg: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label>
+              Steps
+              <input
+                type="number"
+                min="1"
+                max="80"
+                step="1"
+                value={genMeta.steps}
+                onChange={(e) => patchGenMeta({ steps: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label>
+              Clip skip
+              <input
+                type="number"
+                min="1"
+                max="12"
+                step="1"
+                value={genMeta.clipSkip}
+                onChange={(e) => patchGenMeta({ clipSkip: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label>
+              Seed
+              <input
+                type="number"
+                placeholder="random"
+                value={genMeta.seed}
+                onChange={(e) => patchGenMeta({ seed: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label>
+              Quantity
+              <input
+                type="number"
+                min="1"
+                max="4"
+                step="1"
+                value={genMeta.quantity}
+                onChange={(e) => patchGenMeta({ quantity: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label>
+              Size
+              <input
+                placeholder="1024x1024"
+                value={genMeta.size}
+                onChange={(e) => patchGenMeta({ size: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label className="gen-meta-wide">
+              Negative prompt
+              <textarea
+                rows={3}
+                value={genMeta.negativePrompt}
+                onChange={(e) => patchGenMeta({ negativePrompt: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+          </div>
+          {genMeta.lastSeed != null && genMeta.lastSeed !== "" && (
+            <p className="hint">Last seed {genMeta.lastSeed}</p>
+          )}
+          {genMeta.samplerNote ? <p className="hint">{genMeta.samplerNote}</p> : null}
+          {genMeta.clipSkipApplied === false && genMeta.clipSkip ? (
+            <p className="hint">Clip skip {genMeta.clipSkip} is stored. The last generate could not apply it.</p>
+          ) : null}
+          <div className="row">
+            <button type="button" className="ghost" onClick={() => void useExampleMeta()}>
+              Use example
+            </button>
+          </div>
+        </section>
+      )}
 
       {tab === "agent" && agentFocus === "suggestions" && (
         <section className="panel style-rail">
@@ -8489,16 +8819,24 @@ export default function App() {
                     </button>
                   );
                 })()}
-                {detailModel.civitaiUrl && (
-                  <a
-                    className="ghost"
-                    href={detailModel.civitaiUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    Open on Civitai
-                  </a>
-                )}
+                {(() => {
+                  const href = civitaiModelPageUrl(
+                    detailModel,
+                    detailSelectedVersion?.id ?? detailModel.versionId,
+                  );
+                  if (!href) return null;
+                  const nsfwLink = modelPageIsNsfw(detailModel, detailSelectedVersion);
+                  return (
+                    <a
+                      className={`ghost civitai-open-link ${nsfwLink ? "civitai-link-nsfw" : "civitai-link-sfw"}`}
+                      href={href}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open on Civitai
+                    </a>
+                  );
+                })()}
               </div>
               {(detailModel.needsBase || detailModel.baseModel) && (
                 <p className="hint">
@@ -8506,17 +8844,20 @@ export default function App() {
                     `LoRA base family: ${detailModel.baseModel}. Install a matching checkpoint to checkpoints/ on the local worker, then set it as active base on the Worker tab.`}
                 </p>
               )}
-              {detailRelated.length > 0 && (
+              {detailSuggestions.length > 0 && (
                 <div className="civitai-related">
-                  <h4>Needs checkpoint / related</h4>
+                  <h4>
+                    {detailSuggestionsAreRecommended
+                      ? "Recommended base checkpoint"
+                      : "Needs checkpoint / related"}
+                  </h4>
                   <p className="hint">
-                    Civitai does not expose a hard dependency graph — Freya suggests popular
-                    checkpoints for this base family so you can install and set one as active base.
-                    Install puts weights under FREYA_MODELS_DIR (game drive / PVC); set active base
-                    after.
+                    {detailSuggestionsAreRecommended
+                      ? "Civitai lists these checkpoints for this version. Install one, then set it as the active base."
+                      : "Civitai does not expose a hard dependency graph — Freya suggests popular checkpoints for this base family so you can install and set one as active base. Install puts weights under FREYA_MODELS_DIR (game drive / PVC); set active base after."}
                   </p>
                   <div className="lora-row">
-                    {detailRelated.map((rel) => {
+                    {detailSuggestions.map((rel) => {
                       const card = rel?.model || rel;
                       return renderLoraCard(
                         {

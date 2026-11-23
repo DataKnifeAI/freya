@@ -595,6 +595,23 @@ const state = {
     },
   ],
   civitai: CIVITAI_CATALOG,
+  generation: {
+    sampler: "Euler a",
+    cfg: 7,
+    steps: 28,
+    clipSkip: 2,
+    negativePrompt: "",
+    seed: null,
+    size: "",
+    quantity: 1,
+    source: "family",
+    sourceLabel: "Family default (Illustrious/Pony/SDXL) — no example image meta",
+    locked: false,
+    lastSeed: null,
+    samplerApplied: null,
+    samplerNote: null,
+    clipSkipApplied: null,
+  },
 };
 
 function parseBody(opts) {
@@ -1300,7 +1317,18 @@ function mockGenerateArtifact(prompt, body = {}) {
             backend === "local" ? 140 : 28 + (id.length % 40),
           ),
     loras,
+    negativePrompt: body.negativePrompt || state.generation.negativePrompt || "",
+    sampler: body.sampler || state.generation.sampler,
+    cfg: body.cfg ?? state.generation.cfg,
+    steps: body.steps ?? state.generation.steps,
+    clipSkip: body.clipSkip ?? state.generation.clipSkip,
+    seed: body.seed ?? state.generation.seed ?? Math.floor(Math.random() * 1_000_000_000),
+    size: body.size || state.generation.size || "1024x1024",
+    quantity: body.quantity || state.generation.quantity || 1,
+    baseModel: body.baseModel || null,
+    genSource: state.generation.source,
   };
+  state.generation.lastSeed = item.seed;
   state.gallery.unshift(item);
   return {
     artifactId: id,
@@ -2245,6 +2273,47 @@ export async function mockApi(path, opts = {}) {
   if (p === "/v1/worker/stop" && method === "POST") {
     state.workerRuntime = { kind: "mock", name: "mock", running: false, detail: "mock stop" };
     return { ok: true, runtime: state.workerRuntime };
+  }
+
+  if (p === "/v1/generation-meta" && method === "GET") {
+    return { settings: state.generation, persisted: true };
+  }
+  if (p === "/v1/generation-meta" && method === "PUT") {
+    const body = parseBody(opts);
+    const g = state.generation;
+    const set = (key, alt) => {
+      if (body[key] !== undefined) g[key] = body[key];
+      else if (alt && body[alt] !== undefined) g[key] = body[alt];
+    };
+    set("sampler");
+    set("cfg");
+    set("steps");
+    set("clipSkip");
+    set("negativePrompt");
+    if (body.clearSeed) g.seed = null;
+    else if (body.seed !== undefined) g.seed = body.seed;
+    set("size");
+    set("quantity");
+    g.source = "user";
+    g.sourceLabel = "Hand edit";
+    g.locked = true;
+    return { settings: g, persisted: true };
+  }
+  if (p === "/v1/generation-meta/recommend" && method === "POST") {
+    state.generation = {
+      ...state.generation,
+      sampler: "Euler a",
+      cfg: 7,
+      steps: 28,
+      clipSkip: 2,
+      source: "family",
+      sourceLabel: "Family default (Illustrious/Pony/SDXL) — no example image meta",
+      locked: false,
+      samplerApplied: null,
+      samplerNote: null,
+      clipSkipApplied: null,
+    };
+    return { settings: state.generation, persisted: true };
   }
 
   if (p === "/v1/gallery" && method === "GET") {

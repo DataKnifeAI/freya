@@ -13,6 +13,7 @@ import gc
 import io
 import logging
 import os
+import secrets
 import threading
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,11 @@ class GenerateReq(BaseModel):
     seed: int | None = None
     steps: int | None = None
     guidance_scale: float | None = None
+    cfg: float | None = None
+    sampler: str | None = None
+    clip_skip: int | None = Field(default=None, alias="clipSkip")
+    quantity: int | None = None
+    n: int | None = None
     lora_request: list[dict[str, Any]] | None = Field(default=None)
     base_model: str | None = Field(default=None, alias="baseModel")
     frames: int | None = None
@@ -257,6 +263,121 @@ def _ensure_pipe(
     return pipe, applied
 
 
+def _norm_sampler(name: str) -> str:
+    s = " ".join(name.strip().lower().replace("_", " ").split())
+    return s.replace("dpmpp", "dpm++")
+
+
+def _resolve_sampler(name: str | None) -> tuple[str, str, str | None]:
+    """Return (applied label, kind, note).
+
+    kind is euler_a, euler, or dpm2m_karras. Exact for Euler a, Euler, and
+    DPM++ 2M Karras. Other names use the closest of those and say so.
+    """
+    requested = (name or "").strip()
+    key = _norm_sampler(requested)
+    exact = {
+        "euler a": "euler_a",
+        "eulera": "euler_a",
+        "euler ancestral": "euler_a",
+        "euler ancestral discrete": "euler_a",
+        "euler": "euler",
+        "euler discrete": "euler",
+        "dpm++ 2m karras": "dpm2m_karras",
+        "dpm++2m karras": "dpm2m_karras",
+    }
+    kind = exact.get(key)
+    matched = kind is not None
+    if kind is None:
+        if "euler" in key and ("ancestral" in key or key.endswith(" a")):
+            kind = "euler_a"
+        elif "euler" in key:
+            kind = "euler"
+        elif "dpm" in key or "karras" in key:
+            kind = "dpm2m_karras"
+        else:
+            kind = "euler_a"
+    applied = {
+        "euler_a": "Euler a",
+        "euler": "Euler",
+        "dpm2m_karras": "DPM++ 2M Karras",
+    }[kind]
+    note = None
+    if requested and not matched:
+        sched = {
+            "euler_a": "EulerAncestralDiscreteScheduler",
+            "euler": "EulerDiscreteScheduler",
+            "dpm2m_karras": "DPMSolverMultistepScheduler",
+        }[kind]
+        note = f"requested {requested}; applied {applied} ({sched})"
+    return applied, kind, note
+
+
+def _apply_scheduler(pipe: Any, sampler: str | None) -> tuple[str | None, str | None, str | None]:
+    """Set a Diffusers scheduler. On failure, keep the pipeline default and record it."""
+    if not sampler or not str(sampler).strip():
+        return None, None, None
+    applied, kind, note = _resolve_sampler(sampler)
+    try:
+        from diffusers import (
+            DPMSolverMultistepScheduler,
+            EulerAncestralDiscreteScheduler,
+            EulerDiscreteScheduler,
+        )
+
+        config = pipe.scheduler.config
+        if kind == "euler_a":
+            pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(config)
+            sched = "EulerAncestralDiscreteScheduler"
+        elif kind == "euler":
+            pipe.scheduler = EulerDiscreteScheduler.from_config(config)
+            sched = "EulerDiscreteScheduler"
+        else:
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                config,
+                algorithm_type="dpmsolver++",
+                use_karras_sigmas=True,
+                solver_order=2,
+            )
+            sched = "DPMSolverMultistepScheduler"
+        return applied, sched, note
+    except Exception as e:
+        LOG.warning("scheduler map failed for %s: %s", sampler, e)
+        fallback = f"requested {sampler}; scheduler unchanged ({e})"
+        return str(sampler).strip(), None, note or fallback
+
+
+def _random_seed() -> int:
+    return secrets.randbelow(2_147_483_646) or 1
+
+
+def _call_pipe(pipe: Any, kwargs: dict[str, Any], clip_skip: int | None) -> tuple[Any, bool]:
+    """Pass clip_skip when the pipeline accepts it. Never fail the generate over it."""
+    if clip_skip is None or int(clip_skip) <= 0:
+        return pipe(**kwargs), False
+    trial = dict(kwargs)
+    trial["clip_skip"] = int(clip_skip)
+    try:
+        return pipe(**trial), True
+    except TypeError as e:
+        LOG.warning("clip_skip unsupported, stored only: %s", e)
+    except Exception as e:
+        msg = str(e).lower()
+        if "clip_skip" in msg or "unexpected keyword" in msg:
+            LOG.warning("clip_skip rejected, stored only: %s", e)
+        else:
+            raise
+    return pipe(**kwargs), False
+
+
+def _guidance(req: GenerateReq) -> float:
+    if req.guidance_scale is not None:
+        return float(req.guidance_scale)
+    if req.cfg is not None:
+        return float(req.cfg)
+    return DEFAULT_GUIDANCE
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     cuda = torch.cuda.is_available()
@@ -305,14 +426,17 @@ def generate_gif(req: GenerateReq) -> JSONResponse:
     width = min(width, 768)
     height = min(height, 768)
     steps = min(req.steps or 15, 20)
-    guidance = req.guidance_scale if req.guidance_scale is not None else DEFAULT_GUIDANCE
-    base_seed = int(req.seed if req.seed is not None else 42) & 0xFFFFFFFF
+    guidance = _guidance(req)
+    base_seed = int(req.seed if req.seed is not None else _random_seed()) & 0xFFFFFFFF
     device = _device()
+    clip_skip = req.clip_skip
 
     with _lock:
         try:
             pipe, lora_names = _ensure_pipe(model, req.base_model, req.lora_request)
+            applied, scheduler, sampler_note = _apply_scheduler(pipe, req.sampler)
             images = []
+            clip_applied = False
             for i in range(frames):
                 gen = torch.Generator(device=device).manual_seed((base_seed + i * 17) & 0xFFFFFFFF)
                 kwargs: dict[str, Any] = {
@@ -325,7 +449,8 @@ def generate_gif(req: GenerateReq) -> JSONResponse:
                 }
                 if req.negative_prompt:
                     kwargs["negative_prompt"] = req.negative_prompt
-                out = pipe(**kwargs)
+                out, used_clip = _call_pipe(pipe, kwargs, clip_skip)
+                clip_applied = clip_applied or used_clip
                 images.append(out.images[0])
             buf = io.BytesIO()
             images[0].save(
@@ -341,7 +466,7 @@ def generate_gif(req: GenerateReq) -> JSONResponse:
                 _unload_locked()
             return JSONResponse(
                 {
-                    "data": [{"b64_json": b64}],
+                    "data": [{"b64_json": b64, "seed": base_seed}],
                     "model": model,
                     "loras": lora_names,
                     "engine": "diffusers",
@@ -349,6 +474,18 @@ def generate_gif(req: GenerateReq) -> JSONResponse:
                     "frames": frames,
                     "stub": False,
                     "mime": "image/gif",
+                    "seed": base_seed,
+                    "steps": steps,
+                    "guidance_scale": guidance,
+                    "cfg": guidance,
+                    "sampler": req.sampler or applied,
+                    "scheduler": scheduler,
+                    "samplerNote": sampler_note,
+                    "clipSkip": clip_skip,
+                    "clipSkipApplied": clip_applied,
+                    "quantity": 1,
+                    "width": width,
+                    "height": height,
                 }
             )
         except HTTPException:
@@ -368,46 +505,57 @@ def generate(req: GenerateReq) -> JSONResponse:
         raise HTTPException(status_code=400, detail="model is required")
 
     width, height = _parse_size(req.size)
-    steps = req.steps or DEFAULT_STEPS
-    guidance = req.guidance_scale if req.guidance_scale is not None else DEFAULT_GUIDANCE
-    seed = req.seed
+    steps = max(1, min(int(req.steps or DEFAULT_STEPS), 80))
+    guidance = _guidance(req)
+    quantity = max(1, min(int(req.quantity or req.n or 1), 4))
+    base_seed = int(req.seed if req.seed is not None else _random_seed()) & 0xFFFFFFFF
     device = _device()
-    generator = None
-    if seed is not None:
-        generator = torch.Generator(device=device).manual_seed(int(seed) & 0xFFFFFFFF)
+    clip_skip = req.clip_skip
 
     with _lock:
         try:
             pipe, lora_names = _ensure_pipe(model, req.base_model, req.lora_request)
-            kwargs: dict[str, Any] = {
-                "prompt": req.prompt,
-                "num_inference_steps": steps,
-                "guidance_scale": guidance,
-                "width": width,
-                "height": height,
-            }
-            if req.negative_prompt:
-                kwargs["negative_prompt"] = req.negative_prompt
-            if generator is not None:
-                kwargs["generator"] = generator
-            LOG.info(
-                "generate model=%s size=%sx%s steps=%s loras=%s",
-                model,
-                width,
-                height,
-                steps,
-                lora_names,
-            )
-            out = pipe(**kwargs)
-            image = out.images[0]
-            buf = io.BytesIO()
-            image.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            applied, scheduler, sampler_note = _apply_scheduler(pipe, req.sampler)
+            data = []
+            clip_applied = False
+            for i in range(quantity):
+                seed_i = (base_seed + i) & 0xFFFFFFFF
+                generator = torch.Generator(device=device).manual_seed(seed_i)
+                kwargs: dict[str, Any] = {
+                    "prompt": req.prompt,
+                    "num_inference_steps": steps,
+                    "guidance_scale": guidance,
+                    "width": width,
+                    "height": height,
+                    "generator": generator,
+                }
+                if req.negative_prompt:
+                    kwargs["negative_prompt"] = req.negative_prompt
+                LOG.info(
+                    "generate model=%s size=%sx%s steps=%s guidance=%s sampler=%s clip_skip=%s seed=%s i=%s loras=%s",
+                    model,
+                    width,
+                    height,
+                    steps,
+                    guidance,
+                    applied or req.sampler,
+                    clip_skip,
+                    seed_i,
+                    i,
+                    lora_names,
+                )
+                out, used_clip = _call_pipe(pipe, kwargs, clip_skip)
+                clip_applied = clip_applied or used_clip
+                image = out.images[0]
+                buf = io.BytesIO()
+                image.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                data.append({"b64_json": b64, "seed": seed_i})
             if not KEEP_LOADED:
                 _unload_locked()
             return JSONResponse(
                 {
-                    "data": [{"b64_json": b64}],
+                    "data": data,
                     "model": model,
                     "loras": lora_names,
                     "engine": "diffusers",
@@ -415,6 +563,16 @@ def generate(req: GenerateReq) -> JSONResponse:
                     "width": width,
                     "height": height,
                     "steps": steps,
+                    "guidance_scale": guidance,
+                    "cfg": guidance,
+                    "sampler": req.sampler or applied,
+                    "scheduler": scheduler,
+                    "samplerNote": sampler_note,
+                    "clipSkip": clip_skip,
+                    "clipSkipApplied": clip_applied,
+                    "seed": base_seed,
+                    "quantity": quantity,
+                    "negative_prompt": req.negative_prompt,
                 }
             )
         except HTTPException:
