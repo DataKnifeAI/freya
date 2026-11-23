@@ -5,14 +5,14 @@
 //! Also ensures a machine API bearer Secret when `apiTokenSecretRef` is unset.
 
 use freya_crd::{
-    FreyaStudio, LocalObjectRef, SecretKeyRef, SECRET_KEY_ADMIN_PASSWORD, SECRET_KEY_ADMIN_USERNAME,
-    SECRET_KEY_API_TOKEN,
+    FreyaStudio, LocalObjectRef, SecretKeyRef, SECRET_KEY_ADMIN_PASSWORD,
+    SECRET_KEY_ADMIN_USERNAME, SECRET_KEY_API_TOKEN,
 };
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use kube::api::{Patch, PatchParams};
-use kube::{Api, ResourceExt};
 use kube::Error as KubeError;
+use kube::{Api, ResourceExt};
 use std::collections::BTreeMap;
 use tracing::info;
 
@@ -93,6 +93,15 @@ async fn ensure_admin_secret(
         Err(KubeError::Api(err)) if err.code == 404 => None,
         Err(err) => return Err(Error::Kube(err)),
     };
+    if let Some(secret) = &existing {
+        if !secret_owned_by_studio(secret, owner) {
+            info!(
+                %secret_name,
+                "leaving pre-existing admin Secret unchanged (not owned by this FreyaStudio)"
+            );
+            return Ok(false);
+        }
+    }
     let mut data = existing
         .as_ref()
         .and_then(|s| s.data.clone())
@@ -161,6 +170,15 @@ async fn ensure_api_token_secret(
         Err(KubeError::Api(err)) if err.code == 404 => None,
         Err(err) => return Err(Error::Kube(err)),
     };
+    if let Some(secret) = &existing {
+        if !secret_owned_by_studio(secret, owner) {
+            info!(
+                %secret_name,
+                "leaving pre-existing API token Secret unchanged (not owned by this FreyaStudio)"
+            );
+            return Ok(false);
+        }
+    }
     let mut data = existing
         .as_ref()
         .and_then(|s| s.data.clone())
@@ -202,6 +220,25 @@ async fn ensure_api_token_secret(
     .await
     .map_err(Error::Kube)?;
     Ok(generated)
+}
+
+/// Operator-created Secrets carry this Studio's ownerRef, or the credentials labels
+/// from an earlier reconcile. A caller-named Secret that already exists is read-only.
+fn secret_owned_by_studio(secret: &Secret, owner: &OwnerReference) -> bool {
+    if secret
+        .metadata
+        .owner_references
+        .as_ref()
+        .is_some_and(|refs| refs.iter().any(|r| r.uid == owner.uid))
+    {
+        return true;
+    }
+    let Some(labels) = secret.metadata.labels.as_ref() else {
+        return false;
+    };
+    labels.get(LABEL_MANAGED).map(String::as_str) == Some(MANAGED_BY)
+        && labels.get(LABEL_INSTANCE).map(String::as_str) == Some(owner.name.as_str())
+        && labels.get(LABEL_COMPONENT).map(String::as_str) == Some("credentials")
 }
 
 fn generate_password() -> String {

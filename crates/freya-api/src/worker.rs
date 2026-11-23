@@ -18,13 +18,17 @@ impl DiffusionWorkerClient {
     }
 
     pub fn new_with_tls(base: impl Into<String>, tls_insecure: bool) -> Self {
+        let base = base.into().trim_end_matches('/').to_string();
+        // Public HTTPS keeps verification. The flag only applies to loopback,
+        // private, link-local, and cluster DNS. Same rule as the operator.
+        let skip = tls_insecure && tls_skip_allowed(&base);
         let http = reqwest::Client::builder()
-            .danger_accept_invalid_certs(tls_insecure)
+            .danger_accept_invalid_certs(skip)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             http,
-            base: base.into().trim_end_matches('/').to_string(),
+            base,
             token: None,
         }
     }
@@ -60,21 +64,18 @@ impl DiffusionWorkerClient {
         resp.json::<Value>().await.ok()
     }
 
-    /// Prefer authenticated `/v1/stats`, fall back to public `/health`.
+    /// Authenticated `/v1/stats`. A failed call is not replaced with `/health`
+    /// (`{ok:true}` has no GPU or inventory). Use [`Self::health`] for reachability.
     pub async fn stats_detail(&self) -> Option<Value> {
         let resp = self
             .apply_auth(self.http.get(format!("{}/v1/stats", self.base)))
             .send()
             .await
-            .ok();
-        if let Some(resp) = resp {
-            if resp.status().is_success() {
-                if let Ok(v) = resp.json::<Value>().await {
-                    return Some(v);
-                }
-            }
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
         }
-        self.health_detail().await
+        resp.json::<Value>().await.ok()
     }
 
     pub async fn list_loras(&self) -> Result<Vec<LocalAsset>> {
@@ -127,24 +128,19 @@ impl DiffusionWorkerClient {
                         .get("baseModel")
                         .and_then(|x| x.as_str())
                         .map(str::to_string),
-                    name: a
-                        .get("name")
-                        .and_then(|x| x.as_str())
-                        .map(str::to_string),
-                    size_bytes: a
-                        .get("sizeBytes")
-                        .and_then(|x| x.as_u64())
-                        .or_else(|| a.get("sizeBytes").and_then(|x| x.as_i64()).map(|n| n as u64)),
+                    name: a.get("name").and_then(|x| x.as_str()).map(str::to_string),
+                    size_bytes: a.get("sizeBytes").and_then(|x| x.as_u64()).or_else(|| {
+                        a.get("sizeBytes")
+                            .and_then(|x| x.as_i64())
+                            .map(|n| n as u64)
+                    }),
                     model_type: a
                         .get("modelType")
                         .and_then(|x| x.as_str())
                         .map(str::to_string),
                     version_id: a.get("versionId").and_then(|x| x.as_i64()),
                     model_id: a.get("modelId").and_then(|x| x.as_i64()),
-                    source: a
-                        .get("source")
-                        .and_then(|x| x.as_str())
-                        .map(str::to_string),
+                    source: a.get("source").and_then(|x| x.as_str()).map(str::to_string),
                     thumbnail_url: a
                         .get("thumbnailUrl")
                         .and_then(|x| x.as_str())
@@ -521,4 +517,66 @@ pub struct LocalAsset {
     pub source: Option<String>,
     #[serde(default)]
     pub thumbnail_url: Option<String>,
+}
+
+/// Public HTTPS is verified. Skip only for loopback, private, link-local, or cluster DNS.
+/// Keep in sync with `freya_operator::reconcile::tls_skip_allowed`.
+pub(crate) fn tls_skip_allowed(endpoint: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(endpoint.trim()) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host_is_local_or_private(host)
+}
+
+fn host_is_local_or_private(host: &str) -> bool {
+    let h = host
+        .trim()
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if h.is_empty()
+        || h == "localhost"
+        || h.ends_with(".localhost")
+        || h.ends_with(".local")
+        || h.ends_with(".cluster.local")
+        || h.ends_with(".svc")
+        || !h.contains('.')
+    {
+        return true;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let [a, b, _, _] = ip.octets();
+            ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || a == 0
+                || a == 10
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback() || ip.is_unicast_link_local() || (ip.octets()[0] & 0xfe) == 0xfc
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::tls_skip_allowed;
+
+    #[test]
+    fn public_https_does_not_skip_verify() {
+        assert!(!tls_skip_allowed("https://vllm.dataknife.net"));
+        assert!(tls_skip_allowed("https://192.168.3.125:8091"));
+        assert!(tls_skip_allowed("https://127.0.0.1:8091"));
+        assert!(tls_skip_allowed(
+            "https://freya-gpu.freya.svc.cluster.local:8091"
+        ));
+        assert!(tls_skip_allowed("http://freya-worker:8091"));
+    }
 }

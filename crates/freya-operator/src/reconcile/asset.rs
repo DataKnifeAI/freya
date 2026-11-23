@@ -81,7 +81,7 @@ async fn install_remote(
         .unwrap_or(false);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
-        .danger_accept_invalid_certs(tls_insecure)
+        .danger_accept_invalid_certs(tls_insecure && super::tls_skip_allowed(endpoint))
         .build()
         .map_err(|e| Error::Http(e.to_string()))?;
 

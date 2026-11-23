@@ -44,7 +44,7 @@ make mock-ui          # or: cd web && npm i && npm run dev:mock
 ```bash
 cp deploy/compose/.env.example deploy/compose/.env
 # OPENROUTER_API_KEY + FREYA_ADMIN_PASSWORD
-make compose-up       # UI :8080  worker :8091
+make compose-up       # UI :8080  (worker stays on the compose network)
 # make compose-up-gpu # NVIDIA
 # make compose-up-mcp # + MCP :8090
 ```

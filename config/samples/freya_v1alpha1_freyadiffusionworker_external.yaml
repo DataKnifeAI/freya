@@ -15,9 +15,9 @@ kind: FreyaDiffusionWorker
 metadata:
   name: freya-gpu
   namespace: freya
-  annotations:
-    # Set when the worker TLS cert is untrusted (e.g. lab self-signed). Omit with real TLS.
-    freya.dataknife.ai/tls-insecure: "true"
+  # Do not set freya.dataknife.ai/tls-insecure on a public HTTPS endpoint.
+  # Studio verifies that certificate. The annotation only skips verify for
+  # loopback, private, link-local, and cluster DNS hosts.
 spec:
   placement: external
   # Public / LAN URL of freya-local-worker (or vLLM-Omni-compatible) — not the Freya UI host.

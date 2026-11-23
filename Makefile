@@ -40,8 +40,7 @@ vet: fmt-check lint ## Static checks
 ci: vet test ## Local quality gate
 
 manifests: ## Generate CRD YAML into config/crd
-	$(CARGO) run -q -p freya-operator --bin freya-crdgen 2>/dev/null \
-		| awk 'BEGIN{p=0} /^apiVersion:/{p=1} p' > config/crd/freya.dataknife.ai_crds.yaml
+	bash -o pipefail -c '$(CARGO) run -q -p freya-operator --bin freya-crdgen | awk "BEGIN{p=0} /^apiVersion:/{p=1} p" > config/crd/freya.dataknife.ai_crds.yaml.tmp && test -s config/crd/freya.dataknife.ai_crds.yaml.tmp && mv config/crd/freya.dataknife.ai_crds.yaml.tmp config/crd/freya.dataknife.ai_crds.yaml || { rm -f config/crd/freya.dataknife.ai_crds.yaml.tmp; exit 1; }'
 
 install: manifests ## Apply CRDs
 	kubectl apply -f config/crd/freya.dataknife.ai_crds.yaml

@@ -7,9 +7,9 @@ One machine, no operator/CRDs: API + nginx UI + local worker (+ optional MCP).
 ```bash
 cp deploy/compose/.env.example deploy/compose/.env
 # set OPENROUTER_API_KEY + FREYA_ADMIN_PASSWORD
-make compose-up          # UI :8080  worker :8091
+make compose-up          # UI :8080  (worker stays on the compose network)
 # make compose-up-gpu    # NVIDIA overlay
-# make compose-up-mcp    # + MCP :8090
+# make compose-up-mcp    # + MCP on 127.0.0.1:8090 (needs FREYA_API_TOKEN)
 ```
 
 See **[COMPOSE.md](COMPOSE.md)** for volumes, auth, and Compose vs k8s+external-worker. Legacy Comfy/Swarm Compose remains under `legacy/` only.
