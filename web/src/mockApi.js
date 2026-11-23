@@ -366,6 +366,15 @@ const CIVITAI_CATALOG = [
     thumbnailUrl: svgDataUrl("Studio Soft Light", "LORA · portrait", 200),
     triggerWord: "softstudiolight",
     tags: ["portrait", "studio", "light", "soft", "lighting", "photo", "character"],
+    recommendedResources: [
+      {
+        id: 101,
+        name: "Yamer's Anime Illustrator",
+        type: "Checkpoint",
+        modelVersionId: 1011,
+        baseModel: "SDXL 1.0",
+      },
+    ],
   }),
   mockCard({
     id: 303,

@@ -2039,6 +2039,7 @@ function checkpointMatchesFamily(asset, family) {
 
 /** Model-card favorite bucket. Community images are a separate list, never folded into LORA. */
 function favoriteTypeId(item) {
+  if (item?.kind === "community-image") return "";
   const path = String(item?.path || "");
   const t = String(item?.modelType || item?.kind || item?.type || "")
     .toLowerCase()
@@ -2252,9 +2253,9 @@ function mergeOrigin(primary, extra) {
 
 /**
  * Installed checkpoint for a community image.
- * The post's own checkpoint wins. Otherwise the original asset, when that file is
- * installed: the asset itself if it is a checkpoint, then a recommended checkpoint,
- * then one installed checkpoint for the asset's base family. Never downloads.
+ * The post's own checkpoint wins when that file is on the worker.
+ * Otherwise the original asset's recommended checkpoint, when that file is installed.
+ * Does not pick a same-family substitute and does not download.
  */
 function installedBaseForCommunityImage(item, installed, origin) {
   const checkpoints = (installed || []).filter(isCheckpointAsset);
@@ -2262,38 +2263,21 @@ function installedBaseForCommunityImage(item, installed, origin) {
   if (fromPost) return fromPost;
   const fb = origin || item?.fallbackCheckpoint || null;
   if (!fb) return null;
-  if (isCheckpointAsset({ modelType: fb.modelType, kind: fb.modelType, path: fb.path })) {
-    const self = findInstalledResource(
-      {
-        name: fb.name,
-        type: "Checkpoint",
-        modelVersionId: fb.modelVersionId || fb.versionId,
-        modelId: fb.modelId,
-        hash: fb.hash,
-      },
-      checkpoints,
-    );
-    if (self) return self;
-    if (fb.path) {
-      const byPath = checkpoints.find((asset) => asset.path === fb.path);
-      if (byPath) return byPath;
-    }
-  }
   for (const rec of fb.recommended || []) {
+    if (!isCheckpointAsset({ modelType: rec.modelType || rec.type, type: rec.type })) continue;
     const hit = findInstalledResource(
       {
         name: rec.name,
         type: "Checkpoint",
         modelVersionId: rec.versionId || rec.modelVersionId,
         modelId: rec.modelId || rec.id,
+        hash: rec.hash,
       },
       checkpoints,
     );
     if (hit) return hit;
   }
-  const family = String(fb.baseModel || "").trim();
-  if (!family) return null;
-  return checkpoints.find((asset) => checkpointMatchesFamily(asset, family)) || null;
+  return null;
 }
 
 function communityCheckpointLine(item) {
@@ -6336,28 +6320,39 @@ export default function App() {
         /* metadata lookup only — this button does not download */
       }
     }
+    const imageCheckpoint = findInstalledResource(
+      checkpointResourceOf(item),
+      (installedAssets || []).filter(isCheckpointAsset),
+    );
+    const baseName = base?.name || base?.path || "";
+    const recommendedInstead = Boolean(base?.path && !imageCheckpoint && item?.checkpoint);
     let baseNote = "";
     if (base?.path) {
       if (activeBasePath && activeBasePath === base.path) {
-        baseNote = ` Base already ${base.name || base.path}.`;
+        baseNote = recommendedInstead
+          ? ` Checkpoint “${item.checkpoint}” is not installed. Base already ${baseName}.`
+          : ` Base already ${baseName}.`;
       } else {
         const ok = await setInstalledAsBase(base);
-        baseNote = ok
-          ? ` Base set to ${base.name || base.path}.`
-          : " The checkpoint is installed, but the base was not changed.";
+        if (!ok) {
+          baseNote = " The checkpoint is installed, but the base was not changed.";
+        } else if (recommendedInstead) {
+          baseNote = ` Checkpoint “${item.checkpoint}” is not installed. Base set to recommended ${baseName}.`;
+        } else {
+          baseNote = ` Base set to ${baseName}.`;
+        }
       }
     } else if (item?.checkpoint) {
       baseNote = ` Checkpoint “${item.checkpoint}” is not installed.`;
     }
 
     let copied = false;
-    let clipErr = "";
     try {
       copied = await copyCommunityInput({ prompt, negativePrompt: negative });
-    } catch (e) {
-      clipErr = e.message || "Clipboard is not available.";
+    } catch {
+      copied = false;
     }
-    setCommunityErr(clipErr);
+    setCommunityErr("");
     const clip = copied ? " Copied the prompt and negative prompt." : "";
     setCommunityNote(`Filled the prompt, negative prompt, and generation meta.${baseNote}${clip}`);
   };
@@ -6738,7 +6733,10 @@ export default function App() {
     items:
       entry.id === "Images"
         ? imageFavorites
-        : favorites.filter((item) => favoriteTypeId(item) === entry.id),
+        : favorites.filter(
+            (item) =>
+              item?.kind !== "community-image" && favoriteTypeId(item) === entry.id,
+          ),
   })).filter((entry) => entry.items.length > 0);
   const activeFavoriteType = favoriteTypeTabs.some((entry) => entry.id === favoriteType)
     ? favoriteType
