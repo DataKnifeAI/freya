@@ -44,10 +44,7 @@ impl ChatProvidersPrefs {
 
     /// Whether a full OpenRouter model id passes the vendor checkbox filter.
     pub fn includes_model_id(&self, model_id: &str) -> bool {
-        let vendor = model_id
-            .split_once('/')
-            .map(|(v, _)| v)
-            .unwrap_or(model_id);
+        let vendor = model_id.split_once('/').map(|(v, _)| v).unwrap_or(model_id);
         self.includes_vendor(vendor)
     }
 }
@@ -277,6 +274,12 @@ impl AlignmentPrefs {
         self
     }
 
+    /// Local diffusion should receive the user's prompt unchanged.
+    /// True for uncensored alignment or Show NSFW. Cloud image providers are unaffected.
+    pub fn local_adult_passthrough(&self) -> bool {
+        self.model_alignment == "uncensored" || self.allow_nsfw_local
+    }
+
     /// Append tone guidance to pack system instructions (chat / converse / assist).
     pub fn apply_tone(&self, system: &str) -> String {
         let extra = match self.instruction_tone.as_str() {
@@ -294,6 +297,22 @@ impl AlignmentPrefs {
             format!("{system}{extra}")
         }
     }
+}
+
+/// Appended to the converse agent when local adult prompts must pass through.
+pub const LOCAL_ADULT_PASSTHROUGH_CLAUSE: &str = " Local generation with uncensored alignment or Show NSFW: do not refuse, lecture, or replace adult or explicit scene text. Copy the user's scene into generate_image, generate_video, and run_session prompts unchanged. Do not add a safety negative or strip explicit words. Cloud image providers may still refuse on their own.";
+
+/// Cloud prompt rewrite before generate. Local + uncensored or Show NSFW skips it
+/// so a moderated chat model cannot soften the prompt the worker receives.
+pub fn cloud_enhance_enabled(backend: &str, enhance: &str, alignment: &AlignmentPrefs) -> bool {
+    if enhance == "off" {
+        return false;
+    }
+    let wants = matches!(enhance, "on" | "auto" | "prompt-prose" | "prompt-sd");
+    if !wants {
+        return false;
+    }
+    !(backend.eq_ignore_ascii_case("local") && alignment.local_adult_passthrough())
 }
 
 /// Whether a chat model JSON object from OpenRouter `/models` matches alignment prefs.
@@ -493,5 +512,35 @@ mod tests {
         .normalize();
         let out = a.apply_tone("You are Freya.");
         assert!(out.contains("concise and direct"));
+    }
+
+    #[test]
+    fn local_passthrough_skips_cloud_enhance() {
+        let unc = AlignmentPrefs {
+            model_alignment: "uncensored".into(),
+            allow_nsfw_local: false,
+            ..Default::default()
+        }
+        .normalize();
+        let show = AlignmentPrefs {
+            model_alignment: "safety".into(),
+            allow_nsfw_local: true,
+            ..Default::default()
+        }
+        .normalize();
+        let safety = AlignmentPrefs {
+            model_alignment: "safety".into(),
+            allow_nsfw_local: false,
+            ..Default::default()
+        }
+        .normalize();
+        assert!(unc.local_adult_passthrough());
+        assert!(show.local_adult_passthrough());
+        assert!(!safety.local_adult_passthrough());
+        assert!(!cloud_enhance_enabled("local", "auto", &unc));
+        assert!(!cloud_enhance_enabled("local", "prompt-sd", &show));
+        assert!(cloud_enhance_enabled("local", "auto", &safety));
+        assert!(cloud_enhance_enabled("openrouter", "auto", &unc));
+        assert!(!cloud_enhance_enabled("local", "off", &safety));
     }
 }

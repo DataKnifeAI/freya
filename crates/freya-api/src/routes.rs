@@ -651,6 +651,56 @@ fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
     (reply, actions)
 }
 
+/// Cloud chat models often answer a refusal instead of a scene. That text must
+/// not become the local diffusion prompt.
+fn looks_like_model_refusal(text: &str) -> bool {
+    let l = text
+        .to_ascii_lowercase()
+        .replace(['\u{2019}', '\u{2018}', '`'], "'");
+    const MARKERS: &[&str] = &[
+        "i can't",
+        "i cannot",
+        "i won't",
+        "i will not",
+        "i'm not able",
+        "not able to",
+        "can't help",
+        "cannot help",
+        "can't create",
+        "cannot create",
+        "can't generate",
+        "cannot generate",
+        "won't generate",
+        "will not generate",
+        "against my",
+        "content policy",
+        "i must refuse",
+        "unable to create",
+        "unable to generate",
+        "as an ai",
+    ];
+    MARKERS.iter().any(|m| l.contains(m))
+}
+
+fn restore_refused_local_prompt(action: &mut PlannedAction, user_message: &str) {
+    let key = match action.action_type.as_str() {
+        "generate_image" | "generate_video" => "prompt",
+        "run_session" => "goal",
+        _ => return,
+    };
+    let current = action
+        .args
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if current.is_empty() || looks_like_model_refusal(current) {
+        if let Some(obj) = action.args.as_object_mut() {
+            obj.insert(key.to_string(), json!(user_message));
+        }
+    }
+}
+
 fn parse_chat_plan(text: &str, fallback_message: &str) -> (String, Vec<PlannedAction>) {
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(strip_json_fence(text)) {
         let reply = parsed
@@ -1552,27 +1602,39 @@ async fn execute_chat_action(
                 .and_then(|g| g.as_str())
                 .unwrap_or("explore the scene")
                 .trim();
-            let system = load_instruction_toned(&state, "session").await;
-            let or = state.openrouter.read().await;
-            let batch: Vec<String> = match or.chat(&system, goal, None).await {
-                Ok(text) => {
-                    if let Ok(parsed) =
-                        serde_json::from_str::<serde_json::Value>(strip_json_fence(&text))
-                    {
-                        parsed
-                            .get("batchPrompts")
-                            .and_then(|b| b.as_array())
-                            .map(|arr| {
-                                arr.iter()
-                                    .filter_map(|x| x.as_str().map(str::to_string))
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        vec![]
+            let backend_choice = chat_generate_backend(state, pinned, backend).await;
+            let local_passthrough = backend_choice.eq_ignore_ascii_case("local")
+                && state
+                    .config
+                    .read()
+                    .await
+                    .alignment_prefs()
+                    .local_adult_passthrough();
+            let batch: Vec<String> = if local_passthrough {
+                Vec::new()
+            } else {
+                let system = load_instruction_toned(&state, "session").await;
+                let or = state.openrouter.read().await;
+                match or.chat(&system, goal, None).await {
+                    Ok(text) => {
+                        if let Ok(parsed) =
+                            serde_json::from_str::<serde_json::Value>(strip_json_fence(&text))
+                        {
+                            parsed
+                                .get("batchPrompts")
+                                .and_then(|b| b.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|x| x.as_str().map(str::to_string))
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        } else {
+                            vec![]
+                        }
                     }
+                    Err(_) => vec![],
                 }
-                Err(_) => vec![],
             };
             let prompts = if batch.is_empty() {
                 vec![
@@ -1583,7 +1645,6 @@ async fn execute_chat_action(
             } else {
                 batch
             };
-            let backend_choice = chat_generate_backend(state, pinned, backend).await;
             let session_style = style_ref_from_args(&action.args);
             let mut results = Vec::new();
             for p in &prompts {
@@ -3040,7 +3101,10 @@ pub async fn chat(
             )
         }
     } else {
-        let system = load_instruction_toned(&state, "converse").await;
+        let mut system = load_instruction_toned(&state, "converse").await;
+        if alignment.local_adult_passthrough() {
+            system.push_str(crate::prefs::LOCAL_ADULT_PASSTHROUGH_CLAUSE);
+        }
         let mut user_blob = req.message.clone();
         if !hist_blob.is_empty() {
             user_blob = format!(
@@ -3092,7 +3156,7 @@ pub async fn chat(
 
     // Obvious guidance never renders. A scene or outfit does not need
     // generate/draw/make — the router or the converse agent decides.
-    let planned: Vec<PlannedAction> = if req.confirm {
+    let mut planned: Vec<PlannedAction> = if req.confirm {
         planned
     } else {
         planned
@@ -3108,6 +3172,18 @@ pub async fn chat(
             })
             .collect()
     };
+    // Local + uncensored / Show NSFW: a refusal or empty tool prompt is not a
+    // substitute scene. The user's text is what the worker should see.
+    if req
+        .backend
+        .as_deref()
+        .is_some_and(|b| b.eq_ignore_ascii_case("local"))
+        && alignment.local_adult_passthrough()
+    {
+        for action in &mut planned {
+            restore_refused_local_prompt(action, &req.message);
+        }
+    }
 
     // Prefer router-resolved image model when executing generates under Auto.
     let mut env = ActionRun {
@@ -3596,12 +3672,14 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
 
     let backend = req.backend.clone().unwrap_or_else(|| "openrouter".into());
     let enhance = req.enhance.clone().unwrap_or_else(|| "auto".into());
+    let alignment = state.config.read().await.alignment_prefs();
     let mut final_prompt = req.prompt.clone();
     let mut enhanced = None;
 
-    let wants_enhance =
-        enhance == "on" || enhance == "auto" || enhance == "prompt-prose" || enhance == "prompt-sd";
-    if wants_enhance && enhance != "off" {
+    // Local + uncensored / Show NSFW: do not send the prompt through a cloud
+    // rewriter. That call was the path that could soften or refuse adult text
+    // before the worker. Cloud backends still enhance.
+    if crate::prefs::cloud_enhance_enabled(&backend, &enhance, &alignment) {
         let mode = if enhance == "prompt-sd" || backend == "local" {
             "prompt-sd"
         } else {
@@ -4822,6 +4900,30 @@ mod route_footer_tests {
             image_model: None,
             source: "t".into(),
         }
+    }
+
+    #[test]
+    fn local_refusal_prompt_is_replaced_with_the_user_scene() {
+        let mut action = PlannedAction {
+            action_type: "generate_image".into(),
+            args: json!({
+                "prompt": "I can't create explicit images, but here is a tasteful portrait."
+            }),
+        };
+        restore_refused_local_prompt(&mut action, "adult scene as written");
+        assert_eq!(
+            action.args.get("prompt").and_then(|p| p.as_str()),
+            Some("adult scene as written")
+        );
+        let mut kept = PlannedAction {
+            action_type: "generate_image".into(),
+            args: json!({ "prompt": "adult scene as written, closer crop" }),
+        };
+        restore_refused_local_prompt(&mut kept, "adult scene as written");
+        assert_eq!(
+            kept.args.get("prompt").and_then(|p| p.as_str()),
+            Some("adult scene as written, closer crop")
+        );
     }
 
     #[test]
