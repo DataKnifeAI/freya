@@ -114,6 +114,17 @@ pub struct CivitaiClient {
     api_key: String,
 }
 
+/// One page from `GET /api/v1/images`. The next cursor or page is Civitai's, not a local cap.
+#[derive(Debug, Clone)]
+pub struct CommunityImagePage {
+    pub items: Vec<CommunityImage>,
+    pub next_cursor: Option<String>,
+    pub next_page: Option<u32>,
+}
+
+/// First page is about 20. Civitai accepts up to 200; keep a smaller ceiling.
+const COMMUNITY_IMAGE_LIMIT_MAX: u32 = 100;
+
 impl CivitaiClient {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
@@ -487,21 +498,45 @@ impl CivitaiClient {
         version_id: Option<i64>,
         allow_nsfw: bool,
         limit: u32,
-    ) -> Result<Vec<CommunityImage>> {
+        cursor: Option<&str>,
+        page: Option<u32>,
+    ) -> Result<CommunityImagePage> {
         let model_id = model_id.filter(|n| *n > 0);
         let version_id = version_id.filter(|n| *n > 0);
         if model_id.is_none() && version_id.is_none() {
             return Err(anyhow!("modelId or modelVersionId is required"));
         }
-        let url = images_list_url(model_id, version_id, allow_nsfw, limit);
+        let limit = limit.clamp(1, COMMUNITY_IMAGE_LIMIT_MAX);
+        let cursor = clean_image_cursor(cursor);
+        let page = if cursor.is_some() {
+            None
+        } else {
+            page.filter(|n| *n > 0 && *n <= 10_000)
+        };
+        let url = images_list_url(
+            model_id,
+            version_id,
+            allow_nsfw,
+            limit,
+            cursor.as_deref(),
+            page,
+        );
         let v = self
             .get_public_json(&url)
             .await
             .context("civitai community images")?;
-        let mut items = parse_community_images(&v, version_id, allow_nsfw);
-        items.truncate(12);
+        let mut items = parse_community_images_limited(&v, version_id, allow_nsfw, limit as usize);
         self.fill_resource_ids(&mut items).await;
-        Ok(items)
+        let (next_cursor, next_page) = if items.is_empty() {
+            (None, None)
+        } else {
+            images_next(&v)
+        };
+        Ok(CommunityImagePage {
+            items,
+            next_cursor,
+            next_page,
+        })
     }
 
     /// Fill Civitai version ids for generation resources that only named a hash,
@@ -1158,8 +1193,10 @@ fn images_list_url(
     version_id: Option<i64>,
     allow_nsfw: bool,
     limit: u32,
+    cursor: Option<&str>,
+    page: Option<u32>,
 ) -> String {
-    let limit = limit.clamp(1, 12);
+    let limit = limit.clamp(1, COMMUNITY_IMAGE_LIMIT_MAX);
     let mut url =
         format!("https://civitai.com/api/v1/images?limit={limit}&withMeta=true&type=image");
     if allow_nsfw {
@@ -1173,6 +1210,12 @@ fn images_list_url(
     if let Some(id) = version_id {
         url.push_str(&format!("&modelVersionId={id}"));
     }
+    if let Some(cursor) = clean_image_cursor(cursor) {
+        url.push_str("&cursor=");
+        url.push_str(&urlencoding_lite(&cursor));
+    } else if let Some(page) = page.filter(|n| *n > 0 && *n <= 10_000) {
+        url.push_str(&format!("&page={page}"));
+    }
     url
 }
 
@@ -1181,9 +1224,24 @@ fn parse_community_images(
     context_version: Option<i64>,
     allow_nsfw: bool,
 ) -> Vec<CommunityImage> {
+    parse_community_images_limited(
+        payload,
+        context_version,
+        allow_nsfw,
+        COMMUNITY_IMAGE_LIMIT_MAX as usize,
+    )
+}
+
+fn parse_community_images_limited(
+    payload: &Value,
+    context_version: Option<i64>,
+    allow_nsfw: bool,
+    limit: usize,
+) -> Vec<CommunityImage> {
     let Some(items) = payload.get("items").and_then(|i| i.as_array()) else {
         return Vec::new();
     };
+    let limit = limit.clamp(1, COMMUNITY_IMAGE_LIMIT_MAX as usize);
     let mut out = Vec::new();
     for item in items {
         if item.get("type").and_then(|t| t.as_str()) == Some("video") {
@@ -1197,11 +1255,67 @@ fn parse_community_images(
             continue;
         };
         out.push(image);
-        if out.len() >= 12 {
+        if out.len() >= limit {
             break;
         }
     }
     out
+}
+
+fn clean_image_cursor(cursor: Option<&str>) -> Option<String> {
+    let raw = cursor?.trim();
+    if raw.is_empty() || raw.len() > 512 {
+        return None;
+    }
+    if raw.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// `metadata.nextCursor`, or `cursor` / `page` on `metadata.nextPage`.
+fn images_next(payload: &Value) -> (Option<String>, Option<u32>) {
+    let Some(meta) = payload.get("metadata") else {
+        return (None, None);
+    };
+    let cursor = match meta.get("nextCursor") {
+        Some(Value::String(s)) => clean_image_cursor(Some(s)),
+        Some(Value::Number(n)) => n.as_i64().filter(|n| *n >= 0).map(|n| n.to_string()),
+        _ => None,
+    };
+    let next_url = meta.get("nextPage").and_then(|v| v.as_str()).unwrap_or("");
+    let cursor = cursor
+        .or_else(|| query_param(next_url, "cursor").and_then(|s| clean_image_cursor(Some(&s))));
+    if cursor.is_some() {
+        return (cursor, None);
+    }
+    let page = query_param(next_url, "page")
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|n| *n > 0 && *n <= 10_000);
+    (None, page)
+}
+
+fn query_param(url: &str, key: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    parsed
+        .query_pairs()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.into_owned())
+}
+
+/// Grid preview. The original `url` stays the download and the detail image.
+fn civitai_preview_url(url: &str) -> String {
+    if let Some(start) = url.find("/width=") {
+        let after = &url[start + "/width=".len()..];
+        if let Some(slash) = after.find('/') {
+            let mut out = String::with_capacity(url.len() + 8);
+            out.push_str(&url[..start]);
+            out.push_str("/width=768");
+            out.push_str(&after[slash..]);
+            return out;
+        }
+    }
+    url.replace("/original=true/", "/width=768/")
 }
 
 fn parse_community_image(
@@ -1257,7 +1371,7 @@ fn parse_community_image(
         clip_skip,
         size,
         url: url.clone(),
-        thumbnail_url: url.map(|u| u.replace("/original=true/", "/width=256/")),
+        thumbnail_url: url.as_deref().map(civitai_preview_url),
         nsfw,
         nsfw_level,
         civitai_url: community_image_page(id, link_version, nsfw),
@@ -2146,16 +2260,17 @@ mod tests {
 
     #[test]
     fn community_images_keep_prompt_meta_and_color_the_link() {
-        let sfw_url = images_list_url(Some(1319790), Some(1490040), false, 40);
+        let sfw_url = images_list_url(Some(1319790), Some(1490040), false, 40, None, None);
         assert!(sfw_url.starts_with("https://civitai.com/api/v1/images?"));
         assert!(sfw_url.contains("withMeta=true"));
         assert!(sfw_url.contains("nsfw=false"));
         assert!(sfw_url.contains("browsingLevel=1"));
         assert!(sfw_url.contains("modelId=1319790"));
         assert!(sfw_url.contains("modelVersionId=1490040"));
-        assert!(sfw_url.contains("limit=12"));
+        assert!(sfw_url.contains("limit=40"));
+        assert!(!sfw_url.contains("cursor="));
         assert!(!sfw_url.contains("mcp.civitai.com"));
-        let mature = images_list_url(Some(1319790), Some(1490040), true, 12);
+        let mature = images_list_url(Some(1319790), Some(1490040), true, 12, None, None);
         assert!(mature.contains("browsingLevel=31"));
         assert!(!mature.contains("nsfw=true"));
 
@@ -2215,7 +2330,7 @@ mod tests {
             .thumbnail_url
             .as_deref()
             .unwrap()
-            .contains("/width=256/"));
+            .contains("/width=768/"));
         assert_eq!(
             sfw[0].civitai_url,
             "https://civitai.com/images/11?modelVersionId=1490040"
@@ -2249,6 +2364,40 @@ mod tests {
         let nested_items = parse_community_images(&nested, None, false);
         assert_eq!(nested_items[0].prompt.as_deref(), Some("nested prompt"));
         assert_eq!(nested_items[0].civitai_url, "https://civitai.com/images/14");
+
+        let paged = images_list_url(Some(1), None, false, 20, Some("next cursor"), Some(4));
+        assert!(paged.contains("limit=20"));
+        assert!(paged.contains("cursor=next%20cursor"));
+        assert!(!paged.contains("page="));
+        let by_page = images_list_url(Some(1), None, true, 20, None, Some(2));
+        assert!(by_page.contains("page=2"));
+        assert!(by_page.contains("browsingLevel=31"));
+        let wide: Vec<_> = (1..=15)
+            .map(|id| {
+                json!({
+                    "id": id,
+                    "type": "image",
+                    "nsfwLevel": "None",
+                    "url": format!("https://image.civitai.com/x/{id}/original=true/{id}.jpeg"),
+                    "meta": { "prompt": "page" }
+                })
+            })
+            .collect();
+        let page_payload = json!({
+            "items": wide,
+            "metadata": {
+                "nextCursor": "15",
+                "nextPage": "https://civitai.com/api/v1/images?limit=20&cursor=15"
+            }
+        });
+        let page_items = parse_community_images_limited(&page_payload, None, false, 20);
+        assert_eq!(page_items.len(), 15);
+        assert_eq!(images_next(&page_payload).0.as_deref(), Some("15"));
+        assert!(images_next(&page_payload).1.is_none());
+        let page_only = json!({
+            "metadata": { "nextPage": "https://civitai.com/api/v1/images?page=3&limit=20" }
+        });
+        assert_eq!(images_next(&page_only), (None, Some(3)));
 
         let mut known_base = sfw.clone();
         annotate_community_images(
