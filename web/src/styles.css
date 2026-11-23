@@ -704,9 +704,12 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
   font-size: 0.78rem; line-height: 1.35;
   display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
 }
-.agent-gallery-neg, .agent-gallery-meta, .agent-gallery-resources {
+.agent-gallery-neg, .agent-gallery-meta, .agent-gallery-resources, .agent-gallery-checkpoint {
   font-size: 0.72rem; line-height: 1.35; color: var(--chrome-muted);
 }
+.agent-gallery-actions { display: flex; flex-direction: column; gap: 0.35rem; align-items: stretch; }
+.agent-gallery-actions button,
+.agent-gallery-actions a { font-size: 0.72rem; padding: 0.28rem 0.5rem; white-space: nowrap; text-align: center; }
 .agent-gallery-resources { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 a.civitai-open-link.civitai-link-nsfw {
   color: var(--ember) !important;

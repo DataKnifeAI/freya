@@ -496,7 +496,7 @@ impl FreyaMcp {
     }
 
     #[tool(
-        description = "Community images made with a Civitai model. modelId required, modelVersionId optional. Up to 12 posts with prompt, negative prompt, sampler, steps, cfg, seed, and other resources. Does not download or generate. Show NSFW follows Freya settings."
+        description = "Community images made with a Civitai model. modelId required, modelVersionId optional. Up to 12 posts. Each item has prompt, negative, sampler, steps, cfg, seed, resources, checkpoint, checkpointInstalled, checkpointDifferent, and missingResources. Does not download, pin, or change the base. install_asset is a separate call (versionId or modelId). Show NSFW follows Freya settings."
     )]
     async fn civitai_images(
         &self,
