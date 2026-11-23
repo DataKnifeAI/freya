@@ -1977,6 +1977,7 @@ export default function App() {
   const [workerCtlBusy, setWorkerCtlBusy] = useState(false);
   const [civitaiQ, setCivitaiQ] = useState("");
   const installedFingerprintRef = useRef("");
+  const localCheckpointsFpRef = useRef("");
   const downloadJobsFingerprintRef = useRef("");
   const enrichAttemptedRef = useRef(new Set());
   const enrichTimerRef = useRef(null);
@@ -2037,6 +2038,7 @@ export default function App() {
   const [generateBackend, setGenerateBackend] = useState(readGenerateBackend);
   const [localCheckpoints, setLocalCheckpoints] = useState([]);
   const [localBaseModel, setLocalBaseModel] = useState("");
+  const [localBaseFamily, setLocalBaseFamily] = useState("");
   const [localBaseBusy, setLocalBaseBusy] = useState(false);
   const [pendingPlan, setPendingPlan] = useState(() => bootSession.pendingPlan ?? null);
   const [pendingQuestion, setPendingQuestion] = useState(
@@ -2987,25 +2989,7 @@ export default function App() {
   };
   const canAutoInstall = () => Boolean(settings?.civitaiConfigured && hasWorker());
 
-  const refreshLocalBases = async () => {
-    if (!hasWorker()) {
-      setLocalCheckpoints([]);
-      setLocalBaseModel("");
-      return;
-    }
-    try {
-      const [cps, base] = await Promise.all([
-        api("/v1/worker/checkpoints").catch(() => ({ data: [] })),
-        api("/v1/worker/base-model").catch(() => null),
-      ]);
-      const list = Array.isArray(cps?.data) ? cps.data : [];
-      setLocalCheckpoints(list);
-      if (base?.model) setLocalBaseModel(base.model);
-      else if (list[0]?.path) setLocalBaseModel(list[0].path);
-    } catch {
-      /* ignore */
-    }
-  };
+  const refreshLocalBases = () => refreshInstalledAssets({ quiet: true });
 
   useEffect(() => {
     if (generateBackend !== "local" && !hasWorker()) return undefined;
@@ -3027,8 +3011,11 @@ export default function App() {
           baseModel: match?.baseModel || undefined,
         }),
       });
-      setLocalBaseModel(res?.model || path);
-      setSavedMsg(`Active base set to ${res?.model || path}`);
+      const next = res?.model || path;
+      setLocalBaseModel(next);
+      setActiveBasePath(next);
+      if (typeof res?.baseModel === "string") setLocalBaseFamily(res.baseModel);
+      setSavedMsg(`Active base set to ${next}`);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -3429,7 +3416,18 @@ export default function App() {
         applyPrivacyAlignmentFromSettings(a.result);
         setSettings((prev) => ({ ...(prev || {}), ...a.result }));
       }
-      if (a.type === "set_base_model" && a.result?.model) setActiveBasePath(a.result.model);
+      if (a.type === "set_base_model" && a.result?.model) {
+        setActiveBasePath(a.result.model);
+        setLocalBaseModel(a.result.model);
+        if (typeof a.result.baseModel === "string") setLocalBaseFamily(a.result.baseModel);
+      }
+      if (a.type === "delete_installed") {
+        void refreshInstalledAssets({ quiet: true });
+      }
+      if (a.type === "install_asset") {
+        if (a.result?.jobId) void refreshDownloadJobs();
+        else if (a.status === "executed") void refreshInstalledAssets({ quiet: true });
+      }
       if (a.type === "gallery_delete" && a.result?.id) {
         const id = a.result.id;
         setGallery((prev) => prev.filter((g) => g.id !== id && g.artifactId !== id));
@@ -3709,7 +3707,13 @@ export default function App() {
         installedFingerprintRef.current = "";
         setInstalledAssets([]);
       }
+      if (localCheckpointsFpRef.current !== "") {
+        localCheckpointsFpRef.current = "";
+        setLocalCheckpoints([]);
+      }
       setActiveBasePath("");
+      setLocalBaseModel("");
+      setLocalBaseFamily("");
       return;
     }
     if (!quiet) setInstalledBusy(true);
@@ -3738,7 +3742,19 @@ export default function App() {
         installedFingerprintRef.current = fp;
         setInstalledAssets(list);
       }
-      setActiveBasePath(base?.model || "");
+      const cpList = Array.isArray(cps?.data) ? cps.data : [];
+      const cpFp = installedListFingerprint(cpList);
+      if (cpFp !== localCheckpointsFpRef.current) {
+        localCheckpointsFpRef.current = cpFp;
+        setLocalCheckpoints(cpList);
+      }
+      const baseModelPath = typeof base?.model === "string" ? base.model : "";
+      const baseFamily = typeof base?.baseModel === "string" ? base.baseModel : "";
+      setActiveBasePath(baseModelPath);
+      setLocalBaseFamily(baseFamily);
+      if (baseModelPath) setLocalBaseModel(baseModelPath);
+      else if (cpList[0]?.path) setLocalBaseModel(cpList[0].path);
+      else setLocalBaseModel("");
       // Older sidecars often lack thumbnailUrl — resolve via Civitai when possible.
       if (settings?.civitaiConfigured) {
         scheduleEnrichInstalledThumbs(list);
@@ -3877,6 +3893,8 @@ export default function App() {
         }),
       });
       setActiveBasePath(asset.path);
+      setLocalBaseModel(asset.path);
+      if (typeof asset.baseModel === "string") setLocalBaseFamily(asset.baseModel);
       setSavedMsg(`Active base → ${asset.name || asset.path}`);
     } catch (e) {
       setError(e.message);
@@ -4552,16 +4570,30 @@ export default function App() {
   }, [tab, civitaiSubview]);
 
   useEffect(() => {
-    if (tab !== "civitai") return;
-    const hasJobs = downloadJobs.length > 0;
+    if (tab !== "worker") return undefined;
+    refreshInstalledAssets({ quiet: true });
+    return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
+
+  useEffect(() => {
+    if (menuOpen !== "gen-bundle" || generateBackend !== "local") return undefined;
+    refreshInstalledAssets({ quiet: true });
+    return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [menuOpen, generateBackend]);
+
+  useEffect(() => {
     const active = downloadJobs.some((j) =>
       ["queued", "downloading"].includes(j.status),
     );
-    if (!active && !hasJobs) return;
-    let cancelled = false;
+    const onCivitai = tab === "civitai";
+    // Follow in-flight installs from any tab. Success must refresh worker lists
+    // even when this effect restarts because the job just left "downloading".
+    if (!active && !(onCivitai && downloadJobs.length > 0)) return undefined;
     const tick = async () => {
       const jobs = await refreshDownloadJobs();
-      if (cancelled || !Array.isArray(jobs)) return;
+      if (!Array.isArray(jobs)) return;
       const newlySucceeded = [];
       for (const j of jobs) {
         if (j.status !== "succeeded" || !j.id) continue;
@@ -4574,11 +4606,12 @@ export default function App() {
         await refreshInstalledAssets({ quiet: true });
       }
     };
-    const ms = active || civitaiSubview === "downloads" ? 1500 : 5000;
+    const ms = active || (onCivitai && civitaiSubview === "downloads") ? 1500 : 5000;
     const t = setInterval(tick, ms);
+    const soon = setTimeout(tick, 250);
     return () => {
-      cancelled = true;
       clearInterval(t);
+      clearTimeout(soon);
     };
     // Poll cadence depends on whether anything is active — not on every jobs array identity.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -6731,6 +6764,9 @@ export default function App() {
                   busy={busy || workerCtlBusy || mock}
                   hasWorker={hasWorker()}
                   api={api}
+                  checkpoints={localCheckpoints}
+                  active={{ model: activeBasePath, baseModel: localBaseFamily }}
+                  onRefresh={() => refreshInstalledAssets({ quiet: true })}
                   onSaved={(msg) => setSavedMsg(msg)}
                   onError={(msg) => setError(msg)}
                 />
@@ -7934,33 +7970,58 @@ export default function App() {
   );
 }
 
-/** Settings panel: list worker checkpoints + set active base for LoRA-compatible gens. */
-function WorkerBaseModelPanel({ busy, hasWorker, api, onSaved, onError }) {
-  const [checkpoints, setCheckpoints] = useState([]);
+/** Settings panel: list worker checkpoints + set active base for LoRA-compatible gens.
+ * Checkpoint rows come from the parent refresh so install/delete update this select
+ * without a second mount-only fetch.
+ */
+function WorkerBaseModelPanel({
+  busy,
+  hasWorker,
+  api,
+  checkpoints,
+  active,
+  onRefresh,
+  onSaved,
+  onError,
+}) {
   const [catalog, setCatalog] = useState([]);
-  const [active, setActive] = useState(null);
-  const [selected, setSelected] = useState("");
+  const [selected, setSelected] = useState(active?.model || "");
   const [loading, setLoading] = useState(false);
+  const activeModel = typeof active?.model === "string" ? active.model : "";
+  const prevActiveRef = useRef(activeModel);
+
+  useEffect(() => {
+    if (!hasWorker) {
+      setCatalog([]);
+      return undefined;
+    }
+    let cancelled = false;
+    api("/v1/base-models", { cache: "no-store" })
+      .catch(() => ({ items: [] }))
+      .then((models) => {
+        if (!cancelled) setCatalog(Array.isArray(models?.items) ? models.items : []);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [hasWorker, api]);
+
+  useEffect(() => {
+    const activeChanged = prevActiveRef.current !== activeModel;
+    prevActiveRef.current = activeModel;
+    setSelected((prev) => {
+      const paths = (checkpoints || []).map((c) => c.path);
+      if (activeChanged && activeModel) return activeModel;
+      if (prev && paths.includes(prev)) return prev;
+      if (activeModel) return activeModel;
+      return paths[0] || "";
+    });
+  }, [checkpoints, activeModel]);
 
   const refresh = async () => {
-    if (!hasWorker) {
-      setCheckpoints([]);
-      setActive(null);
-      return;
-    }
     setLoading(true);
     try {
-      const [cps, base, models] = await Promise.all([
-        api("/v1/worker/checkpoints").catch(() => ({ data: [] })),
-        api("/v1/worker/base-model").catch(() => null),
-        api("/v1/base-models").catch(() => ({ items: [] })),
-      ]);
-      const list = Array.isArray(cps?.data) ? cps.data : [];
-      setCheckpoints(list);
-      setCatalog(Array.isArray(models?.items) ? models.items : []);
-      setActive(base);
-      if (base?.model) setSelected(base.model);
-      else if (list[0]?.path) setSelected(list[0].path);
+      await onRefresh?.();
     } catch (e) {
       onError?.(e.message);
     } finally {
@@ -7968,16 +8029,11 @@ function WorkerBaseModelPanel({ busy, hasWorker, api, onSaved, onError }) {
     }
   };
 
-  useEffect(() => {
-    refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasWorker]);
-
   const setBase = async () => {
     if (!selected.trim()) return;
     setLoading(true);
     try {
-      const match = checkpoints.find((c) => c.path === selected);
+      const match = (checkpoints || []).find((c) => c.path === selected);
       const catalogHit = catalog.find((c) => c.suggestedModel === selected);
       const body = {
         model: selected.trim(),
@@ -7987,9 +8043,9 @@ function WorkerBaseModelPanel({ busy, hasWorker, api, onSaved, onError }) {
         method: "PUT",
         body: JSON.stringify(body),
       });
-      setActive(res);
-      onSaved?.(`Active base set to ${res.model || selected}`);
-      await refresh();
+      if (res?.model) setSelected(res.model);
+      onSaved?.(`Active base set to ${res?.model || selected}`);
+      await onRefresh?.();
     } catch (e) {
       onError?.(e.message);
     } finally {
@@ -8001,13 +8057,14 @@ function WorkerBaseModelPanel({ busy, hasWorker, api, onSaved, onError }) {
     return <p className="hint">Connect a worker to set a base checkpoint.</p>;
   }
 
+  const checkpointRows = checkpoints || [];
   const options = [
-    ...checkpoints.map((c) => ({
+    ...checkpointRows.map((c) => ({
       value: c.path,
       label: `${c.name || c.id}${c.baseModel ? ` (${c.baseModel})` : ""}`,
     })),
     ...catalog
-      .filter((c) => !checkpoints.some((x) => x.path === c.suggestedModel))
+      .filter((c) => !checkpointRows.some((x) => x.path === c.suggestedModel))
       .map((c) => ({
         value: c.suggestedModel,
         label: `${c.baseModel} hint → ${c.suggestedModel}`,

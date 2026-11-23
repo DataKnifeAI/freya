@@ -1518,25 +1518,21 @@ export async function mockApi(path, opts = {}) {
       openrouter = openrouter.filter((m) => m.zdr);
       video = video.filter((m) => m.zdr);
     }
-    const localAll = [
-      {
-        id: "local/flux-dev",
-        name: "FLUX.1 Dev (local)",
-        backend: "local",
-        kind: "checkpoint",
-        path: "/models/flux-dev.safetensors",
-      },
-      {
-        id: "local/nsfw-pony",
-        name: "NSFW Pony (local)",
-        backend: "local",
-        kind: "checkpoint",
-        path: "/models/nsfw-pony.safetensors",
-      },
-    ];
+    // Same rows the worker list endpoints return — not a frozen demo catalog.
+    const installedLocal = (state.localAssets || []).map((a) => ({
+      id: a.id,
+      name: a.name,
+      backend: "local",
+      kind: a.kind || "checkpoint",
+      path: a.path,
+      baseModel: a.baseModel || null,
+      modelType: a.modelType || null,
+    }));
     const local = allowNsfw
-      ? localAll
-      : localAll.filter((m) => !/nsfw|xxx|porn|explicit/i.test(`${m.id} ${m.name} ${m.path}`));
+      ? installedLocal
+      : installedLocal.filter(
+          (m) => !/nsfw|xxx|porn|explicit/i.test(`${m.id} ${m.name} ${m.path}`),
+        );
     return {
       openrouter: openrouter.map(({ zdr: _z, ...row }) => row),
       chat: chat.map(({ moderated: _m, major: _j, uncensored: _u, ...row }) => row),
@@ -1818,14 +1814,18 @@ export async function mockApi(path, opts = {}) {
   if (p === "/v1/worker/assets" && method === "DELETE") {
     const body = parseBody(opts);
     state.localAssets = (state.localAssets || []).filter((a) => a.path !== body.path);
+    if (state.activeBaseModel === body.path) {
+      state.activeBaseModel = "";
+      state.activeBaseFamily = "";
+    }
     return { ok: true, path: body.path };
   }
 
   if (p === "/v1/worker/base-model" && method === "GET") {
     return {
       ok: true,
-      model: state.activeBaseModel || "checkpoints/mock-sdxl.safetensors",
-      baseModel: state.activeBaseFamily || "SDXL 1.0",
+      model: state.activeBaseModel || "",
+      baseModel: state.activeBaseFamily || null,
       modelsDir: "/mnt/game2/freya/models",
     };
   }
@@ -2284,6 +2284,10 @@ export async function mockApi(path, opts = {}) {
           sizeBytes: done.bytesTotal,
           source: "civitai",
         });
+        if (kind === "checkpoint" && !state.activeBaseModel) {
+          state.activeBaseModel = path;
+          state.activeBaseFamily = body.baseModel || "";
+        }
       }, 800);
     }, 400);
     return {
