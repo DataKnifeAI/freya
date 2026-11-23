@@ -13,7 +13,14 @@ use serde_json::json;
 type ApiResult<T> = Result<T, ApiError>;
 
 pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let cfg = state.config.read().await;
+    let (open_router, civitai, worker_url) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.openrouter_configured(),
+            cfg.civitai_configured(),
+            cfg.diffusion_worker_url.clone(),
+        )
+    };
     let worker_ok = {
         let w = state.worker.read().await;
         match w.as_ref() {
@@ -26,15 +33,15 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "openRouter": cfg.openrouter_configured(),
         "civitai": cfg.civitai_configured(),
         "diffusionWorker": worker_ok,
+        "workerConfigured": worker_url.is_some(),
     }))
 }
 
 /// Proxy worker GPU/runtime stats; enrich VRAM from host `nvidia-smi` when worker returns null.
 pub async fn worker_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let (enabled, url, container, unit) = {
+    let (url, container, unit) = {
         let cfg = state.config.read().await;
         (
-            cfg.worker_enabled,
             cfg.diffusion_worker_url.clone(),
             cfg.worker_container.clone(),
             cfg.worker_systemd_unit.clone(),
@@ -44,7 +51,7 @@ pub async fn worker_stats(State(state): State<AppState>) -> impl IntoResponse {
     let mut worker_payload = Value::Null;
     let mut reachable = false;
     let mut have_stats = false;
-    if enabled {
+    {
         let w = state.worker.read().await;
         if let Some(c) = w.as_ref() {
             if let Some(detail) = c.stats_detail().await {
@@ -54,20 +61,6 @@ pub async fn worker_stats(State(state): State<AppState>) -> impl IntoResponse {
             } else if c.health().await {
                 reachable = true;
             }
-        }
-    } else if let Some(url) = url.as_ref() {
-        // Still probe reachability for the panel when disabled (URL kept, client detached).
-        let probe = crate::worker::DiffusionWorkerClient::new_with_tls(
-            url.clone(),
-            state.config.read().await.worker_tls_insecure,
-        )
-        .with_token(state.config.read().await.worker_token.clone());
-        if let Some(detail) = probe.stats_detail().await {
-            reachable = true;
-            have_stats = true;
-            worker_payload = detail;
-        } else if probe.health().await {
-            reachable = true;
         }
     }
 
@@ -94,7 +87,6 @@ pub async fn worker_stats(State(state): State<AppState>) -> impl IntoResponse {
 
     Json(json!({
         "ok": true,
-        "enabled": enabled,
         "configured": url.is_some(),
         "url": url,
         "reachable": reachable,
@@ -334,26 +326,6 @@ pub async fn worker_stop(State(state): State<AppState>) -> ApiResult<Json<Value>
         .await
         .map_err(ApiError::Msg)?;
     Ok(Json(json!({ "ok": true, "runtime": runtime.to_json() })))
-}
-
-pub async fn worker_enable(State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    {
-        let mut cfg = state.config.write().await;
-        cfg.worker_enabled = true;
-    }
-    state.rebuild_worker_client().await;
-    let _ = state.persist_secrets().await;
-    Ok(Json(json!({ "ok": true, "enabled": true })))
-}
-
-pub async fn worker_disable(State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    {
-        let mut cfg = state.config.write().await;
-        cfg.worker_enabled = false;
-    }
-    state.rebuild_worker_client().await;
-    let _ = state.persist_secrets().await;
-    Ok(Json(json!({ "ok": true, "enabled": false })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -986,10 +958,7 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
     let res = ar.get("result")?;
     match ty {
         "worker_status" => {
-            let configured = res
-                .get("workerConfigured")
-                .and_then(|v| v.as_bool())
-                .or_else(|| res.get("workerEnabled").and_then(|v| v.as_bool()));
+            let configured = res.get("workerConfigured").and_then(|v| v.as_bool());
             let reachable = res.get("reachable").and_then(|v| v.as_bool());
             let mut parts = Vec::new();
             if let Some(c) = configured {
@@ -1854,10 +1823,7 @@ async fn execute_chat_action(
             }
         }
         "worker_status" => {
-            let (worker_enabled, worker_url) = {
-                let cfg = state.config.read().await;
-                (cfg.worker_enabled, cfg.diffusion_worker_url.clone())
-            };
+            let worker_url = state.config.read().await.diffusion_worker_url.clone();
             let mut reachable = false;
             let mut detail = Value::Null;
             if let Some(client) = state.worker.read().await.as_ref() {
@@ -1873,7 +1839,6 @@ async fn execute_chat_action(
                 "status": "executed",
                 "args": action.args,
                 "result": {
-                    "workerEnabled": worker_enabled,
                     "workerConfigured": worker_url.is_some(),
                     "reachable": reachable,
                     "modelLoaded": detail.get("modelLoaded").cloned().unwrap_or(Value::Null),
@@ -3823,9 +3788,6 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     let (bytes, mime, model_used, backend_used) = if modality.is_motion() {
         run_motion_generate(state, &req, &final_prompt, modality).await?
     } else if backend == "local" {
-        if !state.config.read().await.worker_enabled {
-            return Err(ApiError::NoWorker);
-        }
         let worker = state.worker.read().await;
         let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
         let loras: Vec<LoraWeight> = req
@@ -3952,11 +3914,8 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     }))
 }
 
-/// Local jobs run only when Disable is off and a client is attached.
+/// Local jobs run when a saved worker URL has attached the client.
 async fn local_worker_ready(state: &AppState) -> bool {
-    if !state.config.read().await.worker_enabled {
-        return false;
-    }
     state.worker.read().await.is_some()
 }
 
@@ -4002,13 +3961,8 @@ async fn run_motion_generate(
     // Local motion is a worker GIF (the engine has no mp4 T2V). Cloud video stays on OpenRouter.
     // Do not fall through to OpenRouter when the composer pinned Local.
     if pinned_local || (want_gif && backend == "auto") {
-        let enabled = state.config.read().await.worker_enabled;
         let worker = state.worker.read().await;
-        if !enabled {
-            if pinned_local {
-                return Err(ApiError::NoWorker);
-            }
-        } else if let Some(client) = worker.as_ref() {
+        if let Some(client) = worker.as_ref() {
             let gif_model = crate::base_models::filter_local_model(req.model.as_deref());
             match client
                 .generate_gif(
@@ -4330,6 +4284,7 @@ pub struct SettingsPublic {
     pub civitai_configured: bool,
     pub hf_configured: bool,
     pub diffusion_worker_url: Option<String>,
+    /// Agent model (`auto` = internal Auto; `openrouter/auto` is the explicit upstream router).
     pub chat_model: String,
     pub image_model: String,
     /// Freya intent router model (`auto` = Llama 3.1 8B-class).
@@ -4370,7 +4325,6 @@ async fn settings_public_from_state(state: &AppState) -> SettingsPublic {
                 civitai_configured: cfg.civitai_configured(),
                 hf_configured: !cfg.hf_token.is_empty(),
                 diffusion_worker_url: cfg.diffusion_worker_url.clone(),
-                worker_enabled: cfg.worker_enabled,
                 chat_model: cfg.chat_model.clone(),
                 image_model: cfg.image_model.clone(),
                 router_model: cfg.router_model.clone(),
@@ -4740,7 +4694,6 @@ pub async fn settings_put(
             } else {
                 cfg.diffusion_worker_url = Some(url);
             }
-            // Saving the endpoint must not undo Disable. Enable is a separate call.
         }
         if let Some(m) = upd.chat_model {
             cfg.chat_model = m;
@@ -4755,7 +4708,6 @@ pub async fn settings_put(
         civitai_api_key: upd.civitai_api_key,
         hf_token: upd.hf_token,
         diffusion_worker_url: None, // URL already applied above; persist_secrets writes full snapshot
-        worker_enabled: None,
         api_token: None,
         chat_model: None,
         image_model: None,

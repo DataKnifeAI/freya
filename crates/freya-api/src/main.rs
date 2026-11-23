@@ -71,8 +71,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/worker/stats", get(routes::worker_stats))
         .route("/v1/worker/start", post(routes::worker_start))
         .route("/v1/worker/stop", post(routes::worker_stop))
-        .route("/v1/worker/enable", post(routes::worker_enable))
-        .route("/v1/worker/disable", post(routes::worker_disable))
         .route("/v1/worker/installed", get(routes::worker_installed))
         .route("/v1/worker/loras", get(routes::worker_loras))
         .route("/v1/worker/checkpoints", get(routes::worker_checkpoints))

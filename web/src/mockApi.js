@@ -231,8 +231,93 @@ const state = {
     civitaiConfigured: true,
     hfConfigured: false,
     diffusionWorkerUrl: "",
-    chatModel: "openrouter/auto",
-    imageModel: "black-forest-labs/flux.2-klein-4b",
+    chatModel: "auto",
+    imageModel: "auto",
+    routerModel: "auto",
+    apiTokenConfigured: false,
+    adminLoginConfigured: true,
+    authRequired: false,
+    privacy: {
+      zeroDataRetention: false,
+      dataCollection: "allow",
+      chatProviders: {
+        excluded: [],
+        legacyOnly: null,
+      },
+    },
+    alignment: {
+      modelAlignment: "balanced",
+      allowNsfwLocal: false,
+      instructionTone: "warm",
+    },
+    autoFallbacks: {
+      agent: "",
+      agentZdr: "",
+      image: "",
+      imageZdr: "",
+      video: "",
+      videoZdr: "",
+      router: "",
+      costTier: "medium",
+    },
+    instructions: [
+      {
+        id: "converse",
+        label: "Converse (chat agent)",
+        text: "You are Freya, a friendly agentic image studio guide (mock converse).",
+        defaultText: "You are Freya, a friendly agentic image studio guide (mock converse).",
+        overridden: false,
+      },
+      {
+        id: "route",
+        label: "Route (intent classifier)",
+        text: "You are Freya's internal request router (mock).",
+        defaultText: "You are Freya's internal request router (mock).",
+        overridden: false,
+      },
+      {
+        id: "chat",
+        label: "Chat (assist)",
+        text: "You are Freya, a friendly image studio agent (mock chat).",
+        defaultText: "You are Freya, a friendly image studio agent (mock chat).",
+        overridden: false,
+      },
+      {
+        id: "plan",
+        label: "Plan",
+        text: "You are Freya's planner (mock).",
+        defaultText: "You are Freya's planner (mock).",
+        overridden: false,
+      },
+      {
+        id: "suggest",
+        label: "Suggest",
+        text: "You are Freya suggest (mock).",
+        defaultText: "You are Freya suggest (mock).",
+        overridden: false,
+      },
+      {
+        id: "session",
+        label: "Session",
+        text: "You are Freya session (mock).",
+        defaultText: "You are Freya session (mock).",
+        overridden: false,
+      },
+      {
+        id: "prompt-prose",
+        label: "Enhance — prose brief",
+        text: "You are Freya enhance prose (mock).",
+        defaultText: "You are Freya enhance prose (mock).",
+        overridden: false,
+      },
+      {
+        id: "prompt-sd",
+        label: "Enhance — SD keywords",
+        text: "You are Freya enhance SD (mock).",
+        defaultText: "You are Freya enhance SD (mock).",
+        overridden: false,
+      },
+    ],
   },
   styles: STYLE_PACKS,
   gallery: [
@@ -374,6 +459,695 @@ function modelBriefFor(prompt, loraBrief) {
     return trimmed + loraBrief;
   }
   return `A carefully composed scene: ${trimmed}. Natural light and atmosphere, clear focal subject, cohesive color and mood throughout.${loraBrief}`;
+}
+
+function containsAny(hay, needles) {
+  return needles.some((n) => hay.includes(n));
+}
+
+function looksLikeTagPrompt(lower) {
+  if (lower.includes("<lora:") || lower.includes("<lyco:") || lower.includes("(lora:")) return true;
+  const commas = (lower.match(/,/g) || []).length;
+  return commas >= 3 && !lower.includes("?");
+}
+
+function visualCueCount(lower) {
+  const cues = [
+    "cartoon",
+    "meme",
+    "illustration",
+    "illustrated",
+    "painting",
+    "portrait",
+    "sketch",
+    "artwork",
+    "comic",
+    "anime",
+    "watercolor",
+    "oil painting",
+    "background",
+    "lighting",
+    "wearing",
+    "standing",
+    "sitting",
+    "close-up",
+    "close up",
+    "wide shot",
+    "cinematic",
+    "linework",
+    "line art",
+    "landscape",
+    "sunset",
+    "moonlight",
+    "waterfall",
+    "armor",
+    "wings",
+    "cowboy",
+    "outline",
+    "studio light",
+    "digital art",
+    "concept art",
+    "photograph",
+    "in the style",
+    "masterpiece",
+    "highly detailed",
+    "1girl",
+    "1boy",
+    "photo of",
+    "picture of",
+    "image of",
+    "drawing of",
+    "shot of",
+  ];
+  return cues.filter((c) => lower.includes(c)).length;
+}
+
+/** Questions, how-it-works, and LoRA/model clarification — not a prompt to render. */
+export function messageIsChatNotMedia(message) {
+  const lower = String(message || "").trim().toLowerCase();
+  if (!lower) return false;
+  if (looksLikeTagPrompt(lower) && !lower.trimEnd().endsWith("?")) return false;
+  const phrases = [
+    "how does",
+    "how do ",
+    "how can ",
+    "how would ",
+    "what is ",
+    "what are ",
+    "what was ",
+    "what's ",
+    "whats ",
+    "why does",
+    "why is ",
+    "why do ",
+    "explain ",
+    "tell me how",
+    "tell me about",
+    "tell me what",
+    "which lora",
+    "what lora",
+    "which model",
+    "what model",
+    "which checkpoint",
+    "what checkpoint",
+    "which base",
+    "what base",
+    "clarify",
+    "before we generate",
+    "before generating",
+    "don't generate",
+    "do not generate",
+    "not yet",
+    "how it works",
+    "how this works",
+    "what should i",
+    "should i use",
+    "can you explain",
+    "could you explain",
+    "help me understand",
+    "search civitai",
+    "find a lora",
+    "find loras",
+    "suggest idea",
+    "brainstorm",
+    "list lora",
+    "list checkpoint",
+    "worker status",
+  ];
+  if (containsAny(lower, phrases)) return true;
+  const words = lower.split(/\s+/).filter(Boolean);
+  const first = words[0] || "";
+  if (
+    ["who", "what", "why", "how", "when", "where", "which", "whose"].includes(first) &&
+    !(first === "how" && words[1] === "about") &&
+    (lower.trimEnd().endsWith("?") || words.length < 14)
+  ) {
+    return true;
+  }
+  if (
+    words.length < 24 &&
+    (lower.startsWith("can you ") ||
+      lower.startsWith("could you ") ||
+      lower.startsWith("would you ") ||
+      lower.startsWith("please explain"))
+  ) {
+    const imperative = containsAny(lower, [
+      "draw",
+      "generat",
+      "illustrat",
+      "render",
+      "paint",
+      "video",
+      "gif",
+      "animat",
+      "picture",
+      "image",
+    ]);
+    if (!imperative) return true;
+  }
+  return false;
+}
+
+function looksLikeProseScene(lower) {
+  const stripped = lower.trim().replace(/^["'“”«»]+|["'“”«»]+$/g, "");
+  if (stripped.includes("?")) return false;
+  const words = stripped.split(/\s+/).filter(Boolean);
+  if (words.length < 6) return false;
+  const cues = visualCueCount(stripped);
+  if (cues >= 2 && words.length >= 6) return true;
+  if (cues >= 1 && words.length >= 8) return true;
+  const startsScene =
+    stripped.startsWith("a ") ||
+    stripped.startsWith("an ") ||
+    stripped.startsWith("prompt:") ||
+    stripped.startsWith('"') ||
+    stripped.startsWith("“");
+  return startsScene && words.length >= 10 && (stripped.includes(",") || stripped.includes(" with "));
+}
+
+/** none | picture | series | gif | video — series is still a picture modality. */
+export function directMediaAsk(message) {
+  const lower = String(message || "").trim().toLowerCase();
+  if (!lower || messageIsChatNotMedia(message)) return "none";
+  const hasGif =
+    /\bgif\b/.test(lower) || lower.includes(".gif") || lower.includes("animated gif");
+  if (
+    hasGif ||
+    lower.includes("looping animation") ||
+    lower.includes("animated meme") ||
+    lower.includes("short animation") ||
+    lower.includes("animate as gif")
+  ) {
+    return "gif";
+  }
+  if (
+    containsAny(lower, [
+      "video",
+      "t2v",
+      "i2v",
+      "text-to-video",
+      "image-to-video",
+      "text to video",
+      "image to video",
+      "make a clip",
+      "generate a clip",
+      "motion clip",
+      "animate this into",
+      "short clip",
+      "wan 2",
+      "ltx video",
+      "mp4",
+      "webm",
+    ]) ||
+    (lower.includes("animat") && !lower.includes("still") && !hasGif)
+  ) {
+    return "video";
+  }
+  if (
+    containsAny(lower, [
+      "series of",
+      "image series",
+      "picture series",
+      "set of images",
+      "set of pictures",
+      "set of stills",
+      "storyboard",
+      "sequence of images",
+      "sequence of pictures",
+      "several versions",
+      "a few versions",
+      "a few images",
+      "a few pictures",
+      "several images",
+      "several pictures",
+      "variations",
+      "run session",
+      "run a session",
+      "batch of",
+    ])
+  ) {
+    return "series";
+  }
+  if (
+    containsAny(lower, [
+      "generate",
+      "make an image",
+      "make me an image",
+      "create an image",
+      "make a picture",
+      "create a picture",
+      "draw ",
+      "draw me",
+      "render ",
+      "paint ",
+      "produce an image",
+      "still image",
+      "generate this",
+      "image prompt",
+    ]) ||
+    lower.startsWith("prompt:")
+  ) {
+    return "picture";
+  }
+  if (looksLikeTagPrompt(lower) || looksLikeProseScene(lower)) return "picture";
+  return "none";
+}
+
+/** Legacy-aligned modality: chat | picture | gif | video */
+function inferModality(message) {
+  const ask = directMediaAsk(message);
+  if (ask === "gif") {
+    return {
+      modality: "gif",
+      reason: "Heuristic: GIF / looping animation (legacy SwarmUI gif-hd).",
+      source: "heuristic",
+    };
+  }
+  if (ask === "video") {
+    return {
+      modality: "video",
+      reason: "Heuristic: video / T2V / I2V (legacy SwarmUI video).",
+      source: "heuristic",
+    };
+  }
+  if (ask === "picture" || ask === "series") {
+    return {
+      modality: "picture",
+      reason:
+        ask === "series"
+          ? "Heuristic: series of stills."
+          : "Heuristic: still prompt (scene, meme, illustration, or quoted prompt).",
+      source: "heuristic",
+    };
+  }
+  return {
+    modality: "chat",
+    reason: "Heuristic: conversational.",
+    source: "heuristic",
+  };
+}
+
+function offerFromAsk(prompt, ask) {
+  const text = String(prompt || "").trim();
+  if (!text) return null;
+  if (ask === "series") return { prompt: text, type: "run_session" };
+  if (ask === "gif" || ask === "video") {
+    return { prompt: text, type: "generate_video", modality: ask };
+  }
+  if (ask === "picture") return { prompt: text, type: "generate_image" };
+  return null;
+}
+
+/** Quoted prompt in an assistant reply, when the reply itself is not the thing to draw. */
+export function imagePromptFromReply(text) {
+  const raw = String(text || "");
+  const body = raw.split(/\n\s*Route:/i)[0].trim();
+  if (!body) return null;
+  const re = /["“]([^"”\n]{24,})["”]/g;
+  let match;
+  while ((match = re.exec(body))) {
+    const q = match[1].trim();
+    const ask = directMediaAsk(q);
+    if (ask !== "none") return offerFromAsk(q, ask);
+  }
+  const labeled = body.match(/(?:image prompt|prompt)\s*:\s*(.+)$/im);
+  if (labeled) {
+    const line = labeled[1].trim().replace(/^["“]|["”]$/g, "");
+    const ask = directMediaAsk(line);
+    if (ask !== "none") return offerFromAsk(line, ask);
+  }
+  return null;
+}
+
+/** Generate button payload when this assistant turn did not already produce media. */
+export function generateOfferForTurn(messages, index) {
+  const list = Array.isArray(messages) ? messages : [];
+  const m = list[index];
+  if (!m || m.role === "user") return null;
+  if (Array.isArray(m.artifactIds) && m.artifactIds.length) return null;
+  const actions = Array.isArray(m.actions) ? m.actions : [];
+  const done = actions.some(
+    (a) =>
+      (a.type === "generate_image" || a.type === "generate_video" || a.type === "run_session") &&
+      a.status === "executed",
+  );
+  if (done) return null;
+  const proposed = actions.find(
+    (a) =>
+      (a.type === "generate_image" || a.type === "generate_video" || a.type === "run_session") &&
+      a.status === "proposed",
+  );
+  if (proposed) {
+    const prompt = String(proposed.args?.prompt || proposed.args?.goal || "").trim();
+    if (!prompt) return null;
+    return {
+      prompt,
+      type: proposed.type,
+      modality: proposed.args?.modality,
+    };
+  }
+  const prevUser = [...list.slice(0, index)].reverse().find((x) => x.role === "user");
+  if (prevUser) {
+    const fromUser = offerFromAsk(prevUser.content, directMediaAsk(prevUser.content));
+    if (fromUser) return fromUser;
+  }
+  return imagePromptFromReply(m.content);
+}
+
+function wantsImageIntent(message) {
+  return inferModality(message).modality === "picture";
+}
+
+function mockGenerateArtifact(prompt, body = {}) {
+  const loras = Array.isArray(body.loras) ? body.loras : [];
+  const loraBrief =
+    loras.length > 0
+      ? ` LoRAs: ${loras.map((l) => `${l.name}@${l.scale ?? 0.8}`).join(", ")}.`
+      : "";
+  const enhanced = modelBriefFor(prompt, loraBrief);
+  const id = `mock-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+  const modality =
+    body.modality ||
+    inferModality(prompt).modality ||
+    "picture";
+  const isMotion = modality === "gif" || modality === "video";
+  const wantLocal =
+    !isMotion &&
+    (body.backend === "local" ||
+      (body.backend !== "openrouter" &&
+        loras.length > 0 &&
+        Boolean(state.settings.diffusionWorkerUrl)));
+  const backend = isMotion
+    ? modality === "gif" && wantLocal
+      ? "local"
+      : "openrouter"
+    : wantLocal
+      ? "local"
+      : "openrouter";
+  const specificModel = body.model && body.model !== "auto" ? body.model : null;
+  const mime =
+    modality === "video" ? "video/mp4" : modality === "gif" ? "image/gif" : "image/png";
+  const item = {
+    id,
+    prompt,
+    enhancedPrompt: enhanced,
+    backend,
+    model: isMotion
+      ? specificModel || "bytedance/seedance-2.5-flash"
+      : backend === "local"
+        ? "local-worker-stub"
+        : specificModel || state.settings.imageModel || "black-forest-labs/flux.2-klein-4b",
+    createdAt: new Date().toISOString(),
+    mime,
+    modality,
+    url: svgDataUrl(
+      prompt.slice(0, 40) || "Freya",
+      isMotion ? modality : backend,
+      backend === "local" ? 140 : 28 + (id.length % 40),
+    ),
+    loras,
+  };
+  state.gallery.unshift(item);
+  return {
+    artifactId: id,
+    backend: item.backend,
+    model: item.model,
+    enhancedPrompt: enhanced,
+    modality,
+    mime,
+    url: item.url,
+    meta: item,
+    loras,
+  };
+}
+
+function planChatActions(message, body) {
+  const m = String(message || "").toLowerCase();
+  const actions = [];
+  if (m.includes("suggest") || m.includes("idea") || m.includes("brainstorm")) {
+    actions.push({ type: "suggest_ideas", args: { topic: message } });
+  }
+  if (
+    m.includes("civitai") ||
+    m.includes("search for lora") ||
+    m.includes("find a lora") ||
+    m.includes("find loras") ||
+    m.includes("search civitai")
+  ) {
+    const q =
+      (message.split(/\bfor\b/i)[1] || message).trim().slice(0, 80) || BEGINNER_CIVITAI_QUERY;
+    actions.push({ type: "search_civitai", args: { query: q } });
+  }
+  const asksSetBase =
+    m.includes("set base") ||
+    m.includes("switch base") ||
+    m.includes("change base") ||
+    m.includes("use checkpoint") ||
+    m.includes("set checkpoint") ||
+    m.includes("set active base") ||
+    m.includes("switch checkpoint");
+  const asksGetBase =
+    m.includes("active base") ||
+    m.includes("current base") ||
+    m.includes("what base") ||
+    m.includes("which base") ||
+    m.includes("base model") ||
+    m.includes("active checkpoint");
+  const asksList =
+    m.includes("list checkpoint") ||
+    m.includes("list checkpoints") ||
+    m.includes("available checkpoint") ||
+    m.includes("which checkpoints") ||
+    (m.includes("checkpoint") && (m.includes("list") || m.includes("show") || m.includes("available")));
+  const asksStatus =
+    (m.includes("worker") &&
+      (m.includes("status") ||
+        m.includes("reachable") ||
+        m.includes("online") ||
+        m.includes("on?") ||
+        m.includes("off?"))) ||
+    m.includes("is the worker");
+  if (asksSetBase) {
+    actions.push({ type: "list_checkpoints", args: {} });
+    actions.push({ type: "get_base_model", args: {} });
+  } else if (asksGetBase) actions.push({ type: "get_base_model", args: {} });
+  else if (asksList) actions.push({ type: "list_checkpoints", args: {} });
+  else if (asksStatus) actions.push({ type: "worker_status", args: {} });
+
+  const mediaAsk = directMediaAsk(message);
+  if (mediaAsk === "series" || (wantsImageIntent(message) && (m.includes("run session") || m.includes("variations") || m.includes("batch")))) {
+    actions.push({ type: "run_session", args: { goal: message } });
+  } else if (mediaAsk === "picture" || wantsImageIntent(message)) {
+    actions.push({ type: "generate_image", args: { prompt: message, batch: false } });
+  }
+  let reply;
+  if (!actions.length) {
+    reply =
+      "Happy to talk through style, mood, and framing. Say the word when you want me to generate, search Civitai, tweak the worker base, or suggest ideas.";
+  } else if (actions.some((a) => a.type === "generate_image" || a.type === "run_session")) {
+    reply = "On it — generating that image for you.";
+  } else if (actions.some((a) => a.type === "search_civitai")) {
+    reply = "I’ll search Civitai for matching assets.";
+  } else if (
+    actions.some((a) =>
+      ["worker_status", "list_checkpoints", "get_base_model", "set_base_model"].includes(a.type),
+    )
+  ) {
+    reply = "Checking worker settings…";
+  } else {
+    reply = "Here are a few directions we could take.";
+  }
+  if (body?.confirm && Array.isArray(body.actions) && body.actions.length) {
+    return {
+      reply: "Running the confirmed actions.",
+      actions: body.actions.map((a) => ({
+        type: a.type,
+        args: a.args || {},
+      })),
+    };
+  }
+  return { reply, actions };
+}
+
+async function executeMockChatAction(action, body) {
+  const ty = action.type;
+  const args = action.args || {};
+  if (ty === "suggest_ideas") {
+    const topic = args.topic || body.message || BEGINNER_EXAMPLE;
+    const ideas = suggestIdeas(topic);
+    return {
+      type: ty,
+      status: "executed",
+      args,
+      result: {
+        ideas,
+        sessionNote: "Pick an idea and send it, or ask me to generate one.",
+      },
+    };
+  }
+  if (ty === "search_civitai") {
+    const q = (args.query || "").trim() || BEGINNER_CIVITAI_QUERY;
+    const { loras } = lorasForAssist(q);
+    return {
+      type: ty,
+      status: "executed",
+      args: { ...args, query: q },
+      result: { query: q, loras },
+    };
+  }
+  if (ty === "generate_image") {
+    const prompt = (args.prompt || body.message || BEGINNER_EXAMPLE).trim();
+    const result = mockGenerateArtifact(prompt, {
+      ...body,
+      prompt,
+      model: body.imageModel || body.model,
+      loras: body.loras || [],
+    });
+    return { type: ty, status: "executed", args, result };
+  }
+  if (ty === "run_session") {
+    const goal = (args.goal || body.message || BEGINNER_EXAMPLE).trim();
+    const { batchPrompts } = sessionBatch(goal, body.session || {});
+    const results = batchPrompts.map((p) =>
+      mockGenerateArtifact(p, { ...body, prompt: p, loras: body.loras || [] }),
+    );
+    return {
+      type: ty,
+      status: "executed",
+      args,
+      result: { goal, batchPrompts, results },
+    };
+  }
+  if (ty === "install_asset") {
+    if (!state.settings.civitaiConfigured) {
+      return { type: ty, status: "error", args, error: "Civitai API key required" };
+    }
+    if (!state.settings.diffusionWorkerUrl) {
+      return {
+        type: ty,
+        status: "error",
+        args,
+        error: "LoRA install needs a diffusion worker",
+      };
+    }
+    return {
+      type: ty,
+      status: "executed",
+      args,
+      result: { ok: true, destPath: args.destPath || "loras/asset.safetensors", name: args.name },
+    };
+  }
+  if (ty === "worker_status") {
+    const configured = Boolean(state.settings.diffusionWorkerUrl);
+    return {
+      type: ty,
+      status: "executed",
+      args,
+      result: {
+        workerConfigured: configured,
+        reachable: configured,
+        modelLoaded: configured ? state.activeBaseModel || null : null,
+        engine: "mock",
+      },
+    };
+  }
+  if (ty === "list_checkpoints") {
+    // Same as GET /v1/worker/checkpoints — only what was installed this session.
+    return {
+      type: ty,
+      status: "executed",
+      args,
+      result: {
+        checkpoints: (state.localAssets || []).filter((a) => a.kind === "checkpoint"),
+      },
+    };
+  }
+  if (ty === "get_base_model") {
+    return {
+      type: ty,
+      status: "executed",
+      args,
+      result: {
+        ok: true,
+        model: state.activeBaseModel || "",
+        baseModel: state.activeBaseFamily || null,
+      },
+    };
+  }
+  if (ty === "set_base_model") {
+    const model = String(args.model || "").trim();
+    if (!model) {
+      return {
+        type: ty,
+        status: "error",
+        args,
+        error: "missing model path — list_checkpoints first",
+      };
+    }
+    state.activeBaseModel = model;
+    state.activeBaseFamily = args.baseModel || state.activeBaseFamily || "SDXL 1.0";
+    return {
+      type: ty,
+      status: "executed",
+      args,
+      result: { ok: true, model, baseModel: state.activeBaseFamily, engine: "mock" },
+    };
+  }
+  return { type: ty, status: "error", args, error: `unknown action: ${ty}` };
+}
+
+function isSideEffectAction(ty) {
+  return (
+    ty === "generate_image" ||
+    ty === "install_asset" ||
+    ty === "run_session" ||
+    ty === "set_base_model"
+  );
+}
+
+function enrichMockReplyWithWorker(reply, actionResults) {
+  const lines = [];
+  for (const ar of actionResults || []) {
+    if (ar.status === "error") {
+      lines.push(`${ar.type} failed: ${ar.error || "error"}`);
+      continue;
+    }
+    if (ar.status === "proposed") {
+      lines.push(`Proposed: ${ar.type}`);
+      continue;
+    }
+    const res = ar.result || {};
+    if (ar.type === "worker_status") {
+      const parts = [];
+      if (res.workerConfigured === false) parts.push("no worker URL");
+      else if (res.workerConfigured) parts.push("URL configured");
+      if (res.reachable === false) parts.push("not reachable");
+      else if (res.reachable) parts.push("reachable");
+      lines.push(parts.length ? `Worker: ${parts.join(", ")}.` : "Worker status checked.");
+    } else if (ar.type === "list_checkpoints") {
+      const items = res.checkpoints || [];
+      if (!items.length) lines.push("No checkpoints on the worker yet.");
+      else {
+        lines.push(
+          `Checkpoints (${items.length}): ${items
+            .map((c) => `${c.name} [${c.baseModel || "?"}] (${c.path})`)
+            .join("; ")}.`,
+        );
+      }
+    } else if (ar.type === "get_base_model" || ar.type === "set_base_model") {
+      const verb = ar.type === "set_base_model" ? "Active base set to" : "Active base is";
+      lines.push(
+        res.baseModel
+          ? `${verb} ${res.model} (${res.baseModel}).`
+          : `${verb} ${res.model || "(none)"}.`,
+      );
+    }
+  }
+  if (!lines.length) return reply;
+  const block = lines.join(" ");
+  const trimmed = String(reply || "").trim();
+  if (!trimmed || trimmed === "Checking worker settings…") return block;
+  return `${trimmed}\n\n${block}`;
 }
 
 export async function mockApi(path, opts = {}) {
@@ -676,13 +1450,11 @@ export async function mockApi(path, opts = {}) {
 
   if (p === "/v1/worker/stats" && method === "GET") {
     const configured = Boolean(state.settings.diffusionWorkerUrl);
-    const enabled = state.settings.workerEnabled !== false;
     return {
       ok: true,
-      enabled,
       configured,
       url: state.settings.diffusionWorkerUrl || null,
-      reachable: configured && enabled,
+      reachable: configured,
       runtime: state.workerRuntime,
       vram: null,
       host: null,
@@ -822,14 +1594,6 @@ export async function mockApi(path, opts = {}) {
   if (p === "/v1/worker/stop" && method === "POST") {
     state.workerRuntime = { kind: "mock", name: "mock", running: false, detail: "mock stop" };
     return { ok: true, runtime: state.workerRuntime };
-  }
-  if (p === "/v1/worker/enable" && method === "POST") {
-    state.settings.workerEnabled = true;
-    return { ok: true, enabled: true };
-  }
-  if (p === "/v1/worker/disable" && method === "POST") {
-    state.settings.workerEnabled = false;
-    return { ok: true, enabled: false };
   }
 
   if (p === "/v1/gallery" && method === "GET") {
@@ -1139,11 +1903,13 @@ export async function mockApi(path, opts = {}) {
   }
 
   if (p === "/v1/health" || p === "/healthz") {
+    const configured = Boolean(state.settings.diffusionWorkerUrl);
     return {
       ok: true,
       openRouter: state.settings.openRouterConfigured,
       civitai: state.settings.civitaiConfigured,
-      diffusionWorker: Boolean(state.settings.diffusionWorkerUrl),
+      diffusionWorker: configured,
+      workerConfigured: configured,
       mock: true,
     };
   }

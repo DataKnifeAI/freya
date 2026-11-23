@@ -183,9 +183,8 @@ Worker health/stats:
 | API `GET\|PUT /v1/worker/base-model` | Proxies active base |
 | API `GET /v1/base-models` | Static family catalog (SD 1.5 / SDXL / Pony / Flux hints) — no Civitai traffic |
 | API `POST /v1/worker/start\|stop` | Local docker (`FREYA_WORKER_CONTAINER`, default `freya-local-worker`) or systemd unit |
-| API `POST /v1/worker/enable\|disable` | Persist flag in secrets — disabled skips local gens; OpenRouter still works |
 
-**Worker tab** (not Settings): host/port (defaults `localhost`/`8091`), Setup copy for LAN / FQDN / k8s DNS bridge, Generate API token, VRAM bar, **active base** picker, Start / Stop / Enable / Disable. Settings keeps OpenRouter/Civitai keys only — the diffusion URL lives on Worker.
+**Worker tab** (not Settings): host/port (defaults `localhost`/`8091`), Setup copy for LAN / FQDN / k8s DNS bridge, Generate API token, VRAM bar, **active base** picker, Start / Stop. Local vs Cloud chooses whether generation uses the worker. A saved URL attaches the worker client. Settings keeps OpenRouter/Civitai keys only — the diffusion URL lives on Worker.
 
 **GPU engine (this host):** `./scripts/run-local-worker.sh` (or `make run-local-worker`) builds `Dockerfile.worker` and runs Docker `freya-local-worker` with `--gpus all`. Inside the container, freya-worker proxies generate to a **Diffusers** sidecar (`FREYA_ENGINE_URL=http://127.0.0.1:8092`). Checkpoints + Civitai LoRAs under `FREYA_MODELS_DIR` load **on demand** into VRAM and unload after each generate unless `FREYA_ENGINE_KEEP_LOADED=1`. Stats `modelLoaded.loadedInVram` reflects the engine; `nvidia-smi` VRAM appears when the container has GPU access. Compose: `make compose-up-gpu`. Without `FREYA_ENGINE_URL`, generate still returns a stub PNG for wiring tests. CRD `engine: vllm-omni` remains the label for swapping to vLLM-Omni on the same HTTP surface.
 
