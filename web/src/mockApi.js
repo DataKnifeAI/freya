@@ -433,6 +433,75 @@ function sessionBatch(base, session) {
   };
 }
 
+function mockLabelKey(raw) {
+  const file = String(raw || "").split(/[/\\]/).pop() || "";
+  const stem = file.replace(/\.(safetensors|ckpt|pt|gguf|bin)$/i, "");
+  return stem.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function mockQueryHits(query, label) {
+  const q = mockLabelKey(query);
+  const n = mockLabelKey(label);
+  if (q.length < 3 || !n) return false;
+  if (q === n) return true;
+  return (q.length >= 4 && n.includes(q)) || (n.length >= 4 && q.includes(n));
+}
+
+function mockSameAsset(local, search) {
+  const lv = Number(local?.versionId);
+  const sv = Number(search?.versionId);
+  if (lv > 0 && sv > 0) return lv === sv;
+  const localKeys = [mockLabelKey(local?.name), mockLabelKey(local?.path)].filter(Boolean);
+  const searchKeys = [mockLabelKey(search?.name), mockLabelKey(search?.fileName)].filter(Boolean);
+  return localKeys.some((k) => searchKeys.includes(k));
+}
+
+/** Installed name/version first, then Civitai hits that are not that file. */
+function orderMockLookup(query, searchCards) {
+  const installed = state.localAssets || [];
+  const search = Array.isArray(searchCards) ? searchCards : [];
+  const used = new Set();
+  const consumed = new Set();
+  const existing = [];
+  const pushExisting = (local, hit) => {
+    const path = local?.path || "";
+    if (!path || used.has(path)) return;
+    used.add(path);
+    const modelId = local.modelId || (!hit?.path && /^\d+$/.test(String(hit?.id || "")) ? Number(hit.id) : null);
+    existing.push({
+      ...(hit || {}),
+      ...local,
+      modelId: modelId || local.modelId || null,
+      versionId: local.versionId ?? hit?.versionId ?? null,
+      thumbnailUrl: local.thumbnailUrl || hit?.thumbnailUrl || null,
+      imageUrls: local.imageUrls?.length ? local.imageUrls : hit?.imageUrls,
+      path,
+      installed: true,
+    });
+  };
+  if (mockLabelKey(query).length >= 3) {
+    installed.forEach((local) => {
+      if (mockQueryHits(query, local.name) || mockQueryHits(query, local.path)) {
+        const idx = search.findIndex((s) => mockSameAsset(local, s));
+        pushExisting(local, idx >= 0 ? search[idx] : null);
+        if (idx >= 0) consumed.add(idx);
+      }
+    });
+  }
+  search.forEach((hit, i) => {
+    if (consumed.has(i)) return;
+    const local = installed.find((a) => mockSameAsset(a, hit));
+    if (local) {
+      pushExisting(local, hit);
+      consumed.add(i);
+    }
+  });
+  const fresh = search
+    .filter((_, i) => !consumed.has(i))
+    .map((hit) => ({ ...hit, installed: false }));
+  return [...existing, ...fresh];
+}
+
 function lorasForAssist(civitaiQuery) {
   // Mock always returns matches so Suggest/session can demo the Civitai bridge.
   // Install needs civitai + worker; Pin and OpenRouter generate work without a worker.
@@ -992,7 +1061,29 @@ async function executeMockChatAction(action, body) {
       type: ty,
       status: "executed",
       args: { ...args, query: q },
-      result: { query: q, loras },
+      result: { query: q, loras: orderMockLookup(q, loras) },
+    };
+  }
+  if (ty === "list_loras" || ty === "list_installed") {
+    const locals = (state.localAssets || []).map((a) => ({ ...a, installed: true, backend: "local" }));
+    if (ty === "list_loras") {
+      return {
+        type: ty,
+        status: "executed",
+        args,
+        result: { loras: locals.filter((a) => a.kind === "lora" || !a.kind) },
+      };
+    }
+    return {
+      type: ty,
+      status: "executed",
+      args,
+      result: {
+        loras: locals.filter((a) => a.kind === "lora"),
+        checkpoints: locals.filter((a) => a.kind === "checkpoint"),
+        embeddings: locals.filter((a) => a.kind === "embedding"),
+        vaes: locals.filter((a) => a.kind === "vae"),
+      },
     };
   }
   if (ty === "generate_image") {
@@ -1623,6 +1714,123 @@ export async function mockApi(path, opts = {}) {
       enhancedPrompt: item.enhancedPrompt,
       backend: item.backend,
       model: item.model,
+    };
+  }
+
+  if (p === "/v1/chat" && method === "POST") {
+    const body = parseBody(opts);
+    const message = (body.message || "").trim() || BEGINNER_EXAMPLE;
+    const mode = String(body.automationMode || "auto").toLowerCase();
+    const route = inferModality(message);
+    if ((route.modality === "gif" || route.modality === "video") && !body.confirm) {
+      const art = mockGenerateArtifact(message, {
+        modality: route.modality,
+        model: body.imageModel || body.model,
+      });
+      return {
+        reply: `Generating ${route.modality} (mock).`,
+        actions: [
+          {
+            type: "generate_video",
+            status: "executed",
+            args: { prompt: message, modality: route.modality },
+            result: art,
+          },
+        ],
+        pendingConfirmation: false,
+        question: null,
+        ideas: [],
+        loras: [],
+        civitaiQuery: null,
+        artifacts: [art],
+        automationMode: mode,
+        route,
+        resolvedModels: { video: art.model },
+      };
+    }
+    const { reply: plannedReply, actions: planned } = planChatActions(message, body);
+    let reply = plannedReply;
+    const actionResults = [];
+    let pendingConfirmation = false;
+    let question = null;
+
+    const sideEffects = planned.filter((a) => isSideEffectAction(a.type));
+    if (mode === "plan" && !body.confirm && sideEffects.length) {
+      pendingConfirmation = true;
+      for (const a of planned) {
+        if (isSideEffectAction(a.type)) {
+          actionResults.push({ type: a.type, status: "proposed", args: a.args || {} });
+        } else {
+          actionResults.push(await executeMockChatAction(a, body));
+        }
+      }
+      reply =
+        reply ||
+        "Here’s what I’d do — confirm to run generate/install, or keep chatting.";
+    } else if (mode === "auto" && !body.confirm) {
+      const installs = planned.filter((a) => a.type === "install_asset");
+      if (installs.length > 1) {
+        pendingConfirmation = true;
+        question = {
+          kind: "lora",
+          text: "Several LoRA installs are queued — which should Freya install?",
+        };
+        for (const a of planned) {
+          if (isSideEffectAction(a.type)) {
+            actionResults.push({ type: a.type, status: "proposed", args: a.args || {} });
+          } else {
+            actionResults.push(await executeMockChatAction(a, body));
+          }
+        }
+      } else {
+        for (const a of planned) {
+          actionResults.push(await executeMockChatAction(a, body));
+        }
+      }
+    } else {
+      for (const a of planned) {
+        actionResults.push(await executeMockChatAction(a, body));
+      }
+    }
+
+    const ideas = [];
+    const artifacts = [];
+    let civitaiQuery = "";
+    let sawSearch = false;
+    const searchLoras = [];
+    const listed = [];
+    for (const ar of actionResults) {
+      const res = ar.result || {};
+      if (Array.isArray(res.ideas)) ideas.push(...res.ideas);
+      if (res.query) civitaiQuery = res.query;
+      if (ar.type === "search_civitai" && Array.isArray(res.loras)) {
+        sawSearch = true;
+        searchLoras.push(...res.loras);
+      } else if (ar.type === "list_loras" && Array.isArray(res.loras)) {
+        listed.push(...res.loras);
+      } else if (ar.type === "list_installed") {
+        for (const key of ["loras", "checkpoints", "embeddings", "vaes"]) {
+          if (Array.isArray(res[key])) listed.push(...res[key]);
+        }
+      }
+      if (ar.type === "generate_image" && res.artifactId) artifacts.push(res);
+      if (Array.isArray(res.results)) artifacts.push(...res.results);
+    }
+    const loras = sawSearch ? searchLoras : listed;
+
+    reply = enrichMockReplyWithWorker(reply, actionResults);
+
+    return {
+      reply,
+      actions: actionResults,
+      pendingConfirmation,
+      question,
+      ideas,
+      loras,
+      civitaiQuery: civitaiQuery || null,
+      artifacts,
+      automationMode: mode,
+      route,
     };
   }
 

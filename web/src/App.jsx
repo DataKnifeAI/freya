@@ -889,6 +889,268 @@ const IconMoon = () => (
 function CompactMenu({ label, valueLabel, options, value, onChange, open, onOpen, icon, title }) {
   const ref = useRef(null);
 
+/** Installed section order / labels by kind or modelType. */
+const INSTALLED_SECTION_ORDER = [
+  { id: "loras", title: "LoRAs", match: (t) => ["lora", "locon", "dora", "lycoris"].includes(t) },
+  { id: "checkpoints", title: "Checkpoints", match: (t) => t === "checkpoint" },
+  { id: "models", title: "Models", match: (t) => t === "model" },
+  {
+    id: "embeddings",
+    title: "Embeddings",
+    match: (t) => t === "textualinversion" || t === "embedding",
+  },
+  { id: "vae", title: "VAEs", match: (t) => t === "vae" },
+];
+
+function installedSectionId(asset) {
+  const raw = String(asset?.modelType || asset?.kind || "").toLowerCase();
+  // Prefer path prefix when kind/type is missing or generic.
+  const path = String(asset?.path || "");
+  if (path.startsWith("loras/")) return "loras";
+  if (path.startsWith("checkpoints/")) return "checkpoints";
+  if (path.startsWith("embeddings/")) return "embeddings";
+  if (path.startsWith("vae/")) return "vae";
+  for (const sec of INSTALLED_SECTION_ORDER) {
+    if (sec.id === "models") continue; // only via explicit kind
+    if (sec.match(raw)) return sec.id;
+  }
+  if (raw === "model") return "models";
+  return "models";
+}
+
+function groupInstalledAssets(assets) {
+  const buckets = new Map();
+  for (const a of assets || []) {
+    const id = installedSectionId(a);
+    if (!buckets.has(id)) buckets.set(id, []);
+    buckets.get(id).push(a);
+  }
+  const order = ["loras", "checkpoints", "models", "embeddings", "vae"];
+  const titles = {
+    loras: "LoRAs",
+    checkpoints: "Checkpoints",
+    models: "Models",
+    embeddings: "Embeddings",
+    vae: "VAEs",
+  };
+  const out = [];
+  for (const id of order) {
+    const items = buckets.get(id);
+    if (items?.length) out.push({ id, title: titles[id], items });
+  }
+  for (const [id, items] of buckets) {
+    if (!order.includes(id) && items.length) {
+      out.push({ id, title: id.charAt(0).toUpperCase() + id.slice(1), items });
+    }
+  }
+  return out;
+}
+
+const CIVITAI_THUMB_CACHE_KEY = "freya.civitaiThumbCache";
+
+function readThumbCache() {
+  try {
+    const raw = localStorage.getItem(CIVITAI_THUMB_CACHE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeThumbCache(map) {
+  try {
+    localStorage.setItem(CIVITAI_THUMB_CACHE_KEY, JSON.stringify(map));
+  } catch {
+    /* ignore */
+  }
+}
+
+function thumbCacheKey(item) {
+  const mid = item?.modelId ?? item?.civitaiModelId;
+  if (mid != null && mid !== "") return `m:${mid}`;
+  if (item?.versionId != null && item.versionId !== "") return `v:${item.versionId}`;
+  return null;
+}
+
+function rememberCivitaiThumb(item, url) {
+  if (!url) return;
+  const key = thumbCacheKey(item);
+  if (!key) return;
+  const map = readThumbCache();
+  if (map[key] === url) return;
+  map[key] = url;
+  const keys = Object.keys(map);
+  if (keys.length > 400) {
+    for (const k of keys.slice(0, keys.length - 300)) delete map[k];
+  }
+  writeThumbCache(map);
+}
+
+function cachedCivitaiThumb(item) {
+  const key = thumbCacheKey(item);
+  if (!key) return null;
+  return readThumbCache()[key] || null;
+}
+
+/** Prefer real image URLs — meta, imageUrls, localStorage cache, then favorites. */
+function pickCivitaiThumb(item, favoritesList = []) {
+  if (!item) return null;
+  const direct = item.thumbnailUrl || item.imageUrls?.[0] || null;
+  if (direct) return direct;
+  const cached = cachedCivitaiThumb(item);
+  if (cached) return cached;
+  const mid = resolveCivitaiModelId(item);
+  const vid = item.versionId;
+  const fromFav = (favoritesList || []).find(
+    (f) =>
+      (mid != null && resolveCivitaiModelId(f) === mid) ||
+      (vid != null && String(f.versionId) === String(vid)),
+  );
+  return fromFav?.thumbnailUrl || fromFav?.imageUrls?.[0] || null;
+}
+
+/** Keep in sync with order_lookup_assets in crates/freya-api/src/routes.rs. */
+function assetLabelKey(raw) {
+  const file = String(raw || "").split(/[/\\]/).pop() || "";
+  const stem = file.replace(/\.(safetensors|ckpt|pt|gguf|bin)$/i, "");
+  return stem.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function queryHitsLabel(query, label) {
+  const q = assetLabelKey(query);
+  const n = assetLabelKey(label);
+  if (q.length < 3 || !n) return false;
+  if (q === n) return true;
+  return (q.length >= 4 && n.includes(q)) || (n.length >= 4 && q.includes(n));
+}
+
+function cardVersionId(item) {
+  const n = Number(item?.versionId);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Same installed file: equal version ids, or equal name/stem when a version is missing.
+ * Different version ids stay distinct so the other version remains a new hit.
+ */
+function lookupSameAsset(local, search) {
+  if (!local || !search) return false;
+  const lv = cardVersionId(local);
+  const sv = cardVersionId(search);
+  if (lv && sv) return lv === sv;
+  const localKeys = [assetLabelKey(local.name), assetLabelKey(local.path)].filter(Boolean);
+  const searchKeys = [assetLabelKey(search.name), assetLabelKey(search.fileName)].filter(Boolean);
+  return localKeys.some((lk) => searchKeys.includes(lk));
+}
+
+function findInstalledMatch(item, installed) {
+  if (!item || !installed?.length) return null;
+  if (item.path) {
+    const byPath = installed.find((a) => a?.path && a.path === item.path);
+    if (byPath) return byPath;
+  }
+  return installed.find((a) => lookupSameAsset(a, item)) || null;
+}
+
+function mergeInstalledCard(card, live) {
+  const searchModel = !card?.path ? resolveCivitaiModelId(card) : null;
+  const modelId = live?.modelId ?? card?.modelId ?? searchModel ?? null;
+  return {
+    ...(card || {}),
+    ...(live || {}),
+    modelId: modelId || null,
+    versionId: live?.versionId ?? card?.versionId ?? null,
+    thumbnailUrl: live?.thumbnailUrl || card?.thumbnailUrl || null,
+    imageUrls: live?.imageUrls?.length ? live.imageUrls : card?.imageUrls,
+    path: live?.path || card?.path || null,
+    name: live?.name || card?.name,
+    modelType: live?.modelType || live?.kind || card?.modelType,
+    baseModel: live?.baseModel || card?.baseModel,
+    triggerWord: live?.triggerWord || card?.triggerWord,
+    civitaiUrl: live?.civitaiUrl || card?.civitaiUrl,
+    downloadUrl: live?.downloadUrl || card?.downloadUrl,
+    installed: true,
+  };
+}
+
+function lookupCardKey(item) {
+  if (item?.path) return `p:${item.path}`;
+  const ver = cardVersionId(item);
+  if (ver) return `v:${ver}`;
+  return `n:${assetLabelKey(item?.name)}:${item?.id ?? ""}`;
+}
+
+/** Installed name/version matches first. Other search hits stay in `fresh`. */
+function presentLookup(cards, installed, query) {
+  const existing = [];
+  const fresh = [];
+  const seen = new Set();
+  const pushExisting = (item) => {
+    const key = lookupCardKey(item);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    existing.push(item);
+  };
+  const list = Array.isArray(cards) ? cards.filter(Boolean) : [];
+  if (query && installed?.length) {
+    for (const local of installed) {
+      if (queryHitsLabel(query, local?.name) || queryHitsLabel(query, local?.path)) {
+        const hit = list.find((c) => lookupSameAsset(local, c));
+        pushExisting(mergeInstalledCard(hit || local, local));
+      }
+    }
+  }
+  for (const card of list) {
+    const live = findInstalledMatch(card, installed);
+    if (live) {
+      pushExisting(mergeInstalledCard(card, live));
+      continue;
+    }
+    if (card.installed === true || card.path) {
+      pushExisting({ ...card, installed: true });
+      continue;
+    }
+    if (existing.some((e) => lookupSameAsset(e, card))) continue;
+    const key = lookupCardKey(card);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    fresh.push({ ...card, installed: false });
+  }
+  return { existing, fresh };
+}
+
+function lookupQueryFor(cards, query) {
+  const searchish = (cards || []).some((c) => c && !c.path && c.installed !== true);
+  return searchish ? query || "" : "";
+}
+
+/** Prefer the search payload (already installed-first). Otherwise list installed/local. */
+function cardsFromChatPayload(data) {
+  const actions = Array.isArray(data?.actions) ? data.actions : [];
+  const searches = actions.filter(
+    (a) => a?.type === "search_civitai" && a.status === "executed" && Array.isArray(a.result?.loras),
+  );
+  if (searches.length) return searches.flatMap((a) => a.result.loras);
+  const listed = [];
+  for (const a of actions) {
+    if (a?.status !== "executed" || !a.result) continue;
+    if (a.type === "list_loras" && Array.isArray(a.result.loras)) listed.push(...a.result.loras);
+    if (a.type === "list_checkpoints" && Array.isArray(a.result.checkpoints)) {
+      listed.push(...a.result.checkpoints);
+    }
+    if (a.type === "list_installed") {
+      for (const key of ["loras", "checkpoints", "embeddings", "vaes"]) {
+        if (Array.isArray(a.result[key])) listed.push(...a.result[key]);
+      }
+    }
+  }
+  if (listed.length) return listed;
+  return Array.isArray(data?.loras) ? data.loras : [];
+}
+
+/** Dismiss helpers shared by compact + grouped chrome menus. */
+function useChromeMenuDismiss(open, onOpen, ref) {
   useEffect(() => {
     if (!open) return;
     const onDoc = (e) => {
@@ -1551,7 +1813,13 @@ export default function App() {
       if (willFetch) {
         let data;
         if (civitaiId != null) {
-          data = await api(`/v1/civitai/models/${civitaiId}`);
+          try {
+            data = await api(`/v1/civitai/models/${civitaiId}`);
+          } catch (err) {
+            // Chat cards sometimes carry a version id where a model id belongs.
+            if (versionId == null) throw err;
+            data = await api(`/v1/civitai/model-versions/${versionId}`);
+          }
         } else {
           // Installed sidecars often have versionId but null modelId — resolve via version.
           data = await api(`/v1/civitai/model-versions/${versionId}`);
@@ -2098,11 +2366,23 @@ export default function App() {
       : [];
     const artifactIds = artifacts.map((a) => a.artifactId).filter(Boolean);
     const ideasNext = Array.isArray(data.ideas) ? data.ideas : [];
-    const lorasNext = Array.isArray(data.loras) ? data.loras : [];
     const query = data.civitaiQuery || "";
+    const sourceCards = cardsFromChatPayload(data);
+    const presented = presentLookup(
+      sourceCards,
+      installedAssets,
+      lookupQueryFor(sourceCards, query),
+    );
+    const lorasNext = [...presented.existing, ...presented.fresh];
 
     if (ideasNext.length) setIdeas(ideasNext);
     if (lorasNext.length) setSuggestedLoras(lorasNext);
+    if (settings?.civitaiConfigured) {
+      const bare = presented.existing.filter(
+        (a) => a?.path && !a.thumbnailUrl && (a.versionId != null || a.modelId != null),
+      );
+      if (bare.length) scheduleEnrichInstalledThumbs(bare);
+    }
     if (query) {
       setCivitaiQuery(query);
       setCivitaiQ(query);
@@ -2309,6 +2589,7 @@ export default function App() {
       artifactIds,
       ideas: ideasNext,
       loras: lorasNext,
+      civitaiQuery: query || null,
       route,
       routeContext,
       resolvedModels,
@@ -2623,20 +2904,27 @@ export default function App() {
             },
             thumb,
           );
+          const applyThumb = (a) =>
+            a?.path === asset.path
+              ? {
+                  ...a,
+                  thumbnailUrl: a.thumbnailUrl || thumb,
+                  modelId: a.modelId ?? resolvedModelId,
+                  imageUrls: a.imageUrls?.length ? a.imageUrls : model?.imageUrls,
+                }
+              : a;
           setInstalledAssets((prev) => {
-            const next = prev.map((a) =>
-              a.path === asset.path
-                ? {
-                    ...a,
-                    thumbnailUrl: a.thumbnailUrl || thumb,
-                    modelId: a.modelId ?? resolvedModelId,
-                    imageUrls: a.imageUrls?.length ? a.imageUrls : model?.imageUrls,
-                  }
-                : a,
-            );
+            const next = prev.map(applyThumb);
             installedFingerprintRef.current = installedListFingerprint(next);
             return next;
           });
+          setSuggestedLoras((prev) => prev.map(applyThumb));
+          setSession((prev) => ({
+            ...prev,
+            messages: (prev.messages || []).map((m) =>
+              Array.isArray(m.loras) ? { ...m, loras: m.loras.map(applyThumb) } : m,
+            ),
+          }));
         } catch {
           /* ignore per-asset resolve failures */
         }
@@ -3575,6 +3863,51 @@ export default function App() {
     );
   };
 
+  const renderAssetLookup = (cards, query) => {
+    const { existing, fresh } = presentLookup(cards, installedAssets, query || "");
+    if (!existing.length && !fresh.length) return null;
+    return (
+      <div className="lookup-assets">
+        {existing.length > 0 && (
+          <div className="lookup-existing">
+            <span className="lookup-assets-label">Installed</span>
+            <div className="lookup-existing-row">
+              {existing.map((item) => renderLoraCard(item, { compact: true }))}
+            </div>
+          </div>
+        )}
+        {fresh.length > 0 && (
+          <div className="lookup-new">
+            <span className="lookup-assets-label">Other Civitai matches</span>
+            <div className="lookup-new-list" tabIndex={0}>
+              {fresh.map((item) => renderLoraCard(item, { compact: true }))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const detailModel = civitaiDetail?.model;
+  const detailVersions = detailModel?.modelVersions || [];
+  const detailSelectedVersion =
+    detailVersions.find((v) => String(v.id) === String(detailModel?.versionId)) ||
+    detailVersions[0] ||
+    null;
+  const detailFiles = detailSelectedVersion?.files || [];
+  const detailThumbHint = detailModel
+    ? pickCivitaiThumb(detailModel, favorites)
+    : null;
+  const detailImages =
+    (detailModel?.imageUrls?.length
+      ? detailModel.imageUrls
+      : detailThumbHint
+        ? [detailThumbHint]
+        : detailModel?.thumbnailUrl
+          ? [detailModel.thumbnailUrl]
+          : []) || [];
+  const detailRelated = civitaiDetail?.related || [];
+
   const showAssistPanel =
     ideas.length > 0 || suggestedLoras.length > 0 || suggestNote || civitaiQuery;
 
@@ -3892,6 +4225,8 @@ export default function App() {
                     })}
                   </div>
                 )}
+                {Array.isArray(m.loras) && m.loras.length > 0 &&
+                  renderAssetLookup(m.loras, lookupQueryFor(m.loras, m.civitaiQuery || ""))}
                 {Array.isArray(m.ideas) && m.ideas.length > 0 && (
                   <div className="idea-chips">
                     {m.ideas.map((idea) => (
@@ -4067,8 +4402,8 @@ export default function App() {
                 )}
                 {suggestedLoras.length > 0 && (
                   <p className="hint">
-                    {suggestedLoras.length} LoRA candidate{suggestedLoras.length === 1 ? "" : "s"}{" "}
-                    in the gallery pane → pin or install there.
+                    Installed matches stay first. Other Civitai hits stay in the list — nothing is
+                    pinned or downloaded until you choose.
                   </p>
                 )}
               </aside>
@@ -4413,12 +4748,10 @@ export default function App() {
                 </button>
               </div>
               <p className="hint">
-                Pin anytime (no worker needed). Install needs a worker — otherwise Freya generates
-                via OpenRouter.
+                Installed name and version matches come first. Other Civitai hits stay in the
+                list. Pin or install only if you want to — nothing is downloaded automatically.
               </p>
-              <div className="lora-row lora-row-strip">
-                {suggestedLoras.map((l) => renderLoraCard(l, { compact: true }))}
-              </div>
+              {renderAssetLookup(suggestedLoras, lookupQueryFor(suggestedLoras, civitaiQuery))}
             </aside>
           )}
 

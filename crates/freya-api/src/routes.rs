@@ -127,7 +127,242 @@ fn local_asset_json(a: crate::worker::LocalAsset) -> Value {
         "source": a.source,
         "thumbnailUrl": a.thumbnail_url,
         "backend": "local",
+        "installed": true,
     })
+}
+
+fn asset_label_key(raw: &str) -> String {
+    let file = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    let stem = file
+        .trim_end_matches(".safetensors")
+        .trim_end_matches(".ckpt")
+        .trim_end_matches(".pt")
+        .trim_end_matches(".gguf")
+        .trim_end_matches(".bin");
+    stem.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn card_label(v: &Value) -> String {
+    v.get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn card_version(v: &Value) -> Option<i64> {
+    v.get("versionId")
+        .and_then(|x| x.as_i64())
+        .filter(|n| *n > 0)
+}
+
+fn json_field_missing(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) if s.trim().is_empty() => true,
+        Some(Value::Array(a)) if a.is_empty() => true,
+        _ => false,
+    }
+}
+
+/// Name or file-stem equality. Different version ids are not the same asset.
+fn lookup_same_asset(local: &Value, search: &Value) -> bool {
+    match (card_version(local), card_version(search)) {
+        (Some(a), Some(b)) if a == b => return true,
+        (Some(_), Some(_)) => return false,
+        _ => {}
+    }
+    let local_path = local.get("path").and_then(|p| p.as_str()).unwrap_or("");
+    let search_file = search
+        .get("fileName")
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+    let local_keys = [
+        asset_label_key(&card_label(local)),
+        asset_label_key(local_path),
+    ];
+    let search_keys = [
+        asset_label_key(&card_label(search)),
+        asset_label_key(search_file),
+    ];
+    local_keys
+        .iter()
+        .any(|lk| !lk.is_empty() && search_keys.iter().any(|sk| !sk.is_empty() && sk == lk))
+}
+
+fn query_hits_label(query: &str, label: &str) -> bool {
+    let q = asset_label_key(query);
+    let n = asset_label_key(label);
+    if q.len() < 3 || n.is_empty() {
+        return false;
+    }
+    if q == n {
+        return true;
+    }
+    (q.len() >= 4 && n.contains(&q)) || (n.len() >= 4 && q.contains(&n))
+}
+
+fn merge_installed_lookup(local: &Value, search: Option<&Value>) -> Value {
+    let mut out = local.clone();
+    let Some(obj) = out.as_object_mut() else {
+        return local.clone();
+    };
+    obj.insert("installed".into(), json!(true));
+    let Some(search) = search else {
+        return out;
+    };
+    for key in [
+        "modelId",
+        "versionId",
+        "versionName",
+        "thumbnailUrl",
+        "imageUrls",
+        "baseModel",
+        "modelType",
+        "triggerWord",
+        "downloadUrl",
+        "civitaiUrl",
+        "fileId",
+        "fileName",
+        "fileFormat",
+        "stats",
+    ] {
+        if json_field_missing(obj.get(key)) {
+            if let Some(v) = search.get(key) {
+                if !json_field_missing(Some(v)) {
+                    obj.insert(key.to_string(), v.clone());
+                }
+            }
+        }
+    }
+    // Search `id` is the Civitai model id. Installed `id` is a file stem — do not copy it over.
+    if json_field_missing(obj.get("modelId")) {
+        if let Some(id) = search.get("id").and_then(|x| x.as_i64()).filter(|n| *n > 0) {
+            obj.insert("modelId".into(), json!(id));
+        }
+    }
+    out
+}
+
+/// Installed name/version matches first, then Civitai hits that are not that asset.
+/// Does not pin or download.
+fn order_lookup_assets(installed: &[Value], search: &[Value], query: &str) -> Vec<Value> {
+    let mut used_paths = std::collections::HashSet::new();
+    let mut consumed = std::collections::HashSet::new();
+    let mut existing = Vec::new();
+
+    let push_existing = |existing: &mut Vec<Value>,
+                         used_paths: &mut std::collections::HashSet<String>,
+                         local: &Value,
+                         hit: Option<&Value>| {
+        let path = local
+            .get("path")
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .to_string();
+        if path.is_empty() || !used_paths.insert(path) {
+            return;
+        }
+        existing.push(merge_installed_lookup(local, hit));
+    };
+
+    if asset_label_key(query).len() >= 3 {
+        for local in installed {
+            let name = card_label(local);
+            let stem = local.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            if query_hits_label(query, &name) || query_hits_label(query, stem) {
+                let hit_idx = search.iter().position(|s| lookup_same_asset(local, s));
+                push_existing(
+                    &mut existing,
+                    &mut used_paths,
+                    local,
+                    hit_idx.and_then(|i| search.get(i)),
+                );
+                if let Some(i) = hit_idx {
+                    consumed.insert(i);
+                }
+            }
+        }
+    }
+
+    for (i, hit) in search.iter().enumerate() {
+        if consumed.contains(&i) {
+            continue;
+        }
+        if let Some(local) = installed.iter().find(|l| lookup_same_asset(l, hit)) {
+            push_existing(&mut existing, &mut used_paths, local, Some(hit));
+            consumed.insert(i);
+        }
+    }
+
+    let mut ordered = existing;
+    for (i, hit) in search.iter().enumerate() {
+        if consumed.contains(&i) {
+            continue;
+        }
+        let mut card = hit.clone();
+        if let Some(obj) = card.as_object_mut() {
+            obj.insert("installed".into(), json!(false));
+        }
+        ordered.push(card);
+    }
+    ordered
+}
+
+async fn installed_asset_values(state: &AppState) -> Vec<Value> {
+    let Ok(v) = installed_payload(state).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in ["loras", "checkpoints", "embeddings", "vaes"] {
+        if let Some(arr) = v.get(key).and_then(|x| x.as_array()) {
+            out.extend(arr.iter().cloned());
+        }
+    }
+    out
+}
+
+/// Search results already put installed matches first. A bare list is the library.
+fn collect_chat_lookup_cards(action_results: &[Value]) -> Vec<Value> {
+    let mut search_cards = Vec::new();
+    let mut listed = Vec::new();
+    let mut saw_search = false;
+    for ar in action_results {
+        if ar.get("status").and_then(|s| s.as_str()) != Some("executed") {
+            continue;
+        }
+        let ty = ar.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let Some(res) = ar.get("result") else {
+            continue;
+        };
+        let push_arr = |dest: &mut Vec<Value>, v: Option<&Value>| {
+            if let Some(arr) = v.and_then(|x| x.as_array()) {
+                dest.extend(arr.iter().cloned());
+            }
+        };
+        if ty == "search_civitai" {
+            saw_search = true;
+            push_arr(&mut search_cards, res.get("loras"));
+            continue;
+        }
+        match ty {
+            "list_loras" => push_arr(&mut listed, res.get("loras")),
+            "list_checkpoints" => push_arr(&mut listed, res.get("checkpoints")),
+            "list_installed" => {
+                for key in ["loras", "checkpoints", "embeddings", "vaes"] {
+                    push_arr(&mut listed, res.get(key));
+                }
+            }
+            _ => {}
+        }
+    }
+    if saw_search {
+        search_cards
+    } else {
+        listed
+    }
 }
 
 pub async fn worker_checkpoints(State(state): State<AppState>) -> ApiResult<Json<Value>> {
@@ -1499,16 +1734,19 @@ async fn execute_chat_action(
                     "error": "missing query"
                 });
             }
-            let civ = state.civitai.read().await;
-            if !civ.configured() {
-                return json!({
-                    "type": ty,
-                    "status": "error",
-                    "args": action.args,
-                    "error": "Civitai API key not configured"
-                });
-            }
-            match civ.search(q, 12).await {
+            let searched = {
+                let civ = state.civitai.read().await;
+                if !civ.configured() {
+                    return json!({
+                        "type": ty,
+                        "status": "error",
+                        "args": action.args,
+                        "error": "Civitai API key not configured"
+                    });
+                }
+                civ.search(q, 12).await
+            };
+            match searched {
                 Ok(items) => {
                     let mut assets: Vec<_> = items
                         .into_iter()
@@ -1516,11 +1754,19 @@ async fn execute_chat_action(
                         .collect();
                     assets.sort_by_key(|c| crate::civitai::asset_type_rank(&c.model_type));
                     assets.truncate(6);
+                    let search_vals: Vec<Value> = assets
+                        .iter()
+                        .map(|c| serde_json::to_value(c).unwrap_or_else(|_| json!({})))
+                        .collect();
+                    // Drop the Civitai lock before reading the worker. Installed
+                    // name/version matches stay first; other hits stay in the list.
+                    let installed = installed_asset_values(state).await;
+                    let loras = order_lookup_assets(&installed, &search_vals, q);
                     json!({
                         "type": ty,
                         "status": "executed",
                         "args": action.args,
-                        "result": { "query": q, "loras": assets }
+                        "result": { "query": q, "loras": loras }
                     })
                 }
                 Err(e) => json!({
@@ -1861,19 +2107,7 @@ async fn execute_chat_action(
             };
             match client.list_checkpoints().await {
                 Ok(items) => {
-                    let checkpoints: Vec<Value> = items
-                        .into_iter()
-                        .map(|a| {
-                            json!({
-                                "id": a.id,
-                                "name": a.name.unwrap_or_else(|| a.id.clone()),
-                                "kind": a.kind,
-                                "path": a.path,
-                                "baseModel": a.base_model,
-                                "backend": "local",
-                            })
-                        })
-                        .collect();
+                    let checkpoints: Vec<Value> = items.into_iter().map(local_asset_json).collect();
                     json!({
                         "type": ty,
                         "status": "executed",
@@ -1901,19 +2135,7 @@ async fn execute_chat_action(
             };
             match client.list_loras().await {
                 Ok(items) => {
-                    let loras: Vec<Value> = items
-                        .into_iter()
-                        .map(|a| {
-                            json!({
-                                "id": a.id,
-                                "name": a.name.unwrap_or_else(|| a.id.clone()),
-                                "kind": a.kind,
-                                "path": a.path,
-                                "baseModel": a.base_model,
-                                "backend": "local",
-                            })
-                        })
-                        .collect();
+                    let loras: Vec<Value> = items.into_iter().map(local_asset_json).collect();
                     json!({
                         "type": ty,
                         "status": "executed",
@@ -3357,7 +3579,6 @@ pub async fn chat(
 
     // Aggregate convenience fields for the UI
     let mut ideas = Vec::new();
-    let mut loras = Vec::new();
     let mut artifacts = Vec::new();
     let mut civitai_query = String::new();
     for ar in &action_results {
@@ -3368,9 +3589,6 @@ pub async fn chat(
                         ideas.push(json!(s));
                     }
                 }
-            }
-            if let Some(arr) = res.get("loras").and_then(|i| i.as_array()) {
-                loras.extend(arr.iter().cloned());
             }
             if let Some(q) = res.get("query").and_then(|q| q.as_str()) {
                 civitai_query = q.to_string();
@@ -3386,6 +3604,8 @@ pub async fn chat(
             }
         }
     }
+    // Search payload is already installed-first. Do not prepend the full library.
+    let loras = collect_chat_lookup_cards(&action_results);
 
     // Tool results arrive after the LLM reply — fold worker summaries into reply.
     let reply = enrich_reply_with_worker_results(&reply, &action_results);
@@ -4920,5 +5140,100 @@ mod route_footer_tests {
         );
         assert!(!line.contains("base="));
         assert!(!line.contains("lora="));
+    }
+
+    #[test]
+    fn lookup_prefers_installed_version_and_keeps_other_hits() {
+        let installed = vec![json!({
+            "id": "eagle_wing",
+            "name": "Eagle Wing Warrior",
+            "path": "loras/eagle_wing.safetensors",
+            "versionId": 100,
+            "modelId": null,
+            "thumbnailUrl": null,
+            "kind": "lora"
+        })];
+        let search = vec![
+            json!({
+                "id": 901,
+                "name": "Eagle Wing Warrior",
+                "versionId": 100,
+                "thumbnailUrl": "https://img/eagle.png",
+                "modelType": "LORA"
+            }),
+            json!({
+                "id": 902,
+                "name": "Valkyrie Feather Armor",
+                "versionId": 200,
+                "thumbnailUrl": "https://img/val.png",
+                "modelType": "LORA"
+            }),
+        ];
+        let ordered = order_lookup_assets(&installed, &search, "eagle wing");
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0]["installed"], json!(true));
+        assert_eq!(ordered[0]["path"], "loras/eagle_wing.safetensors");
+        assert_eq!(ordered[0]["versionId"], 100);
+        assert_eq!(ordered[0]["modelId"], 901);
+        assert_eq!(ordered[0]["thumbnailUrl"], "https://img/eagle.png");
+        assert_eq!(ordered[1]["installed"], json!(false));
+        assert_eq!(ordered[1]["name"], "Valkyrie Feather Armor");
+        assert_eq!(ordered[1].get("path"), None);
+    }
+
+    #[test]
+    fn lookup_keeps_a_different_version_in_the_new_list() {
+        let installed = vec![json!({
+            "name": "Eagle Wing Warrior",
+            "path": "loras/eagle.safetensors",
+            "versionId": 100,
+            "modelId": 901,
+            "thumbnailUrl": "https://img/installed.png"
+        })];
+        let search = vec![json!({
+            "id": 901,
+            "name": "Eagle Wing Warrior XL",
+            "versionId": 101,
+            "thumbnailUrl": "https://img/xl.png"
+        })];
+        let ordered = order_lookup_assets(&installed, &search, "eagle wing warrior");
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0]["installed"], json!(true));
+        assert_eq!(ordered[0]["path"], "loras/eagle.safetensors");
+        assert_eq!(ordered[0]["versionId"], 100);
+        assert_eq!(ordered[0]["thumbnailUrl"], "https://img/installed.png");
+        assert_eq!(ordered[1]["installed"], json!(false));
+        assert_eq!(ordered[1]["versionId"], 101);
+    }
+
+    #[test]
+    fn lookup_without_installed_assets_lists_search_hits() {
+        let search = vec![json!({ "id": 1, "name": "A", "versionId": 2 })];
+        let ordered = order_lookup_assets(&[], &search, "a");
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0]["installed"], json!(false));
+    }
+
+    #[test]
+    fn chat_cards_use_search_order_not_the_full_library() {
+        let actions = vec![
+            json!({
+                "type": "list_loras",
+                "status": "executed",
+                "result": { "loras": [ { "name": "Unrelated", "path": "loras/unrelated.safetensors" } ] }
+            }),
+            json!({
+                "type": "search_civitai",
+                "status": "executed",
+                "result": { "query": "eagle", "loras": [
+                    { "name": "Eagle Wing Warrior", "path": "loras/eagle.safetensors", "installed": true, "versionId": 100 },
+                    { "name": "Valkyrie", "installed": false, "versionId": 200 }
+                ] }
+            }),
+        ];
+        let cards = collect_chat_lookup_cards(&actions);
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0]["name"], "Eagle Wing Warrior");
+        assert_eq!(cards[1]["name"], "Valkyrie");
     }
 }
