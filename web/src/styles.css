@@ -1838,4 +1838,10 @@ button.help-q:hover,
     animation: none;
     color: var(--coral);
   }
+  .t-live-status {
+    animation: none;
+    background-image: none;
+    -webkit-text-fill-color: currentColor;
+    color: var(--mist-light);
+  }
 }

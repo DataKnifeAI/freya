@@ -285,7 +285,11 @@ function mockCard(partial) {
     fileName: defaultFile?.name,
     fileFormat: defaultFile?.format,
     creator: "freya-mock",
-    civitaiUrl: `https://civitai.com/models/${partial.id}`,
+    civitaiUrl: `${
+      partial.nsfw === true || Number(partial.nsfwLevel) > 1
+        ? "https://civitai.red"
+        : "https://civitai.com"
+    }/models/${partial.id}?modelVersionId=${modelVersions[0]?.id || versionId}`,
     description:
       partial.description ||
       `${partial.name} — mock Civitai asset for Freya. Compatible with ${baseModel} bases.`,
