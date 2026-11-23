@@ -788,6 +788,9 @@ pub struct ChatRequest {
     /// Composer video model pin (`auto` or a provider/model id). Not an API key.
     #[serde(default)]
     pub video_model: Option<String>,
+    /// Compact prior-tool memory (installed, pinned, active base). Not shown in the transcript.
+    #[serde(default)]
+    pub tool_context: Option<String>,
     /// When true, skip LLM planning and execute `actions` (Plan confirmation).
     #[serde(default)]
     pub confirm: bool,
@@ -1843,7 +1846,12 @@ async fn execute_chat_action(
                 .unwrap_or("")
                 .trim();
             let type_raw = search_type_arg(&action.args);
-            match typed_civitai_lookup(state, q, type_raw, 6).await {
+            let limit = action
+                .args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(6) as u32;
+            match typed_civitai_lookup(state, q, type_raw, limit).await {
                 Ok(result) => json!({
                     "type": ty,
                     "status": "executed",
@@ -3277,6 +3285,177 @@ fn lora_from_pin_value(v: &Value) -> Option<LoraIn> {
     })
 }
 
+/// Short Civitai query from a first prompt. Guidance prefixes are not the subject.
+fn subject_query(message: &str) -> String {
+    let raw = message.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    let lower = raw.to_lowercase();
+    let mut start = 0usize;
+    const TAILS: &[&str] = &[
+        "what should i do for ",
+        "what should i do with ",
+        "what can i do for ",
+        "help me choose ",
+        "help me pick ",
+        "help me with ",
+        "which lora for ",
+        "which base for ",
+        "which checkpoint for ",
+        "any assets for ",
+        "any models for ",
+        "any loras for ",
+        "suggest a lora for ",
+        "suggest assets for ",
+    ];
+    for prefix in TAILS {
+        if lower.starts_with(prefix) {
+            start = prefix.len();
+            break;
+        }
+    }
+    let slice = raw[start..]
+        .trim()
+        .trim_matches(|c: char| c == '?' || c == '.' || c == '!' || c == '"');
+    const SKIP: &[&str] = &[
+        "a", "an", "the", "please", "me", "my", "of", "to", "and", "or", "with", "for", "on",
+        "in", "it", "this", "that", "image", "picture", "photo",
+    ];
+    let words: Vec<&str> = slice
+        .split_whitespace()
+        .filter(|w| {
+            let key = w
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                .to_lowercase();
+            !key.is_empty() && !SKIP.contains(&key.as_str())
+        })
+        .take(6)
+        .collect();
+    let q = if words.is_empty() {
+        slice.split_whitespace().take(6).collect::<Vec<_>>().join(" ")
+    } else {
+        words.join(" ")
+    };
+    q.chars().take(80).collect()
+}
+
+fn suggestion_names(cards: &[Value], limit: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    let push = |names: &mut Vec<String>, card: &Value| {
+        if names.len() >= limit {
+            return;
+        }
+        let Some(name) = card.get("name").and_then(|n| n.as_str()).map(str::trim) else {
+            return;
+        };
+        if name.is_empty() || names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            return;
+        }
+        names.push(name.to_string());
+    };
+    for card in cards.iter().filter(|c| {
+        c.get("installed").and_then(|v| v.as_bool()) == Some(true)
+            || c.get("path").and_then(|p| p.as_str()).is_some_and(|p| !p.is_empty())
+    }) {
+        push(&mut names, card);
+    }
+    for card in cards {
+        push(&mut names, card);
+    }
+    names
+}
+
+/// Vague first turn: name a couple of matches and explain pin. A clear render only notes the Agent tab.
+fn note_subject_lookup(reply: &str, modality: &str, cards: &[Value]) -> String {
+    let names = suggestion_names(cards, 2);
+    let reply = reply.trim();
+    if modality == "chat" {
+        if reply.to_lowercase().contains("pin")
+            && reply.to_lowercase().contains("base")
+            && reply.to_lowercase().contains("lora")
+        {
+            return reply.to_string();
+        }
+        let lead = if names.is_empty() {
+            "I looked for a matching LoRA and base.".to_string()
+        } else if names.len() == 1 {
+            format!("A match: {}.", names[0])
+        } else {
+            format!("A couple of matches: {} and {}.", names[0], names[1])
+        };
+        let pin = " Pin one on the Agent tab to use it. That installs the LoRA if it is not on the worker, then pins it, and installs or selects the matching base checkpoint.";
+        if reply.is_empty() {
+            format!("{lead}{pin}")
+        } else {
+            format!("{reply}\n\n{lead}{pin}")
+        }
+    } else if names.is_empty() || reply.to_lowercase().contains("agent tab") {
+        reply.to_string()
+    } else {
+        format!(
+            "{reply}\n\nMatching assets are on the Agent tab ({}) if you want to pin a LoRA or switch the base.",
+            names.join(", ")
+        )
+    }
+}
+
+/// First prompt: installed-first Civitai lookup, one call per agent search type. Does not pin or install.
+async fn run_initial_subject_lookup(state: &AppState, message: &str) -> Vec<Value> {
+    let query = subject_query(message);
+    if query.chars().count() < 2 {
+        return Vec::new();
+    }
+    let configured = state.civitai.read().await.configured();
+    if !configured {
+        return vec![json!({
+            "type": "search_civitai",
+            "status": "error",
+            "args": { "query": query, "type": "LORA" },
+            "error": "Civitai API key not configured"
+        })];
+    }
+    let mut joins = Vec::new();
+    for ty in crate::civitai::AGENT_SEARCH_TYPES {
+        let state = state.clone();
+        let query = query.clone();
+        let limit: u32 = if *ty == "LORA" || *ty == "Checkpoint" {
+            4
+        } else {
+            2
+        };
+        joins.push(tokio::spawn(async move {
+            let args = json!({ "query": query, "type": ty, "limit": limit });
+            match typed_civitai_lookup(&state, &query, ty, limit).await {
+                Ok(result) => json!({
+                    "type": "search_civitai",
+                    "status": "executed",
+                    "args": args,
+                    "result": result
+                }),
+                Err(e) => json!({
+                    "type": "search_civitai",
+                    "status": "error",
+                    "args": args,
+                    "error": e
+                }),
+            }
+        }));
+    }
+    let mut out = Vec::new();
+    for join in joins {
+        match join.await {
+            Ok(v) => out.push(v),
+            Err(e) => out.push(json!({
+                "type": "search_civitai",
+                "status": "error",
+                "error": e.to_string()
+            })),
+        }
+    }
+    out
+}
+
 pub async fn chat(
     State(state): State<AppState>,
     Json(mut req): Json<ChatRequest>,
@@ -3292,7 +3471,7 @@ pub async fn chat(
         _ => "auto".into(),
     };
 
-    let hist_blob = if req.messages.is_empty() {
+    let mut hist_blob = if req.messages.is_empty() {
         String::new()
     } else {
         req.messages
@@ -3304,6 +3483,20 @@ pub async fn chat(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    if let Some(ctx) = req
+        .tool_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let ctx: String = ctx.chars().take(2000).collect();
+        hist_blob = if hist_blob.is_empty() {
+            format!("--- prior tools ---\n{ctx}")
+        } else {
+            format!("{hist_blob}\n\n--- prior tools ---\n{ctx}")
+        };
+    }
+    let initial_turn = !req.confirm && req.messages.is_empty();
 
     let media_ask = crate::router::direct_media_ask(&req.message);
 
@@ -3574,6 +3767,15 @@ pub async fn chat(
         }
     }
 
+    // First prompt looks up the subject (installed first, then each Civitai type).
+    // The fan-out replaces any single search the planner already chose so types are not dropped.
+    let lookup_results = if initial_turn {
+        planned.retain(|a| a.action_type != "search_civitai");
+        run_initial_subject_lookup(&state, &req.message).await
+    } else {
+        Vec::new()
+    };
+
     // Prefer router-resolved image model when executing generates under Auto.
     let mut env = ActionRun {
         loras: req.loras.clone(),
@@ -3658,6 +3860,12 @@ pub async fn chat(
         }
     }
 
+    if !lookup_results.is_empty() {
+        let mut merged = lookup_results;
+        merged.append(&mut action_results);
+        action_results = merged;
+    }
+
     // Aggregate convenience fields for the UI
     let mut ideas = Vec::new();
     let mut artifacts = Vec::new();
@@ -3690,6 +3898,11 @@ pub async fn chat(
 
     // Tool results arrive after the LLM reply — fold worker summaries into reply.
     let reply = enrich_reply_with_worker_results(&reply, &action_results);
+    let reply = if initial_turn {
+        note_subject_lookup(&reply, route.modality.as_str(), &loras)
+    } else {
+        reply
+    };
     let effective_backend = env.backend.as_deref().or(req.backend.as_deref());
     let local_backend = effective_backend.is_some_and(|b| b.eq_ignore_ascii_case("local"));
     let base_name = if local_backend {
@@ -5722,5 +5935,41 @@ mod route_footer_tests {
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0]["name"], "Eagle Wing Warrior");
         assert_eq!(cards[1]["name"], "Valkyrie");
+    }
+
+    #[test]
+    fn subject_query_keeps_the_named_subject() {
+        assert_eq!(
+            subject_query("what should I do for Frankie Foster?"),
+            "Frankie Foster"
+        );
+        let scene = subject_query("a woman in an emerald dress in a neon diner at night");
+        assert!(scene.to_lowercase().contains("emerald"));
+        assert!(scene.to_lowercase().contains("diner"));
+        assert!(!scene.to_lowercase().contains("generate"));
+    }
+
+    #[test]
+    fn vague_lookup_note_mentions_pin_lora_and_base() {
+        let cards = vec![
+            json!({ "name": "Foster LoRA", "path": "loras/foster.safetensors", "installed": true }),
+            json!({ "name": "Other Foster", "installed": false }),
+        ];
+        let note = note_subject_lookup("Happy to help you choose.", "chat", &cards);
+        let lower = note.to_lowercase();
+        assert!(lower.contains("foster lora"));
+        assert!(lower.contains("pin"));
+        assert!(lower.contains("lora"));
+        assert!(lower.contains("base"));
+        assert!(!lower.contains("```"));
+    }
+
+    #[test]
+    fn detailed_lookup_note_does_not_ask_a_question() {
+        let cards = vec![json!({ "name": "Neon Diner", "installed": false })];
+        let note = note_subject_lookup("On it — I’ll make that image for you.", "picture", &cards);
+        assert!(note.contains("Agent tab"));
+        assert!(note.contains("Neon Diner"));
+        assert!(!note.contains('?'));
     }
 }

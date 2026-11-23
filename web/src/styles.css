@@ -894,6 +894,18 @@ button.linkish:hover { text-decoration-color: var(--ember); }
 .t-bubble { margin: 0; font-size: 0.9rem; line-height: 1.45; white-space: pre-wrap; }
 .t-generate-row { margin-top: 0.35rem; }
 .t-generate { padding: 0.35rem 0.75rem; font-size: 0.78rem; }
+.t-tools-disclosure { margin-top: 0.2rem; }
+.t-tools-disclosure > summary {
+  cursor: pointer;
+  font-size: 0.68rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--mist-light);
+}
+.t-tools-disclosure > summary::-webkit-details-marker { display: none; }
+.t-ref-row { display: flex; flex-wrap: wrap; gap: 0.15rem 0.7rem; margin-top: 0.2rem; }
+.t-ref-link { font-size: 0.78rem; padding: 0; }
 .t-tools { list-style: none; margin: 0.35rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.35rem; }
 .t-tool {
   font-size: 0.68rem; font-weight: 600; letter-spacing: 0.02em;
@@ -969,7 +981,7 @@ button.linkish:hover { text-decoration-color: var(--ember); }
 .tabs button.active { background: transparent; color: var(--chrome-text); border-bottom-color: var(--apricot); }
 
 .lora-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 0.6rem; }
-/* Styles-tab match table: one asset per row. Thumb matches the Installed card column (190px, 4/3). */
+/* Agent-tab match table: one asset per row. Thumb matches the Installed card column (190px, 4/3). */
 .style-matches {
   display: grid; gap: 0.4rem;
   padding: 0.15rem 0 0.85rem; margin-bottom: 0.35rem;

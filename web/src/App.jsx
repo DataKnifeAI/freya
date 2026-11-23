@@ -19,15 +19,14 @@ const THEME_STORAGE_KEY = "freya.theme";
 const TAB_STORAGE_KEY = "freya.tab";
 /** Top-level Studio tabs (nav + restore must stay in sync). */
 const STUDIO_TABS = [
+  "agent",
   "gallery",
-  "styles",
-  "civitai",
-  "worker",
   "metrics",
-  "models",
-  "settings",
   "help",
   "guidelines",
+  "models",
+  "worker",
+  "settings",
 ];
 
 /** Empty Auto fallbacks → API uses Privacy/Alignment built-in matrix. */
@@ -442,6 +441,7 @@ function readStoredTab() {
   try {
     if (readHelpHash()) return "help";
     const v = localStorage.getItem(TAB_STORAGE_KEY);
+    if (v === "styles" || v === "civitai") return "agent";
     if (STUDIO_TABS.includes(v)) return v;
   } catch {
     /* ignore */
@@ -1756,6 +1756,99 @@ function presentLookup(cards, installed, query) {
   return { existing, fresh };
 }
 
+function isCheckpointAsset(item) {
+  if (!item) return false;
+  const path = String(item.path || "");
+  if (path.startsWith("checkpoints/")) return true;
+  const t = String(item.modelType || item.kind || "")
+    .toLowerCase()
+    .replace(/[\s_-]/g, "");
+  return t === "checkpoint";
+}
+
+function familyKey(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function checkpointMatchesFamily(asset, family) {
+  const want = familyKey(family);
+  if (!want || want.length < 3) return false;
+  const base = familyKey(asset?.baseModel);
+  const name = familyKey(`${asset?.name || ""} ${asset?.path || ""}`);
+  if (base && (base === want || base.includes(want) || want.includes(base))) return true;
+  return name.includes(want);
+}
+
+function priorToolContext(session) {
+  const lines = [];
+  const pins = (session?.pinnedLoras || []).map((l) => l?.name).filter(Boolean);
+  if (pins.length) lines.push(`pinned: ${pins.join(", ")}`);
+  for (const message of session?.messages || []) {
+    for (const action of message.actions || []) {
+      if (action?.status !== "executed") continue;
+      if (action.type === "install_asset") {
+        const name = action.args?.name || action.result?.destPath;
+        if (name) lines.push(`installed: ${name}`);
+      }
+      if (action.type === "set_base_model") {
+        const model = action.result?.model || action.args?.model;
+        if (model) lines.push(`base: ${model}`);
+      }
+      if (action.type === "pin_lora" && Array.isArray(action.result?.pinnedLoras)) {
+        const names = action.result.pinnedLoras.map((l) => l?.name).filter(Boolean);
+        if (names.length) lines.push(`pinned: ${names.join(", ")}`);
+      }
+      if (action.type === "search_civitai") {
+        const type = action.result?.type || action.args?.type || "";
+        const query = action.result?.query || action.args?.query || "";
+        if (query) lines.push(`searched ${type}: ${query}`.trim());
+      }
+    }
+  }
+  return [...new Set(lines)].slice(-16).join("\n");
+}
+
+function replyMentionsName(content, name) {
+  const label = String(name || "").trim();
+  if (label.length < 2) return false;
+  return String(content || "").toLowerCase().includes(label.toLowerCase());
+}
+
+function referencedAssets(message) {
+  const out = [];
+  const seen = new Set();
+  const push = (item) => {
+    const name = String(item?.name || "").trim();
+    if (!name) return;
+    const key = name.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ ...item, name });
+  };
+  for (const item of message?.loras || []) {
+    if (replyMentionsName(message?.content, item?.name)) push(item);
+  }
+  for (const action of message?.actions || []) {
+    if (action?.status !== "executed" && action?.status !== "proposed") continue;
+    if (action.type !== "install_asset" && action.type !== "pin_lora" && action.type !== "set_base_model") {
+      continue;
+    }
+    const raw = action.args?.name || action.result?.name || action.result?.model || action.args?.model;
+    if (!raw) continue;
+    const name = String(raw).split("/").pop().replace(/\.safetensors$/i, "");
+    if (replyMentionsName(message?.content, name) || action.type !== "search_civitai") push({ name, path: action.result?.model || action.args?.model || action.args?.path || action.args?.destPath });
+  }
+  return out.slice(0, 4);
+}
+
+function imageLinkLabel(art, index) {
+  const prompt = String(art?.prompt || "").trim();
+  if (!prompt) return index === 0 ? "Image" : `Image ${index + 1}`;
+  return prompt.length > 42 ? `${prompt.slice(0, 42)}…` : prompt;
+}
+
 /** Prefer the search payload (already installed-first). Otherwise list installed/local. */
 function cardsFromChatPayload(data) {
   const actions = Array.isArray(data?.actions) ? data.actions : [];
@@ -2181,6 +2274,8 @@ export default function App() {
   const lastSucceededJobIdsRef = useRef(new Set());
   const [civitaiItems, setCivitaiItems] = useState([]);
   const [civitaiSubview, setCivitaiSubviewState] = useState(readStoredCivitaiSubview);
+  /** Agent tab: suggestions table, or a Civitai library subview (search stays typed). */
+  const [agentFocus, setAgentFocus] = useState("suggestions");
   const setCivitaiSubview = (next) => {
     setCivitaiSubviewState(next);
     persistCivitaiSubview(next);
@@ -2266,6 +2361,7 @@ export default function App() {
   const workspaceRef = useRef(null);
   const workspaceSplitRef = useRef(workspaceSplit);
   const civitaiAbortRef = useRef(null);
+  const pinUseLockRef = useRef(new Set());
   const lastCivitaiSearchQRef = useRef("");
 
   const flashSave = (kind, msg) => {
@@ -2339,7 +2435,7 @@ export default function App() {
     }
   };
 
-  /** Featured style example from /v1/styles (styles[0]) — same text Styles tab shows. */
+  /** Featured style example from /v1/styles (styles[0]) — same text the Agent tab shows. */
   const examplePrompt = styles[0]?.examplePrompt || BEGINNER_EXAMPLE;
   const exampleCivitaiQuery = demoCivitaiQuery(examplePrompt);
 
@@ -3479,8 +3575,11 @@ export default function App() {
       // Search payload keeps version ids so installed rows can match them.
       // A worker listing is stored only after that lookup filter.
       setSuggestedLoras(fromSearch ? sourceCards : lorasNext);
-      // Search results are browsed on Styles. A turn that also made images stays put.
-      if (!artifacts.length) setTab("styles");
+      // Lookups render on Agent. A turn that also made images stays put.
+      if (!artifacts.length) {
+        setAgentFocus("suggestions");
+        setTab("agent");
+      }
     }
     if (settings?.civitaiConfigured) {
       const bare = presented.existing.filter(
@@ -3733,6 +3832,7 @@ export default function App() {
         recentPrompts: (session.turns || []).slice(0, 5).map((t) => t.prompt),
       },
       loras: pinnedPayload(),
+      toolContext: priorToolContext(session),
       ...extra,
     };
     body.videoModel = videoModel || AUTO_VIDEO.id;
@@ -4152,9 +4252,152 @@ export default function App() {
         thumbnailUrl: thumb || undefined,
       }),
     });
-    // Install/enqueue must not auto-pin — user pins LoRAs explicitly when wanted.
+    // A plain download never pins. Pin-to-use calls this, then pins or selects the base.
     await refreshDownloadJobs();
     return { dest, jobId: res?.jobId, status: res?.status || "queued" };
+  };
+
+  const waitForInstallJob = async (jobId) => {
+    if (!jobId) return null;
+    const deadline = Date.now() + 10 * 60 * 1000;
+    while (Date.now() < deadline) {
+      const data = await api("/v1/civitai/jobs");
+      const jobs = Array.isArray(data?.data) ? data.data : [];
+      const job = jobs.find((j) => j.id === jobId);
+      if (!job) return null;
+      const status = String(job.status || "").toLowerCase();
+      if (status === "succeeded" || status === "failed" || status === "cancelled") return job;
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    return null;
+  };
+
+  /** Queue a download and resolve the worker path once the job succeeds. Does not pin. */
+  const installAssetAndWait = async (item) => {
+    const existing = findInstalledForItem(item);
+    if (existing?.path) return existing.path;
+    if (!hasWorker()) {
+      setError(`“${item?.name || "Asset"}” needs a worker before it can be installed.`);
+      return null;
+    }
+    if (!settings?.civitaiConfigured) {
+      setError("Add a Civitai key in Settings before installing.");
+      return null;
+    }
+    const active = activeJobForItem(item);
+    let jobId = active?.id;
+    let dest = active?.destPath || destPathForAsset(item);
+    if (!jobId) {
+      const queued = await installOne(item);
+      jobId = queued.jobId;
+      dest = queued.dest || dest;
+    }
+    setSavedMsg(`Installing “${item?.name || dest}”…`);
+    const job = await waitForInstallJob(jobId);
+    const status = String(job?.status || "").toLowerCase();
+    if (status !== "succeeded") {
+      setError(job?.error || `Install of “${item?.name || "asset"}” did not finish.`);
+      return null;
+    }
+    await refreshInstalledAssets({ quiet: true });
+    await refreshDownloadJobs();
+    return job?.destPath || dest;
+  };
+
+  const selectInstalledBase = async (asset) => {
+    if (!asset?.path) return;
+    if (activeBasePath && activeBasePath === asset.path) return;
+    await setInstalledAsBase(asset);
+  };
+
+  /** Explicit pin: install a missing LoRA then pin it, and install or select the matching base. */
+  const pinToUse = async (item) => {
+    if (!item) return;
+    const lock = lookupCardKey(item);
+    if (pinUseLockRef.current.has(lock)) return;
+    pinUseLockRef.current.add(lock);
+    setError("");
+    try {
+      if (isCheckpointAsset(item)) {
+        const path = (await findInstalledForItem(item)?.path) || (await installAssetAndWait(item));
+        if (!path) return;
+        await selectInstalledBase({
+          ...item,
+          path,
+          name: item.name,
+          baseModel: item.baseModel,
+        });
+        setSavedMsg(`Base set to ${item.name || path}.`);
+        return;
+      }
+      if (!isPinnableAsset(item)) {
+        setError(`“${item.name || "Asset"}” is not a LoRA or a checkpoint.`);
+        return;
+      }
+      const installed = findInstalledForItem(item);
+      const path = installed?.path || (await installAssetAndWait(item));
+      if (!path && !installed) return;
+      pinLora(
+        { ...item, ...(installed || {}), path: path || installed?.path || item.path || null },
+        path ? { path } : undefined,
+      );
+      const family = String(item.baseModel || installed?.baseModel || "").trim();
+      if (!family) {
+        setSavedMsg(`Pinned “${item.name}”.`);
+        return;
+      }
+      if (
+        activeBasePath &&
+        checkpointMatchesFamily(
+          { baseModel: localBaseFamily, name: localBaseModel, path: activeBasePath },
+          family,
+        )
+      ) {
+        setSavedMsg(`Pinned “${item.name}”. Base “${family}” is already selected.`);
+        return;
+      }
+      const onDisk = installedAssets.find(
+        (asset) => isCheckpointAsset(asset) && checkpointMatchesFamily(asset, family),
+      );
+      if (onDisk?.path) {
+        await selectInstalledBase(onDisk);
+        setSavedMsg(`Pinned “${item.name}”. Base set to ${onDisk.name || onDisk.path}.`);
+        return;
+      }
+      if (!settings?.civitaiConfigured || !hasWorker()) {
+        setSavedMsg(
+          `Pinned “${item.name}”. No installed checkpoint matches base “${family}”.`,
+        );
+        return;
+      }
+      const data = await api(
+        `/v1/civitai/search?q=${encodeURIComponent(family)}&limit=4&types=Checkpoint`,
+      );
+      const candidate = (data.items || []).find((row) => row) || null;
+      if (!candidate) {
+        setSavedMsg(`Pinned “${item.name}”. No checkpoint matched base “${family}”.`);
+        return;
+      }
+      const basePath = await installAssetAndWait({
+        ...candidate,
+        modelType: candidate.modelType || "Checkpoint",
+      });
+      if (!basePath) return;
+      await selectInstalledBase({
+        ...candidate,
+        path: basePath,
+        modelType: "Checkpoint",
+        baseModel: candidate.baseModel || family,
+      });
+      setSavedMsg(
+        `Pinned “${item.name}”. Installed and selected base ${candidate.name || family}.`,
+      );
+    } catch (e) {
+      const msg = e.message || "Could not pin that asset";
+      if (!/already downloading/i.test(msg)) setError(msg);
+    } finally {
+      pinUseLockRef.current.delete(lock);
+    }
   };
 
   const executeBatch = async (batch, goal) => {
@@ -4772,9 +5015,9 @@ export default function App() {
     }
   };
 
-  // Search-as-you-type on the Civitai tab (debounced; AbortController cancels in-flight).
+  // Search-as-you-type on Agent → Search (debounced; AbortController cancels in-flight).
   useEffect(() => {
-    if (tab !== "civitai" || civitaiSubview !== "search") return;
+    if (tab !== "agent" || agentFocus !== "search") return;
     const q = civitaiQ.trim();
     if (!q) {
       const pending = civitaiAbortRef.current;
@@ -4791,15 +5034,15 @@ export default function App() {
     }, CIVITAI_SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: debounce on query/tab only
-  }, [civitaiQ, tab, civitaiSubview]);
+  }, [civitaiQ, tab, agentFocus]);
 
   useEffect(() => {
-    if (tab !== "civitai") return;
+    if (tab !== "agent") return;
     // Keep installed + jobs warm so search/favorites/detail can flip Install → Delete / Downloading…
     refreshInstalledAssets();
     refreshDownloadJobs();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, civitaiSubview]);
+  }, [tab, agentFocus]);
 
   useEffect(() => {
     if (tab !== "worker") return undefined;
@@ -4819,7 +5062,7 @@ export default function App() {
     const active = downloadJobs.some((j) =>
       ["queued", "downloading"].includes(j.status),
     );
-    const onCivitai = tab === "civitai";
+    const onCivitai = tab === "agent" && agentFocus !== "suggestions";
     // Follow in-flight installs from any tab. Success must refresh worker lists
     // even when this effect restarts because the job just left "downloading".
     if (!active && !(onCivitai && downloadJobs.length > 0)) return undefined;
@@ -4838,7 +5081,7 @@ export default function App() {
         await refreshInstalledAssets({ quiet: true });
       }
     };
-    const ms = active || (onCivitai && civitaiSubview === "downloads") ? 1500 : 5000;
+    const ms = active || (onCivitai && agentFocus === "downloads") ? 1500 : 5000;
     const t = setInterval(tick, ms);
     const soon = setTimeout(tick, 250);
     return () => {
@@ -4849,7 +5092,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     tab,
-    civitaiSubview,
+    agentFocus,
     downloadJobs.some((j) => ["queued", "downloading"].includes(j.status)),
     downloadJobs.length > 0,
   ]);
@@ -5052,10 +5295,11 @@ export default function App() {
     (session.pinnedLoras || []).length > 0 ||
     Boolean(session.sessionNote);
 
-  const renderLoraCard = (item, { compact = false, layout = "card", onAfterPin } = {}) => {
+  const renderLoraCard = (item, { compact = false, layout = "card" } = {}) => {
     const pinned = isPinned(item);
     const favorited = isFavorite(item);
     const pinnable = isPinnableAsset(item);
+    const checkpoint = isCheckpointAsset(item);
     const typeLabel = item.modelType || item.kind || "LORA";
     const downloads = formatStat(item.stats?.downloadCount);
     const thumbUrl = pickCivitaiThumb(item, favorites);
@@ -5106,18 +5350,27 @@ export default function App() {
           >
             <IconStar filled={favorited} />
           </button>
-          {pinnable ? (
+          {pinnable || checkpoint ? (
             <button
               type="button"
-              className={`${pinned ? "primary" : "ghost"} icon-btn`}
-              title={pinned ? "Unpin from this session" : "Pin to session"}
-              aria-label={pinned ? "Unpin from session" : "Pin to session"}
+              className={`${pinned && pinnable ? "primary" : "ghost"} icon-btn`}
+              title={
+                pinned && pinnable
+                  ? "Unpin from this session"
+                  : checkpoint
+                    ? "Install if needed and set as base"
+                    : "Pin to use — installs the LoRA and matching base if needed"
+              }
+              aria-label={
+                pinned && pinnable
+                  ? "Unpin from session"
+                  : checkpoint
+                    ? "Set as base"
+                    : "Pin to use"
+              }
               onClick={() => {
-                if (pinned) unpinLora(item);
-                else {
-                  pinLora(item, item.path ? { path: item.path } : undefined);
-                  onAfterPin?.(item);
-                }
+                if (pinned && pinnable) unpinLora(item);
+                else void pinToUse(item);
               }}
             >
               <IconPin />
@@ -5175,8 +5428,59 @@ export default function App() {
   const chatLookup = presentLookup(suggestedLoras, installedAssets, civitaiQuery || "");
   const chatLookupCount = chatLookup.existing.length + chatLookup.fresh.length;
 
-  const showAssistPanel =
-    ideas.length > 0 || chatLookupCount > 0 || suggestNote || civitaiQuery;
+  const openAgentLibrary = (id) => {
+    setAgentFocus(id);
+    setCivitaiSubview(id);
+  };
+
+  const renderAgentSubnav = () => (
+    <div className="row civitai-subnav" style={{ marginBottom: "0.75rem" }}>
+      <button
+        type="button"
+        className={agentFocus === "suggestions" ? "primary" : "ghost"}
+        aria-pressed={agentFocus === "suggestions"}
+        onClick={() => setAgentFocus("suggestions")}
+      >
+        Suggestions
+      </button>
+      {CIVITAI_SUBNAV.filter((s) => !s.end).map(({ id, label }) => {
+        const count =
+          id === "favorites" ? favorites.length : id === "installed" ? installedAssets.length : 0;
+        return (
+          <button
+            key={id}
+            type="button"
+            className={agentFocus === id ? "primary" : "ghost"}
+            aria-pressed={agentFocus === id}
+            onClick={() => openAgentLibrary(id)}
+          >
+            {count ? `${label} (${count})` : label}
+          </button>
+        );
+      })}
+      <HelpQ topic="help-civitai" label="Civitai" onOpen={openHelp} />
+      {CIVITAI_SUBNAV.filter((s) => s.end).map(({ id, label }) => {
+        const activeDl = downloadJobs.some((j) =>
+          ["queued", "downloading"].includes(j.status),
+        );
+        return (
+          <button
+            key={id}
+            type="button"
+            className={`civitai-subnav-end${activeDl ? " dl-busy" : ""} ${
+              agentFocus === id ? "primary" : "ghost"
+            }`}
+            aria-pressed={agentFocus === id}
+            aria-busy={activeDl || undefined}
+            title={activeDl ? "Downloads in progress" : label}
+            onClick={() => openAgentLibrary(id)}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
 
   const ModeIcon = MODE_ICONS[automationMode] || IconSliders;
   const modeOptions = AUTOMATION_MODES.map((id) => {
@@ -5630,79 +5934,56 @@ export default function App() {
                     );
                   })()}
                 {Array.isArray(m.actions) && m.actions.length > 0 && (
-                  <ul className="t-tools">
-                    {m.actions.map((a, ai) => (
-                      <li key={`${a.type}-${ai}`} className={`t-tool t-tool-${a.status || "done"}`}>
-                        <span className="t-tool-type">{a.type}</span>
-                        <span className="t-tool-status">{a.status || "done"}</span>
-                        {a.status === "error" && a.error ? ` — ${a.error}` : ""}
-                      </li>
-                    ))}
-                  </ul>
+                  <details className="t-tools-disclosure">
+                    <summary>
+                      {m.actions.length} tool{m.actions.length === 1 ? "" : "s"}
+                    </summary>
+                    <ul className="t-tools">
+                      {m.actions.map((a, ai) => (
+                        <li key={`${a.type}-${ai}`} className={`t-tool t-tool-${a.status || "done"}`}>
+                          <span className="t-tool-type">{a.type}</span>
+                          <span className="t-tool-status">{a.status || "done"}</span>
+                          {a.status === "error" && a.error ? ` — ${a.error}` : ""}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
                 )}
-                {m.artifactIds?.length > 0 && (
-                  <div className="t-thumbs">
-                    {m.artifactIds.map((id) => {
+                {(m.artifactIds?.length > 0 || referencedAssets(m).length > 0) && (
+                  <div className="t-ref-row">
+                    {referencedAssets(m).map((item) => (
+                      <button
+                        key={`asset-${item.name}`}
+                        type="button"
+                        className="linkish t-ref-link"
+                        onClick={() => {
+                          setAgentFocus("suggestions");
+                          setTab("agent");
+                          openCivitaiDetail(item);
+                        }}
+                      >
+                        {item.name}
+                      </button>
+                    ))}
+                    {(m.artifactIds || []).map((id, index) => {
                       const art =
                         batchResults.find((r) => r.artifactId === id) ||
                         (result?.artifactId === id ? result : null) ||
                         gallery.find((g) => g.id === id);
-                      const src = art?.url || (art ? gallerySrc(art) : `/v1/gallery/${id}/image`);
-                      const file = art || { id, artifactId: id };
                       return (
-                        <div className="t-thumb-wrap" key={id}>
-                          <button
-                            type="button"
-                            className="t-thumb"
-                            onClick={() => {
-                              if (art) selectGalleryPreview(art);
-                            }}
-                          >
-                            {isVideoArtifact(art) ? (
-                              <video src={src} muted playsInline preload="metadata" />
-                            ) : (
-                              <img src={src} alt="" />
-                            )}
-                          </button>
-                          <MediaDownload
-                            src={src}
-                            item={file}
-                            className="ghost icon-btn t-thumb-dl"
-                            onError={setError}
-                          />
-                        </div>
+                        <button
+                          key={id}
+                          type="button"
+                          className="linkish t-ref-link"
+                          onClick={() => {
+                            if (art) selectGalleryPreview(art);
+                            else setTab("gallery");
+                          }}
+                        >
+                          {imageLinkLabel(art, index)}
+                        </button>
                       );
                     })}
-                  </div>
-                )}
-                {Array.isArray(m.loras) && m.loras.length > 0 && (
-                  <p className="civitai-search-line">
-                    Found {m.loras.length} Civitai match{m.loras.length === 1 ? "" : "es"}
-                    {m.civitaiQuery ? (
-                      <>
-                        {" "}
-                        for <strong>{m.civitaiQuery}</strong>
-                      </>
-                    ) : null}
-                    . Browse them on{" "}
-                    <button type="button" className="linkish" onClick={() => setTab("styles")}>
-                      Styles
-                    </button>
-                    .
-                  </p>
-                )}
-                {Array.isArray(m.ideas) && m.ideas.length > 0 && (
-                  <div className="idea-chips">
-                    {m.ideas.map((idea) => (
-                      <button
-                        key={idea}
-                        type="button"
-                        className="idea-chip"
-                        onClick={() => setPrompt(idea)}
-                      >
-                        {idea}
-                      </button>
-                    ))}
                   </div>
                 )}
               </article>
@@ -5802,62 +6083,6 @@ export default function App() {
               </aside>
             )}
 
-            {sessionLog.length > 0 && (
-              <aside className="session-log" aria-label="Session activity">
-                <span className="session-label">What Freya did</span>
-                <ul>
-                  {sessionLog.map((line, i) => (
-                    <li key={`${i}-${line.slice(0, 24)}`}>{line}</li>
-                  ))}
-                </ul>
-              </aside>
-            )}
-
-            {showAssistPanel && (
-              <aside className="suggestions">
-                <div className="suggestions-head">
-                  <h3>Ideas from Freya</h3>
-                  <button type="button" className="ghost" onClick={clearSuggestions}>
-                    Dismiss
-                  </button>
-                </div>
-                {civitaiQuery && (
-                  <p className="civitai-search-line" role="status">
-                    Searching Civitai for: <strong>{civitaiQuery}</strong>
-                  </p>
-                )}
-                {suggestNote && <p className="hint">{suggestNote}</p>}
-                {ideas.length > 0 && (
-                  <div className="idea-chips">
-                    {ideas.map((idea) => (
-                      <button
-                        key={idea}
-                        type="button"
-                        className="idea-chip"
-                        onClick={() => {
-                          setPrompt(idea);
-                          setSession((prev) => ({
-                            ...prev,
-                            goal: prev.goal || idea,
-                          }));
-                        }}
-                      >
-                        {idea}
-                      </button>
-                    ))}
-                  </div>
-                )}
-                {chatLookupCount > 0 && (
-                  <p className="hint">
-                    {chatLookupCount} match{chatLookupCount === 1 ? "" : "es"} on{" "}
-                    <button type="button" className="linkish" onClick={() => setTab("styles")}>
-                      Styles
-                    </button>
-                    . Installed rows match this lookup by name, filename, or version id.
-                  </p>
-                )}
-              </aside>
-            )}
           </div>
 
           <div className="compose">
@@ -6366,8 +6591,34 @@ export default function App() {
         ))}
       </nav>
 
-      {tab === "styles" && (
+      {tab === "agent" && agentFocus === "suggestions" && (
         <section className="panel style-rail">
+          {renderAgentSubnav()}
+          {(ideas.length > 0 || suggestNote) && (
+            <div className="suggestions agent-suggestions">
+              {suggestNote && <p className="hint">{suggestNote}</p>}
+              {ideas.length > 0 && (
+                <div className="idea-chips">
+                  {ideas.map((idea) => (
+                    <button
+                      key={idea}
+                      type="button"
+                      className="idea-chip"
+                      onClick={() => {
+                        setPrompt(idea);
+                        setSession((prev) => ({
+                          ...prev,
+                          goal: prev.goal || idea,
+                        }));
+                      }}
+                    >
+                      {idea}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           {chatLookupCount > 0 && (
             <div className="style-matches">
               <div className="style-matches-head">
@@ -6387,7 +6638,9 @@ export default function App() {
               </div>
               <p className="hint">
                 Installed rows match this lookup by name, filename, or version id. Other Civitai
-                hits stay in the list below. Nothing is downloaded until you choose.
+                hits stay in the list below. Pin a row to use it: that installs the LoRA if it is
+                not on the worker, then pins it, and installs or selects the matching base. A
+                plain download does not pin.
               </p>
               {renderAssetLookup(chatLookup)}
             </div>
@@ -6414,50 +6667,9 @@ export default function App() {
         </section>
       )}
 
-      {tab === "civitai" && (
+      {tab === "agent" && agentFocus !== "suggestions" && (
         <section className="panel">
-          <div className="row civitai-subnav" style={{ marginBottom: "0.75rem" }}>
-            {CIVITAI_SUBNAV.filter((s) => !s.end).map(({ id, label }) => {
-              const count =
-                id === "favorites"
-                  ? favorites.length
-                  : id === "installed"
-                    ? installedAssets.length
-                    : 0;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  className={civitaiSubview === id ? "primary" : "ghost"}
-                  aria-pressed={civitaiSubview === id}
-                  onClick={() => setCivitaiSubview(id)}
-                >
-                  {count ? `${label} (${count})` : label}
-                </button>
-              );
-            })}
-            <HelpQ topic="help-civitai" label="Civitai" onOpen={openHelp} />
-            {CIVITAI_SUBNAV.filter((s) => s.end).map(({ id, label }) => {
-              const activeDl = downloadJobs.some((j) =>
-                ["queued", "downloading"].includes(j.status),
-              );
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  className={`civitai-subnav-end${activeDl ? " dl-busy" : ""} ${
-                    civitaiSubview === id ? "primary" : "ghost"
-                  }`}
-                  aria-pressed={civitaiSubview === id}
-                  aria-busy={activeDl || undefined}
-                  title={activeDl ? "Downloads in progress" : label}
-                  onClick={() => setCivitaiSubview(id)}
-                >
-                  {label}
-                </button>
-              );
-            })}
-          </div>
+          {renderAgentSubnav()}
           {civitaiSubview === "search" && (
             <>
               {!settings?.civitaiConfigured && (
@@ -7780,8 +7992,10 @@ export default function App() {
 
           <HelpSection id="help-overview" title="Overview" active={helpFocus === "help-overview"}>
             <p>
-              Chat on the left; Gallery / Styles / Civitai / Worker on the tabs. Cloud Generate needs
-              an OpenRouter key. Local LoRAs and Local generate need a diffusion worker.
+              Chat on the left. Tabs are Agent, Gallery, Metrics, Help, Guidelines, Models, Worker,
+              and Settings. Cloud Generate needs an OpenRouter key. Local LoRAs and Local generate
+              need a diffusion worker. There is no separate worker enable switch — use Cloud | Local
+              and Worker start/stop.
             </p>
             <p>
               Keys and Privacy live under Settings. Model pickers, Auto fallbacks, and chat vendors
@@ -7791,11 +8005,12 @@ export default function App() {
 
           <HelpSection id="help-civitai" title="Civitai" active={helpFocus === "help-civitai"}>
             <p>
-              <strong>Search</strong> finds LoRAs / checkpoints (needs a Civitai API key).{" "}
+              <strong>Search</strong> finds LoRAs, checkpoints, and the other types (LoCon, DoRA,
+              LyCORIS, embeddings, VAE) — one type per search, needs a Civitai API key.{" "}
               <strong>★ Favorite</strong> is a persistent library in this browser.{" "}
-              <strong>Pin</strong> is session-only for LoRAs / adapters / embeddings — not
-              checkpoints (use Worker → Set as base). <strong>Install</strong> queues a download
-              and does not auto-pin.
+              <strong>Pin</strong> on a suggestion installs the LoRA if it is not on the worker,
+              then pins it, and installs or selects the matching base. A plain download does not
+              pin. Checkpoints are a base, not a session pin.
             </p>
             <p>
               <strong>Installed</strong> shows assets already on the worker disk as clickable cards
@@ -7803,9 +8018,9 @@ export default function App() {
               set base.
             </p>
             <p>
-              Chat search results open on <strong>Styles</strong> as a scrollable table: installed
-              matches first, then other Civitai hits, one asset per row. Chat only says what it
-              found.
+              Lookups open on <strong>Agent</strong> as a scrollable table: installed matches
+              first, then other Civitai hits, one asset per row, Installed-sized thumbs. Chat
+              keeps the prompt and the reply. Tool calls stay behind a collapsed line.
             </p>
           </HelpSection>
 
@@ -8160,23 +8375,28 @@ export default function App() {
                 >
                   <IconStar filled={isFavorite(detailModel)} />
                 </button>
-                {isPinnableAsset(detailModel) ? (
+                {isPinnableAsset(detailModel) || isCheckpointAsset(detailModel) ? (
                   <button
                     type="button"
                     className={`${isPinned(detailModel) ? "primary" : "ghost"} icon-btn`}
                     title={
-                      isPinned(detailModel) ? "Unpin from this session" : "Pin to session"
+                      isPinned(detailModel)
+                        ? "Unpin from this session"
+                        : isCheckpointAsset(detailModel)
+                          ? "Install if needed and set as base"
+                          : "Pin to use — installs the LoRA and matching base if needed"
                     }
                     aria-label={
-                      isPinned(detailModel) ? "Unpin from session" : "Pin to session"
+                      isPinned(detailModel)
+                        ? "Unpin from session"
+                        : isCheckpointAsset(detailModel)
+                          ? "Set as base"
+                          : "Pin to use"
                     }
                     onClick={() =>
                       isPinned(detailModel)
                         ? unpinLora(detailModel)
-                        : pinLora(
-                            detailModel,
-                            detailModel.path ? { path: detailModel.path } : undefined,
-                          )
+                        : void pinToUse(detailModel)
                     }
                   >
                     <IconPin />
