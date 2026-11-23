@@ -39,6 +39,9 @@ pub struct StudioPrefs {
     pub favorites: Vec<Value>,
     #[serde(default)]
     pub pinned_loras: Vec<Value>,
+    /// Sampler, CFG, steps, clip skip, seed, and the rest of the next local generate.
+    #[serde(default)]
+    pub generation: crate::genmeta::GenerationSettings,
 }
 
 impl Default for StudioPrefs {
@@ -49,6 +52,7 @@ impl Default for StudioPrefs {
             automation_mode: String::new(),
             favorites: Vec::new(),
             pinned_loras: Vec::new(),
+            generation: crate::genmeta::GenerationSettings::default(),
         }
     }
 }
@@ -66,6 +70,8 @@ pub struct StudioPatch {
     pub favorites: Option<Vec<Value>>,
     #[serde(default)]
     pub pinned_loras: Option<Vec<Value>>,
+    #[serde(default)]
+    pub generation: Option<crate::genmeta::GenerationSettings>,
 }
 
 pub fn normalize_backend(raw: &str) -> Result<String, String> {
@@ -115,6 +121,9 @@ pub fn apply_patch(prefs: &mut StudioPrefs, patch: StudioPatch) -> Result<(), St
     }
     if let Some(pins) = patch.pinned_loras {
         prefs.pinned_loras = sanitize_list(&pins, true)?;
+    }
+    if let Some(generation) = patch.generation {
+        prefs.generation = generation;
     }
     Ok(())
 }

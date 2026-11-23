@@ -59,6 +59,11 @@ async fn main() -> anyhow::Result<()> {
     });
     let protected = Router::new()
         .route("/v1/loras", get(list_loras))
+        .route("/v1/checkpoints", get(list_checkpoints))
+        .route("/v1/embeddings", get(list_embeddings))
+        .route("/v1/vae", get(list_vaes))
+        .route("/v1/base-model", get(get_base_model).put(put_base_model))
+        .route("/v1/stats", get(stats))
         .route("/v1/images/generations", post(generate))
         .route("/v1/assets/install", post(install))
         .route_layer(middleware::from_fn_with_state(
@@ -119,7 +124,9 @@ async fn build_stats(app: &App) -> Value {
     let engine = engine_health(app).await;
     let (loaded_in_vram, engine_name) = match &engine {
         Some(e) => (
-            e.get("loadedInVram").and_then(|v| v.as_bool()).unwrap_or(false),
+            e.get("loadedInVram")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             e.get("engine")
                 .and_then(|v| v.as_str())
                 .unwrap_or("diffusers")
@@ -357,20 +364,402 @@ async fn list_loras(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
 #[derive(Deserialize)]
 struct GenReq {
     prompt: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    lora_request: Option<Value>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    seed: Option<i64>,
+    #[serde(default)]
+    negative_prompt: Option<String>,
+    #[serde(default)]
+    steps: Option<u32>,
+    #[serde(default, alias = "cfg", alias = "guidance")]
+    guidance_scale: Option<f64>,
+    #[serde(default)]
+    sampler: Option<String>,
+    #[serde(default)]
+    clip_skip: Option<u32>,
+    #[serde(default, alias = "n")]
+    quantity: Option<u32>,
 }
 
-async fn generate(Json(req): Json<GenReq>) -> Json<serde_json::Value> {
-    // 1x1 PNG stub so Freya gallery path works without a GPU.
-    let png: &[u8] = &[
-        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
-        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
-        0x77, 0x53, 0xde, 0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8,
-        0xcf, 0xc0, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x05, 0xfe, 0xd4, 0xef, 0x00, 0x00,
-        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
-    ];
-    let _ = req.prompt;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(png);
-    Json(json!({ "data": [{ "b64_json": b64 }] }))
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoGenReq {
+    prompt: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    size: Option<String>,
+    #[serde(default)]
+    seed: Option<i64>,
+    #[serde(default)]
+    negative_prompt: Option<String>,
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    frames: Option<u32>,
+    #[serde(default)]
+    steps: Option<u32>,
+    #[serde(default, alias = "cfg", alias = "guidance")]
+    guidance_scale: Option<f64>,
+    #[serde(default)]
+    sampler: Option<String>,
+    #[serde(default)]
+    clip_skip: Option<u32>,
+}
+
+/// Local motion: multi-frame GIF via Diffusers. True T2V (Wan/LTX) is OpenRouter / SwarmUI.
+async fn generate_video(
+    State(app): State<Arc<App>>,
+    Json(req): Json<VideoGenReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let fmt = req.format.as_deref().unwrap_or("gif").to_ascii_lowercase();
+    if fmt != "gif" {
+        return Err((
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({
+                "error": "local worker video supports format=gif only; use OpenRouter for mp4 T2V"
+            })),
+        ));
+    }
+    let active = app.active.read().await.clone();
+    let model = req
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            if active.model.is_empty() {
+                None
+            } else {
+                Some(active.model.clone())
+            }
+        });
+    if app.engine_url.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "FREYA_ENGINE_URL unset — no Diffusers engine for local gif" })),
+        ));
+    }
+    let Some(model) = model else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "no model for local gif" })),
+        ));
+    };
+    let url = format!("{}/v1/generate_gif", app.engine_url);
+    let body = json!({
+        "prompt": req.prompt,
+        "model": model,
+        "baseModel": active.base_model,
+        "size": req.size,
+        "seed": req.seed,
+        "negative_prompt": req.negative_prompt,
+        "frames": req.frames.unwrap_or(6),
+        "format": "gif",
+        "steps": req.steps,
+        "guidance_scale": req.guidance_scale,
+        "sampler": req.sampler,
+        "clipSkip": req.clip_skip,
+    });
+    info!(model = %model, frames = ?req.frames, "engine gif generate");
+    let resp = app.http.post(&url).json(&body).send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("engine unreachable: {e}") })),
+        )
+    })?;
+    let status = resp.status();
+    let mut payload: Value = resp.json().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "error": format!("engine response: {e}") })),
+        )
+    })?;
+    if !status.is_success() {
+        let detail = payload
+            .get("detail")
+            .cloned()
+            .unwrap_or_else(|| json!(payload.to_string()));
+        return Err((
+            StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+            Json(json!({ "error": detail })),
+        ));
+    }
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("stub".into(), json!(false));
+        obj.insert("mime".into(), json!("image/gif"));
+    }
+    Ok(Json(payload))
+}
+
+async fn generate(
+    State(app): State<Arc<App>>,
+    Json(req): Json<GenReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let active = app.active.read().await.clone();
+    let model = req
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            if active.model.is_empty() {
+                None
+            } else {
+                Some(active.model.clone())
+            }
+        });
+    let lora_names: Vec<String> = req
+        .lora_request
+        .as_ref()
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| {
+                    x.get("lora_name")
+                        .or_else(|| x.get("loraName"))
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !app.engine_url.is_empty() {
+        let Some(model) = model.clone() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "no model: set active base (PUT /v1/base-model) or pass model"
+                })),
+            ));
+        };
+        let url = format!("{}/v1/generate", app.engine_url);
+        let body = json!({
+            "prompt": req.prompt,
+            "model": model,
+            "baseModel": active.base_model,
+            "lora_request": req.lora_request,
+            "size": req.size,
+            "seed": req.seed,
+            "negative_prompt": req.negative_prompt,
+            "steps": req.steps,
+            "guidance_scale": req.guidance_scale,
+            "sampler": req.sampler,
+            "clipSkip": req.clip_skip,
+            "quantity": req.quantity.unwrap_or(1).clamp(1, 4),
+            "n": req.quantity.unwrap_or(1).clamp(1, 4),
+        });
+        info!(
+            model = %model,
+            loras = ?lora_names,
+            size = ?req.size,
+            seed = ?req.seed,
+            "engine generate"
+        );
+        let resp = app.http.post(&url).json(&body).send().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("engine unreachable: {e}") })),
+            )
+        })?;
+        let status = resp.status();
+        let mut payload: Value = resp.json().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "error": format!("engine response: {e}") })),
+            )
+        })?;
+        if !status.is_success() {
+            let detail = payload
+                .get("detail")
+                .cloned()
+                .unwrap_or_else(|| json!(payload.to_string()));
+            return Err((
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY),
+                Json(json!({ "error": detail })),
+            ));
+        }
+        if let Some(obj) = payload.as_object_mut() {
+            obj.entry("baseModel")
+                .or_insert_with(|| json!(active.base_model));
+            obj.entry("stub").or_insert(json!(false));
+        }
+        return Ok(Json(payload));
+    }
+
+    info!(
+        model = ?model,
+        loras = ?lora_names,
+        size = ?req.size,
+        seed = ?req.seed,
+        steps = ?req.steps,
+        "stub generate (weights not applied)"
+    );
+    // Visible stub PNG (no GPU) so gallery / local Generate can be smoke-tested.
+    let n = req.quantity.unwrap_or(1).clamp(1, 4);
+    let base_seed = req
+        .seed
+        .unwrap_or_else(|| (Uuid::new_v4().as_u128() as u64 % 2_147_483_646) as i64);
+    let plan = stub_scheduler_note(req.sampler.as_deref());
+    let mut data = Vec::new();
+    for i in 0..n {
+        let seed = base_seed.wrapping_add(i as i64);
+        let png = stub_png_from_prompt(&format!("{}#{seed}", req.prompt), 256, 256);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        data.push(json!({ "b64_json": b64, "seed": seed }));
+    }
+    Ok(Json(json!({
+        "data": data,
+        "model": model,
+        "baseModel": active.base_model,
+        "loras": lora_names,
+        "negativePrompt": req.negative_prompt,
+        "stub": true,
+        "steps": req.steps,
+        "guidance_scale": req.guidance_scale,
+        "cfg": req.guidance_scale,
+        "sampler": req.sampler,
+        "scheduler": plan.0,
+        "samplerNote": plan.1,
+        "clipSkip": req.clip_skip,
+        "clipSkipApplied": false,
+        "quantity": n,
+        "seed": base_seed,
+    })))
+}
+
+/// Stub has no Diffusers scheduler. Record the closest name the engine would load.
+fn stub_scheduler_note(sampler: Option<&str>) -> (Option<String>, String) {
+    let Some(name) = sampler.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (None, "stub engine; no sampler requested".into());
+    };
+    let key = name.to_ascii_lowercase();
+    let (applied, sched) = if key.contains("euler")
+        && (key.contains("ancestral") || key.ends_with(" a") || key == "euler a")
+    {
+        ("Euler a", "EulerAncestralDiscreteScheduler")
+    } else if key == "euler" {
+        ("Euler", "EulerDiscreteScheduler")
+    } else if key.contains("dpm")
+        && key.contains("2m")
+        && key.contains("karras")
+        && !key.contains("sde")
+    {
+        ("DPM++ 2M Karras", "DPMSolverMultistepScheduler")
+    } else if key.contains("dpm") || key.contains("karras") {
+        ("DPM++ 2M Karras", "DPMSolverMultistepScheduler")
+    } else if key.contains("euler") {
+        ("Euler", "EulerDiscreteScheduler")
+    } else {
+        ("Euler a", "EulerAncestralDiscreteScheduler")
+    };
+    let exact = key == "euler a"
+        || key == "euler"
+        || key.replace(' ', "") == "eulera"
+        || key == "dpm++ 2m karras";
+    let note = if exact {
+        format!("stub engine; would apply {applied} ({sched})")
+    } else {
+        format!("requested {name}; stub engine would apply {applied} ({sched})")
+    };
+    (Some(sched.into()), note)
+}
+
+/// Build a valid RGB PNG whose colors derive from the prompt (deterministic stub).
+fn stub_png_from_prompt(prompt: &str, w: u32, h: u32) -> Vec<u8> {
+    let mut hash: u32 = 2166136261;
+    for b in prompt.as_bytes() {
+        hash ^= u32::from(*b);
+        hash = hash.wrapping_mul(16777619);
+    }
+    let r0 = ((hash >> 16) & 0xff) as u8;
+    let g0 = ((hash >> 8) & 0xff) as u8;
+    let b0 = (hash & 0xff) as u8;
+
+    let mut raw = Vec::with_capacity(((w * 3 + 1) * h) as usize);
+    for y in 0..h {
+        raw.push(0); // filter: none
+        for x in 0..w {
+            let t = (x + y) as u8;
+            raw.push(r0.wrapping_add(t));
+            raw.push(g0.wrapping_add(t.wrapping_mul(3)));
+            raw.push(b0.wrapping_add(t.wrapping_mul(5)));
+        }
+    }
+    encode_png_rgb(w, h, &raw)
+}
+
+fn encode_png_rgb(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    let mut ihdr = Vec::with_capacity(13);
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB
+    write_png_chunk(&mut out, b"IHDR", &ihdr);
+    write_png_chunk(&mut out, b"IDAT", &deflate_zlib(raw));
+    write_png_chunk(&mut out, b"IEND", &[]);
+    out
+}
+
+fn write_png_chunk(out: &mut Vec<u8>, ctype: &[u8; 4], data: &[u8]) {
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    out.extend_from_slice(ctype);
+    out.extend_from_slice(data);
+    out.extend_from_slice(&crc32_ieee(ctype, data).to_be_bytes());
+}
+
+/// Stored-block zlib wrapper (no external compress crate).
+fn deflate_zlib(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 16 + data.len().div_ceil(65535) * 5);
+    out.extend_from_slice(&[0x78, 0x01]); // zlib cmf/flg — no compression
+    let mut offset = 0;
+    while offset < data.len() {
+        let end = (offset + 65535).min(data.len());
+        let chunk = &data[offset..end];
+        let last = end == data.len();
+        out.push(if last { 0x01 } else { 0x00 });
+        let n = chunk.len() as u16;
+        out.extend_from_slice(&n.to_le_bytes());
+        out.extend_from_slice(&(!n).to_le_bytes());
+        out.extend_from_slice(chunk);
+        offset = end;
+    }
+    if data.is_empty() {
+        out.extend_from_slice(&[0x01, 0x00, 0x00, 0xff, 0xff]);
+    }
+    out.extend_from_slice(&adler32(data).to_be_bytes());
+    out
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+    for &x in data {
+        a = (a + u32::from(x)) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+fn crc32_ieee(ctype: &[u8], data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xffff_ffff;
+    for &x in ctype.iter().chain(data.iter()) {
+        crc ^= u32::from(x);
+        for _ in 0..8 {
+            let mask = (!(crc & 1)).wrapping_add(1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 #[derive(Deserialize)]
@@ -464,12 +853,8 @@ fn download_request_err(e: reqwest::Error) -> String {
 }
 
 fn validate_install(app: &App, req: &InstallReq) -> Result<PathBuf, (StatusCode, Json<Value>)> {
-    let dest = resolve_dest(&app.models_dir, &req.dest_path).map_err(|e| {
-        (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e })),
-        )
-    })?;
+    let dest = resolve_dest(&app.models_dir, &req.dest_path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
     if !install_url_ok(&req.url) {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
@@ -478,6 +863,444 @@ fn validate_install(app: &App, req: &InstallReq) -> Result<PathBuf, (StatusCode,
             })),
         ));
     }
+    Ok(dest)
+}
+
+fn job_to_json(job: &InstallJob) -> Value {
+    serde_json::to_value(job).unwrap_or(Value::Null)
+}
+
+async fn enqueue_job(app: &App, req: InstallReq) -> Result<InstallJob, (StatusCode, Json<Value>)> {
+    let dest = validate_install(app, &req)?;
+    if dest.exists() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("already installed at {} — delete it first", req.dest_path)
+            })),
+        ));
+    }
+    {
+        let store = app.jobs.lock().await;
+        for e in store.jobs.values() {
+            if e.job.dest_path == req.dest_path
+                && matches!(e.job.status.as_str(), "queued" | "downloading")
+            {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": format!(
+                            "already downloading to {} — wait or cancel the existing job",
+                            req.dest_path
+                        )
+                    })),
+                ));
+            }
+        }
+    }
+    let id = Uuid::new_v4().to_string();
+    let now = now_unix();
+    let job = InstallJob {
+        id: id.clone(),
+        status: "queued".into(),
+        url: req.url.clone(),
+        dest_path: req.dest_path.clone(),
+        name: req.name.clone(),
+        base_model: req.base_model.clone(),
+        model_type: req.model_type.clone(),
+        source: req.source.clone(),
+        bytes_done: 0,
+        bytes_total: None,
+        percent: None,
+        error: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let entry = JobEntry {
+        job: job.clone(),
+        cancel: Arc::new(AtomicBool::new(false)),
+        auth_token: req
+            .auth_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string),
+        version_id: req.version_id,
+        model_id: req.model_id,
+        thumbnail_url: req.thumbnail_url.clone(),
+    };
+    {
+        let mut store = app.jobs.lock().await;
+        store.jobs.insert(id.clone(), entry);
+        store.recent.push_front(id.clone());
+        while store.recent.len() > JOB_HISTORY_CAP {
+            if let Some(old) = store.recent.pop_back() {
+                if let Some(e) = store.jobs.get(&old) {
+                    if matches!(e.job.status.as_str(), "succeeded" | "failed" | "cancelled") {
+                        store.jobs.remove(&old);
+                    } else {
+                        store.recent.push_back(old);
+                        break;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    }
+    app.job_tx.send(id).map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "job queue closed" })),
+        )
+    })?;
+    Ok(job)
+}
+
+/// Sync install (operator / legacy). Prefer `POST /v1/assets/jobs` for UI/agent.
+async fn install(
+    State(app): State<Arc<App>>,
+    Json(req): Json<InstallReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if req.r#async.unwrap_or(false) {
+        let job = enqueue_job(&app, req).await?;
+        return Ok(Json(json!({
+            "ok": true,
+            "queued": true,
+            "job": job_to_json(&job),
+            "jobId": job.id,
+            "status": job.status,
+            "path": job.dest_path,
+            "name": job.name,
+            "baseModel": job.base_model,
+            "modelType": job.model_type,
+        })));
+    }
+    let dest = validate_install(&app, &req)?;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let result = run_download(
+        &app,
+        &req.url,
+        &req.dest_path,
+        &dest,
+        req.auth_token.as_deref(),
+        &AssetMeta {
+            name: req.name.clone(),
+            base_model: req.base_model.clone(),
+            version_id: req.version_id,
+            model_id: req.model_id,
+            model_type: req.model_type.clone(),
+            source: req.source.clone(),
+            thumbnail_url: req.thumbnail_url.clone(),
+        },
+        cancel,
+        None,
+    )
+    .await;
+    match result {
+        Ok(bytes) => {
+            info!(
+                path = %dest.display(),
+                bytes,
+                base = ?req.base_model,
+                "installed asset"
+            );
+            Ok(Json(json!({
+                "ok": true,
+                "path": req.dest_path,
+                "baseModel": req.base_model,
+                "name": req.name,
+                "versionId": req.version_id,
+                "modelId": req.model_id,
+                "modelType": req.model_type,
+                "bytes": bytes,
+            })))
+        }
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e })))),
+    }
+}
+
+async fn enqueue_install(
+    State(app): State<Arc<App>>,
+    Json(req): Json<InstallReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let job = enqueue_job(&app, req).await?;
+    Ok(Json(json!({
+        "ok": true,
+        "queued": true,
+        "job": job_to_json(&job),
+        "jobId": job.id,
+        "status": job.status,
+    })))
+}
+
+async fn list_jobs(State(app): State<Arc<App>>) -> Json<Value> {
+    let store = app.jobs.lock().await;
+    let jobs: Vec<Value> = store
+        .recent
+        .iter()
+        .filter_map(|id| store.jobs.get(id).map(|e| job_to_json(&e.job)))
+        .collect();
+    Json(json!({ "data": jobs }))
+}
+
+async fn get_job(
+    State(app): State<Arc<App>>,
+    PathParam(id): PathParam<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let store = app.jobs.lock().await;
+    let entry = store.jobs.get(&id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "job not found" })),
+        )
+    })?;
+    Ok(Json(json!({ "job": job_to_json(&entry.job) })))
+}
+
+async fn cancel_job(
+    State(app): State<Arc<App>>,
+    PathParam(id): PathParam<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut store = app.jobs.lock().await;
+    let entry = store.jobs.get_mut(&id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "job not found" })),
+        )
+    })?;
+    match entry.job.status.as_str() {
+        "queued" => {
+            entry.cancel.store(true, Ordering::SeqCst);
+            entry.job.status = "cancelled".into();
+            entry.job.updated_at = now_unix();
+            entry.job.error = Some("cancelled before download".into());
+        }
+        "downloading" => {
+            entry.cancel.store(true, Ordering::SeqCst);
+            // Status flips to cancelled in the worker loop when it notices.
+        }
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("cannot cancel job in status {other}")
+                })),
+            ));
+        }
+    }
+    Ok(Json(json!({ "ok": true, "job": job_to_json(&entry.job) })))
+}
+
+/// Drop finished (and optionally idle queued) jobs from the recent list. Never touches in-flight downloads.
+async fn clear_jobs(State(app): State<Arc<App>>, body: Option<Json<ClearJobsReq>>) -> Json<Value> {
+    let include_queued = body.map(|Json(b)| b.include_queued).unwrap_or(false);
+    let mut store = app.jobs.lock().await;
+    let mut drop_ids: Vec<String> = Vec::new();
+    let mut keep = VecDeque::new();
+    for id in store.recent.iter() {
+        let Some(entry) = store.jobs.get(id) else {
+            continue;
+        };
+        let st = entry.job.status.as_str();
+        let finished = matches!(st, "succeeded" | "failed" | "cancelled");
+        let drop_queued = include_queued && st == "queued";
+        if finished || drop_queued {
+            drop_ids.push(id.clone());
+        } else {
+            keep.push_back(id.clone());
+        }
+    }
+    for id in &drop_ids {
+        store.jobs.remove(id);
+    }
+    let removed = drop_ids.len();
+    store.recent = keep;
+    let data: Vec<Value> = store
+        .recent
+        .iter()
+        .filter_map(|id| store.jobs.get(id).map(|e| job_to_json(&e.job)))
+        .collect();
+    Json(json!({ "ok": true, "removed": removed, "data": data }))
+}
+
+async fn delete_asset(
+    State(app): State<Arc<App>>,
+    Json(req): Json<DeleteAssetReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let dest = resolve_dest(&app.models_dir, &req.path)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
+    if !dest.exists() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "asset not found" })),
+        ));
+    }
+    fs::remove_file(&dest).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("delete failed: {e}") })),
+        )
+    })?;
+    let meta = meta_path_for(&dest);
+    let _ = fs::remove_file(&meta).await;
+    // Clear active base if we removed it.
+    {
+        let mut active = app.active.write().await;
+        if active.model == req.path {
+            let next = ActiveBase {
+                model: String::new(),
+                base_model: None,
+            };
+            let _ = persist_active_base(&app.models_dir, &next).await;
+            *active = next;
+        }
+    }
+    info!(path = %req.path, "deleted asset");
+    Ok(Json(json!({ "ok": true, "path": req.path })))
+}
+
+/// Max concurrent Civitai/asset downloads (queue still accepts more; extras stay queued).
+const MAX_CONCURRENT_DOWNLOADS: usize = 3;
+
+fn spawn_job_worker(app: Arc<App>, mut rx: mpsc::UnboundedReceiver<String>) {
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
+        while let Some(id) = rx.recv().await {
+            let permit = match sem.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break,
+            };
+            let app = app.clone();
+            tokio::spawn(async move {
+                process_job(app, id).await;
+                drop(permit);
+            });
+        }
+    });
+}
+
+async fn process_job(app: Arc<App>, id: String) {
+    let (url, dest_path, auth, meta, cancel) = {
+        let mut store = app.jobs.lock().await;
+        let Some(entry) = store.jobs.get_mut(&id) else {
+            return;
+        };
+        if entry.cancel.load(Ordering::SeqCst) || entry.job.status == "cancelled" {
+            entry.job.status = "cancelled".into();
+            entry.job.updated_at = now_unix();
+            return;
+        }
+        entry.job.status = "downloading".into();
+        entry.job.updated_at = now_unix();
+        (
+            entry.job.url.clone(),
+            entry.job.dest_path.clone(),
+            entry.auth_token.clone(),
+            AssetMeta {
+                name: entry.job.name.clone(),
+                base_model: entry.job.base_model.clone(),
+                version_id: entry.version_id,
+                model_id: entry.model_id,
+                model_type: entry.job.model_type.clone(),
+                source: entry.job.source.clone(),
+                thumbnail_url: entry.thumbnail_url.clone(),
+            },
+            entry.cancel.clone(),
+        )
+    };
+    let dest = match resolve_dest(&app.models_dir, &dest_path) {
+        Ok(p) => p,
+        Err(e) => {
+            update_job_failed(&app, &id, e).await;
+            return;
+        }
+    };
+    let result = run_download(
+        &app,
+        &url,
+        &dest_path,
+        &dest,
+        auth.as_deref(),
+        &meta,
+        cancel.clone(),
+        Some(id.clone()),
+    )
+    .await;
+    let mut store = app.jobs.lock().await;
+    let Some(entry) = store.jobs.get_mut(&id) else {
+        return;
+    };
+    entry.job.updated_at = now_unix();
+    match result {
+        Ok(bytes) => {
+            if cancel.load(Ordering::SeqCst) {
+                entry.job.status = "cancelled".into();
+                entry.job.error = Some("cancelled".into());
+                let _ = fs::remove_file(&dest).await;
+            } else {
+                entry.job.status = "succeeded".into();
+                entry.job.bytes_done = bytes;
+                if let Some(total) = entry.job.bytes_total {
+                    entry.job.percent = Some(100.0);
+                    let _ = total;
+                } else {
+                    entry.job.bytes_total = Some(bytes);
+                    entry.job.percent = Some(100.0);
+                }
+                entry.job.error = None;
+                info!(job = %id, path = %dest_path, bytes, "install job succeeded");
+            }
+        }
+        Err(e) => {
+            if cancel.load(Ordering::SeqCst) || e.contains("cancelled") {
+                entry.job.status = "cancelled".into();
+                entry.job.error = Some("cancelled".into());
+            } else {
+                entry.job.status = "failed".into();
+                entry.job.error = Some(e);
+            }
+        }
+    }
+}
+
+async fn update_job_failed(app: &App, id: &str, error: String) {
+    let mut store = app.jobs.lock().await;
+    if let Some(entry) = store.jobs.get_mut(id) {
+        entry.job.status = "failed".into();
+        entry.job.error = Some(error);
+        entry.job.updated_at = now_unix();
+    }
+}
+
+async fn update_job_progress(app: &App, id: &str, done: u64, total: Option<u64>) {
+    let mut store = app.jobs.lock().await;
+    if let Some(entry) = store.jobs.get_mut(id) {
+        entry.job.bytes_done = done;
+        entry.job.bytes_total = total.or(entry.job.bytes_total);
+        entry.job.percent = entry.job.bytes_total.map(|t| {
+            if t == 0 {
+                0.0
+            } else {
+                (done as f64 / t as f64) * 100.0
+            }
+        });
+        entry.job.updated_at = now_unix();
+    }
+}
+
+/// Download to disk with optional progress + cancel. Returns bytes written.
+#[allow(clippy::too_many_arguments)]
+async fn run_download(
+    app: &App,
+    url: &str,
+    dest_path: &str,
+    dest: &Path,
+    auth_token: Option<&str>,
+    meta: &AssetMeta,
+    cancel: Arc<AtomicBool>,
+    job_id: Option<String>,
+) -> Result<u64, String> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .await
@@ -493,10 +1316,7 @@ fn validate_install(app: &App, req: &InstallReq) -> Result<PathBuf, (StatusCode,
     {
         req_builder = req_builder.bearer_auth(token);
     }
-    let resp = req_builder
-        .send()
-        .await
-        .map_err(|e| internal("download request", e))?;
+    let mut resp = req_builder.send().await.map_err(download_request_err)?;
     if !resp.status().is_success() {
         return Err((
             axum::http::StatusCode::BAD_REQUEST,
@@ -578,6 +1398,35 @@ mod tests {
         ));
         assert!(!install_url_ok("https://evil.example/steal"));
         assert!(!install_url_ok("file:///etc/passwd"));
+        // R2 delivery must not be accepted as a direct install URL (SSRF).
+        assert!(!install_url_ok(
+            "https://civitai-delivery-worker-prod.abc.r2.cloudflarestorage.com/file"
+        ));
+    }
+
+    #[test]
+    fn allowlist_civitai_r2_redirect_only() {
+        let r2 = "civitai-delivery-worker-prod.5ac0637cfd0766c97916cefa3764fbdf.r2.cloudflarestorage.com";
+        assert!(civitai_r2_delivery_host(r2));
+        assert!(!civitai_r2_delivery_host(
+            "evil-delivery.abc.r2.cloudflarestorage.com"
+        ));
+        assert!(!redirect_host_ok(r2, &[]));
+        let from_civitai =
+            vec![reqwest::Url::parse("https://civitai.com/api/download/models/1").unwrap()];
+        assert!(redirect_host_ok(r2, &from_civitai));
+        assert!(redirect_host_ok("b2.civitai.com", &from_civitai));
+        let from_evil = vec![reqwest::Url::parse("https://evil.example/x").unwrap()];
+        assert!(!redirect_host_ok(r2, &from_evil));
+    }
+
+    #[test]
+    fn meta_sidecar_path() {
+        let p = PathBuf::from("/models/checkpoints/foo.safetensors");
+        assert_eq!(
+            meta_path_for(&p),
+            PathBuf::from("/models/checkpoints/foo.safetensors.meta.json")
+        );
     }
 
     fn tempfile_dir() -> PathBuf {

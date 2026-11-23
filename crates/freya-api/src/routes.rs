@@ -847,6 +847,37 @@ fn infer_civitai_search_type(message: &str) -> &'static str {
     }
 }
 
+fn stamp_gen_args(args: &mut Value, message: &str) {
+    let patch = crate::genmeta::patch_from_message(message);
+    let Some(obj) = args.as_object_mut() else {
+        return;
+    };
+    if let Some(s) = patch.sampler.as_deref() {
+        obj.insert("sampler".into(), json!(s));
+    }
+    if let Some(n) = patch.cfg {
+        obj.insert("cfg".into(), json!(n));
+    }
+    if let Some(n) = patch.steps {
+        obj.insert("steps".into(), json!(n));
+    }
+    if let Some(n) = patch.clip_skip {
+        obj.insert("clipSkip".into(), json!(n));
+    }
+    if let Some(n) = patch.seed {
+        obj.insert("seed".into(), json!(n));
+    }
+    if let Some(n) = patch.quantity {
+        obj.insert("quantity".into(), json!(n));
+    }
+    if crate::genmeta::wants_reuse(message) {
+        obj.insert("reuse".into(), json!(true));
+    }
+    if patch.any() {
+        obj.insert("persistMeta".into(), json!(true));
+    }
+}
+
 fn wants_image_intent(message: &str) -> bool {
     crate::router::infer_modality(message)
         .modality
@@ -958,18 +989,30 @@ fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
         });
     }
 
-    if wants_image_intent(message) {
+    if wants_image_intent(message) || crate::genmeta::wants_reuse(message) {
         if m.contains("run session") || m.contains("variations") || m.contains("batch") {
+            let mut args = json!({ "goal": message });
+            stamp_gen_args(&mut args, message);
             actions.push(PlannedAction {
                 action_type: "run_session".into(),
-                args: json!({ "goal": message }),
+                args,
             });
         } else {
+            let mut args = json!({ "prompt": message, "batch": false });
+            stamp_gen_args(&mut args, message);
             actions.push(PlannedAction {
                 action_type: "generate_image".into(),
-                args: json!({ "prompt": message, "batch": false }),
+                args,
             });
         }
+    } else if crate::genmeta::settings_command_only(message) {
+        // "set steps to 30" with no scene — write the shared store, do not render.
+        let mut args = json!({});
+        stamp_gen_args(&mut args, message);
+        actions.push(PlannedAction {
+            action_type: "set_generation_meta".into(),
+            args,
+        });
     }
 
     let reply = if actions.is_empty() {
@@ -1179,6 +1222,8 @@ fn is_side_effect_action(ty: &str) -> bool {
             | "set_privacy"
             | "set_generate_backend"
             | "set_automation_mode"
+            | "set_generation_meta"
+            | "recommend_generation_meta"
             | "favorite_asset"
             | "unfavorite_asset"
             | "pin_lora"
@@ -1624,6 +1669,14 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
         "set_privacy" | "set_alignment" | "set_generate_backend" | "set_automation_mode" => {
             Some(format!("{ty} saved."))
         }
+        "set_generation_meta" | "recommend_generation_meta" => {
+            let label = res
+                .get("settings")
+                .and_then(|s| s.get("sourceLabel"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("Generation settings saved.");
+            Some(label.to_string())
+        }
         "generate_image" | "generate_video" => {
             let backend = res.get("backend").and_then(|b| b.as_str()).unwrap_or("?");
             let model = res
@@ -1908,19 +1961,14 @@ async fn execute_chat_action(
                 });
             }
             let backend_choice = chat_generate_backend(state, pinned, backend).await;
-            let req = GenerateRequest {
-                prompt: prompt.to_string(),
-                negative_prompt: None,
-                enhance: Some("auto".into()),
-                backend: Some(backend_choice.clone()),
-                model: resolve_action_image_model(image_model, &backend_choice),
-                style_ref: style_ref_from_args(&action.args),
-                loras: pinned.to_vec(),
-                size: None,
-                seed: None,
-                modality: Some("picture".into()),
-                duration: None,
-            };
+            let req = image_generate_request(
+                prompt.to_string(),
+                &action.args,
+                backend_choice.clone(),
+                resolve_action_image_model(image_model, &backend_choice),
+                style_ref_from_args(&action.args),
+                pinned.to_vec(),
+            );
             match run_generate(state, req).await {
                 Ok(result) => json!({
                     "type": ty,
@@ -1966,19 +2014,16 @@ async fn execute_chat_action(
                 .unwrap_or("video")
                 .to_string();
             let backend_choice = chat_generate_backend(state, pinned, backend).await;
-            let mut req = GenerateRequest {
-                prompt: prompt.to_string(),
-                negative_prompt: None,
-                enhance: Some("auto".into()),
-                backend: Some(backend_choice),
-                model: video_model.map(str::to_string),
-                style_ref: style_ref_from_args(&action.args),
-                loras: vec![],
-                size: None,
-                seed: None,
-                modality: Some(modality),
-                duration: action.args.get("duration").and_then(|d| d.as_i64()),
-            };
+            let mut req = image_generate_request(
+                prompt.to_string(),
+                &action.args,
+                backend_choice,
+                video_model.map(str::to_string),
+                style_ref_from_args(&action.args),
+                vec![],
+            );
+            req.modality = Some(modality);
+            req.duration = action.args.get("duration").and_then(|d| d.as_i64());
             if req.model.as_deref() == Some("auto") {
                 req.model = None;
             }
@@ -2058,19 +2103,14 @@ async fn execute_chat_action(
             let session_style = style_ref_from_args(&action.args);
             let mut results = Vec::new();
             for p in &prompts {
-                let req = GenerateRequest {
-                    prompt: p.clone(),
-                    negative_prompt: None,
-                    enhance: Some("auto".into()),
-                    backend: Some(backend_choice.clone()),
-                    model: resolve_action_image_model(image_model, &backend_choice),
-                    style_ref: session_style.clone(),
-                    loras: pinned.to_vec(),
-                    size: None,
-                    seed: None,
-                    modality: Some("picture".into()),
-                    duration: None,
-                };
+                let req = image_generate_request(
+                    p.clone(),
+                    &action.args,
+                    backend_choice.clone(),
+                    resolve_action_image_model(image_model, &backend_choice),
+                    session_style.clone(),
+                    pinned.to_vec(),
+                );
                 match run_generate(state, req).await {
                     Ok(r) => results.push(r),
                     Err(e) => {
@@ -2996,6 +3036,33 @@ async fn execute_chat_action(
                 Err(e) => action_error(ty, &action.args, e),
             }
         }
+        "get_generation_meta" => {
+            action_ok(ty, &action.args, generation_meta_value(state, false).await)
+        }
+        "recommend_generation_meta" => {
+            action_ok(ty, &action.args, generation_meta_value(state, true).await)
+        }
+        "set_generation_meta" => {
+            if let Some(msg) = reject_secret_fields(&action.args) {
+                return action_error(ty, &action.args, msg);
+            }
+            let patch = crate::genmeta::patch_from_value(&action.args);
+            if !patch.any() {
+                return action_error(
+                    ty,
+                    &action.args,
+                    "provide sampler, cfg, steps, clipSkip, negativePrompt, seed, size, or quantity",
+                );
+            }
+            let mut settings = state.config.read().await.studio.generation.clone();
+            settings.apply_patch(&patch, "agent", true);
+            write_generation(state, &settings).await;
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "settings": settings, "persisted": true }),
+            )
+        }
         other => json!({
             "type": other,
             "status": "error",
@@ -3159,12 +3226,25 @@ fn phase_for_action(ty: &str) -> Option<&'static str> {
     match ty {
         "generate_image" | "generate_video" | "run_session" => Some("Generating"),
         "install_asset" => Some("Downloading"),
-        "search_civitai" | "suggest_ideas" | "list_loras" | "list_checkpoints"
-        | "list_installed" | "list_styles" | "list_models" | "list_favorites" | "list_pins"
-        | "list_install_jobs" | "gallery_list" | "gallery_get" | "get_settings"
-        | "get_route_defaults" | "worker_status" | "get_base_model" | "apply_style" => {
-            Some("Searching")
-        }
+        "search_civitai"
+        | "suggest_ideas"
+        | "list_loras"
+        | "list_checkpoints"
+        | "list_installed"
+        | "list_styles"
+        | "list_models"
+        | "list_favorites"
+        | "list_pins"
+        | "list_install_jobs"
+        | "gallery_list"
+        | "gallery_get"
+        | "get_settings"
+        | "get_route_defaults"
+        | "worker_status"
+        | "get_base_model"
+        | "apply_style"
+        | "get_generation_meta"
+        | "recommend_generation_meta" => Some("Searching"),
         _ => None,
     }
 }
@@ -3269,6 +3349,11 @@ fn lora_from_pin_value(v: &Value) -> Option<LoraIn> {
             .get("baseModel")
             .and_then(|b| b.as_str())
             .map(str::to_string),
+        version_id: v.get("versionId").and_then(|x| x.as_i64()),
+        model_id: v
+            .get("modelId")
+            .and_then(|x| x.as_i64())
+            .or_else(|| v.get("id").and_then(|x| x.as_i64())),
     })
 }
 
@@ -3981,14 +4066,16 @@ async fn chat_run(
                 })
             )
         };
+        let mut args = json!({
+            "prompt": req.message,
+            "modality": modality,
+        });
+        stamp_gen_args(&mut args, &req.message);
         (
             reply,
             vec![PlannedAction {
                 action_type: "generate_video".into(),
-                args: json!({
-                    "prompt": req.message,
-                    "modality": modality,
-                }),
+                args,
             }],
         )
     } else if !req.confirm
@@ -4004,11 +4091,13 @@ async fn chat_run(
             } else {
                 "On it — I’ll make a short series of images.".to_string()
             };
+            let mut args = json!({ "goal": req.message });
+            stamp_gen_args(&mut args, &req.message);
             (
                 reply,
                 vec![PlannedAction {
                     action_type: "run_session".into(),
-                    args: json!({ "goal": req.message }),
+                    args,
                 }],
             )
         } else {
@@ -4017,14 +4106,41 @@ async fn chat_run(
             } else {
                 "On it — I’ll make that image for you.".to_string()
             };
+            let mut args = json!({ "prompt": req.message, "batch": false });
+            stamp_gen_args(&mut args, &req.message);
             (
                 reply,
                 vec![PlannedAction {
                     action_type: "generate_image".into(),
-                    args: json!({ "prompt": req.message, "batch": false }),
+                    args,
                 }],
             )
         }
+    } else if !req.confirm && crate::genmeta::wants_reuse(&req.message) {
+        let reply = if mode == "plan" {
+            "Ready to generate again with the same settings — press Generate to run it.".to_string()
+        } else {
+            "Using the same settings as the last image.".to_string()
+        };
+        let mut args = json!({ "prompt": req.message, "batch": false });
+        stamp_gen_args(&mut args, &req.message);
+        (
+            reply,
+            vec![PlannedAction {
+                action_type: "generate_image".into(),
+                args,
+            }],
+        )
+    } else if !req.confirm && crate::genmeta::settings_command_only(&req.message) {
+        let mut args = json!({});
+        stamp_gen_args(&mut args, &req.message);
+        (
+            "Updated the generation settings.".to_string(),
+            vec![PlannedAction {
+                action_type: "set_generation_meta".into(),
+                args,
+            }],
+        )
     } else {
         let mut system = load_instruction_toned(&state, "converse").await;
         if alignment.local_adult_passthrough() {
@@ -4400,6 +4516,28 @@ pub struct GenerateRequest {
     pub size: Option<String>,
     #[serde(default)]
     pub seed: Option<i64>,
+    /// `picture` | `gif` | `video` — omit to infer from prompt.
+    #[serde(default)]
+    pub modality: Option<String>,
+    /// Video duration seconds (OpenRouter), when supported.
+    #[serde(default)]
+    pub duration: Option<i64>,
+    #[serde(default)]
+    pub steps: Option<u32>,
+    #[serde(default, alias = "guidance", alias = "guidanceScale")]
+    pub cfg: Option<f64>,
+    #[serde(default)]
+    pub sampler: Option<String>,
+    #[serde(default)]
+    pub clip_skip: Option<u32>,
+    #[serde(default, alias = "n")]
+    pub quantity: Option<u32>,
+    /// Repeat the last gallery sidecar (sampler, cfg, steps, clip skip, seed, …).
+    #[serde(default)]
+    pub reuse_meta: Option<bool>,
+    /// Write request sampling fields into the shared generation store.
+    #[serde(default)]
+    pub persist_meta: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -4408,6 +4546,16 @@ pub struct LoraIn {
     pub name: String,
     #[serde(default = "one")]
     pub scale: f32,
+    /// Relative path on the worker (`loras/foo.safetensors`) when known.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Civitai base family (SDXL 1.0, Pony, …) — used to pick a checkpoint.
+    #[serde(default)]
+    pub base_model: Option<String>,
+    #[serde(default)]
+    pub version_id: Option<i64>,
+    #[serde(default)]
+    pub model_id: Option<i64>,
 }
 
 fn one() -> f32 {
@@ -4507,7 +4655,420 @@ pub async fn run(
     run_generate(&state, req).await.map(Json)
 }
 
+fn image_generate_request(
+    prompt: String,
+    args: &Value,
+    backend: String,
+    model: Option<String>,
+    style_ref: Option<String>,
+    loras: Vec<LoraIn>,
+) -> GenerateRequest {
+    let from_args = crate::genmeta::patch_from_value(args);
+    let from_text = crate::genmeta::patch_from_message(&prompt);
+    let pick_s = |a: &Option<String>, b: &Option<String>| a.clone().or_else(|| b.clone());
+    let reuse = args.get("reuse").and_then(|v| v.as_bool()).unwrap_or(false)
+        || args
+            .get("reuseMeta")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        || crate::genmeta::wants_reuse(&prompt);
+    let persist = args
+        .get("persistMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || from_args.any()
+        || from_text.any();
+    GenerateRequest {
+        prompt,
+        negative_prompt: pick_s(&from_args.negative_prompt, &from_text.negative_prompt),
+        enhance: Some("auto".into()),
+        backend: Some(backend),
+        model,
+        style_ref,
+        loras,
+        size: pick_s(&from_args.size, &from_text.size).and_then(|s| crate::genmeta::clean_size(&s)),
+        seed: if from_args.clear_seed {
+            None
+        } else {
+            from_args.seed.or(from_text.seed)
+        },
+        modality: Some("picture".into()),
+        duration: None,
+        steps: from_args.steps.or(from_text.steps),
+        cfg: from_args.cfg.or(from_text.cfg),
+        sampler: pick_s(&from_args.sampler, &from_text.sampler),
+        clip_skip: from_args.clip_skip.or(from_text.clip_skip),
+        quantity: from_args.quantity.or(from_text.quantity),
+        reuse_meta: Some(reuse),
+        persist_meta: Some(persist),
+    }
+}
+
+struct PreparedGen {
+    sampler: String,
+    cfg: f64,
+    steps: u32,
+    clip_skip: u32,
+    negative: Option<String>,
+    seed: i64,
+    size: Option<String>,
+    quantity: u32,
+    source: String,
+    source_label: String,
+}
+
+struct SelAsset {
+    kind: &'static str,
+    name: String,
+    version_id: Option<i64>,
+    base: Option<String>,
+}
+
+fn pin_version(pin: &Value) -> Option<i64> {
+    pin.get("versionId")
+        .and_then(|v| v.as_i64())
+        .or_else(|| pin.get("version_id").and_then(|v| v.as_i64()))
+}
+
+fn sel_from_pin(pin: &Value) -> Option<SelAsset> {
+    if !crate::studio::is_pinnable(pin) {
+        return None;
+    }
+    let name = pin
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(SelAsset {
+        kind: "lora",
+        name,
+        version_id: pin_version(pin),
+        base: pin
+            .get("baseModel")
+            .and_then(|b| b.as_str())
+            .map(str::to_string),
+    })
+}
+
+async fn selection_assets(state: &AppState, req: &GenerateRequest) -> (Vec<SelAsset>, String) {
+    let pins = state.config.read().await.studio.pinned_loras.clone();
+    let mut assets = Vec::new();
+    if req.loras.is_empty() {
+        for pin in &pins {
+            if let Some(sel) = sel_from_pin(pin) {
+                assets.push(sel);
+            }
+        }
+    } else {
+        for lora in &req.loras {
+            let matched = pins.iter().find(|pin| {
+                let name = pin.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let path = pin.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                name.eq_ignore_ascii_case(&lora.name)
+                    || path == lora.path.as_deref().unwrap_or("")
+                    || path.ends_with(&format!("/{}.safetensors", lora.name))
+            });
+            assets.push(SelAsset {
+                kind: "lora",
+                name: lora.name.clone(),
+                version_id: lora.version_id.or_else(|| matched.and_then(pin_version)),
+                base: lora.base_model.clone().or_else(|| {
+                    matched
+                        .and_then(|p| p.get("baseModel"))
+                        .and_then(|b| b.as_str())
+                        .map(str::to_string)
+                }),
+            });
+        }
+    }
+    let mut family = assets
+        .iter()
+        .find_map(|a| a.base.clone())
+        .unwrap_or_default();
+    if let Some(client) = state.worker.read().await.as_ref() {
+        if let Ok(active) = client.get_active_base().await {
+            let model_path = active
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            let base = active
+                .get("baseModel")
+                .and_then(|b| b.as_str())
+                .map(str::to_string);
+            if family.is_empty() {
+                family = base.clone().unwrap_or_default();
+            }
+            let mut version_id = None;
+            if let Ok(cps) = client.list_checkpoints().await {
+                if let Some(hit) = cps.iter().find(|c| c.path == model_path) {
+                    version_id = hit.version_id;
+                    if family.is_empty() {
+                        family = hit.base_model.clone().unwrap_or_default();
+                    }
+                }
+            }
+            if !model_path.is_empty() || version_id.is_some() {
+                assets.push(SelAsset {
+                    kind: "checkpoint",
+                    name: checkpoint_display_name(&model_path),
+                    version_id,
+                    base,
+                });
+            }
+        }
+    }
+    (assets, family)
+}
+
+fn selection_key(assets: &[SelAsset], family: &str) -> String {
+    if assets.is_empty() {
+        return format!("family:{family}");
+    }
+    assets
+        .iter()
+        .map(|a| {
+            format!(
+                "{}:{}:{}:{}",
+                a.kind,
+                a.version_id.unwrap_or(0),
+                a.name,
+                a.base.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+async fn recommend_current(
+    state: &AppState,
+    req: &GenerateRequest,
+) -> crate::genmeta::RecommendedGen {
+    let (assets, family) = selection_assets(state, req).await;
+    let civ_ok = state.civitai.read().await.configured();
+    if civ_ok {
+        for kind in ["lora", "checkpoint"] {
+            for asset in assets.iter().filter(|a| a.kind == kind) {
+                let Some(vid) = asset.version_id else {
+                    continue;
+                };
+                let fetched = {
+                    let civ = state.civitai.read().await;
+                    civ.version_example(vid).await
+                };
+                let Ok(ver) = fetched else {
+                    continue;
+                };
+                let base = ver
+                    .base_model
+                    .clone()
+                    .or_else(|| asset.base.clone())
+                    .unwrap_or_else(|| family.clone());
+                if ver
+                    .example
+                    .as_ref()
+                    .map(|e| e.has_sampling())
+                    .unwrap_or(false)
+                {
+                    let label = match &ver.model_name {
+                        Some(n) if !n.is_empty() => format!("{n} {}", ver.version_name),
+                        _ => format!("{} {}", asset.name, ver.version_name),
+                    };
+                    return crate::genmeta::recommend_from_example(
+                        ver.example.as_ref(),
+                        &base,
+                        &label,
+                    );
+                }
+            }
+        }
+    }
+    let base = if family.is_empty() {
+        assets
+            .iter()
+            .find_map(|a| a.base.clone())
+            .unwrap_or_default()
+    } else {
+        family
+    };
+    crate::genmeta::recommend_from_example(None, &base, "")
+}
+
+async fn write_generation(state: &AppState, settings: &crate::genmeta::GenerationSettings) {
+    {
+        let mut cfg = state.config.write().await;
+        cfg.studio.generation = settings.clone();
+    }
+    let _ = state.persist_secrets().await;
+}
+
+async fn prepare_generation(
+    state: &AppState,
+    req: &mut GenerateRequest,
+    client_size: Option<String>,
+    style_size: Option<String>,
+) -> PreparedGen {
+    if req.reuse_meta.unwrap_or(false) && crate::genmeta::reuse_command_only(&req.prompt) {
+        if let Ok(Some(last)) = state.gallery.latest_generation().await {
+            if !last.prompt.trim().is_empty() {
+                req.prompt = last.prompt.clone();
+            }
+        }
+    }
+
+    let mut stored = state.config.read().await.studio.generation.clone();
+    if req.reuse_meta.unwrap_or(false) {
+        if let Ok(Some(last)) = state.gallery.latest_generation().await {
+            if let Some(s) = last.sampler.clone().filter(|s| !s.trim().is_empty()) {
+                stored.sampler = Some(s);
+            }
+            if let Some(c) = last.cfg {
+                stored.cfg = Some(c);
+            }
+            if let Some(s) = last.steps {
+                stored.steps = Some(s);
+            }
+            if let Some(c) = last.clip_skip {
+                stored.clip_skip = Some(c);
+            }
+            stored.negative_prompt = last.negative_prompt.clone();
+            stored.seed = last.seed.or(stored.seed);
+            if let Some(sz) = last.size.clone() {
+                stored.size = Some(sz);
+            }
+            if let Some(q) = last.quantity {
+                stored.quantity = Some(q);
+            }
+            stored.locked = true;
+            stored.source = Some("last".into());
+            stored.source_label = Some(format!(
+                "Reused from the last image{}",
+                last.seed
+                    .map(|s| format!(" (seed {s})"))
+                    .unwrap_or_default()
+            ));
+            write_generation(state, &stored).await;
+        }
+    }
+
+    let (assets, family) = selection_assets(state, req).await;
+    let key = selection_key(&assets, &family);
+    let refresh = !req.reuse_meta.unwrap_or(false)
+        && !stored.locked
+        && (!stored.sampling_complete() || stored.recommend_key.as_deref() != Some(key.as_str()));
+    let fill_gaps =
+        !req.reuse_meta.unwrap_or(false) && stored.locked && !stored.sampling_complete();
+    if refresh || fill_gaps {
+        let rec = recommend_current(state, req).await;
+        if refresh {
+            stored.apply_recommendation(&rec, &key);
+            write_generation(state, &stored).await;
+        } else {
+            if stored
+                .sampler
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                stored.sampler = Some(rec.sampler);
+            }
+            if stored.cfg.is_none() {
+                stored.cfg = Some(rec.cfg);
+            }
+            if stored.steps.is_none() {
+                stored.steps = Some(rec.steps);
+            }
+            if stored.clip_skip.is_none() {
+                stored.clip_skip = Some(rec.clip_skip);
+            }
+            write_generation(state, &stored).await;
+        }
+    }
+
+    let mut working = stored.clone();
+    if let Some(s) = req.sampler.clone().filter(|s| !s.trim().is_empty()) {
+        working.sampler = Some(s);
+    }
+    if let Some(c) = req.cfg {
+        working.cfg = Some(crate::genmeta::clamp_cfg(c));
+    }
+    if let Some(s) = req.steps {
+        working.steps = Some(crate::genmeta::clamp_steps(s));
+    }
+    if let Some(c) = req.clip_skip {
+        working.clip_skip = Some(crate::genmeta::clamp_clip(c));
+    }
+    if let Some(n) = req.negative_prompt.clone() {
+        working.negative_prompt = {
+            let t = n.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+    }
+    if let Some(seed) = req.seed {
+        working.seed = Some(seed);
+    }
+    if let Some(q) = req.quantity {
+        working.quantity = Some(crate::genmeta::clamp_quantity(q));
+    }
+    if let Some(sz) = client_size.as_deref().and_then(crate::genmeta::clean_size) {
+        working.size = Some(sz);
+    }
+
+    if req.persist_meta.unwrap_or(false) && !req.reuse_meta.unwrap_or(false) {
+        working.locked = true;
+        working.source = Some("agent".into());
+        working.source_label = Some("Set from chat".into());
+        write_generation(state, &working).await;
+    }
+
+    let fam = crate::genmeta::family_default(&family);
+    let sampler = working
+        .sampler
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| fam.sampler.into());
+    let cfg = crate::genmeta::clamp_cfg(working.cfg.unwrap_or(fam.cfg));
+    let steps = crate::genmeta::clamp_steps(working.steps.unwrap_or(fam.steps));
+    let clip_skip = crate::genmeta::clamp_clip(working.clip_skip.unwrap_or(fam.clip_skip));
+    let seed = working.seed.unwrap_or_else(crate::genmeta::random_seed);
+    let quantity = crate::genmeta::clamp_quantity(working.quantity.unwrap_or(1));
+    let size = working
+        .size
+        .clone()
+        .or_else(|| style_size.as_deref().and_then(crate::genmeta::clean_size));
+    PreparedGen {
+        sampler,
+        cfg,
+        steps,
+        clip_skip,
+        negative: working.negative_prompt.clone(),
+        seed,
+        size,
+        quantity,
+        source: working.source.clone().unwrap_or_else(|| "family".into()),
+        source_label: working
+            .source_label
+            .clone()
+            .unwrap_or_else(|| fam_label_fallback(&fam)),
+    }
+}
+
+fn fam_label_fallback(fam: &crate::genmeta::FamilyDefault) -> String {
+    format!("Family default ({})", fam.label)
+}
+
 async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<serde_json::Value> {
+    let client_size = req.size.clone();
+    req.loras = session_lora_pins(std::mem::take(&mut req.loras));
     let styles = styles::load_styles(&state.packs_dir)
         .await
         .unwrap_or_default();
@@ -4533,6 +5094,10 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
                 .map(|l| LoraIn {
                     name: l.name.clone(),
                     scale: l.scale,
+                    path: None,
+                    base_model: None,
+                    version_id: None,
+                    model_id: None,
                 })
                 .collect();
         }
@@ -4550,6 +5115,21 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     {
         req.backend = Some("local".into());
     }
+
+    let style_size = if client_size.is_none() {
+        req.size.clone()
+    } else {
+        None
+    };
+    let prepared = prepare_generation(state, &mut req, client_size, style_size).await;
+    req.negative_prompt = prepared.negative.clone();
+    req.seed = Some(prepared.seed);
+    req.size = prepared.size.clone();
+    req.sampler = Some(prepared.sampler.clone());
+    req.cfg = Some(prepared.cfg);
+    req.steps = Some(prepared.steps);
+    req.clip_skip = Some(prepared.clip_skip);
+    req.quantity = Some(prepared.quantity);
 
     let backend = req.backend.clone().unwrap_or_else(|| "openrouter".into());
     let enhance = req.enhance.clone().unwrap_or_else(|| "auto".into());
@@ -4659,8 +5239,62 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     }
 
     let modality = resolve_generate_modality(&req);
-    let (bytes, mime, model_used, backend_used) = if modality.is_motion() {
-        run_motion_generate(state, &req, &final_prompt, modality).await?
+    struct Batch {
+        images: Vec<(Vec<u8>, i64)>,
+        mime: String,
+        model: String,
+        backend: String,
+        base_model: Option<String>,
+        sampler_applied: Option<String>,
+        sampler_note: Option<String>,
+        clip_skip_applied: bool,
+        steps: u32,
+        cfg: f64,
+    }
+    let batch = if modality.is_motion() {
+        let motion = run_motion_generate(state, &req, &final_prompt, modality).await?;
+        let seed = motion
+            .applied
+            .as_ref()
+            .and_then(|a| a.images.first())
+            .and_then(|i| i.seed)
+            .unwrap_or(prepared.seed);
+        let (steps, cfg, applied, note, clip_ok) = motion
+            .applied
+            .as_ref()
+            .map(|a| {
+                (
+                    a.steps.unwrap_or(prepared.steps),
+                    a.guidance.unwrap_or(prepared.cfg),
+                    a.scheduler.clone().or(a.sampler.clone()),
+                    a.sampler_note.clone(),
+                    a.clip_skip_applied.unwrap_or(false),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    prepared.steps,
+                    prepared.cfg,
+                    None,
+                    Some(
+                        "recorded only; this path does not apply sampler, steps, or clip skip"
+                            .into(),
+                    ),
+                    false,
+                )
+            });
+        Batch {
+            images: vec![(motion.bytes, seed)],
+            mime: motion.mime,
+            model: motion.model,
+            backend: motion.backend,
+            base_model: None,
+            sampler_applied: applied,
+            sampler_note: note,
+            clip_skip_applied: clip_ok,
+            steps,
+            cfg,
+        }
     } else if backend == "local" {
         let worker = state.worker.read().await;
         let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
@@ -4724,23 +5358,44 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
                 );
             }
         }
-        let bytes = client
-            .generate(
-                &final_prompt,
-                req.model.as_deref(),
-                &loras,
-                req.size.as_deref(),
-                req.seed,
-                req.negative_prompt.as_deref(),
-            )
-            .await
-            .map_err(ApiError::from)?;
-        (
-            bytes,
-            "image/png".to_string(),
-            req.model.clone().unwrap_or_else(|| "local".into()),
-            "local".to_string(),
-        )
+        let call = crate::worker::GenCall {
+            prompt: final_prompt.clone(),
+            model: model.clone(),
+            loras,
+            size: req.size.clone(),
+            seed: req.seed,
+            negative: req.negative_prompt.clone(),
+            steps: req.steps,
+            guidance: req.cfg,
+            sampler: req.sampler.clone(),
+            clip_skip: req.clip_skip,
+            quantity: req.quantity,
+        };
+        let result = client.generate(&call).await.map_err(ApiError::from)?;
+        let images = result
+            .images
+            .iter()
+            .enumerate()
+            .map(|(i, img)| {
+                (
+                    img.bytes.clone(),
+                    img.seed
+                        .unwrap_or_else(|| prepared.seed.wrapping_add(i as i64)),
+                )
+            })
+            .collect();
+        Batch {
+            images,
+            mime: "image/png".into(),
+            model: model.clone().unwrap_or_else(|| "local".into()),
+            backend: "local".into(),
+            base_model: active_base_label,
+            sampler_applied: result.scheduler.clone().or(result.sampler.clone()),
+            sampler_note: result.sampler_note.clone(),
+            clip_skip_applied: result.clip_skip_applied.unwrap_or(false),
+            steps: result.steps.unwrap_or(prepared.steps),
+            cfg: result.guidance.unwrap_or(prepared.cfg),
+        }
     } else {
         let or = state.openrouter.read().await;
         let img = or
@@ -4750,41 +5405,112 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&img.b64)
             .map_err(|e| ApiError::Msg(e.to_string()))?;
-        (
-            bytes,
-            img.mime,
-            req.model
-                .clone()
-                .unwrap_or_else(|| or.default_image_model().to_string()),
-            "openrouter".to_string(),
-        )
+        let note = if prepared.quantity > 1 {
+            "OpenRouter image API generates one image; sampler, steps, clip skip, and quantity are stored only"
+        } else {
+            "recorded only; OpenRouter image API does not apply sampler, steps, or clip skip"
+        };
+        Batch {
+            images: vec![(bytes, prepared.seed)],
+            mime: img.mime,
+            model: model.unwrap_or(default_image),
+            backend: "openrouter".into(),
+            base_model: None,
+            sampler_applied: None,
+            sampler_note: Some(note.into()),
+            clip_skip_applied: false,
+            steps: prepared.steps,
+            cfg: prepared.cfg,
+        }
     };
 
-    let mut meta = ArtifactMeta {
-        id: String::new(),
-        prompt: req.prompt.clone(),
-        enhanced_prompt: enhanced.clone(),
-        backend: backend_used.clone(),
-        model: model_used.clone(),
-        style_ref: req.style_ref.clone(),
-        loras: req.loras.iter().map(|l| l.name.clone()).collect(),
-        created_at: String::new(),
-        mime: mime.clone(),
-        filename: String::new(),
-    };
-    let saved = state
-        .gallery
-        .save(&bytes, &mime, &mut meta)
-        .await
-        .map_err(ApiError::from)?;
+    let lora_names: Vec<String> = req.loras.iter().map(|l| l.name.clone()).collect();
+    let mut saved_all = Vec::new();
+    for (bytes, seed) in &batch.images {
+        let mut meta = ArtifactMeta {
+            id: String::new(),
+            prompt: req.prompt.clone(),
+            enhanced_prompt: enhanced.clone(),
+            backend: batch.backend.clone(),
+            model: batch.model.clone(),
+            style_ref: req.style_ref.clone(),
+            loras: lora_names.clone(),
+            created_at: String::new(),
+            mime: batch.mime.clone(),
+            filename: String::new(),
+            negative_prompt: prepared.negative.clone(),
+            sampler: Some(prepared.sampler.clone()),
+            sampler_applied: batch.sampler_applied.clone(),
+            sampler_note: batch.sampler_note.clone(),
+            cfg: Some(batch.cfg),
+            steps: Some(batch.steps),
+            clip_skip: Some(prepared.clip_skip),
+            clip_skip_applied: Some(batch.clip_skip_applied),
+            seed: Some(*seed),
+            size: prepared.size.clone(),
+            base_model: batch.base_model.clone(),
+            quantity: Some(prepared.quantity),
+            gen_source: Some(prepared.source.clone()),
+        };
+        let saved = state
+            .gallery
+            .save(bytes, &batch.mime, &mut meta)
+            .await
+            .map_err(ApiError::from)?;
+        saved_all.push(saved);
+    }
+    let saved = saved_all
+        .first()
+        .cloned()
+        .ok_or_else(|| ApiError::Msg("worker returned no images".into()))?;
+    {
+        let mut cfgw = state.config.write().await;
+        let g = &mut cfgw.studio.generation;
+        g.last_seed = saved.seed;
+        g.sampler_applied = batch.sampler_applied.clone();
+        g.sampler_note = batch.sampler_note.clone();
+        g.clip_skip_applied = Some(batch.clip_skip_applied);
+        if g.sampler.is_none() {
+            g.sampler = Some(prepared.sampler.clone());
+        }
+        if g.cfg.is_none() {
+            g.cfg = Some(batch.cfg);
+        }
+        if g.steps.is_none() {
+            g.steps = Some(batch.steps);
+        }
+        if g.clip_skip.is_none() {
+            g.clip_skip = Some(prepared.clip_skip);
+        }
+    }
+    let _ = state.persist_secrets().await;
 
+    let extras: Vec<Value> = saved_all.iter().skip(1).map(with_gallery_url).collect();
     Ok(json!({
         "artifactId": saved.id,
-        "backend": backend_used,
-        "model": model_used,
+        "backend": batch.backend,
+        "model": batch.model,
         "enhancedPrompt": enhanced,
+        "modality": modality.as_str(),
+        "mime": batch.mime,
         "url": format!("/v1/gallery/{}/image", saved.id),
         "meta": saved,
+        "seed": prepared.seed,
+        "seeds": saved_all.iter().filter_map(|m| m.seed).collect::<Vec<_>>(),
+        "sampler": prepared.sampler,
+        "samplerApplied": batch.sampler_applied,
+        "samplerNote": batch.sampler_note,
+        "cfg": batch.cfg,
+        "steps": batch.steps,
+        "clipSkip": prepared.clip_skip,
+        "clipSkipApplied": batch.clip_skip_applied,
+        "negativePrompt": prepared.negative,
+        "size": prepared.size,
+        "quantity": prepared.quantity,
+        "baseModel": batch.base_model,
+        "genSource": prepared.source,
+        "sourceLabel": prepared.source_label,
+        "results": extras,
     }))
 }
 
@@ -4822,12 +5548,20 @@ fn resolve_generate_modality(req: &GenerateRequest) -> crate::router::Modality {
     crate::router::infer_modality(&req.prompt).modality
 }
 
+struct MotionOut {
+    bytes: Vec<u8>,
+    mime: String,
+    model: String,
+    backend: String,
+    applied: Option<crate::worker::WorkerGenResult>,
+}
+
 async fn run_motion_generate(
     state: &AppState,
     req: &GenerateRequest,
     final_prompt: &str,
     modality: crate::router::Modality,
-) -> ApiResult<(Vec<u8>, String, String, String)> {
+) -> ApiResult<MotionOut> {
     let want_gif = matches!(modality, crate::router::Modality::Gif);
     let backend = req.backend.as_deref().unwrap_or("auto");
     let pinned_local = backend == "local";
@@ -4838,23 +5572,33 @@ async fn run_motion_generate(
         let worker = state.worker.read().await;
         if let Some(client) = worker.as_ref() {
             let gif_model = crate::base_models::filter_local_model(req.model.as_deref());
-            match client
-                .generate_gif(
-                    final_prompt,
-                    gif_model.as_deref(),
-                    req.size.as_deref(),
-                    req.seed,
-                    req.negative_prompt.as_deref(),
-                )
-                .await
-            {
-                Ok(bytes) => {
-                    return Ok((
+            let call = crate::worker::GenCall {
+                prompt: final_prompt.to_string(),
+                model: gif_model.clone(),
+                loras: vec![],
+                size: req.size.clone(),
+                seed: req.seed,
+                negative: req.negative_prompt.clone(),
+                steps: req.steps,
+                guidance: req.cfg,
+                sampler: req.sampler.clone(),
+                clip_skip: req.clip_skip,
+                quantity: Some(1),
+            };
+            match client.generate_gif(&call).await {
+                Ok(result) => {
+                    let bytes = result
+                        .images
+                        .first()
+                        .map(|i| i.bytes.clone())
+                        .unwrap_or_default();
+                    return Ok(MotionOut {
                         bytes,
-                        "image/gif".into(),
-                        gif_model.unwrap_or_else(|| "local-gif".into()),
-                        "local".into(),
-                    ));
+                        mime: "image/gif".into(),
+                        model: gif_model.unwrap_or_else(|| "local-gif".into()),
+                        backend: "local".into(),
+                        applied: Some(result),
+                    });
                 }
                 Err(e) => {
                     if pinned_local {
@@ -4911,7 +5655,13 @@ async fn run_motion_generate(
     } else {
         (vid.bytes, vid.mime)
     };
-    Ok((bytes, mime, vid.model, "openrouter".into()))
+    Ok(MotionOut {
+        bytes,
+        mime,
+        model: vid.model,
+        backend: "openrouter".into(),
+        applied: None,
+    })
 }
 
 fn size_to_video_aspect(size: &str) -> Option<&'static str> {
@@ -5206,18 +5956,42 @@ pub async fn civitai_lookup(
 }
 
 fn civitai_detail_response(detail: crate::civitai::CivitaiModelDetail) -> Json<serde_json::Value> {
-    // Nested shape for the UI modal: { model, related: [{ model, note }] }.
-    let related: Vec<_> = detail
-        .related
+    // Recommended checkpoints are the base suggestion rows. Popular-family hits stay the fallback.
+    let recommended: Vec<_> = detail
+        .recommended_resources
         .iter()
+        .filter(|r| r.resource_type.eq_ignore_ascii_case("Checkpoint"))
         .map(|r| {
             json!({
-                "relation": "compatible_checkpoint",
-                "note": detail.base_model.as_ref().map(|b| format!("Popular checkpoint for {b}")),
-                "model": r,
+                "relation": "recommended_checkpoint",
+                "note": "Recommended base checkpoint",
+                "model": {
+                    "id": r.id,
+                    "modelId": r.id,
+                    "name": r.name,
+                    "modelType": r.resource_type,
+                    "versionId": r.model_version_id,
+                    "baseModel": r.base_model,
+                    "nsfw": r.nsfw,
+                }
             })
         })
         .collect();
+    let related: Vec<_> = if !recommended.is_empty() {
+        recommended
+    } else {
+        detail
+            .related
+            .iter()
+            .map(|r| {
+                json!({
+                    "relation": "compatible_checkpoint",
+                    "note": detail.base_model.as_ref().map(|b| format!("Popular checkpoint for {b}")),
+                    "model": r,
+                })
+            })
+            .collect()
+    };
     let mut model = serde_json::to_value(&detail).unwrap_or(json!({}));
     if let Some(obj) = model.as_object_mut() {
         // Keep related nested under the response envelope, not duplicated on model.
@@ -5231,8 +6005,12 @@ pub async fn civitai_model(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
     let civ = state.civitai.read().await;
-    let detail = civ.get_model(id).await.map_err(ApiError::from)?;
+    let detail = civ
+        .get_model(id, allow_nsfw)
+        .await
+        .map_err(ApiError::from)?;
     Ok(civitai_detail_response(detail))
 }
 
@@ -5241,9 +6019,10 @@ pub async fn civitai_model_version(
     State(state): State<AppState>,
     axum::extract::Path(version_id): axum::extract::Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
     let civ = state.civitai.read().await;
     let detail = civ
-        .get_model_by_version(version_id)
+        .get_model_by_version(version_id, allow_nsfw)
         .await
         .map_err(ApiError::from)?;
     Ok(civitai_detail_response(detail))
@@ -5527,6 +6306,78 @@ fn const_eq_str(a: &str, b: &str) -> bool {
 
 pub async fn settings_get(State(state): State<AppState>) -> Json<SettingsPublic> {
     Json(settings_public_from_state(&state).await)
+}
+
+fn blank_generate_request() -> GenerateRequest {
+    GenerateRequest {
+        prompt: String::new(),
+        negative_prompt: None,
+        enhance: None,
+        backend: None,
+        model: None,
+        style_ref: None,
+        loras: vec![],
+        size: None,
+        seed: None,
+        modality: None,
+        duration: None,
+        steps: None,
+        cfg: None,
+        sampler: None,
+        clip_skip: None,
+        quantity: None,
+        reuse_meta: None,
+        persist_meta: None,
+    }
+}
+
+async fn generation_meta_value(state: &AppState, force: bool) -> Value {
+    let blank = blank_generate_request();
+    let (assets, family) = selection_assets(state, &blank).await;
+    let key = selection_key(&assets, &family);
+    let mut settings = state.config.read().await.studio.generation.clone();
+    let refresh = force
+        || (!settings.locked
+            && (!settings.sampling_complete()
+                || settings.recommend_key.as_deref() != Some(key.as_str())));
+    if refresh {
+        let rec = recommend_current(state, &blank).await;
+        let seed = settings.seed;
+        let quantity = settings.quantity;
+        let size = settings.size.clone();
+        let last_seed = settings.last_seed;
+        settings.apply_recommendation(&rec, &key);
+        settings.seed = seed;
+        settings.quantity = quantity;
+        if size.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            settings.size = size;
+        }
+        settings.last_seed = last_seed;
+        write_generation(state, &settings).await;
+    }
+    json!({ "settings": settings, "persisted": true })
+}
+
+pub async fn generation_meta_get(State(state): State<AppState>) -> Json<Value> {
+    Json(generation_meta_value(&state, false).await)
+}
+
+pub async fn generation_meta_recommend(State(state): State<AppState>) -> Json<Value> {
+    Json(generation_meta_value(&state, true).await)
+}
+
+pub async fn generation_meta_put(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> ApiResult<Json<Value>> {
+    if let Some(msg) = reject_secret_fields(&body) {
+        return Err(ApiError::Msg(msg));
+    }
+    let patch = crate::genmeta::patch_from_value(&body);
+    let mut settings = state.config.read().await.studio.generation.clone();
+    settings.apply_patch(&patch, "user", true);
+    write_generation(&state, &settings).await;
+    Ok(Json(json!({ "settings": settings, "persisted": true })))
 }
 
 pub async fn studio_get(State(state): State<AppState>) -> Json<crate::studio::StudioPrefs> {

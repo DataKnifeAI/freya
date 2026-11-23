@@ -481,6 +481,25 @@ button.linkish:hover { text-decoration-color: var(--ember); }
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--mist-light);
+  background-image: linear-gradient(
+    100deg,
+    var(--mist-light) 0%,
+    var(--mist-light) 32%,
+    var(--apricot) 48%,
+    var(--mist) 62%,
+    var(--mist-light) 78%,
+    var(--mist-light) 100%
+  );
+  background-size: 220% 100%;
+  background-position: 100% 50%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: status-word-sweep 1.6s linear infinite;
+}
+@keyframes status-word-sweep {
+  0% { background-position: 100% 50%; }
+  100% { background-position: -120% 50%; }
 }
 html.chat-busy, html.chat-busy * { cursor: none !important; }
 .chat-pointer {
@@ -657,9 +676,163 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
 .lora-card { border-top: 2px solid var(--apricot-line); padding: 0.55rem 0.1rem 0.3rem; display: grid; gap: 0.4rem; align-content: start; }
 .lora-card h4 { margin: 0; font-size: 0.92rem; font-weight: 600; line-height: 1.25; }
 .lora-card p { margin: 0.1rem 0 0; font-size: 0.74rem; opacity: 0.72; line-height: 1.35; }
-.lora-card-actions { gap: 0.3rem; }
-.lora-card-actions button { padding: 0.3rem 0.6rem; font-size: 0.72rem; }
+.lora-card-meta { opacity: 0.85 !important; letter-spacing: 0.02em; }
+.lora-stat-badge {
+  position: absolute; right: 0.35rem; top: 0.35rem; z-index: 2;
+  padding: 0.1rem 0.3rem; font-size: 0.58rem; font-weight: 700;
+  color: var(--mat-text); background: var(--mat); border: 1px solid var(--mat-line);
+}
+.lora-card-actions {
+  gap: 0.3rem;
+  flex-wrap: nowrap;
+  align-items: center;
+}
+.lora-card-actions button,
+.lora-card-actions a.ghost { padding: 0.3rem 0.6rem; font-size: 0.72rem; text-decoration: none; }
+a.civitai-open-link.civitai-link-nsfw {
+  color: var(--ember) !important;
+  border-color: color-mix(in srgb, var(--ember) 72%, transparent) !important;
+}
+a.civitai-open-link.civitai-link-sfw {
+  color: #2f6fdb !important;
+  border-color: rgba(47, 111, 219, 0.55) !important;
+}
+:root[data-theme="light"] a.civitai-open-link.civitai-link-sfw {
+  color: #1d4e9e !important;
+  border-color: rgba(29, 78, 158, 0.45) !important;
+}
+.lora-card-actions .icon-btn {
+  width: 2rem; height: 2rem; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+}
+.lora-card-actions .icon-btn svg { display: block; }
+.civitai-subnav { gap: 0.35rem; align-items: center; flex-wrap: wrap; }
+.civitai-subnav .civitai-subnav-end { margin-left: auto; }
+/* Color-cycle the Downloads label while any install job is queued/downloading. */
+.civitai-subnav button.civitai-subnav-end.dl-busy {
+  transition: none;
+  animation: downloads-text-cycle 1.6s ease-in-out infinite;
+}
+@keyframes downloads-text-cycle {
+  0%, 100% { color: var(--apricot); }
+  33% { color: var(--mist); }
+  66% { color: var(--mist-light); }
+}
+.civitai-search-row .icon-btn { flex: none; width: 2.2rem; height: 2.2rem; padding: 0; }
+.installed-sections { display: grid; gap: 1.25rem; }
+.installed-section-title {
+  margin: 0 0 0.45rem;
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--mist-light, var(--chrome-text));
+}
+.install-job-list,
+.installed-asset-list { display: grid; gap: 0.65rem; }
+.install-job-row,
+.installed-asset-row {
+  border-top: 2px solid var(--apricot-line);
+  padding: 0.55rem 0.15rem 0.35rem;
+  display: grid; gap: 0.3rem;
+}
+.install-job-head {
+  display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.35rem; align-items: baseline;
+}
+.install-job-status {
+  font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--mist-light);
+}
+.install-job-status.status-succeeded { color: var(--celadon, #6a9e78); }
+.install-job-status.status-failed,
+.install-job-status.status-cancelled { color: var(--apricot); }
+.install-job-status.status-downloading { color: var(--chrome-text); }
+.install-job-progress {
+  height: 0.35rem; background: var(--chrome-field); border: 1px solid var(--chrome-line-soft);
+  overflow: hidden;
+}
+.install-job-bar {
+  height: 100%; background: var(--apricot); transition: width 200ms ease;
+}
+.install-job-meta { justify-content: space-between; }
+.installed-meta-pre {
+  margin: 0; padding: 0.65rem; overflow: auto; max-height: 50vh;
+  font-size: 0.78rem; background: var(--chrome-field); border: 1px solid var(--chrome-line-soft);
+}
+.civitai-modal-backdrop {
+  /* Transparent outside the card so the page shows through; click-outside still closes. */
+  position: fixed; inset: 0; z-index: 80; background: transparent;
+  display: grid; place-items: center; padding: 1rem; overflow: auto;
+}
+.civitai-modal {
+  width: min(720px, 100%); max-height: min(90vh, 900px); overflow: auto;
+  background: var(--panel); color: var(--chrome-text); border: 1px solid var(--chrome-line);
+  border-top: 2px solid var(--apricot-line); padding: 0.85rem 1rem 1rem;
+  display: grid; gap: 0.75rem; box-shadow: var(--shadow);
+}
+.civitai-modal-head { display: flex; justify-content: space-between; gap: 0.75rem; align-items: start; }
+.civitai-modal-head h3 { margin: 0.35rem 0 0.15rem; font-size: 1.15rem; line-height: 1.25; }
+.civitai-modal-gallery { display: grid; gap: 0.45rem; }
+.civitai-modal-gallery > img {
+  width: 100%; max-height: 42vh; object-fit: contain; background: var(--img-bg);
+  border: 1px solid var(--chrome-line-soft);
+}
+.civitai-modal-thumbs { gap: 0.35rem; }
+.civitai-modal-thumbs button {
+  padding: 0; width: 56px; height: 56px; overflow: hidden; border: 1px solid var(--chrome-line);
+}
+.civitai-modal-thumbs img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.civitai-modal-body { display: grid; gap: 0.55rem; }
+.civitai-modal-body p { margin: 0; font-size: 0.88rem; line-height: 1.45; }
+.civitai-variant-picks {
+  display: grid;
+  gap: 0.45rem;
+  padding: 0.35rem 0;
+  border-top: 1px solid var(--apricot-line);
+  border-bottom: 1px solid var(--apricot-line);
+}
+.civitai-variant-picks label {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.78rem;
+  opacity: 0.9;
+}
+.civitai-variant-picks select {
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  font-size: 0.85rem;
+}
+.civitai-variant-picks code {
+  font-size: 0.78rem;
+  word-break: break-all;
+}
+.civitai-related { display: grid; gap: 0.4rem; margin-top: 0.35rem; padding-top: 0.55rem; border-top: 1px solid var(--chrome-line-soft); }
+.civitai-related h4 { margin: 0; font-size: 0.92rem; }
+.civitai-needs-base {
+  margin: 0; padding: 0.4rem 0.55rem; font-size: 0.82rem; line-height: 1.4;
+  background: var(--celadon-tint-strong); border-left: 3px solid var(--mist); color: var(--paper-text);
+}
+.lora-type-badge:not(.lora-card-thumb .lora-type-badge) {
+  position: static; display: inline-block; margin-bottom: 0.15rem;
+}
 .row { display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: center; }
+.gen-meta { display: flex; flex-direction: column; gap: 0.75rem; }
+.gen-meta-source { margin: 0; }
+.gen-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+  gap: 0.65rem 0.85rem;
+}
+.gen-meta label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.75rem;
+  letter-spacing: 0.02em;
+}
+.gen-meta-wide { grid-column: 1 / -1; }
+.gen-meta textarea { min-height: 4.5rem; resize: vertical; }
 
 /* Gallery / salon — warm bone mats in both themes */
 .salon { animation: fade 300ms ease both; }

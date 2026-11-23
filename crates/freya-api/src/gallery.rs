@@ -21,6 +21,33 @@ pub struct ArtifactMeta {
     pub created_at: String,
     pub mime: String,
     pub filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negative_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampler: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampler_applied: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampler_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cfg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_skip: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clip_skip_applied: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<u32>,
+    /// `civitai` | `family` | `user` | `agent` | `last`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gen_source: Option<String>,
 }
 
 #[derive(Clone)]
@@ -75,6 +102,16 @@ impl Gallery {
         }
         out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(out)
+    }
+
+    /// Newest sidecar, preferring one that recorded a seed or sampler.
+    pub async fn latest_generation(&self) -> Result<Option<ArtifactMeta>> {
+        let items = self.list().await?;
+        Ok(items
+            .iter()
+            .find(|m| m.seed.is_some() || m.sampler.is_some() || m.steps.is_some())
+            .cloned()
+            .or_else(|| items.into_iter().next()))
     }
 
     pub async fn get(&self, id: &str) -> Result<Option<ArtifactMeta>> {

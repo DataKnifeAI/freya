@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::debug;
 
 /// Installable weight types Freya surfaces by default (not every Civitai ModelType).
 pub const DEFAULT_SEARCH_TYPES: &[&str] = &[
@@ -161,7 +162,9 @@ impl CivitaiClient {
     }
 
     /// Full model detail (+ related checkpoints for non-checkpoint assets when baseModel is known).
-    pub async fn get_model(&self, id: i64) -> Result<CivitaiModelDetail> {
+    /// `allow_nsfw` is Freya's Show NSFW preference. Recommended resources that are themselves
+    /// NSFW are omitted when it is off.
+    pub async fn get_model(&self, id: i64, allow_nsfw: bool) -> Result<CivitaiModelDetail> {
         if !self.configured() {
             return Err(anyhow!(
                 "Civitai API key not set — add it in Freya Settings or CIVITAI_API_KEY"
@@ -179,8 +182,14 @@ impl CivitaiClient {
             ));
         }
         let mut detail = parse_model_detail(&v);
-        // Civitai has no first-class dependency graph; use version baseModel → popular checkpoints.
-        if !detail.model_type.eq_ignore_ascii_case("Checkpoint") {
+        self.attach_recommended(&mut detail, allow_nsfw).await;
+        // Public v1 has no dependency graph. When the model lists recommended checkpoints,
+        // those are the suggestion rows. Otherwise fall back to popular checkpoints for the family.
+        let has_recommended_ckpt = detail
+            .recommended_resources
+            .iter()
+            .any(|r| r.resource_type.eq_ignore_ascii_case("Checkpoint"));
+        if !has_recommended_ckpt && !detail.model_type.eq_ignore_ascii_case("Checkpoint") {
             if let Some(base) = detail
                 .base_model
                 .as_deref()
@@ -283,7 +292,11 @@ impl CivitaiClient {
     }
 
     /// Resolve a version id → full model detail (for Installed cards that only have versionId).
-    pub async fn get_model_by_version(&self, version_id: i64) -> Result<CivitaiModelDetail> {
+    pub async fn get_model_by_version(
+        &self,
+        version_id: i64,
+        allow_nsfw: bool,
+    ) -> Result<CivitaiModelDetail> {
         if !self.configured() {
             return Err(anyhow!(
                 "Civitai API key not set — add it in Freya Settings or CIVITAI_API_KEY"
@@ -307,7 +320,7 @@ impl CivitaiClient {
             .get("modelId")
             .and_then(|x| x.as_i64())
             .ok_or_else(|| anyhow!("civitai model version {version_id}: missing modelId"))?;
-        let mut detail = self.get_model(model_id).await?;
+        let mut detail = self.get_model(model_id, allow_nsfw).await?;
         // Prefer the installed version when present on the model.
         if detail.model_versions.iter().any(|ver| ver.id == version_id) {
             if let Some(ver) = detail
@@ -337,15 +350,135 @@ impl CivitaiClient {
                     detail.file_format = file.format.clone().or_else(|| file.file_type.clone());
                     detail.download_url = file.download_url.clone();
                 }
+                detail.recommended_resources = ver.recommended_resources.clone();
+                if let Some(url) = detail.civitai_url.clone() {
+                    detail.civitai_url = Some(with_version_query(&url, ver.id));
+                }
             }
         }
         Ok(detail)
     }
 
-    async fn get_json(&self, url: &str) -> Result<Value> {
+    /// `GET /api/v1/models/{id}` omits `recommendedResources`. The same API key on
+    /// `model.getById` returns `modelVersions[].recommendedResources`. Failures leave the
+    /// detail usable — we never invent a resource that was not in that payload.
+    async fn attach_recommended(&self, detail: &mut CivitaiModelDetail, allow_nsfw: bool) {
+        let mut any = false;
+        for ver in &mut detail.model_versions {
+            ver.recommended_resources = filter_recommended(&ver.recommended_resources, allow_nsfw);
+            if !ver.recommended_resources.is_empty() {
+                any = true;
+            }
+        }
+        if !any && detail.id > 0 {
+            match self.fetch_trpc_recommended(detail.id).await {
+                Ok(rows) => {
+                    for ver in &mut detail.model_versions {
+                        if let Some((_, list)) = rows.iter().find(|(id, _)| *id == ver.id) {
+                            ver.recommended_resources = filter_recommended(list, allow_nsfw);
+                        }
+                    }
+                }
+                Err(err) => debug!("recommended resources skipped: {err}"),
+            }
+        }
+        detail.recommended_resources = detail
+            .model_versions
+            .iter()
+            .find(|ver| Some(ver.id) == detail.version_id)
+            .map(|ver| ver.recommended_resources.clone())
+            .unwrap_or_default();
+    }
+
+    async fn fetch_trpc_recommended(
+        &self,
+        model_id: i64,
+    ) -> Result<Vec<(i64, Vec<CivitaiRecommendedResource>)>> {
+        let input = format!(r#"{{"json":{{"id":{model_id}}}}}"#);
+        let url = format!(
+            "https://civitai.com/api/trpc/model.getById?input={}",
+            urlencoding_lite(&input)
+        );
         let resp = self
             .http
             .get(&url)
+            .timeout(std::time::Duration::from_secs(8))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .context("civitai recommended resources")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("civitai recommended resources: {status}"));
+        }
+        let v: Value = serde_json::from_str(&text).context("civitai recommended resources json")?;
+        let versions = v
+            .pointer("/result/data/json/modelVersions")
+            .and_then(|x| x.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Ok(versions
+            .iter()
+            .filter_map(|ver| {
+                let id = ver.get("id").and_then(|x| x.as_i64()).unwrap_or(0);
+                let list = parse_recommended_resources(ver);
+                if id > 0 && !list.is_empty() {
+                    Some((id, list))
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
+    /// One version payload, including example-image meta. Does not walk related models.
+    pub async fn version_example(&self, version_id: i64) -> Result<VersionExample> {
+        if !self.configured() {
+            return Err(anyhow!(
+                "Civitai API key not set — add it in Freya Settings or CIVITAI_API_KEY"
+            ));
+        }
+        let url = format!("https://civitai.com/api/v1/model-versions/{version_id}");
+        let v = self
+            .get_json_timeout(&url, std::time::Duration::from_secs(8))
+            .await
+            .context("civitai get model version meta")?;
+        if v.get("error").is_some() {
+            return Err(anyhow!(
+                "civitai model version {}: {}",
+                version_id,
+                v.get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("not found")
+            ));
+        }
+        let ver = parse_model_version(&v, 12);
+        let model_name = v
+            .pointer("/model/name")
+            .and_then(|n| n.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        Ok(VersionExample {
+            version_id: ver.id,
+            version_name: ver.name,
+            model_name,
+            base_model: ver.base_model,
+            example: ver.example_meta,
+        })
+    }
+
+    async fn get_json(&self, url: &str) -> Result<Value> {
+        self.get_json_timeout(url, std::time::Duration::from_secs(30))
+            .await
+    }
+
+    async fn get_json_timeout(&self, url: &str, timeout: std::time::Duration) -> Result<Value> {
+        let resp = self
+            .http
+            .get(url)
+            .timeout(timeout)
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
             .await
@@ -450,6 +583,127 @@ fn parse_model_file(f: &Value) -> CivitaiModelFile {
     }
 }
 
+fn civitai_model_page(id: i64, version_id: Option<i64>, nsfw: bool) -> String {
+    let host = if nsfw {
+        "https://civitai.red"
+    } else {
+        "https://civitai.com"
+    };
+    match version_id {
+        Some(v) if v > 0 => format!("{host}/models/{id}?modelVersionId={v}"),
+        _ => format!("{host}/models/{id}"),
+    }
+}
+
+fn with_version_query(url: &str, version_id: i64) -> String {
+    let base = url.split('?').next().unwrap_or(url);
+    if version_id > 0 {
+        format!("{base}?modelVersionId={version_id}")
+    } else {
+        base.to_string()
+    }
+}
+
+fn value_is_nsfw(v: &Value) -> bool {
+    v.get("nsfw").and_then(|x| x.as_bool()).unwrap_or(false)
+        || v.get("nsfwLevel")
+            .and_then(|x| x.as_i64())
+            .map(|n| n > 1)
+            .unwrap_or(false)
+}
+
+/// Map Civitai `recommendedResources` (nested `model.getById` shape, or a flat
+/// `{id,name,type,modelVersionId,baseModel}` object) onto the detail payload.
+/// Does not add resources that are absent from the object.
+fn parse_recommended_resources(ver: &Value) -> Vec<CivitaiRecommendedResource> {
+    let Some(arr) = ver.get("recommendedResources").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in arr {
+        if let Some(rec) = parse_recommended_resource(item) {
+            let key = (rec.id, rec.model_version_id);
+            if !out
+                .iter()
+                .any(|e: &CivitaiRecommendedResource| (e.id, e.model_version_id) == key)
+            {
+                out.push(rec);
+            }
+        }
+    }
+    out
+}
+
+fn parse_recommended_resource(item: &Value) -> Option<CivitaiRecommendedResource> {
+    if let Some(model) = item.get("model").filter(|m| m.get("id").is_some()) {
+        let id = model.get("id").and_then(|x| x.as_i64())?;
+        let name = model
+            .get("name")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let resource_type = model
+            .get("type")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Checkpoint")
+            .to_string();
+        let model_version_id = item
+            .get("modelVersionId")
+            .and_then(|x| x.as_i64())
+            .or_else(|| item.get("id").and_then(|x| x.as_i64()));
+        let base_model = item
+            .get("baseModel")
+            .and_then(|x| x.as_str())
+            .or_else(|| model.get("baseModel").and_then(|x| x.as_str()))
+            .map(|s| s.to_string());
+        return Some(CivitaiRecommendedResource {
+            id,
+            name: name.to_string(),
+            resource_type,
+            model_version_id,
+            base_model,
+            nsfw: value_is_nsfw(model) || value_is_nsfw(item),
+        });
+    }
+    let id = item
+        .get("id")
+        .and_then(|x| x.as_i64())
+        .or_else(|| item.get("modelId").and_then(|x| x.as_i64()))?;
+    let name = item
+        .get("name")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let resource_type = item
+        .get("type")
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Checkpoint")
+        .to_string();
+    Some(CivitaiRecommendedResource {
+        id,
+        name: name.to_string(),
+        resource_type,
+        model_version_id: item.get("modelVersionId").and_then(|x| x.as_i64()),
+        base_model: item
+            .get("baseModel")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        nsfw: value_is_nsfw(item),
+    })
+}
+
+fn filter_recommended(
+    list: &[CivitaiRecommendedResource],
+    allow_nsfw: bool,
+) -> Vec<CivitaiRecommendedResource> {
+    list.iter()
+        .filter(|r| allow_nsfw || !r.nsfw)
+        .cloned()
+        .collect()
+}
+
 fn parse_model_version(ver: &Value, image_limit: usize) -> CivitaiModelVersion {
     let trained_words = parse_trained_words(ver);
     let files: Vec<CivitaiModelFile> = ver
@@ -459,7 +713,8 @@ fn parse_model_version(ver: &Value, image_limit: usize) -> CivitaiModelVersion {
         .unwrap_or_default();
     let mut image_urls = Vec::new();
     let mut example_prompt = None;
-    if let Some(images) = ver.get("images").and_then(|i| i.as_array()) {
+    let images = ver.get("images").and_then(|i| i.as_array());
+    if let Some(images) = images {
         for img in images.iter().take(image_limit) {
             if let Some(u) = img.get("url").and_then(|u| u.as_str()) {
                 image_urls.push(u.to_string());
@@ -472,6 +727,10 @@ fn parse_model_version(ver: &Value, image_limit: usize) -> CivitaiModelVersion {
             }
         }
     }
+    let example_meta = ver
+        .get("images")
+        .and_then(|i| i.as_array())
+        .and_then(|images| crate::genmeta::example_from_images(images.iter().take(24)));
     CivitaiModelVersion {
         id: ver.get("id").and_then(|x| x.as_i64()).unwrap_or(0),
         name: ver
@@ -499,6 +758,8 @@ fn parse_model_version(ver: &Value, image_limit: usize) -> CivitaiModelVersion {
             Some(image_urls)
         },
         example_prompt,
+        example_meta,
+        recommended_resources: parse_recommended_resources(ver),
     }
 }
 
@@ -598,12 +859,9 @@ fn parse_model_card(item: &Value, detailed: bool) -> CivitaiModelCard {
         None
     };
 
+    let nsfw_level = item.get("nsfwLevel").and_then(|x| x.as_i64());
     let nsfw = item.get("nsfw").and_then(|x| x.as_bool()).unwrap_or(false)
-        || item
-            .get("nsfwLevel")
-            .and_then(|x| x.as_i64())
-            .map(|n| n > 1)
-            .unwrap_or(false)
+        || nsfw_level.map(|n| n > 1).unwrap_or(false)
         || crate::prefs::looks_nsfw_label(&name);
 
     CivitaiModelCard {
@@ -635,8 +893,9 @@ fn parse_model_card(item: &Value, detailed: bool) -> CivitaiModelCard {
         } else {
             Some(image_urls)
         },
-        civitai_url: Some(format!("https://civitai.com/models/{id}")),
+        civitai_url: Some(civitai_model_page(id, version_id, nsfw)),
         nsfw,
+        nsfw_level,
         model_versions,
     }
 }
@@ -671,8 +930,16 @@ fn parse_model_detail(item: &Value) -> CivitaiModelDetail {
         thumbs_up: card.thumbs_up,
         image_urls: card.image_urls,
         civitai_url: card.civitai_url,
+        nsfw: card.nsfw,
+        nsfw_level: card.nsfw_level,
         needs_base,
-        model_versions: card.model_versions,
+        model_versions: card.model_versions.clone(),
+        recommended_resources: card
+            .model_versions
+            .iter()
+            .find(|ver| Some(ver.id) == card.version_id)
+            .map(|ver| ver.recommended_resources.clone())
+            .unwrap_or_default(),
         related: Vec::new(),
     }
 }
@@ -851,7 +1118,92 @@ mod tests {
         let detail = parse_model_detail(&item);
         assert_eq!(detail.model_versions.len(), 2);
         assert_eq!(detail.file_id, Some(2));
+        assert_eq!(
+            card.civitai_url.as_deref(),
+            Some("https://civitai.com/models/42?modelVersionId=100")
+        );
     }
+
+    #[test]
+    fn nsfw_level_uses_civitai_red_and_keeps_recommended_checkpoint() {
+        let item = json!({
+            "id": 1319790,
+            "name": "Frankie Foster",
+            "type": "LORA",
+            "nsfw": false,
+            "nsfwLevel": 3,
+            "modelVersions": [{
+                "id": 1490040,
+                "name": "-Illustrious XL-",
+                "baseModel": "Illustrious",
+                "files": [],
+                "recommendedResources": [{
+                    "id": 1410435,
+                    "name": "v11.0",
+                    "baseModel": "Illustrious",
+                    "model": {
+                        "id": 827184,
+                        "name": "WAI-illustrious-SDXL",
+                        "type": "Checkpoint",
+                        "nsfw": true
+                    }
+                }]
+            }]
+        });
+        let detail = parse_model_detail(&item);
+        assert_eq!(
+            detail.civitai_url.as_deref(),
+            Some("https://civitai.red/models/1319790?modelVersionId=1490040")
+        );
+        assert!(detail.nsfw);
+        assert_eq!(detail.nsfw_level, Some(3));
+        assert_eq!(detail.recommended_resources.len(), 1);
+        let rec = &detail.recommended_resources[0];
+        assert_eq!(rec.id, 827184);
+        assert_eq!(rec.name, "WAI-illustrious-SDXL");
+        assert_eq!(rec.resource_type, "Checkpoint");
+        assert_eq!(rec.model_version_id, Some(1410435));
+        assert_eq!(rec.base_model.as_deref(), Some("Illustrious"));
+        assert!(rec.nsfw);
+        assert!(filter_recommended(&detail.recommended_resources, false).is_empty());
+        assert_eq!(
+            filter_recommended(&detail.recommended_resources, true).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn flat_recommended_resource_is_kept() {
+        let item = json!({
+            "recommendedResources": [{
+                "id": 827184,
+                "name": "WAI-illustrious-SDXL",
+                "type": "Checkpoint",
+                "modelVersionId": 1410435,
+                "baseModel": "Illustrious",
+                "nsfw": false
+            }]
+        });
+        let list = parse_recommended_resources(&item);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, 827184);
+        assert_eq!(list[0].model_version_id, Some(1410435));
+        assert!(!list[0].nsfw);
+        assert_eq!(filter_recommended(&list, false).len(), 1);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersionExample {
+    pub version_id: i64,
+    pub version_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub example: Option<crate::genmeta::ExampleMeta>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -894,6 +1246,12 @@ pub struct CivitaiModelVersion {
     pub image_urls: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub example_prompt: Option<String>,
+    /// Sampling fields from the first example image that has steps or a sampler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub example_meta: Option<crate::genmeta::ExampleMeta>,
+    /// Creator-listed resources for this version (checkpoints, LoRAs, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommended_resources: Vec<CivitaiRecommendedResource>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -910,4 +1268,116 @@ pub struct CivitaiModelCard {
     pub thumbnail_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub example_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trained_words: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_word: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbs_up: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<CivitaiStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_urls: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub civitai_url: Option<String>,
+    /// From Civitai `nsfw` / nsfwLevel — used when Freya NSFW filter is off.
+    #[serde(default)]
+    pub nsfw: bool,
+    /// Civitai `nsfwLevel` (1 = SFW). Levels above 1 open on civitai.red.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nsfw_level: Option<i64>,
+    /// All versions + file variants (present on search when Civitai returns them; always on detail).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_versions: Vec<CivitaiModelVersion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CivitaiStats {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbs_up_count: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CivitaiModelDetail {
+    pub id: i64,
+    pub name: String,
+    pub model_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub example_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trained_words: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_word: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creator: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbs_up: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_urls: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub civitai_url: Option<String>,
+    /// From Civitai `nsfw` / nsfwLevel (also a name heuristic). Drives the civitai.red link.
+    #[serde(default)]
+    pub nsfw: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nsfw_level: Option<i64>,
+    /// Human hint when adapters need a compatible checkpoint family.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub needs_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_versions: Vec<CivitaiModelVersion>,
+    /// Recommended resources for the selected version (id, name, type, modelVersionId, baseModel).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommended_resources: Vec<CivitaiRecommendedResource>,
+    /// Popular checkpoints for the same baseModel family (best-effort related assets).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<CivitaiModelCard>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CivitaiRecommendedResource {
+    pub id: i64,
+    pub name: String,
+    #[serde(rename = "type")]
+    pub resource_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_version_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_model: Option<String>,
+    /// Recommended model is NSFW (`nsfw` true or nsfwLevel > 1).
+    #[serde(default)]
+    pub nsfw: bool,
 }
