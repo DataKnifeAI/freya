@@ -2328,10 +2328,32 @@ export async function mockApi(path, opts = {}) {
         nsfwLevel: "None",
         civitaiUrl: `https://civitai.com/images/11${versionQuery}`,
         resources: [
-          { name: "example-checkpoint", type: "Checkpoint" },
-          { name: "example-lora", type: "lora", weight: 0.8 },
+          { name: "waiNSFWIllustrious_v100", type: "Checkpoint", hash: "7e87327f89" },
+          { name: "example-lora", type: "lora", weight: 0.8, modelVersionId: 1490040 },
         ],
         modelVersionIds: modelVersionId ? [modelVersionId] : [],
+        checkpoint: "waiNSFWIllustrious_v100",
+        checkpointInstalled: false,
+        checkpointDifferent: true,
+        missingResources: [
+          {
+            name: "waiNSFWIllustrious_v100",
+            type: "Checkpoint",
+            hash: "7e87327f89",
+            modelVersionId: 1367422,
+            modelId: 827184,
+            installable: true,
+            destPath: "checkpoints/waiNSFWIllustrious_v100.safetensors",
+          },
+          {
+            name: "example-lora",
+            type: "LORA",
+            modelVersionId: 1490040,
+            modelId: 1319790,
+            installable: true,
+            destPath: "loras/example-lora.safetensors",
+          },
+        ],
       },
     ];
     if (allowNsfw) {
@@ -2350,8 +2372,12 @@ export async function mockApi(path, opts = {}) {
         nsfw: true,
         nsfwLevel: "X",
         civitaiUrl: `https://civitai.red/images/12${versionQuery}`,
-        resources: [{ name: "example-checkpoint", type: "Checkpoint" }],
+        resources: [{ name: "waiNSFWIllustrious_v100", type: "Checkpoint" }],
         modelVersionIds: modelVersionId ? [modelVersionId] : [],
+        checkpoint: "waiNSFWIllustrious_v100",
+        checkpointInstalled: true,
+        checkpointDifferent: false,
+        missingResources: [],
       });
     }
     return {

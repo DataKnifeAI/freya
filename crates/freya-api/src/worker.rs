@@ -150,6 +150,7 @@ impl DiffusionWorkerClient {
                         .get("thumbnailUrl")
                         .and_then(|x| x.as_str())
                         .map(str::to_string),
+                    hash: local_asset_hash(a),
                 });
             }
         }
@@ -659,6 +660,31 @@ pub struct LocalAsset {
     pub source: Option<String>,
     #[serde(default)]
     pub thumbnail_url: Option<String>,
+    /// File hash when the worker sidecar has one (SHA256 or AutoV2).
+    #[serde(default)]
+    pub hash: Option<String>,
+}
+
+fn local_asset_hash(asset: &Value) -> Option<String> {
+    let accept = |raw: &str| -> Option<String> {
+        let hex = raw.trim().rsplit([':', '/']).next().unwrap_or(raw).trim();
+        if hex.len() < 10 || hex.len() > 128 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(hex.to_ascii_lowercase())
+    };
+    for key in ["hash", "sha256", "autoV2", "autoV3"] {
+        if let Some(token) = asset.get(key).and_then(|v| v.as_str()).and_then(&accept) {
+            return Some(token);
+        }
+    }
+    let hashes = asset.get("hashes")?.as_object()?;
+    for key in ["SHA256", "sha256", "AutoV2", "autoV2", "AutoV3", "autoV3"] {
+        if let Some(token) = hashes.get(key).and_then(|v| v.as_str()).and_then(&accept) {
+            return Some(token);
+        }
+    }
+    None
 }
 
 /// True when the JSON is worker inventory, not the liveness `{ok:true}` body.

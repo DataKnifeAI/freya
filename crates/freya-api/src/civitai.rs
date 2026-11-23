@@ -500,7 +500,143 @@ impl CivitaiClient {
             .context("civitai community images")?;
         let mut items = parse_community_images(&v, version_id, allow_nsfw);
         items.truncate(12);
+        self.fill_resource_ids(&mut items).await;
         Ok(items)
+    }
+
+    /// Fill Civitai version ids for generation resources that only named a hash,
+    /// and names for version ids that arrived without one. A miss stays as a
+    /// filename or hash — callers must not invent a download for those.
+    async fn fill_resource_ids(&self, images: &mut [CommunityImage]) {
+        let mut hashes = Vec::new();
+        for image in images.iter() {
+            for resource in &image.resources {
+                if resource.model_version_id.is_some_and(|n| n > 0) {
+                    continue;
+                }
+                let Some(hash) = resource.hash.clone() else {
+                    continue;
+                };
+                if !hashes.iter().any(|h: &String| h == &hash) {
+                    hashes.push(hash);
+                }
+            }
+        }
+        hashes.truncate(24);
+        for chunk in hashes.chunks(4) {
+            let pending = chunk.iter().cloned().map(|hash| {
+                let client = self.clone();
+                async move {
+                    let found = client.version_by_hash(&hash).await.ok();
+                    (hash, found)
+                }
+            });
+            for (hash, found) in futures::future::join_all(pending).await {
+                let Some(found) = found else {
+                    continue;
+                };
+                for image in images.iter_mut() {
+                    for resource in &mut image.resources {
+                        if resource.hash.as_deref() == Some(hash.as_str())
+                            && resource.model_version_id.is_none()
+                        {
+                            apply_resolved_version(resource, &found);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut version_ids = Vec::new();
+        for image in images.iter() {
+            for resource in &image.resources {
+                if !resource.name.trim().is_empty() {
+                    continue;
+                }
+                let Some(id) = resource.model_version_id.filter(|n| *n > 0) else {
+                    continue;
+                };
+                if !version_ids.contains(&id) {
+                    version_ids.push(id);
+                }
+            }
+        }
+        version_ids.truncate(24);
+        for chunk in version_ids.chunks(4) {
+            let pending = chunk.iter().copied().map(|id| {
+                let client = self.clone();
+                async move {
+                    let found = client.version_by_id_brief(id).await.ok();
+                    (id, found)
+                }
+            });
+            for (id, found) in futures::future::join_all(pending).await {
+                let Some(found) = found else {
+                    continue;
+                };
+                for image in images.iter_mut() {
+                    for resource in &mut image.resources {
+                        if resource.model_version_id == Some(id) && resource.name.trim().is_empty()
+                        {
+                            apply_resolved_version(resource, &found);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn version_by_hash(&self, hash: &str) -> Result<ResolvedVersion> {
+        let hash = hash_token(hash).ok_or_else(|| anyhow!("bad civitai hash"))?;
+        let url = format!("https://civitai.com/api/v1/model-versions/by-hash/{hash}");
+        let v = self.catalog_json(&url).await?;
+        parse_resolved_version(&v).ok_or_else(|| anyhow!("civitai hash {hash}: not a version"))
+    }
+
+    async fn version_by_id_brief(&self, version_id: i64) -> Result<ResolvedVersion> {
+        let url = format!("https://civitai.com/api/v1/model-versions/{version_id}");
+        let v = self.catalog_json(&url).await?;
+        parse_resolved_version(&v)
+            .ok_or_else(|| anyhow!("civitai version {version_id}: unreadable"))
+    }
+
+    /// Public catalog first. Retry with the API key only when the public read
+    /// is refused, so a 404 does not wait on a second call.
+    async fn catalog_json(&self, url: &str) -> Result<Value> {
+        let timeout = std::time::Duration::from_secs(8);
+        match self.get_public_json_timeout(url, timeout).await {
+            Ok(v) => Ok(v),
+            Err(err) if self.configured() && catalog_retry_with_key(&err) => {
+                self.get_json_timeout(url, timeout).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Latest version's primary file. Used when a generation resource has a model id only.
+    pub async fn resolve_model_download(&self, model_id: i64) -> Result<ResolvedDownload> {
+        if !self.configured() {
+            return Err(anyhow!(
+                "Civitai API key not set — add it in Freya Settings or CIVITAI_API_KEY"
+            ));
+        }
+        let url = format!("https://civitai.com/api/v1/models/{model_id}");
+        let v = self.get_json(&url).await.context("civitai get model")?;
+        if v.get("error").is_some() {
+            return Err(anyhow!(
+                "civitai model {}: {}",
+                model_id,
+                v.get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("not found")
+            ));
+        }
+        let detail = parse_model_detail(&v);
+        let version_id = detail
+            .version_id
+            .ok_or_else(|| anyhow!("civitai model {model_id}: no version"))?;
+        self.resolve_version_download(version_id, detail.file_id)
+            .await
     }
 
     async fn get_json(&self, url: &str) -> Result<Value> {
@@ -528,10 +664,19 @@ impl CivitaiClient {
     /// Public catalog read. Omits `Authorization` so an account browsing level cannot
     /// override the explicit `nsfw` / `browsingLevel` query.
     async fn get_public_json(&self, url: &str) -> Result<Value> {
+        self.get_public_json_timeout(url, std::time::Duration::from_secs(20))
+            .await
+    }
+
+    async fn get_public_json_timeout(
+        &self,
+        url: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
         let resp = self
             .http
             .get(url)
-            .timeout(std::time::Duration::from_secs(20))
+            .timeout(timeout)
             .header("Accept", "application/json")
             .send()
             .await
@@ -1109,6 +1254,10 @@ fn parse_community_image(
         civitai_url: community_image_page(id, link_version, nsfw),
         resources: meta.map(parse_image_resources).unwrap_or_default(),
         model_version_ids,
+        checkpoint: None,
+        checkpoint_installed: false,
+        checkpoint_different: false,
+        missing_resources: Vec::new(),
     })
 }
 
@@ -1161,50 +1310,521 @@ fn community_image_page(image_id: i64, version_id: Option<i64>, nsfw: bool) -> S
 
 fn parse_image_resources(meta: &Value) -> Vec<CommunityImageResource> {
     let mut out = Vec::new();
-    if let Some(model) = meta_string(meta, &["model"]) {
-        out.push(CommunityImageResource {
-            name: model,
-            resource_type: "Checkpoint".into(),
-            weight: None,
-            model_version_id: None,
-        });
-    }
     for key in ["resources", "civitaiResources"] {
         let Some(arr) = meta.get(key).and_then(|v| v.as_array()) else {
             continue;
         };
         for item in arr {
-            let Some(name) = item
-                .get("name")
-                .and_then(|n| n.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            else {
+            let Some(resource) = parse_one_image_resource(item) else {
                 continue;
             };
-            if out.iter().any(|e| e.name.eq_ignore_ascii_case(name)) {
+            upsert_image_resource(&mut out, resource);
+        }
+    }
+    if let Some(model) = meta_string(meta, &["model"]) {
+        upsert_image_resource(
+            &mut out,
+            CommunityImageResource {
+                name: model.chars().take(120).collect(),
+                resource_type: "Checkpoint".into(),
+                weight: None,
+                model_version_id: None,
+                model_id: None,
+                hash: meta_string(meta, &["modelhash"]).and_then(|h| hash_token(&h)),
+                installable: None,
+                dest_path: None,
+            },
+        );
+    }
+    if let Some(obj) = meta.get("hashes").and_then(|h| h.as_object()) {
+        for (key, value) in obj {
+            let Some(hash) = value.as_str().and_then(hash_token) else {
+                continue;
+            };
+            let nk = norm_meta_key(key);
+            if nk == "model" || nk == "checkpoint" {
+                if let Some(existing) = out
+                    .iter_mut()
+                    .find(|r| is_checkpoint_type(&r.resource_type))
+                {
+                    if existing.hash.is_none() {
+                        existing.hash = Some(hash);
+                    }
+                }
                 continue;
             }
-            let resource_type = item
-                .get("type")
-                .and_then(|t| t.as_str())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("model")
-                .to_string();
-            out.push(CommunityImageResource {
-                name: name.chars().take(120).collect(),
-                resource_type,
-                weight: item.get("weight").and_then(value_f64),
-                model_version_id: item
-                    .get("modelVersionId")
-                    .or_else(|| item.get("versionId"))
-                    .and_then(value_i64)
-                    .filter(|n| *n > 0),
-            });
+            let label = key
+                .split_once(':')
+                .map(|(_, name)| name.trim())
+                .unwrap_or(key);
+            if let Some(existing) = out
+                .iter_mut()
+                .find(|r| !r.name.trim().is_empty() && r.name.eq_ignore_ascii_case(label))
+            {
+                if existing.hash.is_none() {
+                    existing.hash = Some(hash);
+                }
+            }
         }
     }
     out
+}
+
+fn parse_one_image_resource(item: &Value) -> Option<CommunityImageResource> {
+    // Weight 0 is listed on the post but was not applied.
+    if item
+        .get("weight")
+        .and_then(value_f64)
+        .is_some_and(|w| w == 0.0)
+    {
+        return None;
+    }
+    let name = item
+        .get("name")
+        .and_then(|n| n.as_str())
+        .or_else(|| item.get("modelName").and_then(|n| n.as_str()))
+        .or_else(|| item.get("modelVersionName").and_then(|n| n.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(120).collect::<String>())
+        .unwrap_or_default();
+    let hash = item
+        .get("hash")
+        .or_else(|| item.get("modelHash"))
+        .or_else(|| item.get("sha256"))
+        .and_then(|v| v.as_str())
+        .and_then(hash_token);
+    let model_version_id = item
+        .get("modelVersionId")
+        .or_else(|| item.get("versionId"))
+        .and_then(value_i64)
+        .filter(|n| *n > 0);
+    let model_id = item.get("modelId").and_then(value_i64).filter(|n| *n > 0);
+    if name.is_empty() && hash.is_none() && model_version_id.is_none() && model_id.is_none() {
+        return None;
+    }
+    let resource_type = item
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("model")
+        .to_string();
+    Some(CommunityImageResource {
+        name,
+        resource_type,
+        weight: item.get("weight").and_then(value_f64),
+        model_version_id,
+        model_id,
+        hash,
+        installable: None,
+        dest_path: None,
+    })
+}
+
+fn upsert_image_resource(out: &mut Vec<CommunityImageResource>, resource: CommunityImageResource) {
+    if let Some(existing) = out.iter_mut().find(|e| same_image_resource(e, &resource)) {
+        merge_image_resource(existing, resource);
+        return;
+    }
+    out.push(resource);
+}
+
+fn same_image_resource(a: &CommunityImageResource, b: &CommunityImageResource) -> bool {
+    match (
+        a.model_version_id.filter(|n| *n > 0),
+        b.model_version_id.filter(|n| *n > 0),
+    ) {
+        (Some(x), Some(y)) => return x == y,
+        _ => {}
+    }
+    if let (Some(x), Some(y)) = (a.hash.as_deref(), b.hash.as_deref()) {
+        return hashes_match(x, y);
+    }
+    let an = asset_stem_key(&a.name);
+    let bn = asset_stem_key(&b.name);
+    !an.is_empty() && an == bn && kinds_compatible(&a.resource_type, &b.resource_type)
+}
+
+fn merge_image_resource(dst: &mut CommunityImageResource, src: CommunityImageResource) {
+    if dst.name.trim().is_empty() {
+        dst.name = src.name;
+    }
+    if is_checkpoint_type(&src.resource_type) && !is_checkpoint_type(&dst.resource_type) {
+        dst.resource_type = src.resource_type;
+    }
+    if dst.weight.is_none() {
+        dst.weight = src.weight;
+    }
+    if dst.model_version_id.is_none() {
+        dst.model_version_id = src.model_version_id;
+    }
+    if dst.model_id.is_none() {
+        dst.model_id = src.model_id;
+    }
+    if dst.hash.is_none() {
+        dst.hash = src.hash;
+    }
+}
+
+fn catalog_retry_with_key(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    !(msg.contains("civitai 404") || msg.contains("civitai 400"))
+}
+
+struct ResolvedVersion {
+    version_id: i64,
+    model_id: Option<i64>,
+    model_name: Option<String>,
+    version_name: Option<String>,
+    file_name: Option<String>,
+    model_type: Option<String>,
+}
+
+fn parse_resolved_version(v: &Value) -> Option<ResolvedVersion> {
+    let version_id = v.get("id").and_then(value_i64).filter(|n| *n > 0)?;
+    let model_name = v
+        .pointer("/model/name")
+        .and_then(|n| n.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(120).collect());
+    let model_type = v
+        .pointer("/model/type")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let version_name = v
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(120).collect());
+    let file_name = v
+        .get("files")
+        .and_then(|f| f.as_array())
+        .and_then(|files| {
+            files
+                .iter()
+                .find(|f| f.get("primary").and_then(|p| p.as_bool()) == Some(true))
+                .or_else(|| files.first())
+        })
+        .and_then(|f| f.get("name").and_then(|n| n.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some(ResolvedVersion {
+        version_id,
+        model_id: v.get("modelId").and_then(value_i64).filter(|n| *n > 0),
+        model_name,
+        version_name,
+        file_name,
+        model_type,
+    })
+}
+
+fn apply_resolved_version(resource: &mut CommunityImageResource, resolved: &ResolvedVersion) {
+    if resource.model_version_id.is_none() {
+        resource.model_version_id = Some(resolved.version_id);
+    }
+    if resource.model_id.is_none() {
+        resource.model_id = resolved.model_id;
+    }
+    if resource.name.trim().is_empty() {
+        resource.name = resolved_display_name(resolved);
+    }
+    if resource.resource_type.trim().is_empty() {
+        if let Some(ty) = resolved.model_type.clone() {
+            resource.resource_type = ty;
+        }
+    }
+}
+
+fn resolved_display_name(resolved: &ResolvedVersion) -> String {
+    if let Some(file) = resolved.file_name.as_deref() {
+        let stem = file_stem(file);
+        if !stem.is_empty() {
+            return stem;
+        }
+    }
+    if let Some(name) = resolved.model_name.clone() {
+        return name;
+    }
+    if let Some(name) = resolved.version_name.clone() {
+        return name;
+    }
+    format!("version {}", resolved.version_id)
+}
+
+fn file_stem(name: &str) -> String {
+    let file = name.rsplit(['/', '\\']).next().unwrap_or(name).trim();
+    let lower = file.to_ascii_lowercase();
+    let stem = if let Some(suffix) = [".safetensors", ".ckpt", ".pt", ".gguf", ".bin"]
+        .iter()
+        .find(|suffix| lower.ends_with(*suffix))
+    {
+        &file[..file.len() - suffix.len()]
+    } else {
+        file
+    };
+    stem.trim().chars().take(120).collect()
+}
+
+fn hash_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_matches(['"', '\'']);
+    let hex = trimmed.rsplit([':', '/']).next().unwrap_or(trimmed).trim();
+    // AutoV2 is 10 hex; shorter CRC32/AutoV1 values collide on by-hash.
+    if hex.len() < 10 || hex.len() > 128 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(hex.to_ascii_lowercase())
+}
+
+fn hashes_match(a: &str, b: &str) -> bool {
+    let a = a.trim().to_ascii_lowercase();
+    let b = b.trim().to_ascii_lowercase();
+    if a.len() < 10 || b.len() < 10 {
+        return false;
+    }
+    a == b || a.starts_with(&b) || b.starts_with(&a)
+}
+
+pub(crate) fn is_checkpoint_type(raw: &str) -> bool {
+    matches!(
+        norm_meta_key(raw).as_str(),
+        "checkpoint" | "model" | "ckpt" | "base"
+    )
+}
+
+fn is_lora_type(raw: &str) -> bool {
+    let key = norm_meta_key(raw);
+    matches!(key.as_str(), "lora" | "locon" | "dora" | "lycoris" | "lyco") || key.contains("lora")
+}
+
+fn is_embedding_type(raw: &str) -> bool {
+    matches!(
+        norm_meta_key(raw).as_str(),
+        "textualinversion" | "embedding" | "embed" | "textinversion"
+    )
+}
+
+fn is_install_candidate(raw: &str) -> bool {
+    is_checkpoint_type(raw) || is_lora_type(raw) || is_embedding_type(raw)
+}
+
+fn kind_bucket(raw: &str) -> &'static str {
+    if is_checkpoint_type(raw) {
+        "checkpoint"
+    } else if is_embedding_type(raw) {
+        "embedding"
+    } else if is_lora_type(raw) {
+        "lora"
+    } else {
+        "other"
+    }
+}
+
+fn kinds_compatible(resource_type: &str, asset_kind: &str) -> bool {
+    let resource = kind_bucket(resource_type);
+    let asset = kind_bucket(asset_kind);
+    resource == asset || asset == "other" || resource == "other"
+}
+
+fn asset_stem_key(raw: &str) -> String {
+    file_stem(raw)
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn resource_label(resource: &CommunityImageResource) -> String {
+    let name = resource.name.trim();
+    if !name.is_empty() {
+        return name.to_string();
+    }
+    if let Some(id) = resource.model_version_id.filter(|n| *n > 0) {
+        return format!("version {id}");
+    }
+    if let Some(hash) = resource.hash.as_deref() {
+        return format!("hash {hash}");
+    }
+    "checkpoint".into()
+}
+
+fn resource_installable(resource: &CommunityImageResource) -> bool {
+    resource.model_version_id.is_some_and(|n| n > 0) || resource.model_id.is_some_and(|n| n > 0)
+}
+
+fn canonical_install_type(raw: &str) -> String {
+    let key = norm_meta_key(raw);
+    if is_checkpoint_type(raw) {
+        "Checkpoint".into()
+    } else if is_embedding_type(raw) {
+        "TextualInversion".into()
+    } else if key == "locon" {
+        "LoCon".into()
+    } else if key == "dora" {
+        "DoRA".into()
+    } else if key == "lycoris" || key == "lyco" {
+        "LyCORIS".into()
+    } else {
+        "LORA".into()
+    }
+}
+
+fn safe_file_stem(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "model".into()
+    } else {
+        trimmed.chars().take(80).collect()
+    }
+}
+
+fn dest_path_for_resource(resource: &CommunityImageResource) -> String {
+    let folder = if is_checkpoint_type(&resource.resource_type) {
+        "checkpoints"
+    } else if is_embedding_type(&resource.resource_type) {
+        "embeddings"
+    } else {
+        "loras"
+    };
+    let stem = safe_file_stem(&resource_label(resource));
+    format!("{folder}/{stem}.safetensors")
+}
+
+fn checkpoint_of(image: &CommunityImage) -> Option<&CommunityImageResource> {
+    let mut found: Option<&CommunityImageResource> = None;
+    for resource in &image.resources {
+        if !is_checkpoint_type(&resource.resource_type) {
+            continue;
+        }
+        match found {
+            None => found = Some(resource),
+            Some(prev) if prev.name.trim().is_empty() && !resource.name.trim().is_empty() => {
+                found = Some(resource);
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+fn resource_matches(resource: &CommunityImageResource, asset: &InstalledAssetMatch) -> bool {
+    match (
+        resource.model_version_id.filter(|n| *n > 0),
+        asset.version_id.filter(|n| *n > 0),
+    ) {
+        (Some(a), Some(b)) => return a == b,
+        _ => {}
+    }
+    match (
+        resource.model_id.filter(|n| *n > 0),
+        asset.model_id.filter(|n| *n > 0),
+    ) {
+        (Some(a), Some(b)) if a != b => return false,
+        (Some(_), Some(_)) if resource.model_version_id.filter(|n| *n > 0).is_none() => {
+            return kinds_compatible(&resource.resource_type, &asset.kind);
+        }
+        _ => {}
+    }
+    if let (Some(left), Some(right)) = (resource.hash.as_deref(), asset.hash.as_deref()) {
+        if hashes_match(left, right) {
+            return true;
+        }
+    }
+    if !kinds_compatible(&resource.resource_type, &asset.kind) {
+        return false;
+    }
+    let want = asset_stem_key(&resource.name);
+    if want.is_empty() {
+        return false;
+    }
+    let name = asset_stem_key(&asset.name);
+    let path = asset_stem_key(&asset.path);
+    (!name.is_empty() && want == name) || (!path.is_empty() && want == path)
+}
+
+/// Compare each post's checkpoint and other generation resources to installed files.
+pub fn annotate_community_images(images: &mut [CommunityImage], inventory: &StudioInventory) {
+    for image in images {
+        annotate_community_image(image, inventory);
+    }
+}
+
+fn annotate_community_image(image: &mut CommunityImage, inventory: &StudioInventory) {
+    let checkpoint = checkpoint_of(image).cloned();
+    match checkpoint.as_ref() {
+        Some(resource) => {
+            let installed = inventory
+                .installed
+                .iter()
+                .any(|asset| resource_matches(resource, asset));
+            let same_base = inventory
+                .current_base
+                .as_ref()
+                .is_some_and(|asset| resource_matches(resource, asset));
+            image.checkpoint = Some(resource_label(resource));
+            image.checkpoint_installed = installed;
+            image.checkpoint_different = inventory.base_known && !same_base;
+        }
+        None => {
+            image.checkpoint = None;
+            image.checkpoint_installed = false;
+            image.checkpoint_different = false;
+        }
+    }
+    image.missing_resources = image
+        .resources
+        .iter()
+        .filter(|resource| {
+            is_install_candidate(&resource.resource_type)
+                && !inventory
+                    .installed
+                    .iter()
+                    .any(|asset| resource_matches(resource, asset))
+        })
+        .map(|resource| {
+            let mut missing = resource.clone();
+            if missing.name.trim().is_empty() {
+                missing.name = resource_label(resource);
+            }
+            missing.resource_type = canonical_install_type(&resource.resource_type);
+            missing.installable = Some(resource_installable(resource));
+            missing.dest_path = Some(dest_path_for_resource(&missing));
+            missing
+        })
+        .collect();
+}
+
+/// Worker files the gallery can match by name, hash, or Civitai id.
+#[derive(Debug, Clone, Default)]
+pub struct StudioInventory {
+    pub installed: Vec<InstalledAssetMatch>,
+    /// Active base, when the worker answered. Empty means no base is selected.
+    pub current_base: Option<InstalledAssetMatch>,
+    /// False when the worker is configured but the base read failed.
+    pub base_known: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstalledAssetMatch {
+    pub name: String,
+    pub path: String,
+    pub kind: String,
+    pub version_id: Option<i64>,
+    pub model_id: Option<i64>,
+    pub hash: Option<String>,
 }
 
 fn meta_string(meta: &Value, names: &[&str]) -> Option<String> {
@@ -1620,6 +2240,241 @@ mod tests {
         let nested_items = parse_community_images(&nested, None, false);
         assert_eq!(nested_items[0].prompt.as_deref(), Some("nested prompt"));
         assert_eq!(nested_items[0].civitai_url, "https://civitai.com/images/14");
+
+        let mut known_base = sfw.clone();
+        annotate_community_images(
+            &mut known_base,
+            &StudioInventory {
+                base_known: true,
+                ..StudioInventory::default()
+            },
+        );
+        assert_eq!(
+            known_base[0].checkpoint.as_deref(),
+            Some("example-checkpoint")
+        );
+        assert!(!known_base[0].checkpoint_installed);
+        assert!(known_base[0].checkpoint_different);
+        assert!(known_base[0].missing_resources.iter().any(|r| {
+            r.name == "example-checkpoint" && r.installable == Some(false) && r.dest_path.is_some()
+        }));
+        assert!(known_base[0]
+            .missing_resources
+            .iter()
+            .any(|r| r.name == "FrankieXL" && r.installable == Some(false)));
+    }
+
+    #[test]
+    fn community_checkpoint_compares_hash_name_and_version() {
+        let payload = json!({
+            "items": [{
+                "id": 61422506,
+                "postId": 13731164,
+                "type": "image",
+                "nsfwLevel": "None",
+                "url": "https://image.civitai.com/x/abc/original=true/abc.jpeg",
+                "meta": {
+                    "prompt": "FrankieFosterSC, red hair",
+                    "Model": "waiNSFWIllustrious_v100",
+                    "Model hash": "7e87327f89",
+                    "hashes": { "model": "7e87327f89", "lora:FrankieXL": "3480fafddb0f" },
+                    "resources": [
+                        {"hash": "3480fafddb0f", "name": "FrankieXL", "type": "lora", "weight": 1},
+                        {"hash": "7e87327f89", "name": "waiNSFWIllustrious_v100", "type": "model"},
+                        {"name": "unused", "type": "lora", "weight": 0}
+                    ]
+                }
+            }, {
+                "id": 119646452,
+                "type": "image",
+                "nsfwLevel": "None",
+                "meta": {
+                    "prompt": "on-site generation",
+                    "civitaiResources": [
+                        {"type": "checkpoint", "modelVersionId": 2514310},
+                        {"type": "lora", "weight": 1, "modelVersionId": 1490040}
+                    ]
+                }
+            }]
+        });
+        let mut items = parse_community_images(&payload, Some(1490040), false);
+        assert_eq!(items.len(), 2);
+        let ckpt = items[0]
+            .resources
+            .iter()
+            .find(|r| r.name == "waiNSFWIllustrious_v100")
+            .unwrap();
+        assert_eq!(ckpt.hash.as_deref(), Some("7e87327f89"));
+        assert!(is_checkpoint_type(&ckpt.resource_type));
+        assert_eq!(
+            items[0]
+                .resources
+                .iter()
+                .filter(|r| r.name == "waiNSFWIllustrious_v100")
+                .count(),
+            1
+        );
+        let lora = items[0]
+            .resources
+            .iter()
+            .find(|r| r.name == "FrankieXL")
+            .unwrap();
+        assert_eq!(lora.hash.as_deref(), Some("3480fafddb0f"));
+        assert!(items[0].resources.iter().all(|r| r.name != "unused"));
+        assert!(items[1].resources.iter().any(|r| {
+            r.model_version_id == Some(2514310) && is_checkpoint_type(&r.resource_type)
+        }));
+
+        let resolved = parse_resolved_version(&json!({
+            "id": 1367422,
+            "modelId": 827184,
+            "name": "v10.0",
+            "model": {"name": "WAI-illustrious-SDXL", "type": "Checkpoint"},
+            "files": [{"name": "WAI-Nsfw-Illustrious-10.safetensors", "primary": true}]
+        }))
+        .unwrap();
+        apply_resolved_version(
+            items[0]
+                .resources
+                .iter_mut()
+                .find(|r| r.hash.as_deref() == Some("7e87327f89"))
+                .unwrap(),
+            &resolved,
+        );
+        assert_eq!(items[0].resources[1].model_version_id, Some(1367422));
+        assert_eq!(
+            items[0]
+                .resources
+                .iter()
+                .find(|r| r.hash.as_deref() == Some("7e87327f89"))
+                .unwrap()
+                .name,
+            "waiNSFWIllustrious_v100"
+        );
+        assert_eq!(
+            items[0]
+                .resources
+                .iter()
+                .find(|r| r.hash.as_deref() == Some("7e87327f89"))
+                .unwrap()
+                .model_id,
+            Some(827184)
+        );
+
+        let current = InstalledAssetMatch {
+            name: "WAI-Nsfw-Illustrious-10".into(),
+            path: "checkpoints/WAI-Nsfw-Illustrious-10.safetensors".into(),
+            kind: "checkpoint".into(),
+            version_id: Some(1367422),
+            model_id: Some(827184),
+            hash: Some("7e87327f89".into()),
+        };
+        annotate_community_images(
+            &mut items,
+            &StudioInventory {
+                installed: vec![current.clone()],
+                current_base: Some(current),
+                base_known: true,
+            },
+        );
+        assert_eq!(
+            items[0].checkpoint.as_deref(),
+            Some("waiNSFWIllustrious_v100")
+        );
+        assert!(items[0].checkpoint_installed);
+        assert!(!items[0].checkpoint_different);
+        assert!(items[0]
+            .missing_resources
+            .iter()
+            .all(|r| r.name != "waiNSFWIllustrious_v100"));
+        let missing_lora = items[0]
+            .missing_resources
+            .iter()
+            .find(|r| r.name == "FrankieXL")
+            .unwrap();
+        assert_eq!(missing_lora.installable, Some(false));
+        assert_eq!(
+            missing_lora.dest_path.as_deref(),
+            Some("loras/FrankieXL.safetensors")
+        );
+
+        items[0]
+            .resources
+            .iter_mut()
+            .find(|r| r.name == "FrankieXL")
+            .unwrap()
+            .model_version_id = Some(1490040);
+        let other = InstalledAssetMatch {
+            name: "other".into(),
+            path: "checkpoints/other.safetensors".into(),
+            kind: "checkpoint".into(),
+            version_id: Some(1),
+            model_id: Some(2),
+            hash: None,
+        };
+        annotate_community_images(
+            &mut items,
+            &StudioInventory {
+                installed: vec![other.clone()],
+                current_base: Some(other),
+                base_known: true,
+            },
+        );
+        assert!(items[0].checkpoint_different);
+        assert!(!items[0].checkpoint_installed);
+        let missing_ckpt = items[0]
+            .missing_resources
+            .iter()
+            .find(|r| r.name == "waiNSFWIllustrious_v100")
+            .unwrap();
+        assert_eq!(missing_ckpt.installable, Some(true));
+        assert_eq!(missing_ckpt.model_version_id, Some(1367422));
+        assert_eq!(missing_ckpt.model_id, Some(827184));
+        assert_eq!(
+            missing_ckpt.dest_path.as_deref(),
+            Some("checkpoints/waiNSFWIllustrious_v100.safetensors")
+        );
+        assert!(items[0]
+            .missing_resources
+            .iter()
+            .any(|r| r.name == "FrankieXL" && r.installable == Some(true)));
+
+        let mut named = parse_community_images(
+            &json!({
+                "items": [{
+                    "id": 1,
+                    "nsfwLevel": "None",
+                    "meta": { "Model": "waiNSFWIllustrious_v100", "prompt": "x" }
+                }]
+            }),
+            None,
+            false,
+        );
+        annotate_community_images(
+            &mut named,
+            &StudioInventory {
+                installed: vec![InstalledAssetMatch {
+                    name: "waiNSFWIllustrious_v100".into(),
+                    path: "checkpoints/waiNSFWIllustrious_v100.safetensors".into(),
+                    kind: "checkpoint".into(),
+                    version_id: None,
+                    model_id: None,
+                    hash: None,
+                }],
+                current_base: Some(InstalledAssetMatch {
+                    name: "waiNSFWIllustrious_v100".into(),
+                    path: "checkpoints/waiNSFWIllustrious_v100.safetensors".into(),
+                    kind: "checkpoint".into(),
+                    version_id: None,
+                    model_id: None,
+                    hash: None,
+                }),
+                base_known: true,
+            },
+        );
+        assert!(named[0].checkpoint_installed);
+        assert!(!named[0].checkpoint_different);
+        assert!(named[0].missing_resources.is_empty());
     }
 }
 
@@ -1821,7 +2676,7 @@ pub struct CivitaiRecommendedResource {
     pub nsfw: bool,
 }
 
-/// One other checkpoint or adapter named on a community image.
+/// One checkpoint, LoRA, or embedding named on a community image.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CommunityImageResource {
@@ -1832,6 +2687,17 @@ pub struct CommunityImageResource {
     pub weight: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_version_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<i64>,
+    /// AutoV2 / SHA256 from generation data. Not a download by itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+    /// False when the post has a name or hash and no Civitai model or version id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub installable: Option<bool>,
+    /// Worker path for `install_asset`. Set on missing resources only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dest_path: Option<String>,
 }
 
 /// Community post made with a model version. Bytes stay on Civitai's image host.
@@ -1870,4 +2736,16 @@ pub struct CommunityImage {
     pub resources: Vec<CommunityImageResource>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub model_version_ids: Vec<i64>,
+    /// Checkpoint name from this post's generation data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    /// True when that checkpoint file is already on the worker.
+    #[serde(default)]
+    pub checkpoint_installed: bool,
+    /// True when it is not the studio's current base. False when the base is unknown.
+    #[serde(default)]
+    pub checkpoint_different: bool,
+    /// Checkpoint, LoRAs, and embeddings from this post that are not on the worker.
+    #[serde(default)]
+    pub missing_resources: Vec<CommunityImageResource>,
 }

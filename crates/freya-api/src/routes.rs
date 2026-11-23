@@ -131,6 +131,7 @@ fn local_asset_json(a: crate::worker::LocalAsset) -> Value {
         "sizeBytes": a.size_bytes,
         "source": a.source,
         "thumbnailUrl": a.thumbnail_url,
+        "hash": a.hash,
         "backend": "local",
         "installed": true,
     })
@@ -1955,11 +1956,7 @@ async fn execute_chat_action(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(12) as u32;
             let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
-            let civ = state.civitai.read().await;
-            match civ
-                .community_images(model_id, version_id, allow_nsfw, limit)
-                .await
-            {
+            match load_community_images(state, model_id, version_id, allow_nsfw, limit).await {
                 Ok(items) => json!({
                     "type": ty,
                     "status": "executed",
@@ -2188,6 +2185,11 @@ async fn execute_chat_action(
                 .and_then(|u| u.as_str())
                 .unwrap_or("");
             let version_id = action.args.get("versionId").and_then(|x| x.as_i64());
+            let model_id = action
+                .args
+                .get("modelId")
+                .and_then(|x| x.as_i64())
+                .or_else(|| action.args.get("id").and_then(|x| x.as_i64()));
             let dest_path = action
                 .args
                 .get("destPath")
@@ -2198,12 +2200,12 @@ async fn execute_chat_action(
                 .get("name")
                 .and_then(|n| n.as_str())
                 .map(str::to_string);
-            if download_url.is_empty() && version_id.is_none() {
+            if download_url.is_empty() && version_id.is_none() && model_id.is_none() {
                 return json!({
                     "type": ty,
                     "status": "error",
                     "args": action.args,
-                    "error": "missing downloadUrl or versionId"
+                    "error": "missing downloadUrl, versionId, or modelId"
                 });
             }
             let install_req = InstallCivitaiRequest {
@@ -2216,11 +2218,7 @@ async fn execute_chat_action(
                     .and_then(|x| x.as_str())
                     .map(str::to_string),
                 version_id,
-                model_id: action
-                    .args
-                    .get("modelId")
-                    .and_then(|x| x.as_i64())
-                    .or_else(|| action.args.get("id").and_then(|x| x.as_i64())),
+                model_id,
                 file_id: action.args.get("fileId").and_then(|x| x.as_i64()),
                 model_type: action
                     .args
@@ -3120,7 +3118,28 @@ async fn civitai_install_inner(
     }
     drop(cfg);
 
-    // Prefer client URL; otherwise resolve from versionId (+ optional fileId).
+    // Prefer client URL; otherwise resolve from versionId, or modelId's latest version.
+    if req.download_url.trim().is_empty() && req.version_id.filter(|n| *n > 0).is_none() {
+        let model_id = req.model_id.filter(|n| *n > 0).ok_or_else(|| {
+            ApiError::Msg("downloadUrl, versionId, or modelId required to install".into())
+        })?;
+        let civ = state.civitai.read().await;
+        let resolved = civ
+            .resolve_model_download(model_id)
+            .await
+            .map_err(ApiError::from)?;
+        req.version_id = Some(resolved.version_id);
+        req.download_url = resolved.download_url;
+        if req.file_id.is_none() {
+            req.file_id = resolved.file_id;
+        }
+        if req.base_model.is_none() {
+            req.base_model = resolved.base_model;
+        }
+        if req.thumbnail_url.is_none() {
+            req.thumbnail_url = resolved.thumbnail_url;
+        }
+    }
     if req.download_url.trim().is_empty() {
         let version_id = req
             .version_id
@@ -6217,6 +6236,108 @@ fn json_i64(v: Option<&serde_json::Value>) -> Option<i64> {
         })
 }
 
+fn installed_match(asset: crate::worker::LocalAsset) -> crate::civitai::InstalledAssetMatch {
+    let kind = if asset.path.starts_with("checkpoints/") {
+        "checkpoint"
+    } else if asset.path.starts_with("embeddings/") {
+        "embedding"
+    } else if asset.path.starts_with("loras/") {
+        "lora"
+    } else {
+        asset.model_type.as_deref().unwrap_or(asset.kind.as_str())
+    };
+    crate::civitai::InstalledAssetMatch {
+        name: asset.name.unwrap_or_else(|| {
+            asset
+                .path
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(asset.id.as_str())
+                .to_string()
+        }),
+        path: asset.path,
+        kind: kind.to_string(),
+        version_id: asset.version_id,
+        model_id: asset.model_id,
+        hash: asset.hash,
+    }
+}
+
+async fn studio_inventory(state: &AppState) -> crate::civitai::StudioInventory {
+    let worker = state.worker.read().await;
+    let Some(client) = worker.as_ref() else {
+        return crate::civitai::StudioInventory {
+            installed: Vec::new(),
+            current_base: None,
+            base_known: true,
+        };
+    };
+    let mut installed = Vec::new();
+    if let Ok(items) = client.list_checkpoints().await {
+        installed.extend(items.into_iter().map(installed_match));
+    }
+    if let Ok(items) = client.list_loras().await {
+        installed.extend(items.into_iter().map(installed_match));
+    }
+    if let Ok(items) = client.list_embeddings().await {
+        installed.extend(items.into_iter().map(installed_match));
+    }
+    let base = client.get_active_base().await.ok();
+    let Some(base) = base else {
+        return crate::civitai::StudioInventory {
+            installed,
+            current_base: None,
+            base_known: false,
+        };
+    };
+    let path = base
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let current_base = path.map(|path| {
+        installed
+            .iter()
+            .find(|asset| asset.path == path)
+            .cloned()
+            .unwrap_or_else(|| crate::civitai::InstalledAssetMatch {
+                name: path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(path.as_str())
+                    .to_string(),
+                path,
+                kind: "checkpoint".into(),
+                version_id: None,
+                model_id: None,
+                hash: None,
+            })
+    });
+    crate::civitai::StudioInventory {
+        installed,
+        current_base,
+        base_known: true,
+    }
+}
+
+async fn load_community_images(
+    state: &AppState,
+    model_id: Option<i64>,
+    version_id: Option<i64>,
+    allow_nsfw: bool,
+    limit: u32,
+) -> Result<Vec<crate::civitai::CommunityImage>, anyhow::Error> {
+    let mut items = {
+        let civ = state.civitai.read().await;
+        civ.community_images(model_id, version_id, allow_nsfw, limit)
+            .await?
+    };
+    let inventory = studio_inventory(state).await;
+    crate::civitai::annotate_community_images(&mut items, &inventory);
+    Ok(items)
+}
+
 /// Community images for the model or version in context. Cap 12. Does not download.
 pub async fn civitai_images(
     State(state): State<AppState>,
@@ -6231,9 +6352,7 @@ pub async fn civitai_images(
     }
     let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
     let limit = q.limit.unwrap_or(12);
-    let civ = state.civitai.read().await;
-    let items = civ
-        .community_images(model_id, version_id, allow_nsfw, limit)
+    let items = load_community_images(&state, model_id, version_id, allow_nsfw, limit)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({

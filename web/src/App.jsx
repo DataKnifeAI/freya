@@ -1857,10 +1857,22 @@ function isCheckpointAsset(item) {
   if (!item) return false;
   const path = String(item.path || "");
   if (path.startsWith("checkpoints/")) return true;
-  const t = String(item.modelType || item.kind || "")
+  const t = String(item.modelType || item.kind || item.type || "")
     .toLowerCase()
     .replace(/[\s_-]/g, "");
-  return t === "checkpoint";
+  return t === "checkpoint" || t === "model" || t === "ckpt";
+}
+
+function communityInstallType(raw) {
+  const t = String(raw || "")
+    .toLowerCase()
+    .replace(/[\s_-]/g, "");
+  if (t === "checkpoint" || t === "model" || t === "ckpt") return "Checkpoint";
+  if (t === "textualinversion" || t === "embedding" || t === "embed") return "TextualInversion";
+  if (t === "locon") return "LoCon";
+  if (t === "dora") return "DoRA";
+  if (t === "lycoris" || t === "lyco") return "LyCORIS";
+  return "LORA";
 }
 
 function familyKey(value) {
@@ -2407,6 +2419,7 @@ export default function App() {
   const [communityBusy, setCommunityBusy] = useState(false);
   const [communityErr, setCommunityErr] = useState("");
   const [communityNote, setCommunityNote] = useState("");
+  const [communityInstallId, setCommunityInstallId] = useState(null);
   const [civitaiDetailBusy, setCivitaiDetailBusy] = useState(false);
   const [detailImageIdx, setDetailImageIdx] = useState(0);
   const [downloadJobs, setDownloadJobs] = useState([]);
@@ -4205,6 +4218,10 @@ export default function App() {
   };
 
   const destPathForAsset = (item) => {
+    const given = String(item?.destPath || "");
+    if (given && !given.includes("..") && !given.startsWith("/") && !given.includes("\\")) {
+      return given;
+    }
     const safe = (item.name || "model").replace(/[^a-zA-Z0-9._-]+/g, "_");
     const ext = fileExtFromVariant(item);
     const t = (item.modelType || "").toLowerCase();
@@ -5765,6 +5782,60 @@ export default function App() {
     }
   };
 
+  /** Queue missing generation resources. Does not pin or change the current base. */
+  const installCommunityMissing = async (item) => {
+    const missing = (item?.missingResources || []).filter(
+      (r) => r && r.installable !== false && (r.modelVersionId || r.modelId),
+    );
+    if (!missing.length) {
+      setCommunityNote("");
+      setCommunityErr("Those files only have a name or hash, so there is no Civitai download.");
+      return;
+    }
+    if (!hasWorker()) {
+      setCommunityErr("A worker is needed before those files can be installed.");
+      return;
+    }
+    if (!settings?.civitaiConfigured) {
+      setCommunityErr("Add a Civitai key in Settings before installing.");
+      return;
+    }
+    setCommunityInstallId(item.id);
+    setCommunityErr("");
+    let queued = 0;
+    const problems = [];
+    try {
+      for (const resource of missing) {
+        const card = {
+          name: resource.name || `version ${resource.modelVersionId || resource.modelId}`,
+          modelType: communityInstallType(resource.type),
+          versionId: resource.modelVersionId || undefined,
+          modelId: resource.modelId || undefined,
+          destPath: resource.destPath || undefined,
+        };
+        if (findInstalledForItem(card)) continue;
+        try {
+          await installOne(card);
+          queued += 1;
+        } catch (e) {
+          const msg = e.message || "Install failed";
+          if (/already (installed|downloading)/i.test(msg)) continue;
+          problems.push(resource.name ? `${resource.name}: ${msg}` : msg);
+        }
+      }
+      if (queued) {
+        setCommunityNote(
+          `Queued ${queued} download${queued === 1 ? "" : "s"}. The current base is unchanged.`,
+        );
+      } else if (!problems.length) {
+        setCommunityNote("Those files are already installed or downloading. The current base is unchanged.");
+      }
+      if (problems.length) setCommunityErr(problems.join("; "));
+    } finally {
+      setCommunityInstallId(null);
+    }
+  };
+
   useEffect(() => {
     if (tab !== "agent" || agentFocus !== "gallery" || !galleryKey) {
       return undefined;
@@ -7026,11 +7097,24 @@ export default function App() {
                 .filter(Boolean)
                 .join(" · ");
               const resources = (item.resources || [])
+                .filter((r) => !isCheckpointAsset({ modelType: r?.type, type: r?.type }))
                 .map((r) => {
                   const weight = r.weight != null ? ` ${r.weight}` : "";
                   return `${r.name}${r.type ? ` (${r.type}${weight})` : ""}`;
                 })
                 .join(", ");
+              const checkpointLine = item.checkpoint
+                ? [
+                    item.checkpoint,
+                    item.checkpointDifferent ? "different" : "",
+                    item.checkpointInstalled ? "installed" : "not installed",
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")
+                : "";
+              const installableMissing = (item.missingResources || []).filter(
+                (r) => r && r.installable !== false && (r.modelVersionId || r.modelId),
+              );
               return (
                 <li key={item.id} className="agent-gallery-item">
                   <button
@@ -7049,6 +7133,9 @@ export default function App() {
                     )}
                     <span className="agent-gallery-copy">
                       <span className="agent-gallery-prompt">{item.prompt || "No prompt"}</span>
+                      {checkpointLine ? (
+                        <span className="agent-gallery-checkpoint">{checkpointLine}</span>
+                      ) : null}
                       {item.negativePrompt ? (
                         <span className="agent-gallery-neg">Negative: {item.negativePrompt}</span>
                       ) : null}
@@ -7058,18 +7145,34 @@ export default function App() {
                       ) : null}
                     </span>
                   </button>
-                  {item.civitaiUrl ? (
-                    <a
-                      className={`ghost civitai-open-link ${
-                        item.nsfw ? "civitai-link-nsfw" : "civitai-link-sfw"
-                      }`}
-                      href={item.civitaiUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      Open
-                    </a>
-                  ) : null}
+                  <span className="agent-gallery-actions">
+                    {installableMissing.length > 0 ? (
+                      <button
+                        type="button"
+                        className="ghost"
+                        disabled={communityInstallId === item.id}
+                        title={`Download ${installableMissing
+                          .map((r) => r.name)
+                          .filter(Boolean)
+                          .join(", ")}. Does not change the base.`}
+                        onClick={() => void installCommunityMissing(item)}
+                      >
+                        {communityInstallId === item.id ? "Queuing…" : "Install missing"}
+                      </button>
+                    ) : null}
+                    {item.civitaiUrl ? (
+                      <a
+                        className={`ghost civitai-open-link ${
+                          item.nsfw ? "civitai-link-nsfw" : "civitai-link-sfw"
+                        }`}
+                        href={item.civitaiUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Open
+                      </a>
+                    ) : null}
+                  </span>
                 </li>
               );
             })}
