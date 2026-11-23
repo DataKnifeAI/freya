@@ -106,11 +106,6 @@ pub struct Config {
     )]
     pub worker_systemd_unit: String,
 
-    /// When false, API treats the worker as unavailable (OpenRouter still works).
-    /// Persisted via secrets file / Settings enable|disable.
-    #[arg(long, env = "FREYA_WORKER_ENABLED", default_value_t = true)]
-    pub worker_enabled: bool,
-
     /// Comma-separated allowed CORS origins. Empty + no token → permissive (dev warning).
     /// Empty + token set → same-origin only (no `*`).
     #[arg(long, env = "FREYA_CORS_ORIGINS", default_value = "")]

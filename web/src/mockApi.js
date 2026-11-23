@@ -442,7 +442,6 @@ const state = {
     civitaiConfigured: true,
     hfConfigured: false,
     diffusionWorkerUrl: "",
-    workerEnabled: true,
     chatModel: "auto",
     imageModel: "auto",
     routerModel: "auto",
@@ -1258,16 +1257,15 @@ async function executeMockChatAction(action, body) {
     };
   }
   if (ty === "worker_status") {
-    const enabled = state.settings.workerEnabled !== false;
+    const configured = Boolean(state.settings.diffusionWorkerUrl);
     return {
       type: ty,
       status: "executed",
       args,
       result: {
-        workerEnabled: enabled,
-        workerConfigured: Boolean(state.settings.diffusionWorkerUrl),
-        reachable: enabled && Boolean(state.settings.diffusionWorkerUrl),
-        modelLoaded: enabled ? state.activeBaseModel || null : null,
+        workerConfigured: configured,
+        reachable: configured,
+        modelLoaded: configured ? state.activeBaseModel || null : null,
         engine: "mock",
       },
     };
@@ -1341,7 +1339,7 @@ function enrichMockReplyWithWorker(reply, actionResults) {
     if (ar.type === "worker_status") {
       const parts = [];
       if (res.workerConfigured === false) parts.push("no worker URL");
-      else if (res.workerConfigured || res.workerEnabled) parts.push("URL configured");
+      else if (res.workerConfigured) parts.push("URL configured");
       if (res.reachable === false) parts.push("not reachable");
       else if (res.reachable) parts.push("reachable");
       lines.push(parts.length ? `Worker: ${parts.join(", ")}.` : "Worker status checked.");
@@ -1726,13 +1724,11 @@ export async function mockApi(path, opts = {}) {
 
   if (p === "/v1/worker/stats" && method === "GET") {
     const configured = Boolean(state.settings.diffusionWorkerUrl);
-    const enabled = state.settings.workerEnabled !== false;
     return {
       ok: true,
-      enabled,
       configured,
       url: state.settings.diffusionWorkerUrl || null,
-      reachable: configured && enabled,
+      reachable: configured,
       runtime: state.workerRuntime,
       vram: null,
       host: null,
@@ -1872,14 +1868,6 @@ export async function mockApi(path, opts = {}) {
   if (p === "/v1/worker/stop" && method === "POST") {
     state.workerRuntime = { kind: "mock", name: "mock", running: false, detail: "mock stop" };
     return { ok: true, runtime: state.workerRuntime };
-  }
-  if (p === "/v1/worker/enable" && method === "POST") {
-    state.settings.workerEnabled = true;
-    return { ok: true, enabled: true };
-  }
-  if (p === "/v1/worker/disable" && method === "POST") {
-    state.settings.workerEnabled = false;
-    return { ok: true, enabled: false };
   }
 
   if (p === "/v1/gallery" && method === "GET") {
@@ -2339,14 +2327,13 @@ export async function mockApi(path, opts = {}) {
   }
 
   if (p === "/v1/health" || p === "/healthz") {
-    const enabled = state.settings.workerEnabled !== false;
+    const configured = Boolean(state.settings.diffusionWorkerUrl);
     return {
       ok: true,
       openRouter: state.settings.openRouterConfigured,
       civitai: state.settings.civitaiConfigured,
-      diffusionWorker: Boolean(state.settings.diffusionWorkerUrl) && enabled,
-      workerEnabled: enabled,
-      workerConfigured: Boolean(state.settings.diffusionWorkerUrl),
+      diffusionWorker: configured,
+      workerConfigured: configured,
       mock: true,
     };
   }

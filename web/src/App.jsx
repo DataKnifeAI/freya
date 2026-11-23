@@ -236,31 +236,6 @@ function activeBaseEngineHint(modelLoaded, workerStats) {
   return ` — selected (${engineName})`;
 }
 
-/** Off when settings or worker stats say so — same signal as the status dots. */
-function workerGenerationOff(settings, workerStats) {
-  return settings?.workerEnabled === false || workerStats?.enabled === false;
-}
-
-/**
- * An explicit workerEnabled from the API wins. A missing flag must not wipe a
- * known disabled worker (that greys out Enable while local generation stays off).
- * Otherwise keep workerStats.enabled.
- */
-function mergeSettingsWorkerFlag(prev, incoming, workerStats) {
-  if (!incoming || typeof incoming !== "object") return incoming;
-  if (typeof incoming.workerEnabled === "boolean") return incoming;
-  if (prev?.workerEnabled === false || workerStats?.enabled === false) {
-    return { ...incoming, workerEnabled: false };
-  }
-  if (typeof workerStats?.enabled === "boolean") {
-    return { ...incoming, workerEnabled: workerStats.enabled };
-  }
-  if (typeof prev?.workerEnabled === "boolean") {
-    return { ...incoming, workerEnabled: prev.workerEnabled };
-  }
-  return incoming;
-}
-
 /** Label container vs host models path when both are known. */
 function modelsDirHint(workerStats) {
   const dir = workerStats?.modelsDir;
@@ -1999,13 +1974,6 @@ export default function App() {
   const [workerUrlOverride, setWorkerUrlOverride] = useState("");
   const [useWorkerUrlOverride, setUseWorkerUrlOverride] = useState(false);
   const [workerStats, setWorkerStats] = useState(null);
-  const workerStatsRef = useRef(null);
-  workerStatsRef.current = workerStats;
-  const commitSettings = (incoming, statsHint) => {
-    setSettings((prev) =>
-      mergeSettingsWorkerFlag(prev, incoming, statsHint ?? workerStatsRef.current),
-    );
-  };
   const [workerCtlBusy, setWorkerCtlBusy] = useState(false);
   const [civitaiQ, setCivitaiQ] = useState("");
   const installedFingerprintRef = useRef("");
@@ -2556,7 +2524,7 @@ export default function App() {
       ]);
       const items = s.items || [];
       setStyles(items);
-      commitSettings(st);
+      setSettings(st);
       applyPrivacyAlignmentFromSettings(st);
       applyInstructionsFromSettings(st);
       if (typeof st.chatModel === "string" && st.chatModel.trim()) {
@@ -2819,13 +2787,7 @@ export default function App() {
       return;
     }
     try {
-      const st = await api("/v1/worker/stats");
-      setWorkerStats((prev) => {
-        if (st && typeof st.enabled !== "boolean" && typeof prev?.enabled === "boolean") {
-          return { ...st, enabled: prev.enabled };
-        }
-        return st;
-      });
+      setWorkerStats(await api("/v1/worker/stats"));
     } catch {
       setWorkerStats(null);
     }
@@ -2841,25 +2803,14 @@ export default function App() {
   }, [tab, mock, studioToken, authStatus?.authRequired]);
 
   const workerControl = async (action) => {
-    if (!["start", "stop", "enable", "disable"].includes(action)) return;
+    if (!["start", "stop"].includes(action)) return;
     setWorkerCtlBusy(true);
     setError("");
     setSavedMsg("");
     try {
-      const res = await api(`/v1/worker/${action}`, { method: "POST", body: "{}" });
-      let statsHint;
-      if (
-        (action === "enable" || action === "disable") &&
-        typeof res?.enabled === "boolean"
-      ) {
-        const enabled = res.enabled;
-        statsHint = { ...(workerStatsRef.current || {}), enabled };
-        workerStatsRef.current = statsHint;
-        setWorkerStats((prev) => ({ ...(prev || {}), enabled }));
-        setSettings((prev) => ({ ...(prev || {}), workerEnabled: enabled }));
-      }
+      await api(`/v1/worker/${action}`, { method: "POST", body: "{}" });
       const st = await api("/v1/settings");
-      commitSettings(st, statsHint);
+      setSettings(st);
       applyWorkerEndpoint(st.diffusionWorkerUrl || "");
       await refreshWorkerStats();
       const health = await api("/v1/health").catch(() => null);
@@ -2867,8 +2818,6 @@ export default function App() {
       const note = {
         stop: `Worker stop requested${healthNote}`,
         start: `Worker start requested${healthNote}`,
-        enable: "Worker enabled for local generation.",
-        disable: "Worker disabled. The URL is kept. OpenRouter still works.",
       }[action];
       setSavedMsg(note);
     } catch (e) {
@@ -2907,7 +2856,7 @@ export default function App() {
         body: JSON.stringify({ routerModel: id }),
       });
       // API flattens SettingsPublic + persisted
-      commitSettings(st);
+      setSettings(st);
     } catch {
       /* offline / unauth — localStorage still holds the pick */
     }
@@ -2920,7 +2869,7 @@ export default function App() {
         method: "PUT",
         body: JSON.stringify(patch),
       });
-      commitSettings(st);
+      setSettings(st);
     } catch {
       /* localStorage still holds the pick */
     }
@@ -3030,7 +2979,6 @@ export default function App() {
   // Prefer persisted URL so default placeholders do not fake a configured worker.
   const hasWorker = () => Boolean(settings?.diffusionWorkerUrl);
   const workerReachable = Boolean(workerStats?.reachable);
-  const workerOff = workerGenerationOff(settings, workerStats);
   const localBackendOk = hasWorker() && workerReachable;
   const localBackendReason = !hasWorker()
     ? "Set a worker URL on the Worker tab first"
@@ -3203,7 +3151,7 @@ export default function App() {
         method: "PUT",
         body: JSON.stringify({ diffusionWorkerUrl: composedWorkerUrl() }),
       });
-      commitSettings(st);
+      setSettings(st);
       applyWorkerEndpoint(st.diffusionWorkerUrl || "");
       await refreshWorkerStats();
       flashSave(
@@ -3395,7 +3343,7 @@ export default function App() {
           return `Worker ${
             a.result?.reachable
               ? "reachable"
-              : a.result?.workerConfigured || a.result?.workerEnabled
+              : a.result?.workerConfigured
                 ? "unreachable"
                 : "not configured"
           }`;
@@ -3467,23 +3415,11 @@ export default function App() {
         if (typeof routerM === "string" && routerM) setRouterModel(routerM);
         if (typeof video === "string" && video) setVideoModel(video);
         persistModels(chat || agentModel, image || imageModel, routerM || routerModel, video || videoModel);
-        setSettings((prev) =>
-          mergeSettingsWorkerFlag(
-            prev,
-            { ...(prev || {}), ...a.result },
-            workerStatsRef.current,
-          ),
-        );
+        setSettings((prev) => ({ ...(prev || {}), ...a.result }));
       }
       if (a.type === "set_privacy" || a.type === "set_alignment" || a.type === "set_cost_tier") {
         applyPrivacyAlignmentFromSettings(a.result);
-        setSettings((prev) =>
-          mergeSettingsWorkerFlag(
-            prev,
-            { ...(prev || {}), ...a.result },
-            workerStatsRef.current,
-          ),
-        );
+        setSettings((prev) => ({ ...(prev || {}), ...a.result }));
       }
       if (a.type === "set_base_model" && a.result?.model) {
         setActiveBasePath(a.result.model);
@@ -4265,7 +4201,7 @@ export default function App() {
       method: "PUT",
       body: JSON.stringify(body),
     });
-    commitSettings(st);
+    setSettings(st);
     if (wroteOr) setOpenrouterKey("");
     if (wroteCiv) setCivitaiKey("");
     await refresh();
@@ -4323,7 +4259,7 @@ export default function App() {
         method: "PUT",
         body: JSON.stringify(body),
       });
-      commitSettings(st);
+      setSettings(st);
       applyPrivacyAlignmentFromSettings(st);
       applyInstructionsFromSettings(st, instructionMode);
       markPrivacyAlignmentSynced(prefs);
@@ -4374,7 +4310,7 @@ export default function App() {
           },
         }),
       });
-      commitSettings(st);
+      setSettings(st);
       applyInstructionsFromSettings(st, instructionMode);
       const disk =
         st?.persisted === false
@@ -4405,7 +4341,7 @@ export default function App() {
           },
         }),
       });
-      commitSettings(st);
+      setSettings(st);
       applyInstructionsFromSettings(st, instructionMode);
       flashSave(
         "settings",
@@ -4441,7 +4377,7 @@ export default function App() {
         method: "PUT",
         body: JSON.stringify(body),
       });
-      commitSettings(st);
+      setSettings(st);
       if (which === "openrouter") {
         setOpenrouterKey("");
         setOrMetrics(null);
@@ -4510,7 +4446,7 @@ export default function App() {
           body: JSON.stringify(snap),
         });
         if (gen !== prefsGenRef.current) return;
-        commitSettings(st);
+        setSettings(st);
         markPrivacyAlignmentSynced(snap);
         await refreshModels();
       } catch (e) {
@@ -5191,13 +5127,11 @@ export default function App() {
               >
                 <span
                   className={`status-dot ${
-                    workerOff
-                      ? ""
-                      : workerStats?.reachable
-                        ? "on"
-                        : settings.diffusionWorkerUrl
-                          ? "warn"
-                          : ""
+                    workerStats?.reachable
+                      ? "on"
+                      : settings.diffusionWorkerUrl
+                        ? "warn"
+                        : ""
                   }`}
                 />
                 Worker
@@ -6672,13 +6606,11 @@ export default function App() {
                 <div className="worker-panel-head">
                   <span
                     className={`status-dot ${
-                      workerOff
-                        ? ""
-                        : workerStats?.reachable
-                          ? "on"
-                          : workerStats?.configured || composedWorkerUrl()
-                            ? "warn"
-                            : ""
+                      workerStats?.reachable
+                        ? "on"
+                        : workerStats?.configured || composedWorkerUrl()
+                          ? "warn"
+                          : ""
                     }`}
                   />
                   <strong>Status</strong>
@@ -6687,13 +6619,11 @@ export default function App() {
                       ? "mock stats"
                       : workerStats
                         ? [
-                            workerOff
-                              ? "disabled"
-                              : workerStats.reachable
-                                ? "reachable"
-                                : workerStats.configured || composedWorkerUrl()
-                                  ? "unreachable"
-                                  : "not configured",
+                            workerStats.reachable
+                              ? "reachable"
+                              : workerStats.configured || composedWorkerUrl()
+                                ? "unreachable"
+                                : "not configured",
                             workerStats.runtime?.kind && workerStats.runtime.kind !== "none"
                               ? workerStats.runtime.kind
                               : null,
@@ -6861,24 +6791,6 @@ export default function App() {
                     title="Stop local docker/systemd worker"
                   >
                     ■ Stop
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost"
-                    disabled={busy || workerCtlBusy || mock || !workerOff}
-                    onClick={() => workerControl("enable")}
-                    title="Use the saved worker for local generation"
-                  >
-                    Enable
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost"
-                    disabled={busy || workerCtlBusy || mock || workerOff}
-                    onClick={() => workerControl("disable")}
-                    title="Skip local generation. The URL stays saved"
-                  >
-                    Disable
                   </button>
                 </div>
               </div>

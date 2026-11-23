@@ -33,9 +33,6 @@ pub struct RuntimeSecrets {
     /// Persisted worker URL so Settings survive API restarts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diffusion_worker_url: Option<String>,
-    /// When false, API skips local gens / treats worker as unavailable.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worker_enabled: Option<bool>,
     /// Studio bearer (`FREYA_API_TOKEN`). Overrides env when present so UI rotate survives restarts
     /// when the secrets file lives on durable storage (e.g. gallery PVC).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,16 +70,11 @@ impl AppState {
         let gallery = Gallery::open(cfg.gallery_dir.clone()).await?;
         let openrouter = OpenRouterClient::new(&cfg);
         let civitai = CivitaiClient::new(cfg.civitai_api_key.clone());
-        // A saved URL is not enough. Disable must leave no client, including
-        // when secrets have not been loaded yet (`FREYA_WORKER_ENABLED=false`).
-        let worker = if cfg.worker_enabled {
-            cfg.diffusion_worker_url.as_ref().map(|u| {
-                DiffusionWorkerClient::new_with_tls(u.clone(), cfg.worker_tls_insecure)
-                    .with_token(cfg.worker_token.clone())
-            })
-        } else {
-            None
-        };
+        // A configured URL attaches the worker client. Local vs Cloud chooses the generate path.
+        let worker = cfg.diffusion_worker_url.as_ref().map(|u| {
+            DiffusionWorkerClient::new_with_tls(u.clone(), cfg.worker_tls_insecure)
+                .with_token(cfg.worker_token.clone())
+        });
         let packs_dir = cfg.packs_dir.clone();
         let state = Self {
             config: Arc::new(RwLock::new(cfg)),
@@ -138,9 +130,6 @@ impl AppState {
             } else {
                 cfg.diffusion_worker_url = Some(url);
             }
-        }
-        if let Some(enabled) = secrets.worker_enabled {
-            cfg.worker_enabled = enabled;
         }
         if let Some(tok) = secrets.api_token {
             // Empty string clears auth (local/dev). Non-empty overrides env / previous value.
@@ -232,14 +221,10 @@ impl AppState {
     /// Attach or clear the in-memory worker client from the configured URL.
     pub async fn rebuild_worker_client(&self) {
         let cfg = self.config.read().await;
-        let next = if cfg.worker_enabled {
-            cfg.diffusion_worker_url.as_ref().map(|u| {
-                DiffusionWorkerClient::new_with_tls(u.clone(), cfg.worker_tls_insecure)
-                    .with_token(cfg.worker_token.clone())
-            })
-        } else {
-            None
-        };
+        let next = cfg.diffusion_worker_url.as_ref().map(|u| {
+            DiffusionWorkerClient::new_with_tls(u.clone(), cfg.worker_tls_insecure)
+                .with_token(cfg.worker_token.clone())
+        });
         *self.worker.write().await = next;
     }
 
@@ -253,7 +238,6 @@ impl AppState {
             civitai_api_key: none_if_blank(&cfg.civitai_api_key),
             hf_token: none_if_blank(&cfg.hf_token),
             diffusion_worker_url: cfg.diffusion_worker_url.clone(),
-            worker_enabled: Some(cfg.worker_enabled),
             api_token: if cfg.api_token.trim().is_empty() {
                 None
             } else {
