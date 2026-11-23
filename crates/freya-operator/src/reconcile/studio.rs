@@ -16,6 +16,7 @@ use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
     IngressServiceBackend, IngressSpec, ServiceBackendPort,
 };
+use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Patch, PatchParams};
@@ -32,11 +33,23 @@ pub async fn reconcile(studio: Arc<FreyaStudio>, ctx: Arc<Ctx>) -> Result<Action
     info!(%ns, studio = %name, "reconciling FreyaStudio");
 
     let owner = studio.controller_owner_ref(&()).ok_or(Error::OwnerRef)?;
+    let creds =
+        crate::reconcile::credentials::ensure_studio_credentials(&ctx, &ns, &studio, &owner)
+            .await?;
     ensure_gallery_pvc(&ctx, &ns, &name, &studio, &owner).await?;
     ensure_api_deployment(&ctx, &ns, &name, &studio, &owner).await?;
     ensure_ui_deployment(&ctx, &ns, &name, &studio, &owner).await?;
     ensure_service(&ctx, &ns, &name, "api", 8080, &owner).await?;
     ensure_service(&ctx, &ns, &name, "ui", 80, &owner).await?;
+
+    let mcp_endpoint = if studio.spec.mcp_enabled {
+        ensure_mcp_deployment(&ctx, &ns, &name, &studio, &owner, creds.api_token.as_ref()).await?;
+        ensure_service(&ctx, &ns, &name, "mcp", 8090, &owner).await?;
+        Some(format!("http://{name}-mcp.{ns}.svc.cluster.local:8090/mcp"))
+    } else {
+        None
+    };
+
     if studio.spec.ingress.enabled {
         if studio.spec.api_token_secret_ref.is_none() {
             warn!(
@@ -74,6 +87,32 @@ async fn resolve_worker(
         ),
     };
     Ok((url, worker.spec.auth_secret_ref.clone()))
+}
+
+/// Ingress host plus in-cluster Service DNS and port-forward loopback.
+/// Empty or `*` is not used — that disables the MCP Host check.
+fn mcp_allowed_hosts(studio: &FreyaStudio, name: &str, ns: &str) -> String {
+    let svc = format!("{name}-mcp");
+    let mut hosts = vec![
+        svc.clone(),
+        format!("{svc}.{ns}"),
+        format!("{svc}.{ns}.svc"),
+        format!("{svc}.{ns}.svc.cluster.local"),
+        "localhost".into(),
+        "127.0.0.1".into(),
+        "::1".into(),
+    ];
+    if let Some(host) = studio
+        .spec
+        .ingress
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+    {
+        hosts.push(host.to_string());
+    }
+    hosts.join(",")
 }
 
 fn labels(instance: &str, component: &str) -> BTreeMap<String, String> {
@@ -212,12 +251,24 @@ async fn ensure_api_deployment(
             value: Some(worker_name.clone()),
             ..Default::default()
         });
-        let (worker_url, worker_auth) = resolve_worker(ctx, ns, worker_name).await?;
+        let (worker_url, worker_auth, tls_insecure) = resolve_worker(ctx, ns, worker_name).await?;
         env.push(EnvVar {
             name: "FREYA_DIFFUSION_WORKER_URL".into(),
-            value: Some(worker_url),
+            value: Some(worker_url.clone()),
             ..Default::default()
         });
+        if tls_insecure && super::tls_skip_allowed(&worker_url) {
+            env.push(EnvVar {
+                name: "FREYA_WORKER_TLS_INSECURE".into(),
+                value: Some("true".into()),
+                ..Default::default()
+            });
+        } else if tls_insecure {
+            warn!(
+                %worker_url,
+                "ignoring freya.dataknife.ai/tls-insecure on a public worker URL"
+            );
+        }
         if let Some(ref auth) = worker_auth {
             env.push(secret_env("FREYA_WORKER_TOKEN", auth, true));
         }
@@ -411,15 +462,7 @@ async fn ensure_mcp_deployment(
         },
         EnvVar {
             name: "FREYA_MCP_ALLOWED_HOSTS".into(),
-            value: Some(
-                studio
-                    .spec
-                    .ingress
-                    .host
-                    .clone()
-                    .filter(|h| !h.trim().is_empty())
-                    .unwrap_or_default(),
-            ),
+            value: Some(mcp_allowed_hosts(studio, name, ns)),
             ..Default::default()
         },
     ];

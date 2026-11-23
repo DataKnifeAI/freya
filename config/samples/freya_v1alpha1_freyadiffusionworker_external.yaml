@@ -4,6 +4,9 @@ kind: FreyaDiffusionWorker
 metadata:
   name: freya-gpu
   namespace: freya
+  # Do not set freya.dataknife.ai/tls-insecure on a public HTTPS endpoint.
+  # Studio verifies that certificate. The annotation only skips verify for
+  # loopback, private, link-local, and cluster DNS hosts.
 spec:
   placement: external
   externalEndpoint: http://gpu-box.lan:8091

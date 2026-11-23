@@ -48,11 +48,11 @@ make compose-down
 | Service | Host port (default) | Notes |
 |---------|---------------------|--------|
 | **freya-web** (nginx UI) | **8080** | Proxies `/v1/` → `freya-api:8080` |
-| **freya-worker** | **8091** | Diffusion stub / GPU worker |
-| **freya-mcp** (profile `mcp`) | **8090** | Streamable HTTP at `/mcp` |
+| **freya-worker** | (not published) | API uses `http://freya-worker:8091` on the Compose network |
+| **freya-mcp** (profile `mcp`) | **127.0.0.1:8090** | Streamable HTTP at `/mcp`. Requires `FREYA_API_TOKEN` |
 | freya-api | (internal only) | Reachable as `http://freya-api:8080` on the Compose network |
 
-Open **http://127.0.0.1:8080/** → Sign in with `FREYA_ADMIN_USER` / `FREYA_ADMIN_PASSWORD`. Worker tab can use host `freya-worker` / port `8091` from inside the stack, or `127.0.0.1:8091` from the browser’s perspective when calling through the API (API already has `FREYA_DIFFUSION_WORKER_URL=http://freya-worker:8091`).
+Open **http://127.0.0.1:8080/** → Sign in with `FREYA_ADMIN_USER` / `FREYA_ADMIN_PASSWORD`. The API already has `FREYA_DIFFUSION_WORKER_URL=http://freya-worker:8091`. The worker port is not published on the host.
 
 ## Volumes / host paths
 
@@ -69,7 +69,7 @@ Portable: set those to `./data/gallery`, `./data/models`, `./data/secrets` in `d
 | Mechanism | Compose |
 |-----------|---------|
 | Admin UI login | Set `FREYA_ADMIN_PASSWORD` in `.env` (and optional `FREYA_ADMIN_USER`) |
-| Machine bearer | Optional `FREYA_API_TOKEN` — used by MCP / curl; UI can also rotate via Worker → Generate API token (persists under secrets dir) |
+| Machine bearer | `FREYA_API_TOKEN` — required for MCP (`/mcp` returns 401 when empty). UI can also rotate via Worker → Generate API token (persists under secrets dir) |
 | Worker bearer | Optional `FREYA_WORKER_TOKEN` — same value on API + worker |
 
 Empty tokens + empty admin password leave `/v1` open (local/dev warning). Prefer at least an admin password for anything beyond loopback.
@@ -93,7 +93,7 @@ Standalone GPU host (Studio elsewhere): `./scripts/run-local-worker.sh` → cont
 ```bash
 make compose-up-mcp
 # Cursor / agents: http://127.0.0.1:8090/mcp
-# Set FREYA_API_TOKEN in .env if the API requires a bearer
+# Set FREYA_API_TOKEN in .env. Empty token is rejected. Host check stays on localhost.
 ```
 
 ## Images

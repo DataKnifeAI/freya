@@ -24,9 +24,20 @@ make mock-ui          # or: cd web && npm i && npm run dev:mock
 **Full stack:**
 
 ```bash
-export OPENROUTER_API_KEY=sk-or-...
-# optional — search/install Civitai LoRAs onto a worker
-export CIVITAI_API_KEY=...
+cp deploy/compose/.env.example deploy/compose/.env
+# OPENROUTER_API_KEY + FREYA_ADMIN_PASSWORD
+make compose-up       # UI :8080  (worker stays on the compose network)
+# make compose-up-gpu # NVIDIA
+# make compose-up-mcp # + MCP :8090
+```
+
+**Full stack (cargo + Vite):**
+
+```bash
+cp .env.example .env
+# edit .env — set OPENROUTER_API_KEY=sk-or-... (required)
+# optional: CIVITAI_API_KEY, FREYA_API_TOKEN, FREYA_WORKER_TOKEN, FREYA_CORS_ORIGINS
+set -a && source .env && set +a
 
 make run-api          # :8080
 cd web && npm install && npm run dev   # :5173

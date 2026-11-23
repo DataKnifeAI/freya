@@ -565,11 +565,10 @@ fn sniff_video_mime(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Catalog ids are `provider/model`. `openrouter/` is the upstream-router vendor,
-/// not a prefix to put in front of another id.
-/// `openrouter/google/gemini-3-pro-image` → `google/gemini-3-pro-image`.
-/// `openrouter/google-gemini-pro-image-1` is dropped (no provider left).
-/// `openrouter/auto` is left intact so the upstream-router check still sees it.
+/// Catalog ids are `provider/model`. `openrouter/` in front of another provider
+/// is a prefix to strip. A smashed vendor slug (`openrouter/google-gemini-…`)
+/// is invented and dropped. A real first-party id (`openrouter/horizon-alpha`)
+/// stays. `openrouter/auto` stays so the upstream-router check still sees it.
 pub fn canonicalize_catalog_id(raw: &str) -> String {
     let s = raw.trim();
     if s.is_empty() {
@@ -585,9 +584,40 @@ pub fn canonicalize_catalog_id(raw: &str) -> String {
         if rest.contains('/') && !rest.starts_with('/') {
             return rest.to_string();
         }
-        return String::new();
+        if rest.is_empty() || smashed_vendor_slug(rest) {
+            return String::new();
+        }
+        return s.to_string();
     }
     s.to_string()
+}
+
+/// `google-gemini-pro-image-1` is a vendor name glued on without a slash.
+fn smashed_vendor_slug(rest: &str) -> bool {
+    let l = rest.to_ascii_lowercase();
+    const HEADS: &[&str] = &[
+        "google",
+        "openai",
+        "anthropic",
+        "meta",
+        "meta-llama",
+        "mistral",
+        "mistralai",
+        "black-forest",
+        "qwen",
+        "deepseek",
+        "cohere",
+        "amazon",
+        "nvidia",
+        "stability",
+        "bytedance",
+        "x-ai",
+        "xai",
+        "flux",
+    ];
+    HEADS
+        .iter()
+        .any(|v| l == *v || l.starts_with(&format!("{v}-")) || l.starts_with(&format!("{v}_")))
 }
 
 /// Real still-image catalog id, or `None` when the slug is Auto, prose, or invented.
@@ -1153,6 +1183,22 @@ mod tests {
                 "openrouter/google-gemini-pro-image-1"
             ),
             crate::router::DEFAULT_AUTO_IMAGE_MODEL
+        );
+        // First-party chat ids stay. They are still not image models.
+        assert_eq!(
+            canonicalize_catalog_id("openrouter/horizon-alpha"),
+            "openrouter/horizon-alpha"
+        );
+        assert_eq!(
+            canonicalize_catalog_id("openrouter/google-gemini-pro-image-1"),
+            ""
+        );
+        assert_eq!(
+            resolve_image_model(
+                "openrouter/horizon-alpha",
+                "black-forest-labs/flux.2-klein-4b"
+            ),
+            "black-forest-labs/flux.2-klein-4b"
         );
     }
 

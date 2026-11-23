@@ -607,7 +607,6 @@ fn obvious_guidance(lower: &str) -> bool {
         "any ideas",
         "any assets",
         "which assets",
-        "would help",
         "models that",
         "you able",
         "are you able",
@@ -616,36 +615,44 @@ fn obvious_guidance(lower: &str) -> bool {
         "have we ",
         "have you ",
         "was that generated",
-        "using the lora?",
     ];
-    contains_any(lower, ADVICE)
+    if contains_any(lower, ADVICE) {
+        return true;
+    }
+    // Broad fragments only count when the message is not already a render.
+    if obvious_still(lower) || obvious_motion(lower).is_some() {
+        return false;
+    }
+    const SOFT: &[&str] = &["using the lora?", "would help"];
+    contains_any(lower, SOFT)
 }
 
 /// Obvious motion request. The bare words "video" or "gif" are not enough.
 fn obvious_motion(lower: &str) -> Option<DirectMedia> {
-    let gif = lower.contains("gif of")
-        || lower.contains("make a gif")
+    let asked = lower.contains('?');
+    let gif_imperative = lower.contains("make a gif")
+        || lower.contains("generate a gif")
         || lower.contains("animated gif")
-        || lower.contains(".gif")
-        || lower.contains("looping animation")
         || lower.contains("animate as gif")
+        || lower.contains("looping animation");
+    let gif_loose = lower.contains("gif of")
+        || lower.contains(".gif")
         || (has_word(lower, "gif") && (lower.contains("make ") || lower.contains("generate ")));
-    if gif {
+    if gif_imperative || (!asked && gif_loose) {
         return Some(DirectMedia::Gif);
     }
-    const VIDEO: &[&str] = &[
+    const VIDEO_IMPERATIVE: &[&str] = &[
         "text-to-video",
         "image-to-video",
         "text to video",
         "image to video",
         "make a video",
         "make a clip",
-        "video of",
-        "short video",
+        "generate a video",
         "animate this",
-        "short clip",
     ];
-    if contains_any(lower, VIDEO) {
+    const VIDEO_LOOSE: &[&str] = &["video of", "short video", "short clip"];
+    if contains_any(lower, VIDEO_IMPERATIVE) || (!asked && contains_any(lower, VIDEO_LOOSE)) {
         Some(DirectMedia::Video)
     } else {
         None
@@ -702,8 +709,16 @@ fn obvious_still(lower: &str) -> bool {
         "make the picture",
         "generate an image",
         "generate a picture",
+        "generate a ",
+        "generate an ",
         "generate the image",
         "generate this",
+        "generate that",
+        "please generate",
+        "create an image",
+        "create a picture",
+        "create me an image",
+        "create me a picture",
         "render a ",
         "render an ",
         "paint a ",
@@ -1026,9 +1041,7 @@ pub fn prompt_is_adult_scene(text: &str) -> bool {
         "panties",
         "thong",
         "boobs",
-        "tits",
         "breasts",
-        "breast",
         "cock",
         "cocks",
         "dick",
@@ -1042,7 +1055,6 @@ pub fn prompt_is_adult_scene(text: &str) -> bool {
         "sex",
         "sexual",
         "sexually",
-        "explicit",
         "xxx",
         "undressed",
         "stripper",
@@ -1050,12 +1062,10 @@ pub fn prompt_is_adult_scene(text: &str) -> bool {
         "slut",
         "dildo",
         "erection",
-        "hardcore",
         "softcore",
         "rule34",
         "r34",
         "yaoi",
-        "yuri",
         "incest",
         "milf",
         "anal",
@@ -1065,7 +1075,6 @@ pub fn prompt_is_adult_scene(text: &str) -> bool {
         "creampie",
         "deepthroat",
         "moaning",
-        "straddling",
         "making love",
         "clothes off",
         "no clothes",
@@ -1084,7 +1093,75 @@ pub fn prompt_is_adult_scene(text: &str) -> bool {
         "gets naked",
         "18+",
     ];
-    TERMS.iter().any(|term| contains_term(&l, term))
+    if TERMS.iter().any(|term| contains_term(&l, term)) {
+        return true;
+    }
+    // Singular "breast" / "tits" are ordinary in food and bird names.
+    contextual_term(
+        &l,
+        "breast",
+        &["chicken", "turkey", "duck", "goose", "quail"],
+        &["pocket", "cancer", "milk"],
+    ) || contextual_term(
+        &l,
+        "tits",
+        &[
+            "blue",
+            "great",
+            "crested",
+            "bearded",
+            "coal",
+            "marsh",
+            "willow",
+            "long-tailed",
+        ],
+        &[],
+    )
+}
+
+/// Word-bounded `term` that is not sitting next to an ordinary neighbor.
+fn contextual_term(hay: &str, term: &str, deny_prev: &[&str], deny_next: &[&str]) -> bool {
+    let bytes = hay.as_bytes();
+    let needle = term.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let end = i + needle.len();
+            let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                let prev = previous_word(hay, i);
+                let next = next_word(hay, end);
+                let denied =
+                    deny_prev.iter().any(|w| prev == *w) || deny_next.iter().any(|w| next == *w);
+                if !denied {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn previous_word(hay: &str, at: usize) -> &str {
+    let head = hay[..at].trim_end();
+    let start = head
+        .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    &head[start..]
+}
+
+fn next_word(hay: &str, end: usize) -> &str {
+    let tail = hay[end..].trim_start();
+    let n = tail
+        .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+        .unwrap_or(tail.len());
+    &tail[..n]
 }
 
 fn contains_term(hay: &str, term: &str) -> bool {
@@ -1402,9 +1479,48 @@ mod tests {
             "make it",
             "make the picture",
             "can you draw me a cat?",
+            "please generate",
+            "generate a cat",
+            "generate that",
+            "create an image of a harbor",
+            "generate an image of Frankie using the lora?",
+            "draw me a cat that would help tell the story",
         ] {
             assert_eq!(infer_modality(turn).modality, Modality::Picture, "{turn}");
         }
+        assert_eq!(
+            direct_media_ask("what gif should I make?"),
+            DirectMedia::None
+        );
+        assert_eq!(
+            direct_media_ask("is that video of Frankie any good?"),
+            DirectMedia::None
+        );
+        assert_eq!(
+            infer_modality("can you make a gif of a cat?").modality,
+            Modality::Gif
+        );
+        assert_eq!(
+            infer_modality("make a video of a cat").modality,
+            Modality::Video
+        );
+    }
+
+    #[test]
+    fn ordinary_wording_is_not_an_adult_scene() {
+        assert!(!prompt_is_adult_scene("chicken breast on a plate"));
+        assert!(!prompt_is_adult_scene("a pair of blue tits on a branch"));
+        assert!(!prompt_is_adult_scene(
+            "explicit instructions for the checkpoint install"
+        ));
+        assert!(!prompt_is_adult_scene(
+            "portrait of Yuri in a school uniform"
+        ));
+        assert!(!prompt_is_adult_scene("hardcore parkour on a rooftop"));
+        assert!(!prompt_is_adult_scene("straddling a fence at dusk"));
+        assert!(prompt_is_adult_scene("nude woman on a bed, explicit sex"));
+        assert!(prompt_is_adult_scene("her breasts, soft light"));
+        assert!(prompt_is_adult_scene("close crop of her tits"));
     }
 
     #[test]

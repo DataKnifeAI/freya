@@ -1686,22 +1686,14 @@ export default function App() {
     const s = st?.studio;
     if (!s || typeof s !== "object") return;
     if (Array.isArray(s.favorites)) {
-      if (s.favorites.length) {
-        setFavorites(s.favorites);
-        writeFavorites(s.favorites);
-      } else {
-        const local = readFavorites();
-        if (local.length) void persistStudio({ favorites: local });
-      }
+      setFavorites(s.favorites);
+      writeFavorites(s.favorites);
     }
-    if (Array.isArray(s.pinnedLoras) && s.pinnedLoras.length) {
+    if (Array.isArray(s.pinnedLoras)) {
       setSession((prev) => ({
         ...prev,
         pinnedLoras: s.pinnedLoras.filter(isPinnableAsset),
       }));
-    } else if (Array.isArray(s.pinnedLoras)) {
-      const localPins = (session.pinnedLoras || []).filter(isPinnableAsset);
-      if (localPins.length) void persistStudio({ pinnedLoras: localPins });
     }
     if (s.generateBackend === "local" || s.generateBackend === "cloud") {
       setGenerateBackend(s.generateBackend);
@@ -1710,7 +1702,20 @@ export default function App() {
     if (typeof s.videoModel === "string" && s.videoModel.trim()) {
       const video = s.videoModel.trim();
       setVideoModel(video);
-      persistModels(agentModel, imageModel, routerModel, video);
+      // Only the video pin. agent/image/router in this render can be older
+      // than the settings response that started the refresh.
+      try {
+        const raw = localStorage.getItem(MODELS_STORAGE_KEY);
+        const parsed = raw ? JSON.parse(raw) : {};
+        if (parsed && typeof parsed === "object") {
+          localStorage.setItem(
+            MODELS_STORAGE_KEY,
+            JSON.stringify({ ...parsed, videoModel: video }),
+          );
+        }
+      } catch {
+        /* ignore */
+      }
     }
     if (s.automationMode === "plan" || s.automationMode === "auto" || s.automationMode === "yolo") {
       setAutomationMode(s.automationMode);
@@ -2463,11 +2468,11 @@ export default function App() {
     if (!quiet) setInstalledBusy(true);
     try {
       const [loras, cps, embeddings, vaes, base] = await Promise.all([
-        api("/v1/worker/loras").catch(() => ({ data: [] })),
-        api("/v1/worker/checkpoints").catch(() => ({ data: [] })),
-        api("/v1/worker/embeddings").catch(() => ({ data: [] })),
-        api("/v1/worker/vae").catch(() => ({ data: [] })),
-        api("/v1/worker/base-model").catch(() => ({})),
+        api("/v1/worker/loras"),
+        api("/v1/worker/checkpoints"),
+        api("/v1/worker/embeddings"),
+        api("/v1/worker/vae"),
+        api("/v1/worker/base-model"),
       ]);
       const list = [
         ...(Array.isArray(loras?.data) ? loras.data : []),
@@ -2496,15 +2501,13 @@ export default function App() {
       const baseFamily = typeof base?.baseModel === "string" ? base.baseModel : "";
       setActiveBasePath(baseModelPath);
       setLocalBaseFamily(baseFamily);
-      if (baseModelPath) setLocalBaseModel(baseModelPath);
-      else if (cpList[0]?.path) setLocalBaseModel(cpList[0].path);
-      else setLocalBaseModel("");
+      setLocalBaseModel(baseModelPath);
       // Older sidecars often lack thumbnailUrl — resolve via Civitai when possible.
       if (settings?.civitaiConfigured) {
         scheduleEnrichInstalledThumbs(list);
       }
     } catch (e) {
-      setError(e.message || "Failed to load installed assets");
+      if (!quiet) setError(e.message || "Failed to load installed assets");
     } finally {
       if (!quiet) setInstalledBusy(false);
     }
@@ -5883,7 +5886,7 @@ function WorkerBaseModelPanel({
       if (activeChanged && activeModel) return activeModel;
       if (prev && paths.includes(prev)) return prev;
       if (activeModel) return activeModel;
-      return paths[0] || "";
+      return "";
     });
   }, [checkpoints, activeModel]);
 

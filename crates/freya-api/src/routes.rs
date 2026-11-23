@@ -43,12 +43,16 @@ pub async fn worker_stats(State(state): State<AppState>) -> impl IntoResponse {
     let runtime = crate::worker_ctl::detect(&container, &unit).await;
     let mut worker_payload = Value::Null;
     let mut reachable = false;
+    let mut have_stats = false;
     if enabled {
         let w = state.worker.read().await;
         if let Some(c) = w.as_ref() {
             if let Some(detail) = c.stats_detail().await {
                 reachable = true;
+                have_stats = true;
                 worker_payload = detail;
+            } else if c.health().await {
+                reachable = true;
             }
         }
     } else if let Some(url) = url.as_ref() {
@@ -60,13 +64,18 @@ pub async fn worker_stats(State(state): State<AppState>) -> impl IntoResponse {
         .with_token(state.config.read().await.worker_token.clone());
         if let Some(detail) = probe.stats_detail().await {
             reachable = true;
+            have_stats = true;
             worker_payload = detail;
+        } else if probe.health().await {
+            reachable = true;
         }
     }
 
     let mut vram = worker_payload.get("vram").cloned().unwrap_or(Value::Null);
     let mut host = worker_payload.get("host").cloned().unwrap_or(Value::Null);
-    if vram.is_null() {
+    // Host nvidia-smi fills a worker that reported stats with null VRAM
+    // (GPU-less container). A failed /v1/stats must not borrow the host GPU.
+    if have_stats && vram.is_null() {
         let host_vram = crate::gpu::collect_host_vram().await;
         if !host_vram.is_null() {
             vram = host_vram;
@@ -654,22 +663,31 @@ fn looks_like_model_refusal(text: &str) -> bool {
     let l = text
         .to_ascii_lowercase()
         .replace(['\u{2019}', '\u{2018}', '`'], "'");
+    // Phrase-shaped refusals. Bare "i can't" / "against my" show up in scene text.
     const MARKERS: &[&str] = &[
-        "i can't",
-        "i cannot",
-        "i won't",
-        "i will not",
-        "i'm not able",
-        "not able to",
+        "i can't help",
+        "i cannot help",
+        "i can't assist",
+        "i cannot assist",
         "can't help",
         "cannot help",
+        "can't assist",
+        "cannot assist",
         "can't create",
         "cannot create",
         "can't generate",
         "cannot generate",
         "won't generate",
         "will not generate",
-        "against my",
+        "i won't create",
+        "i will not create",
+        "i'm not able",
+        "i am not able",
+        "not able to generate",
+        "not able to create",
+        "against my guidelines",
+        "against my policy",
+        "against my programming",
         "content policy",
         "i must refuse",
         "unable to create",
@@ -700,13 +718,48 @@ fn normalize_sd_rewrite(text: &str) -> String {
     t
 }
 
-/// Adult local rewrite must be a scene prompt: not a refusal, not the raw line.
+fn sd_prompt_shape(text: &str) -> bool {
+    text.contains(',') || text.split_whitespace().count() >= 12
+}
+
+/// Adult local rewrite must be a scene prompt, not a refusal.
+/// An echo of the user line counts only when that line is already checkpoint-shaped.
+/// A short raw scene is not accepted in place of a rewrite.
 fn adult_rewrite_ok(text: &str, original: &str) -> bool {
     let t = text.trim();
-    if t.is_empty() || looks_like_model_refusal(t) || t.eq_ignore_ascii_case(original.trim()) {
+    let original = original.trim();
+    if t.is_empty() || looks_like_model_refusal(t) {
         return false;
     }
-    t.contains(',') || t.split_whitespace().count() >= 12
+    if t.eq_ignore_ascii_case(original) {
+        return sd_prompt_shape(original);
+    }
+    sd_prompt_shape(t)
+}
+
+/// Second uncensored writer when the first cell refuses or errors.
+/// Auto's first writer is already the matrix cell, so the other cost tier is the retry.
+fn adult_retry_model(
+    first: &str,
+    privacy: &crate::prefs::PrivacyPrefs,
+    fallbacks: &crate::prefs::AutoFallbacksPrefs,
+) -> Option<String> {
+    let matrix = crate::router::local_adult_matrix_model(privacy, fallbacks);
+    if matrix != first {
+        return Some(matrix);
+    }
+    let mut other = fallbacks.clone();
+    other.cost_tier = if fallbacks.cost_tier.eq_ignore_ascii_case("low") {
+        "medium".into()
+    } else {
+        "low".into()
+    };
+    let alt = crate::router::local_adult_matrix_model(privacy, &other);
+    if alt == first {
+        None
+    } else {
+        Some(alt)
+    }
 }
 
 fn restore_refused_local_prompt(action: &mut PlannedAction, user_message: &str) {
@@ -1701,12 +1754,26 @@ async fn execute_chat_action(
                     }
                 }
             }
-            json!({
-                "type": ty,
-                "status": "executed",
-                "args": action.args,
-                "result": { "goal": goal, "batchPrompts": prompts, "results": results }
-            })
+            let failed = results
+                .iter()
+                .filter_map(|r| r.get("error").and_then(|e| e.as_str()))
+                .collect::<Vec<_>>();
+            if !results.is_empty() && failed.len() == results.len() {
+                json!({
+                    "type": ty,
+                    "status": "error",
+                    "args": action.args,
+                    "error": failed.first().copied().unwrap_or("series generation failed"),
+                    "result": { "goal": goal, "batchPrompts": prompts, "results": results }
+                })
+            } else {
+                json!({
+                    "type": ty,
+                    "status": "executed",
+                    "args": action.args,
+                    "result": { "goal": goal, "batchPrompts": prompts, "results": results }
+                })
+            }
         }
         "install_asset" => {
             let download_url = action
@@ -2861,11 +2928,11 @@ impl ActionRun {
             self.backend.as_deref(),
         )
         .await;
-        self.absorb(&v);
+        self.absorb(action, &v);
         v
     }
 
-    fn absorb(&mut self, v: &Value) {
+    fn absorb(&mut self, action: &PlannedAction, v: &Value) {
         if v.get("status").and_then(|s| s.as_str()) != Some("executed") {
             return;
         }
@@ -2875,19 +2942,26 @@ impl ActionRun {
         };
         match ty {
             "set_chat_models" => {
-                if let Some(m) = res.get("imageModel").and_then(|m| m.as_str()) {
-                    if !m.is_empty() {
-                        self.image_model = Some(m.to_string());
+                // The result is the full settings snapshot. Copy a model only
+                // when this action pinned it, so a chat pin does not replace
+                // the router-resolved image id with stored Auto.
+                if action_arg_present(&action.args, "imageModel") {
+                    if let Some(m) = res.get("imageModel").and_then(|m| m.as_str()) {
+                        if !m.is_empty() {
+                            self.image_model = Some(m.to_string());
+                        }
                     }
                 }
-                let video = res.get("videoModel").and_then(|m| m.as_str()).or_else(|| {
-                    res.get("studio")
-                        .and_then(|s| s.get("videoModel"))
-                        .and_then(|m| m.as_str())
-                });
-                if let Some(m) = video {
-                    if !m.is_empty() {
-                        self.video_model = Some(m.to_string());
+                if action_arg_present(&action.args, "videoModel") {
+                    let video = res.get("videoModel").and_then(|m| m.as_str()).or_else(|| {
+                        res.get("studio")
+                            .and_then(|s| s.get("videoModel"))
+                            .and_then(|m| m.as_str())
+                    });
+                    if let Some(m) = video {
+                        if !m.is_empty() {
+                            self.video_model = Some(m.to_string());
+                        }
                     }
                 }
             }
@@ -2908,6 +2982,12 @@ impl ActionRun {
             _ => {}
         }
     }
+}
+
+fn action_arg_present(args: &Value, key: &str) -> bool {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.trim().is_empty())
 }
 
 fn lora_from_pin_value(v: &Value) -> Option<LoraIn> {
@@ -3201,12 +3281,19 @@ pub async fn chat(
     };
     // Local + uncensored / Show NSFW: a refusal or empty tool prompt is not a
     // substitute scene. The user's text is what the worker should see.
-    if req
+    // Auto GIF runs on the worker too; a cloud still does not.
+    let worker_ready = state.worker.read().await.is_some();
+    let pinned_local = req
         .backend
         .as_deref()
-        .is_some_and(|b| b.eq_ignore_ascii_case("local"))
-        && alignment.local_adult_passthrough()
-    {
+        .is_some_and(|b| b.eq_ignore_ascii_case("local"));
+    let auto_gif = routes_to_local_worker(
+        req.backend.as_deref(),
+        crate::router::Modality::Gif,
+        worker_ready,
+    ) && crate::router::direct_media_ask(&req.message)
+        == crate::router::DirectMedia::Gif;
+    if alignment.local_adult_passthrough() && (pinned_local || auto_gif) {
         for action in &mut planned {
             restore_refused_local_prompt(action, &req.message);
         }
@@ -3527,6 +3614,13 @@ pub async fn generate_series(
         req.backend.as_deref(),
     )
     .await;
+    if v.get("status").and_then(|s| s.as_str()) == Some("error") {
+        let msg = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("series generation failed");
+        return Err(ApiError::Msg(msg.to_string()));
+    }
     Ok(Json(v))
 }
 
@@ -3630,7 +3724,12 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     // uncensored writer so the worker gets a checkpoint prompt, not a refusal.
     // Cloud image generation still uses the configured chat model.
     if crate::prefs::enhance_enabled(&enhance) {
-        let local = backend.eq_ignore_ascii_case("local");
+        let modality_for_writer = resolve_generate_modality(&req);
+        let worker_ready = state.worker.read().await.is_some();
+        // Local stills, and Auto GIF (the worker path), use the local writer.
+        // Ordinary text stays on the baseline model. Adult text uses Cydonia/Dolphin.
+        let local =
+            routes_to_local_worker(req.backend.as_deref(), modality_for_writer, worker_ready);
         let mode = if enhance == "prompt-sd" || local {
             "prompt-sd"
         } else {
@@ -3670,13 +3769,15 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
                 if let Some(text) = accepted {
                     final_prompt = text.clone();
                     enhanced = Some(text);
-                } else {
-                    let matrix = crate::router::local_adult_matrix_model(&privacy, &auto_fallbacks);
-                    let retry = if matrix != p.model {
-                        or.chat(&system, &req.prompt, Some(&matrix)).await.ok()
-                    } else {
-                        None
-                    };
+                } else if let Some(retry_model) =
+                    adult_retry_model(&p.model, &privacy, &auto_fallbacks)
+                {
+                    tracing::info!(
+                        first = %p.model,
+                        retry = %retry_model,
+                        "local adult prompt rewrite retry"
+                    );
+                    let retry = or.chat(&system, &req.prompt, Some(&retry_model)).await.ok();
                     if let Some(text) = retry
                         .as_deref()
                         .map(normalize_sd_rewrite)
@@ -3689,6 +3790,10 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
                             "local prompt rewrite did not return a scene prompt".into(),
                         ));
                     }
+                } else {
+                    return Err(ApiError::Msg(
+                        "local prompt rewrite did not return a scene prompt".into(),
+                    ));
                 }
             } else if let Some(text) = rewritten.as_deref().map(normalize_sd_rewrite) {
                 if !text.is_empty() && !looks_like_model_refusal(&text) {
@@ -3827,6 +3932,24 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
         "url": format!("/v1/gallery/{}/image", saved.id),
         "meta": saved,
     }))
+}
+
+/// Local stills when the composer pinned Local. Auto GIF uses the worker when one is up.
+/// Cloud video and omitted-backend stills stay on OpenRouter.
+fn routes_to_local_worker(
+    backend: Option<&str>,
+    modality: crate::router::Modality,
+    worker_ready: bool,
+) -> bool {
+    let pinned = backend.map(str::trim).filter(|s| !s.is_empty());
+    match pinned {
+        Some(s) if s.eq_ignore_ascii_case("local") => true,
+        Some(s) if s.eq_ignore_ascii_case("auto") => {
+            worker_ready && modality == crate::router::Modality::Gif
+        }
+        None => worker_ready && modality == crate::router::Modality::Gif,
+        _ => false,
+    }
 }
 
 fn resolve_generate_modality(req: &GenerateRequest) -> crate::router::Modality {
@@ -4675,6 +4798,82 @@ mod route_footer_tests {
             image_model: None,
             source: "t".into(),
         }
+    }
+
+    #[test]
+    fn refusal_heuristic_ignores_scene_wording() {
+        assert!(looks_like_model_refusal(
+            "I can't create explicit images, but here is a tasteful portrait."
+        ));
+        assert!(!looks_like_model_refusal(
+            "she whispered i can't breathe, pressed against my chest"
+        ));
+        assert!(!looks_like_model_refusal(
+            "not able to stand, knees against my thighs"
+        ));
+    }
+
+    #[test]
+    fn adult_rewrite_accepts_an_echo_of_a_checkpoint_prompt() {
+        let scene = "nude woman, on a bed, soft window light, detailed skin";
+        assert!(adult_rewrite_ok(scene, scene));
+        assert!(!adult_rewrite_ok("nude woman", "nude woman"));
+        assert!(adult_retry_model(
+            "thedrummer/cydonia-24b-v4.1",
+            &crate::prefs::PrivacyPrefs::default(),
+            &crate::prefs::AutoFallbacksPrefs {
+                cost_tier: "medium".into(),
+                ..Default::default()
+            },
+        )
+        .is_some_and(|id| id != "thedrummer/cydonia-24b-v4.1"));
+    }
+
+    #[test]
+    fn chat_pin_does_not_replace_the_resolved_image_model() {
+        let mut run = ActionRun {
+            loras: vec![],
+            image_model: Some("google/gemini-2.5-flash-image".into()),
+            video_model: Some("google/veo-3.1".into()),
+            backend: None,
+        };
+        let chat_only = PlannedAction {
+            action_type: "set_chat_models".into(),
+            args: json!({ "chatModel": "deepseek/deepseek-v4-pro" }),
+        };
+        run.absorb(
+            &chat_only,
+            &json!({
+                "status": "executed",
+                "type": "set_chat_models",
+                "result": {
+                    "chatModel": "deepseek/deepseek-v4-pro",
+                    "imageModel": "auto",
+                    "videoModel": "auto"
+                }
+            }),
+        );
+        assert_eq!(
+            run.image_model.as_deref(),
+            Some("google/gemini-2.5-flash-image")
+        );
+        assert_eq!(run.video_model.as_deref(), Some("google/veo-3.1"));
+        let image_pin = PlannedAction {
+            action_type: "set_chat_models".into(),
+            args: json!({ "imageModel": "black-forest-labs/flux.2-klein-4b" }),
+        };
+        run.absorb(
+            &image_pin,
+            &json!({
+                "status": "executed",
+                "type": "set_chat_models",
+                "result": { "imageModel": "black-forest-labs/flux.2-klein-4b" }
+            }),
+        );
+        assert_eq!(
+            run.image_model.as_deref(),
+            Some("black-forest-labs/flux.2-klein-4b")
+        );
     }
 
     #[test]

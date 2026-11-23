@@ -5,7 +5,7 @@
 #   cp deploy/compose/.env.example deploy/compose/.env
 #   # edit .env — OPENROUTER_API_KEY + FREYA_ADMIN_PASSWORD
 #   make compose-up
-#   # UI http://127.0.0.1:8080  worker :8091  optional MCP :8090
+#   # UI http://127.0.0.1:8080  worker stays on the compose network  optional MCP 127.0.0.1:8090
 #
 # Docs: docs/COMPOSE.md
 
@@ -78,8 +78,8 @@ services:
       FREYA_WORKER_TOKEN: ${FREYA_WORKER_TOKEN:-}
     volumes:
       - ${FREYA_MODELS_DIR:-/mnt/game2/freya/models}:/data/models
-    ports:
-      - "${FREYA_WORKER_PORT:-8091}:8091"
+    # Not published on the host. The API reaches the worker at freya-worker:8091.
+    # Publishing 8091 with an empty FREYA_WORKER_TOKEN exposes generate and deletes.
     networks:
       - freya
     # GPU Diffusers engine: `make compose-up-gpu` (compose.gpu.yaml / Dockerfile.worker).
@@ -99,10 +99,10 @@ services:
       FREYA_MCP_BIND: 0.0.0.0:8090
       FREYA_API_URL: http://freya-api:8080
       FREYA_API_TOKEN: ${FREYA_API_TOKEN:-}
-      # Host header allowlist for Streamable HTTP; * disables check (LAN/compose).
-      FREYA_MCP_ALLOWED_HOSTS: ${FREYA_MCP_ALLOWED_HOSTS:-*}
+      # Loopback only. Empty or * does not disable the Host check.
+      FREYA_MCP_ALLOWED_HOSTS: ${FREYA_MCP_ALLOWED_HOSTS:-localhost,127.0.0.1}
     ports:
-      - "${FREYA_MCP_PORT:-8090}:8090"
+      - "127.0.0.1:${FREYA_MCP_PORT:-8090}:8090"
     networks:
       - freya
     depends_on:
