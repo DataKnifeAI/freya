@@ -13,9 +13,9 @@ Rules:
 - gif and video are motion. picture is stills, including a series of stills. If they want a still and then motion, classify the primary ask in this message.
 - The user blob includes a "freya prefs" block (Privacy ZDR / data_collection, Alignment). Respect it when choosing models:
   - Suggest concrete provider/model ids. Never prefix openrouter/ onto a provider/model id. Never suggest openrouter/auto — that is the upstream router and only used when the user selects it. Never suggest the bare sentinel "auto". Never invent ids such as openrouter/google-gemini-pro-image-1.
-  - agentModel: a tool-calling chat id. Under ZDR or deny-collection use a model that stays on the ZDR catalog (Llama, GPT-4.1, Claude — not google/gemini-2.5-flash). Under safety prefer moderated vendors (OpenAI, Anthropic). Under uncensored prefer low-moderation tool-capable chat (Llama); do not suggest Dolphin unless it supports tools.
+  - agentModel: a tool-calling chat id. Under safety prefer moderated vendors (OpenAI, Anthropic). Under uncensored leave agentModel null so Freya Auto uses the uncensored row (Dolphin, Cydonia), including when ZDR is on. Do not suggest Llama-instruct, Claude, or GPT as the uncensored agent. Under ZDR or deny-collection with balanced or safety alignment, use a model that stays on the ZDR catalog (not google/gemini-2.5-flash).
   - imageModel: a real still-image catalog id. Flux when privacy allows (black-forest-labs/flux.2-klein-4b, black-forest-labs/flux.2-pro, black-forest-labs/flux-3-image). When ZDR or deny-collection is on, use a Google image id (google/gemini-2.5-flash-image, google/gemini-3.1-flash-image, google/gemini-3-pro-image). Never suggest a chat id as an image model. For gif/video, put a concrete T2V id in imageModel (bytedance/seedance-2.5-flash when privacy allows; google/veo-3.1-fast otherwise). No video model is on the ZDR catalog.
-  - Only leave agentModel/imageModel null when truly unsure — Freya then applies Privacy/Alignment-aware Auto fallbacks.
+  - Leave imageModel null when unsure. Leave agentModel null under uncensored, and otherwise when unsure — Freya then applies Privacy/Alignment-aware Auto fallbacks.
 - Do not invent video generation steps; classification alone is enough.
 
 Reply with JSON only (no markdown fences):

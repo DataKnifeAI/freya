@@ -396,6 +396,16 @@ pub fn resolve_agent_model_prefs(
                 fallbacks,
             ));
         }
+        // Uncensored Auto must not be overridden by a high-refusal suggestion
+        // (route used to ask for Llama). A pinned model is returned above.
+        if alignment.model_alignment == "uncensored" && !keeps_uncensored_agent(&sug) {
+            return Some(resolve_auto_fallback(
+                AutoFallbackKind::Agent,
+                privacy,
+                alignment,
+                fallbacks,
+            ));
+        }
         return Some(sug);
     }
     Some(resolve_auto_fallback(
@@ -886,6 +896,23 @@ pub fn infer_modality_prefs(
 
 /// Drop router prose / null-ish placeholders that LLMs echo from the prompt
 /// (e.g. `"None, letting Freya use Auto default (ZDR-aware)."`).
+/// Router suggestions that stay on the uncensored agent row.
+/// Llama-instruct, Claude, and GPT are not in that row.
+fn keeps_uncensored_agent(id: &str) -> bool {
+    let l = id.to_ascii_lowercase();
+    const MARKERS: &[&str] = &[
+        "uncensored",
+        "dolphin",
+        "cydonia",
+        "venice",
+        "abliterat",
+        "cognitivecomputations",
+        "thedrummer",
+        "wizard-vicuna",
+    ];
+    MARKERS.iter().any(|m| l.contains(m))
+}
+
 fn sanitize_router_model_suggestion(raw: &str) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() {
@@ -1495,6 +1522,49 @@ mod tests {
             resolve_agent_model_prefs(Some(AUTO_AGENT), &route, &privacy, &alignment, &fb)
                 .as_deref(),
             Some(DEFAULT_AUTO_AGENT_MODEL_UNCENSORED)
+        );
+    }
+
+    #[test]
+    fn uncensored_auto_ignores_llama_suggestion() {
+        let route = RouteDecision {
+            modality: Modality::Picture,
+            reason: "t".into(),
+            agent_model: Some("meta-llama/llama-3.1-8b-instruct".into()),
+            image_model: None,
+            source: "t".into(),
+        };
+        let privacy = PrivacyPrefs {
+            zero_data_retention: true,
+            ..Default::default()
+        };
+        let alignment = AlignmentPrefs {
+            model_alignment: "uncensored".into(),
+            ..Default::default()
+        };
+        let fb = AutoFallbacksPrefs::default();
+        assert_eq!(
+            resolve_agent_model_prefs(Some("auto"), &route, &privacy, &alignment, &fb).as_deref(),
+            Some(DEFAULT_AUTO_AGENT_MODEL_UNCENSORED)
+        );
+        assert_eq!(
+            resolve_agent_model_prefs(
+                Some("meta-llama/llama-3.1-8b-instruct"),
+                &route,
+                &privacy,
+                &alignment,
+                &fb
+            )
+            .as_deref(),
+            Some("meta-llama/llama-3.1-8b-instruct")
+        );
+        let cydonia = RouteDecision {
+            agent_model: Some("thedrummer/cydonia-24b-v4.1".into()),
+            ..route
+        };
+        assert_eq!(
+            resolve_agent_model_prefs(Some("auto"), &cydonia, &privacy, &alignment, &fb).as_deref(),
+            Some("thedrummer/cydonia-24b-v4.1")
         );
     }
 
