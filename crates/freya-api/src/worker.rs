@@ -404,11 +404,9 @@ impl DiffusionWorkerClient {
     }
 
     pub async fn get_install_job(&self, id: &str) -> Result<Value> {
+        let url = worker_job_url(&self.base, id, false)?;
         let resp = self
-            .apply_auth(
-                self.http
-                    .get(format!("{}/v1/assets/jobs/{}", self.base, id)),
-            )
+            .apply_auth(self.http.get(url))
             .send()
             .await
             .context("get install job")?;
@@ -424,11 +422,9 @@ impl DiffusionWorkerClient {
     }
 
     pub async fn cancel_install_job(&self, id: &str) -> Result<Value> {
+        let url = worker_job_url(&self.base, id, true)?;
         let resp = self
-            .apply_auth(
-                self.http
-                    .post(format!("{}/v1/assets/jobs/{}/cancel", self.base, id)),
-            )
+            .apply_auth(self.http.post(url))
             .send()
             .await
             .context("cancel install job")?;
@@ -499,6 +495,43 @@ pub struct LoraWeight {
 
 fn one() -> f32 {
     1.0
+}
+
+/// Single path segment: UUID or `[A-Za-z0-9_-]+`. No `/ ? # % . ..`.
+/// Same rule as freya-mcp. Does not percent-encode.
+fn safe_path_segment(id: &str) -> Result<&str> {
+    let id = id.trim();
+    if id.is_empty()
+        || id.contains('/')
+        || id.contains('?')
+        || id.contains('#')
+        || id.contains('%')
+        || id.contains('.')
+        || id.contains("..")
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(anyhow!("invalid job id"));
+    }
+    Ok(id)
+}
+
+fn worker_job_url(base: &str, id: &str, cancel: bool) -> Result<String> {
+    let id = safe_path_segment(id)?;
+    let base = base.trim_end_matches('/');
+    let suffix = if cancel {
+        format!("/v1/assets/jobs/{id}/cancel")
+    } else {
+        format!("/v1/assets/jobs/{id}")
+    };
+    let url = format!("{base}{suffix}");
+    let parsed = reqwest::Url::parse(&url).context("parse worker job url")?;
+    if parsed.query().is_some() || parsed.fragment().is_some() || !parsed.path().ends_with(&suffix)
+    {
+        return Err(anyhow!("invalid job id"));
+    }
+    Ok(url)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -581,7 +614,7 @@ fn host_is_local_or_private(host: &str) -> bool {
 
 #[cfg(test)]
 mod tls_tests {
-    use super::{inventory_stats, tls_skip_allowed};
+    use super::{inventory_stats, tls_skip_allowed, worker_job_url};
 
     #[test]
     fn health_ok_is_not_inventory() {
@@ -592,6 +625,26 @@ mod tls_tests {
         assert!(inventory_stats(
             &serde_json::json!({ "ok": true, "vram": null, "loras": 0, "modelsDir": "/models" })
         ));
+    }
+
+    #[test]
+    fn job_id_path_rejects_injection() {
+        for id in ["../auth/token", "x?x", "../../worker/start?"] {
+            assert!(worker_job_url("http://worker.internal", id, true).is_err());
+            assert!(worker_job_url("http://worker.internal", id, false).is_err());
+        }
+        let url = worker_job_url(
+            "http://worker.internal",
+            "550e8400-e29b-41d4-a716-446655440000",
+            true,
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(
+            parsed.path(),
+            "/v1/assets/jobs/550e8400-e29b-41d4-a716-446655440000/cancel"
+        );
+        assert!(parsed.query().is_none());
     }
 
     #[test]

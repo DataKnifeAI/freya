@@ -333,7 +333,7 @@ impl FreyaMcp {
         &self,
         Parameters(args): Parameters<GalleryGetArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let path = format!("/v1/gallery/{}", args.id);
+        let path = crate::api::bind_path_segment("/v1/gallery", &args.id, "").map_err(map_err)?;
         let v = self.api.get_json(&path).await.map_err(map_err)?;
         json_ok(v)
     }
@@ -498,7 +498,8 @@ impl FreyaMcp {
         &self,
         Parameters(args): Parameters<JobIdArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let path = format!("/v1/civitai/jobs/{}/cancel", args.job_id);
+        let path = crate::api::bind_path_segment("/v1/civitai/jobs", &args.job_id, "/cancel")
+            .map_err(map_err)?;
         let v = self
             .api
             .post_json(&path, &json!({}))
@@ -549,7 +550,7 @@ impl FreyaMcp {
         &self,
         Parameters(args): Parameters<GalleryGetArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let path = format!("/v1/gallery/{}", args.id);
+        let path = crate::api::bind_path_segment("/v1/gallery", &args.id, "").map_err(map_err)?;
         let v = self
             .api
             .delete_json(&path, &json!({}))
@@ -565,11 +566,12 @@ impl FreyaMcp {
         &self,
         Parameters(args): Parameters<GalleryGetArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let path = format!("/v1/gallery/{}", args.id);
+        let path = crate::api::bind_path_segment("/v1/gallery", &args.id, "").map_err(map_err)?;
+        let image =
+            crate::api::bind_path_segment("/v1/gallery", &args.id, "/image").map_err(map_err)?;
         let mut v = self.api.get_json(&path).await.map_err(map_err)?;
         if let Some(obj) = v.as_object_mut() {
-            obj.entry("url".to_string())
-                .or_insert_with(|| json!(format!("/v1/gallery/{}/image", args.id)));
+            obj.entry("url".to_string()).or_insert_with(|| json!(image));
             obj.insert(
                 "note".into(),
                 json!("The Studio download button saves this file. Bytes are not in this tool result."),
