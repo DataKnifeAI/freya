@@ -236,6 +236,31 @@ function activeBaseEngineHint(modelLoaded, workerStats) {
   return ` — selected (${engineName})`;
 }
 
+/** Off when settings or worker stats say so — same signal as the status dots. */
+function workerGenerationOff(settings, workerStats) {
+  return settings?.workerEnabled === false || workerStats?.enabled === false;
+}
+
+/**
+ * An explicit workerEnabled from the API wins. A missing flag must not wipe a
+ * known disabled worker (that greys out Enable while local generation stays off).
+ * Otherwise keep workerStats.enabled.
+ */
+function mergeSettingsWorkerFlag(prev, incoming, workerStats) {
+  if (!incoming || typeof incoming !== "object") return incoming;
+  if (typeof incoming.workerEnabled === "boolean") return incoming;
+  if (prev?.workerEnabled === false || workerStats?.enabled === false) {
+    return { ...incoming, workerEnabled: false };
+  }
+  if (typeof workerStats?.enabled === "boolean") {
+    return { ...incoming, workerEnabled: workerStats.enabled };
+  }
+  if (typeof prev?.workerEnabled === "boolean") {
+    return { ...incoming, workerEnabled: prev.workerEnabled };
+  }
+  return incoming;
+}
+
 /** Label container vs host models path when both are known. */
 function modelsDirHint(workerStats) {
   const dir = workerStats?.modelsDir;
@@ -1974,6 +1999,13 @@ export default function App() {
   const [workerUrlOverride, setWorkerUrlOverride] = useState("");
   const [useWorkerUrlOverride, setUseWorkerUrlOverride] = useState(false);
   const [workerStats, setWorkerStats] = useState(null);
+  const workerStatsRef = useRef(null);
+  workerStatsRef.current = workerStats;
+  const commitSettings = (incoming, statsHint) => {
+    setSettings((prev) =>
+      mergeSettingsWorkerFlag(prev, incoming, statsHint ?? workerStatsRef.current),
+    );
+  };
   const [workerCtlBusy, setWorkerCtlBusy] = useState(false);
   const [civitaiQ, setCivitaiQ] = useState("");
   const installedFingerprintRef = useRef("");
@@ -2524,7 +2556,7 @@ export default function App() {
       ]);
       const items = s.items || [];
       setStyles(items);
-      setSettings(st);
+      commitSettings(st);
       applyPrivacyAlignmentFromSettings(st);
       applyInstructionsFromSettings(st);
       if (typeof st.chatModel === "string" && st.chatModel.trim()) {
@@ -2788,7 +2820,12 @@ export default function App() {
     }
     try {
       const st = await api("/v1/worker/stats");
-      setWorkerStats(st);
+      setWorkerStats((prev) => {
+        if (st && typeof st.enabled !== "boolean" && typeof prev?.enabled === "boolean") {
+          return { ...st, enabled: prev.enabled };
+        }
+        return st;
+      });
     } catch {
       setWorkerStats(null);
     }
@@ -2809,9 +2846,20 @@ export default function App() {
     setError("");
     setSavedMsg("");
     try {
-      await api(`/v1/worker/${action}`, { method: "POST", body: "{}" });
+      const res = await api(`/v1/worker/${action}`, { method: "POST", body: "{}" });
+      let statsHint;
+      if (
+        (action === "enable" || action === "disable") &&
+        typeof res?.enabled === "boolean"
+      ) {
+        const enabled = res.enabled;
+        statsHint = { ...(workerStatsRef.current || {}), enabled };
+        workerStatsRef.current = statsHint;
+        setWorkerStats((prev) => ({ ...(prev || {}), enabled }));
+        setSettings((prev) => ({ ...(prev || {}), workerEnabled: enabled }));
+      }
       const st = await api("/v1/settings");
-      setSettings(st);
+      commitSettings(st, statsHint);
       applyWorkerEndpoint(st.diffusionWorkerUrl || "");
       await refreshWorkerStats();
       const health = await api("/v1/health").catch(() => null);
@@ -2859,7 +2907,7 @@ export default function App() {
         body: JSON.stringify({ routerModel: id }),
       });
       // API flattens SettingsPublic + persisted
-      setSettings(st);
+      commitSettings(st);
     } catch {
       /* offline / unauth — localStorage still holds the pick */
     }
@@ -2872,7 +2920,7 @@ export default function App() {
         method: "PUT",
         body: JSON.stringify(patch),
       });
-      setSettings(st);
+      commitSettings(st);
     } catch {
       /* localStorage still holds the pick */
     }
@@ -2982,6 +3030,7 @@ export default function App() {
   // Prefer persisted URL so default placeholders do not fake a configured worker.
   const hasWorker = () => Boolean(settings?.diffusionWorkerUrl);
   const workerReachable = Boolean(workerStats?.reachable);
+  const workerOff = workerGenerationOff(settings, workerStats);
   const localBackendOk = hasWorker() && workerReachable;
   const localBackendReason = !hasWorker()
     ? "Set a worker URL on the Worker tab first"
@@ -3154,7 +3203,7 @@ export default function App() {
         method: "PUT",
         body: JSON.stringify({ diffusionWorkerUrl: composedWorkerUrl() }),
       });
-      setSettings(st);
+      commitSettings(st);
       applyWorkerEndpoint(st.diffusionWorkerUrl || "");
       await refreshWorkerStats();
       flashSave(
@@ -3418,11 +3467,23 @@ export default function App() {
         if (typeof routerM === "string" && routerM) setRouterModel(routerM);
         if (typeof video === "string" && video) setVideoModel(video);
         persistModels(chat || agentModel, image || imageModel, routerM || routerModel, video || videoModel);
-        setSettings((prev) => ({ ...(prev || {}), ...a.result }));
+        setSettings((prev) =>
+          mergeSettingsWorkerFlag(
+            prev,
+            { ...(prev || {}), ...a.result },
+            workerStatsRef.current,
+          ),
+        );
       }
       if (a.type === "set_privacy" || a.type === "set_alignment" || a.type === "set_cost_tier") {
         applyPrivacyAlignmentFromSettings(a.result);
-        setSettings((prev) => ({ ...(prev || {}), ...a.result }));
+        setSettings((prev) =>
+          mergeSettingsWorkerFlag(
+            prev,
+            { ...(prev || {}), ...a.result },
+            workerStatsRef.current,
+          ),
+        );
       }
       if (a.type === "set_base_model" && a.result?.model) {
         setActiveBasePath(a.result.model);
@@ -4204,7 +4265,7 @@ export default function App() {
       method: "PUT",
       body: JSON.stringify(body),
     });
-    setSettings(st);
+    commitSettings(st);
     if (wroteOr) setOpenrouterKey("");
     if (wroteCiv) setCivitaiKey("");
     await refresh();
@@ -4262,7 +4323,7 @@ export default function App() {
         method: "PUT",
         body: JSON.stringify(body),
       });
-      setSettings(st);
+      commitSettings(st);
       applyPrivacyAlignmentFromSettings(st);
       applyInstructionsFromSettings(st, instructionMode);
       markPrivacyAlignmentSynced(prefs);
@@ -4313,7 +4374,7 @@ export default function App() {
           },
         }),
       });
-      setSettings(st);
+      commitSettings(st);
       applyInstructionsFromSettings(st, instructionMode);
       const disk =
         st?.persisted === false
@@ -4344,7 +4405,7 @@ export default function App() {
           },
         }),
       });
-      setSettings(st);
+      commitSettings(st);
       applyInstructionsFromSettings(st, instructionMode);
       flashSave(
         "settings",
@@ -4380,7 +4441,7 @@ export default function App() {
         method: "PUT",
         body: JSON.stringify(body),
       });
-      setSettings(st);
+      commitSettings(st);
       if (which === "openrouter") {
         setOpenrouterKey("");
         setOrMetrics(null);
@@ -4449,7 +4510,7 @@ export default function App() {
           body: JSON.stringify(snap),
         });
         if (gen !== prefsGenRef.current) return;
-        setSettings(st);
+        commitSettings(st);
         markPrivacyAlignmentSynced(snap);
         await refreshModels();
       } catch (e) {
@@ -5130,7 +5191,7 @@ export default function App() {
               >
                 <span
                   className={`status-dot ${
-                    settings.workerEnabled === false || workerStats?.enabled === false
+                    workerOff
                       ? ""
                       : workerStats?.reachable
                         ? "on"
@@ -6611,7 +6672,7 @@ export default function App() {
                 <div className="worker-panel-head">
                   <span
                     className={`status-dot ${
-                      settings?.workerEnabled === false || workerStats?.enabled === false
+                      workerOff
                         ? ""
                         : workerStats?.reachable
                           ? "on"
@@ -6626,7 +6687,7 @@ export default function App() {
                       ? "mock stats"
                       : workerStats
                         ? [
-                            settings?.workerEnabled === false || workerStats.enabled === false
+                            workerOff
                               ? "disabled"
                               : workerStats.reachable
                                 ? "reachable"
@@ -6804,7 +6865,7 @@ export default function App() {
                   <button
                     type="button"
                     className="ghost"
-                    disabled={busy || workerCtlBusy || mock || settings?.workerEnabled !== false}
+                    disabled={busy || workerCtlBusy || mock || !workerOff}
                     onClick={() => workerControl("enable")}
                     title="Use the saved worker for local generation"
                   >
@@ -6813,7 +6874,7 @@ export default function App() {
                   <button
                     type="button"
                     className="ghost"
-                    disabled={busy || workerCtlBusy || mock || settings?.workerEnabled === false}
+                    disabled={busy || workerCtlBusy || mock || workerOff}
                     onClick={() => workerControl("disable")}
                     title="Skip local generation. The URL stays saved"
                   >
