@@ -362,7 +362,7 @@ function readImageFavorites() {
     const raw = localStorage.getItem(IMAGE_FAVORITES_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((x) => x && x.id != null) : [];
+    return Array.isArray(parsed) ? parsed.map(normalizeImageFavorite).filter(Boolean) : [];
   } catch {
     return [];
   }
@@ -385,33 +385,60 @@ function communityImageFilename(item) {
   return `civitai-${id}.${ext}`;
 }
 
-function communityImageFavorite(item, ctx) {
+function communityImageFavorite(item, ctx, origin) {
+  const resources = (item?.resources || [])
+    .map(slimCommunityResource)
+    .filter(Boolean)
+    .slice(0, 32);
+  const missingResources = (item?.missingResources || [])
+    .map(slimCommunityResource)
+    .filter(Boolean)
+    .slice(0, 32);
+  const prompt = String(item?.prompt || "").slice(0, 4000);
+  const negative = String(item?.negativePrompt || item?.negative || "").slice(0, 4000);
+  const sampler = item?.sampler ?? item?.meta?.sampler ?? null;
+  const steps = item?.steps ?? item?.meta?.steps ?? null;
+  const cfg = item?.cfg ?? item?.meta?.cfg ?? null;
+  const seed = item?.seed ?? item?.meta?.seed ?? null;
+  const clipSkip = item?.clipSkip ?? item?.meta?.clipSkip ?? null;
+  const size = item?.size || item?.meta?.size || null;
   return {
+    kind: "community-image",
     id: item.id,
     url: item.url || item.thumbnailUrl || "",
-    prompt: String(item.prompt || "").slice(0, 4000),
-    negative: String(item.negativePrompt || "").slice(0, 4000),
-    meta: {
-      sampler: item.sampler ?? null,
-      steps: item.steps ?? null,
-      cfg: item.cfg ?? null,
-      seed: item.seed ?? null,
-      clipSkip: item.clipSkip ?? null,
-      size: item.size || null,
-    },
+    thumbnailUrl: item.thumbnailUrl || item.url || "",
+    prompt,
+    negativePrompt: negative,
+    negative,
+    sampler,
+    steps,
+    cfg,
+    seed,
+    clipSkip,
+    size,
+    meta: { sampler, steps, cfg, seed, clipSkip, size },
     nsfw: Boolean(item.nsfw),
-    modelId: ctx?.modelId ?? null,
-    modelVersionId: ctx?.modelVersionId ?? item.modelVersionIds?.[0] ?? null,
+    civitaiUrl: item.civitaiUrl || null,
+    checkpoint: item.checkpoint || null,
+    resources,
+    missingResources,
+    modelId: ctx?.modelId ?? item.modelId ?? null,
+    modelVersionId:
+      ctx?.modelVersionId ?? item.modelVersionId ?? item.modelVersionIds?.[0] ?? null,
+    modelName: ctx?.name || item.modelName || null,
+    fallbackCheckpoint: origin || item.fallbackCheckpoint || null,
   };
 }
 
+/** Clipboard copy of prompt + negative. Returns false when there is nothing to copy. */
 async function copyCommunityInput(item) {
   const prompt = String(item?.prompt || "").trim();
-  const negative = String(item?.negativePrompt || "").trim();
+  const negative = String(item?.negativePrompt || item?.negative || "").trim();
   const text = [prompt, negative ? `Negative: ${negative}` : ""].filter(Boolean).join("\n\n");
-  if (!text) throw new Error("This image has no prompt to copy.");
+  if (!text) return false;
   if (!navigator.clipboard?.writeText) throw new Error("Clipboard is not available.");
   await navigator.clipboard.writeText(text);
+  return true;
 }
 
 /** Human-readable byte size for storage meters (Worker tab). */
@@ -1664,6 +1691,18 @@ const CIVITAI_SUBNAV = [
   { id: "downloads", label: "Downloads", end: true },
 ];
 
+/** Favorites sub-tabs. Empty types stay hidden. Images are community gallery favorites. */
+const FAVORITE_TYPE_TABS = [
+  { id: "LORA", label: "LORA" },
+  { id: "LoCon", label: "LoCon" },
+  { id: "DoRA", label: "DoRA" },
+  { id: "LyCORIS", label: "LyCORIS" },
+  { id: "Checkpoint", label: "Checkpoint" },
+  { id: "TextualInversion", label: "TextualInversion" },
+  { id: "VAE", label: "VAE" },
+  { id: "Images", label: "Images" },
+];
+
 /** Installed section order / labels by kind or modelType. */
 const INSTALLED_SECTION_ORDER = [
   { id: "loras", title: "LoRAs", match: (t) => ["lora", "locon", "dora", "lycoris"].includes(t) },
@@ -1996,6 +2035,308 @@ function checkpointMatchesFamily(asset, family) {
   const name = familyKey(`${asset?.name || ""} ${asset?.path || ""}`);
   if (base && (base === want || base.includes(want) || want.includes(base))) return true;
   return name.includes(want);
+}
+
+/** Model-card favorite bucket. Community images are a separate list, never folded into LORA. */
+function favoriteTypeId(item) {
+  const path = String(item?.path || "");
+  const t = String(item?.modelType || item?.kind || item?.type || "")
+    .toLowerCase()
+    .replace(/[\s_-]/g, "");
+  if (t === "locon") return "LoCon";
+  if (t === "dora") return "DoRA";
+  if (t === "lycoris" || t === "lyco") return "LyCORIS";
+  if (
+    t === "textualinversion" ||
+    t === "embedding" ||
+    t === "embed" ||
+    path.startsWith("embeddings/")
+  ) {
+    return "TextualInversion";
+  }
+  if (t === "vae" || path.startsWith("vae/")) return "VAE";
+  if (t === "checkpoint" || t === "ckpt" || t === "model" || path.startsWith("checkpoints/")) {
+    return "Checkpoint";
+  }
+  return "LORA";
+}
+
+function positiveId(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function hashToken(raw) {
+  const trimmed = String(raw || "")
+    .trim()
+    .replace(/^['"]|['"]$/g, "");
+  const hex = (trimmed.split(/[:/]/).pop() || "").trim();
+  if (hex.length < 10 || hex.length > 128 || !/^[0-9a-f]+$/i.test(hex)) return "";
+  return hex.toLowerCase();
+}
+
+function hashesMatch(a, b) {
+  const left = hashToken(a);
+  const right = hashToken(b);
+  if (!left || !right) return false;
+  return left === right || left.startsWith(right) || right.startsWith(left);
+}
+
+function kindBucket(raw) {
+  const t = String(raw || "")
+    .toLowerCase()
+    .replace(/[\s_-]/g, "");
+  if (["checkpoint", "model", "ckpt", "base"].includes(t)) return "checkpoint";
+  if (["textualinversion", "embedding", "embed", "textinversion"].includes(t)) return "embedding";
+  if (
+    t === "lora" ||
+    t === "locon" ||
+    t === "dora" ||
+    t === "lycoris" ||
+    t === "lyco" ||
+    t.includes("lora")
+  ) {
+    return "lora";
+  }
+  return "other";
+}
+
+function kindsCompatible(resourceType, assetKind) {
+  const resource = kindBucket(resourceType);
+  const asset = kindBucket(assetKind);
+  return resource === asset || asset === "other" || resource === "other";
+}
+
+/** Same rules as the API resource match: version id wins, then model id, hash, then file stem. */
+function resourceMatchesAsset(resource, asset) {
+  if (!resource || !asset) return false;
+  const rv = positiveId(resource.modelVersionId ?? resource.versionId);
+  const av = positiveId(asset.versionId);
+  if (rv && av) return rv === av;
+  const rm = positiveId(resource.modelId);
+  const am = positiveId(asset.modelId);
+  if (rm && am && rm !== am) return false;
+  if (rm && am && !rv) {
+    return kindsCompatible(resource.type || resource.modelType, asset.modelType || asset.kind);
+  }
+  if (resource.hash && asset.hash && hashesMatch(resource.hash, asset.hash)) return true;
+  const resourceType = resource.type || resource.modelType || "Checkpoint";
+  if (!kindsCompatible(resourceType, asset.modelType || asset.kind)) return false;
+  const want = assetLabelKey(resource.name || "");
+  if (!want) return false;
+  const name = assetLabelKey(asset.name);
+  const path = assetLabelKey(asset.path);
+  return Boolean((name && want === name) || (path && want === path));
+}
+
+function slimCommunityResource(resource) {
+  if (!resource) return null;
+  const name = String(resource.name || "").trim();
+  const type = resource.type || resource.modelType || "";
+  const modelVersionId = positiveId(resource.modelVersionId ?? resource.versionId);
+  const modelId = positiveId(resource.modelId);
+  if (!name && !modelVersionId && !modelId && !resource.hash) return null;
+  return {
+    name,
+    type,
+    modelVersionId,
+    modelId,
+    hash: resource.hash || null,
+    weight: resource.weight ?? null,
+    installable: resource.installable !== false,
+    destPath: resource.destPath || null,
+  };
+}
+
+function checkpointResourceOf(item) {
+  const resources = Array.isArray(item?.resources) ? item.resources : [];
+  const found = resources.filter((r) =>
+    isCheckpointAsset({
+      modelType: r?.type || r?.modelType,
+      type: r?.type || r?.modelType,
+    }),
+  );
+  const named = found.find((r) => String(r?.name || "").trim()) || found[0];
+  if (named) return named;
+  const name = String(item?.checkpoint || "").trim();
+  if (!name) return null;
+  return { name, type: "Checkpoint" };
+}
+
+function findInstalledResource(resource, assets) {
+  if (!resource) return null;
+  return (assets || []).find((asset) => resourceMatchesAsset(resource, asset)) || null;
+}
+
+function recommendedCheckpointsFromCard(card, versionId) {
+  if (!card) return [];
+  const versions = card.modelVersions || [];
+  const ver =
+    versions.find((v) => versionId != null && String(v.id) === String(versionId)) ||
+    versions[0] ||
+    null;
+  const raw =
+    (ver?.recommendedResources?.length ? ver.recommendedResources : card.recommendedResources) ||
+    [];
+  return raw
+    .map(recommendedResourceCard)
+    .filter((rec) => rec && isCheckpointAsset(rec))
+    .map((rec) => ({
+      id: rec.id,
+      modelId: rec.modelId ?? rec.id,
+      name: rec.name,
+      modelType: "Checkpoint",
+      versionId: rec.versionId ?? null,
+      baseModel: rec.baseModel || null,
+    }));
+}
+
+function findContextCard(ctx, pools) {
+  if (!ctx) return null;
+  const list = (pools || []).filter(Boolean);
+  const id = ctx.modelId != null && ctx.modelId !== "" ? String(ctx.modelId) : "";
+  const ver =
+    ctx.modelVersionId != null && ctx.modelVersionId !== "" ? String(ctx.modelVersionId) : "";
+  if (id) {
+    const hit = list.find((card) => {
+      const cid = resolveCivitaiModelId(card);
+      return cid != null && String(cid) === id;
+    });
+    if (hit) return hit;
+  }
+  if (ver) {
+    const hit = list.find((card) => card.versionId != null && String(card.versionId) === ver);
+    if (hit) return hit;
+  }
+  const name = assetLabelKey(ctx.name || "");
+  if (name.length >= 4) return list.find((card) => assetLabelKey(card.name) === name) || null;
+  return null;
+}
+
+function originFromCard(card, ctx) {
+  if (!card && !ctx) return null;
+  const versionId = ctx?.modelVersionId || card?.versionId || null;
+  const versions = card?.modelVersions || [];
+  const ver =
+    versions.find((v) => versionId != null && String(v.id) === String(versionId)) ||
+    versions[0] ||
+    null;
+  return {
+    modelId: (card ? resolveCivitaiModelId(card) : null) ?? ctx?.modelId ?? null,
+    modelVersionId: versionId,
+    name: card?.name || ctx?.name || null,
+    modelType: card?.modelType || card?.kind || null,
+    baseModel: ver?.baseModel || card?.baseModel || null,
+    path: card?.path || null,
+    versionId: card?.versionId ?? versionId,
+    hash: card?.hash || null,
+    recommended: recommendedCheckpointsFromCard(card, versionId),
+  };
+}
+
+function mergeOrigin(primary, extra) {
+  if (!primary) return extra || null;
+  if (!extra) return primary;
+  return {
+    modelId: primary.modelId || extra.modelId || null,
+    modelVersionId: primary.modelVersionId || extra.modelVersionId || null,
+    name: primary.name || extra.name || null,
+    modelType: primary.modelType || extra.modelType || null,
+    baseModel: primary.baseModel || extra.baseModel || null,
+    path: primary.path || extra.path || null,
+    versionId: primary.versionId || extra.versionId || null,
+    hash: primary.hash || extra.hash || null,
+    recommended: primary.recommended?.length ? primary.recommended : extra.recommended || [],
+  };
+}
+
+/**
+ * Installed checkpoint for a community image.
+ * The post's own checkpoint wins. Otherwise the original asset, when that file is
+ * installed: the asset itself if it is a checkpoint, then a recommended checkpoint,
+ * then one installed checkpoint for the asset's base family. Never downloads.
+ */
+function installedBaseForCommunityImage(item, installed, origin) {
+  const checkpoints = (installed || []).filter(isCheckpointAsset);
+  const fromPost = findInstalledResource(checkpointResourceOf(item), checkpoints);
+  if (fromPost) return fromPost;
+  const fb = origin || item?.fallbackCheckpoint || null;
+  if (!fb) return null;
+  if (isCheckpointAsset({ modelType: fb.modelType, kind: fb.modelType, path: fb.path })) {
+    const self = findInstalledResource(
+      {
+        name: fb.name,
+        type: "Checkpoint",
+        modelVersionId: fb.modelVersionId || fb.versionId,
+        modelId: fb.modelId,
+        hash: fb.hash,
+      },
+      checkpoints,
+    );
+    if (self) return self;
+    if (fb.path) {
+      const byPath = checkpoints.find((asset) => asset.path === fb.path);
+      if (byPath) return byPath;
+    }
+  }
+  for (const rec of fb.recommended || []) {
+    const hit = findInstalledResource(
+      {
+        name: rec.name,
+        type: "Checkpoint",
+        modelVersionId: rec.versionId || rec.modelVersionId,
+        modelId: rec.modelId || rec.id,
+      },
+      checkpoints,
+    );
+    if (hit) return hit;
+  }
+  const family = String(fb.baseModel || "").trim();
+  if (!family) return null;
+  return checkpoints.find((asset) => checkpointMatchesFamily(asset, family)) || null;
+}
+
+function communityCheckpointLine(item) {
+  if (!item?.checkpoint) return "";
+  if (item.kind === "community-image") return String(item.checkpoint);
+  return [
+    item.checkpoint,
+    item.checkpointDifferent ? "different" : "",
+    item.checkpointInstalled ? "installed" : "not installed",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function normalizeImageFavorite(item) {
+  if (!item || item.id == null) return null;
+  const meta = item.meta && typeof item.meta === "object" ? item.meta : {};
+  const negative = String(item.negativePrompt || item.negative || "");
+  return {
+    kind: "community-image",
+    id: item.id,
+    url: item.url || item.thumbnailUrl || "",
+    thumbnailUrl: item.thumbnailUrl || item.url || "",
+    prompt: String(item.prompt || ""),
+    negativePrompt: negative,
+    negative,
+    sampler: item.sampler ?? meta.sampler ?? null,
+    steps: item.steps ?? meta.steps ?? null,
+    cfg: item.cfg ?? meta.cfg ?? null,
+    seed: item.seed ?? meta.seed ?? null,
+    clipSkip: item.clipSkip ?? meta.clipSkip ?? null,
+    size: item.size || meta.size || null,
+    meta,
+    nsfw: Boolean(item.nsfw),
+    civitaiUrl: item.civitaiUrl || null,
+    checkpoint: item.checkpoint || null,
+    resources: Array.isArray(item.resources) ? item.resources : [],
+    missingResources: Array.isArray(item.missingResources) ? item.missingResources : [],
+    modelId: item.modelId ?? null,
+    modelVersionId: item.modelVersionId ?? null,
+    modelName: item.modelName || null,
+    fallbackCheckpoint: item.fallbackCheckpoint || null,
+  };
 }
 
 function priorToolContext(session) {
@@ -2531,6 +2872,7 @@ export default function App() {
   const [communityMore, setCommunityMore] = useState(false);
   const [communityDetail, setCommunityDetail] = useState(null);
   const [imageFavorites, setImageFavorites] = useState(readImageFavorites);
+  const [favoriteType, setFavoriteType] = useState("LORA");
   const communitySentinelRef = useRef(null);
   const communityPagerRef = useRef({ key: "", cursor: null, page: null, done: true });
   const communityFlightRef = useRef(false);
@@ -3137,9 +3479,9 @@ export default function App() {
     }
   };
 
-  const genMetaBody = (form) => {
+  const genMetaBody = (form, extra = {}) => {
     const num = (v) => (v === "" || v == null || Number.isNaN(Number(v)) ? null : Number(v));
-    return {
+    const body = {
       sampler: form.sampler || null,
       cfg: num(form.cfg),
       steps: num(form.steps),
@@ -3150,12 +3492,15 @@ export default function App() {
       size: form.size || null,
       quantity: num(form.quantity) || 1,
     };
+    if (extra.source) body.source = extra.source;
+    if (extra.sourceLabel) body.sourceLabel = extra.sourceLabel;
+    return body;
   };
 
-  const saveGenMeta = async (form) => {
+  const saveGenMeta = async (form, extra) => {
     const data = await api("/v1/generation-meta", {
       method: "PUT",
-      body: JSON.stringify(genMetaBody(form)),
+      body: JSON.stringify(genMetaBody(form, extra)),
     });
     applyGenMeta(data);
     return data;
@@ -4606,7 +4951,7 @@ export default function App() {
   };
 
   const setInstalledAsBase = async (asset) => {
-    if (!asset?.path) return;
+    if (!asset?.path) return false;
     try {
       await api("/v1/worker/base-model", {
         method: "PUT",
@@ -4619,8 +4964,10 @@ export default function App() {
       setLocalBaseModel(asset.path);
       if (typeof asset.baseModel === "string") setLocalBaseFamily(asset.baseModel);
       setSavedMsg(`Active base → ${asset.name || asset.path}`);
+      return true;
     } catch (e) {
       setError(e.message);
+      return false;
     }
   };
 
@@ -5885,27 +6232,134 @@ export default function App() {
   const imageFavorited = (item) =>
     imageFavorites.some((f) => String(f.id) === String(item?.id));
 
+  const originForContext = (ctx) => {
+    if (!ctx) return null;
+    const card = findContextCard(ctx, [
+      detailModel,
+      ...favorites,
+      ...civitaiItems,
+      ...suggestedLoras,
+      ...installedAssets,
+      ...(session?.pinnedLoras || []),
+    ]);
+    return originFromCard(card, ctx);
+  };
+
   const toggleImageFavorite = (item) => {
     if (!item?.id) return;
     setImageFavorites((prev) => {
       const exists = prev.some((f) => String(f.id) === String(item.id));
+      const ctx = galleryContext || {
+        modelId: item.modelId ?? null,
+        modelVersionId: item.modelVersionId ?? item.modelVersionIds?.[0] ?? null,
+        name: item.modelName || "",
+      };
       const next = exists
         ? prev.filter((f) => String(f.id) !== String(item.id))
-        : [communityImageFavorite(item, galleryContext), ...prev].slice(0, 200);
+        : [communityImageFavorite(item, ctx, originForContext(ctx)), ...prev].slice(0, 200);
       writeImageFavorites(next);
       return next;
     });
   };
 
+  const metaField = (item, key) => {
+    const direct = item?.[key];
+    if (direct != null && direct !== "") return direct;
+    const nested = item?.meta?.[key];
+    if (nested != null && nested !== "") return nested;
+    return "";
+  };
+
+  /** Copy fills the composer, negative prompt, and Agent Meta, then the clipboard. */
   const copyImageInput = async (item) => {
-    try {
-      await copyCommunityInput(item);
-      setCommunityErr("");
-      setCommunityNote("Copied the prompt and negative prompt.");
-    } catch (e) {
+    const prompt = String(item?.prompt || "").trim();
+    const negative = String(item?.negativePrompt || item?.negative || "").trim();
+    const sampler = metaField(item, "sampler");
+    const steps = metaField(item, "steps");
+    const cfg = metaField(item, "cfg");
+    const clipSkip = metaField(item, "clipSkip");
+    const seed = metaField(item, "seed");
+    const size = metaField(item, "size");
+    const hasAnything = [prompt, negative, sampler, steps, cfg, clipSkip, seed, size].some(
+      (value) => value !== "" && value != null,
+    );
+    if (!hasAnything && !item?.checkpoint) {
       setCommunityNote("");
-      setCommunityErr(e.message || "Could not copy");
+      setCommunityErr("This image has no prompt or generation data to copy.");
+      return;
     }
+    if (prompt) setPrompt(prompt);
+    const next = {
+      ...genMetaRef.current,
+      sampler: sampler === "" ? "" : String(sampler),
+      cfg,
+      steps,
+      clipSkip,
+      seed,
+      size: size ? String(size) : "",
+      negativePrompt: negative,
+      source: "gallery",
+      sourceLabel: "Community image",
+      locked: true,
+    };
+    genMetaDirtyRef.current = true;
+    genMetaRef.current = next;
+    setGenMeta(next);
+    try {
+      await saveGenMeta(next, { source: "gallery", sourceLabel: "Community image" });
+    } catch {
+      /* the form already holds the image's values */
+    }
+
+    const ctx = {
+      modelId: item?.modelId ?? galleryContext?.modelId ?? null,
+      modelVersionId: item?.modelVersionId ?? galleryContext?.modelVersionId ?? null,
+      name: item?.modelName || galleryContext?.name || "",
+    };
+    let origin = mergeOrigin(originForContext(ctx), item?.fallbackCheckpoint || null);
+    let base = installedBaseForCommunityImage(item, installedAssets, origin);
+    const modelId = ctx.modelId || origin?.modelId;
+    if (!base && modelId && settings?.civitaiConfigured) {
+      try {
+        const data = await api(`/v1/civitai/models/${modelId}`);
+        const model = data?.model || data;
+        origin = mergeOrigin(
+          originFromCard(model, {
+            ...ctx,
+            modelVersionId: ctx.modelVersionId || model?.versionId || null,
+            name: ctx.name || model?.name || "",
+          }),
+          origin,
+        );
+        base = installedBaseForCommunityImage(item, installedAssets, origin);
+      } catch {
+        /* metadata lookup only — this button does not download */
+      }
+    }
+    let baseNote = "";
+    if (base?.path) {
+      if (activeBasePath && activeBasePath === base.path) {
+        baseNote = ` Base already ${base.name || base.path}.`;
+      } else {
+        const ok = await setInstalledAsBase(base);
+        baseNote = ok
+          ? ` Base set to ${base.name || base.path}.`
+          : " The checkpoint is installed, but the base was not changed.";
+      }
+    } else if (item?.checkpoint) {
+      baseNote = ` Checkpoint “${item.checkpoint}” is not installed.`;
+    }
+
+    let copied = false;
+    let clipErr = "";
+    try {
+      copied = await copyCommunityInput({ prompt, negativePrompt: negative });
+    } catch (e) {
+      clipErr = e.message || "Clipboard is not available.";
+    }
+    setCommunityErr(clipErr);
+    const clip = copied ? " Copied the prompt and negative prompt." : "";
+    setCommunityNote(`Filled the prompt, negative prompt, and generation meta.${baseNote}${clip}`);
   };
 
   const renderCommunityActions = (item) => {
@@ -5935,7 +6389,7 @@ export default function App() {
         <button
           type="button"
           className="ghost icon-btn"
-          title="Copy prompt and negative prompt"
+          title="Fill the prompt, negative prompt, and generation meta"
           aria-label="Copy input"
           onClick={(e) => {
             e.stopPropagation();
@@ -5988,6 +6442,28 @@ export default function App() {
           </a>
         ) : null}
       </>
+    );
+  };
+
+  const renderCommunityTile = (item) => {
+    const checkpointLine = communityCheckpointLine(item);
+    const preview = item.thumbnailUrl || item.url;
+    return (
+      <li key={item.id} className="agent-gallery-tile">
+        <button
+          type="button"
+          className="agent-gallery-shot"
+          onClick={() => setCommunityDetail(item)}
+        >
+          {preview ? <img src={preview} alt="" /> : <span className="agent-gallery-thumb-empty" />}
+        </button>
+        <div className="agent-gallery-tile-actions">{renderCommunityActions(item)}</div>
+        {checkpointLine ? (
+          <div className="agent-gallery-tile-foot">
+            <span className="agent-gallery-checkpoint">{checkpointLine}</span>
+          </div>
+        ) : null}
+      </li>
     );
   };
 
@@ -6189,7 +6665,11 @@ export default function App() {
       </button>
       {CIVITAI_SUBNAV.filter((s) => !s.end).map(({ id, label }) => {
         const count =
-          id === "favorites" ? favorites.length : id === "installed" ? installedAssets.length : 0;
+          id === "favorites"
+            ? favorites.length + imageFavorites.length
+            : id === "installed"
+              ? installedAssets.length
+              : 0;
         return (
           <button
             key={id}
@@ -6253,6 +6733,18 @@ export default function App() {
     ? ensureSelectedOption(routerModels, routerModel)
     : PLACEHOLDER_ROUTER_MODELS;
   const modelsMenuNote = modelsCatalogReady ? null : MODELS_API_HINT;
+  const favoriteTypeTabs = FAVORITE_TYPE_TABS.map((entry) => ({
+    ...entry,
+    items:
+      entry.id === "Images"
+        ? imageFavorites
+        : favorites.filter((item) => favoriteTypeId(item) === entry.id),
+  })).filter((entry) => entry.items.length > 0);
+  const activeFavoriteType = favoriteTypeTabs.some((entry) => entry.id === favoriteType)
+    ? favoriteType
+    : favoriteTypeTabs[0]?.id || "";
+  const activeFavoriteItems =
+    favoriteTypeTabs.find((entry) => entry.id === activeFavoriteType)?.items || [];
 
   const signedIn =
     mock || hasBrowserBearer() || !(authStatus?.authRequired || settings?.authRequired);
@@ -7362,7 +7854,7 @@ export default function App() {
                   galleryContext.modelVersionId
                     ? ` · version ${galleryContext.modelVersionId}`
                     : ""
-                }. Click an image to open it. Favorite, copy, download, install, and the Civitai link sit under the image.`
+                }. Click an image to open it. Copy fills the prompt, negative prompt, and generation meta. Favorite, copy, download, install, and the Civitai link sit under the image.`
               : "Open a model, or use a suggested or installed row, to list community images for that version."}
           </p>
           {communityBusy && <p className="hint">Loading community images…</p>}
@@ -7372,45 +7864,15 @@ export default function App() {
             <p className="hint">No community images for this version.</p>
           )}
           <ul className="agent-gallery-list">
-            {communityImages.map((item) => {
-              const checkpointLine = item.checkpoint
-                ? [
-                    item.checkpoint,
-                    item.checkpointDifferent ? "different" : "",
-                    item.checkpointInstalled ? "installed" : "not installed",
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")
-                : "";
-              const preview = item.thumbnailUrl || item.url;
-              return (
-                <li key={item.id} className="agent-gallery-tile">
-                  <button
-                    type="button"
-                    className="agent-gallery-shot"
-                    onClick={() => setCommunityDetail(item)}
-                  >
-                    {preview ? (
-                      <img src={preview} alt="" />
-                    ) : (
-                      <span className="agent-gallery-thumb-empty" />
-                    )}
-                  </button>
-                  <div className="agent-gallery-tile-actions">{renderCommunityActions(item)}</div>
-                  {checkpointLine ? (
-                    <div className="agent-gallery-tile-foot">
-                      <span className="agent-gallery-checkpoint">{checkpointLine}</span>
-                    </div>
-                  ) : null}
-                </li>
-              );
-            })}
+            {communityImages.map((item) => renderCommunityTile(item))}
           </ul>
           <div ref={communitySentinelRef} className="agent-gallery-sentinel" />
           {communityMore && <p className="hint">Loading more images…</p>}
         </section>
       )}
-      {tab === "agent" && agentFocus === "gallery" && communityDetail && (
+      {tab === "agent" &&
+        communityDetail &&
+        (agentFocus === "gallery" || agentFocus === "favorites") && (
         <div
           className="civitai-modal-backdrop"
           role="presentation"
@@ -7441,31 +7903,33 @@ export default function App() {
             </div>
             <div className="civitai-modal-body">
               <p>{communityDetail.prompt || "No prompt"}</p>
-              {communityDetail.negativePrompt ? (
-                <p className="hint">Negative: {communityDetail.negativePrompt}</p>
+              {communityDetail.negativePrompt || communityDetail.negative ? (
+                <p className="hint">
+                  Negative: {communityDetail.negativePrompt || communityDetail.negative}
+                </p>
               ) : null}
               <p className="hint">
                 {[
-                  communityDetail.sampler,
-                  communityDetail.steps != null ? `${communityDetail.steps} steps` : "",
-                  communityDetail.cfg != null ? `CFG ${communityDetail.cfg}` : "",
-                  communityDetail.seed != null ? `seed ${communityDetail.seed}` : "",
-                  communityDetail.clipSkip != null ? `clip skip ${communityDetail.clipSkip}` : "",
-                  communityDetail.size || "",
+                  communityDetail.sampler ?? communityDetail.meta?.sampler,
+                  (communityDetail.steps ?? communityDetail.meta?.steps) != null
+                    ? `${communityDetail.steps ?? communityDetail.meta?.steps} steps`
+                    : "",
+                  (communityDetail.cfg ?? communityDetail.meta?.cfg) != null
+                    ? `CFG ${communityDetail.cfg ?? communityDetail.meta?.cfg}`
+                    : "",
+                  (communityDetail.seed ?? communityDetail.meta?.seed) != null
+                    ? `seed ${communityDetail.seed ?? communityDetail.meta?.seed}`
+                    : "",
+                  (communityDetail.clipSkip ?? communityDetail.meta?.clipSkip) != null
+                    ? `clip skip ${communityDetail.clipSkip ?? communityDetail.meta?.clipSkip}`
+                    : "",
+                  communityDetail.size || communityDetail.meta?.size || "",
                 ]
                   .filter(Boolean)
                   .join(" · ")}
               </p>
-              {communityDetail.checkpoint ? (
-                <p className="agent-gallery-checkpoint">
-                  {[
-                    communityDetail.checkpoint,
-                    communityDetail.checkpointDifferent ? "different" : "",
-                    communityDetail.checkpointInstalled ? "installed" : "not installed",
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                </p>
+              {communityCheckpointLine(communityDetail) ? (
+                <p className="agent-gallery-checkpoint">{communityCheckpointLine(communityDetail)}</p>
               ) : null}
               {(communityDetail.resources || []).some(
                 (r) => !isCheckpointAsset({ modelType: r?.type, type: r?.type }),
@@ -7725,7 +8189,7 @@ export default function App() {
           )}
           {civitaiSubview === "favorites" && (
             <>
-              {favorites.length === 0 ? (
+              {favoriteTypeTabs.length === 0 ? (
                 <div className="gallery-empty">
                   <div className="gallery-empty-art">
                     <img
@@ -7737,14 +8201,53 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                <div className="lora-row">
-                  {favorites.map((item) =>
-                    renderLoraCard(item, {
-                      pinLabel: "Pin to session",
-                      onAfterPin: () => setTab("gallery"),
-                    }),
+                <>
+                  <div className="row favorite-type-nav" role="tablist" aria-label="Favorite types">
+                    {favoriteTypeTabs.map((entry) => (
+                      <button
+                        key={entry.id}
+                        type="button"
+                        role="tab"
+                        aria-selected={entry.id === activeFavoriteType}
+                        className={entry.id === activeFavoriteType ? "primary" : "ghost"}
+                        onClick={() => setFavoriteType(entry.id)}
+                      >
+                        {entry.label}
+                      </button>
+                    ))}
+                  </div>
+                  {activeFavoriteType === "Images" && communityErr ? (
+                    <p className="err">{communityErr}</p>
+                  ) : null}
+                  {activeFavoriteType === "Images" && communityNote ? (
+                    <p className="hint">{communityNote}</p>
+                  ) : null}
+                  {activeFavoriteItems.length === 0 ? (
+                    <div className="gallery-empty">
+                      <div className="gallery-empty-art">
+                        <img
+                          src="/empty-favorites.png"
+                          alt="No favorites yet."
+                          className="gallery-empty-img"
+                          draggable={false}
+                        />
+                      </div>
+                    </div>
+                  ) : activeFavoriteType === "Images" ? (
+                    <ul className="agent-gallery-list">
+                      {activeFavoriteItems.map((item) => renderCommunityTile(item))}
+                    </ul>
+                  ) : (
+                    <div className="lora-row">
+                      {activeFavoriteItems.map((item) =>
+                        renderLoraCard(item, {
+                          pinLabel: "Pin to session",
+                          onAfterPin: () => setTab("gallery"),
+                        }),
+                      )}
+                    </div>
                   )}
-                </div>
+                </>
               )}
             </>
           )}
@@ -9014,7 +9517,9 @@ export default function App() {
             <p>
               <strong>Search</strong> finds LoRAs, checkpoints, and the other types (LoCon, DoRA,
               LyCORIS, embeddings, VAE) — one type per search, needs a Civitai API key.{" "}
-              <strong>★ Favorite</strong> is a persistent library in this browser.{" "}
+              <strong>★ Favorite</strong> is a persistent library in this browser, with a tab per
+              type: LORA, LoCon, DoRA, LyCORIS, Checkpoint, TextualInversion, VAE, and Images for
+              community gallery favorites.{" "}
               <strong>Pin</strong> on a suggestion installs the LoRA if it is not on the worker,
               then pins it, and installs or selects the matching base. A plain download does not
               pin. Checkpoints are a base, not a session pin.
