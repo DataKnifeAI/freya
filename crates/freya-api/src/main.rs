@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/gallery/{id}/remix", post(routes::gallery_remix))
         .route("/v1/models", get(routes::models))
         .route("/v1/styles", get(routes::styles_list))
+        .route("/v1/route-defaults", get(routes::route_defaults))
         .route("/v1/civitai/search", get(routes::civitai_search))
         .route("/v1/civitai/lookup", get(routes::civitai_lookup))
         .route("/v1/civitai/models/{id}", get(routes::civitai_model))

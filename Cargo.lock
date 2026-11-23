@@ -593,6 +593,8 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "futures",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

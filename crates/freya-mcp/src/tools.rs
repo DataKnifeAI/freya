@@ -112,7 +112,7 @@ impl CivitaiAssetType {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CivitaiSearchArgs {
-    /// Search query.
+    /// Short subject: character or asset name, 2–6 words. Not the whole prompt, scene, clothing, or lighting.
     pub q: String,
     /// Required. Exactly one of `LORA`, `LoCon`, `DoRA`, `LyCORIS`, `Checkpoint`, `TextualInversion`, `VAE`.
     /// Embedding is `TextualInversion`. Model is not a Civitai type.
@@ -121,6 +121,22 @@ pub struct CivitaiSearchArgs {
     pub asset_type: CivitaiAssetType,
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleRefArgs {
+    /// Style pack id from list_styles.
+    #[serde(alias = "id")]
+    pub style_ref: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicArgs {
+    /// Optional focus for the ideas. Does not generate an image.
+    #[serde(default)]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -861,6 +877,89 @@ impl FreyaMcp {
         let v = self
             .api
             .put_json("/v1/studio", &body)
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(description = "List favorited asset cards. No secrets.")]
+    async fn list_favorites(&self) -> Result<CallToolResult, McpError> {
+        let studio = self.api.get_json("/v1/studio").await.map_err(map_err)?;
+        let favorites = studio
+            .get("favorites")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        json_ok(json!({ "favorites": favorites }))
+    }
+
+    #[tool(description = "List session LoRA pins. Checkpoints are not pins. No secrets.")]
+    async fn list_pins(&self) -> Result<CallToolResult, McpError> {
+        let studio = self.api.get_json("/v1/studio").await.map_err(map_err)?;
+        let pins = studio
+            .get("pinnedLoras")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        json_ok(json!({ "pinnedLoras": pins }))
+    }
+
+    #[tool(description = "List local LoRAs on the diffusion worker")]
+    async fn list_loras(&self) -> Result<CallToolResult, McpError> {
+        let v = self
+            .api
+            .get_json("/v1/worker/loras")
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Look up one style pack by id. Pass that styleRef to generate_image to use it. Does not generate."
+    )]
+    async fn apply_style(
+        &self,
+        Parameters(args): Parameters<StyleRefArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let styles = self.api.get_json("/v1/styles").await.map_err(map_err)?;
+        let id = args.style_ref.trim();
+        let found = styles
+            .get("items")
+            .and_then(|v| v.as_array())
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(|i| i.as_str()) == Some(id))
+            })
+            .cloned();
+        match found {
+            Some(pack) => json_ok(pack),
+            None => Err(map_err(format!("unknown styleRef: {id}"))),
+        }
+    }
+
+    #[tool(description = "Propose alternative scene ideas. Does not generate an image.")]
+    async fn suggest_ideas(
+        &self,
+        Parameters(args): Parameters<TopicArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let topic = args.topic.unwrap_or_else(|| "a memorable scene".into());
+        let v = self
+            .api
+            .post_json(
+                "/v1/assist",
+                &json!({ "mode": "suggest", "message": topic }),
+            )
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Auto sentinels and resolved agent/router/image/video defaults. No API keys."
+    )]
+    async fn get_route_defaults(&self) -> Result<CallToolResult, McpError> {
+        let v = self
+            .api
+            .get_json("/v1/route-defaults")
             .await
             .map_err(map_err)?;
         json_ok(v)

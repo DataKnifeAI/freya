@@ -1,11 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { api, isMockMode } from "./api.js";
-import HeroCanvas from "./HeroCanvas.jsx";
-import {
-  BEGINNER_CIVITAI_QUERY,
-  BEGINNER_EXAMPLE,
-  demoCivitaiQuery,
-} from "./mockApi.js";
+import { api, AUTH_REQUIRED_EVENT, hasBrowserBearer, isMockMode, postChat } from "./api.js";
+import { BEGINNER_EXAMPLE, demoCivitaiQuery, generateOfferForTurn } from "./mockApi.js";
 
 const AUTOMATION_MODES = ["plan", "auto", "yolo"];
 const AUTOMATION_LABELS = { plan: "Plan", auto: "Auto", yolo: "YOLO" };
@@ -840,6 +835,26 @@ const IconSpinner = () => (
     </Svg>
   </span>
 );
+/** Follows the pointer while a chat turn is in flight. Does not capture clicks. */
+function ChatPointer() {
+  const [pos, setPos] = useState({ x: -40, y: -40 });
+  useEffect(() => {
+    const onMove = (e) => setPos({ x: e.clientX, y: e.clientY });
+    window.addEventListener("pointermove", onMove, { passive: true });
+    document.documentElement.classList.add("chat-busy");
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      document.documentElement.classList.remove("chat-busy");
+    };
+  }, []);
+  return (
+    <span
+      className="chat-pointer"
+      style={{ left: pos.x, top: pos.y }}
+      aria-hidden="true"
+    />
+  );
+}
 const IconBulb = () => (
   <Svg>
     <path d="M9 18h6M10 21h4" />
@@ -1491,6 +1506,8 @@ export default function App() {
   const [tab, setTab] = useState("gallery");
   const [prompt, setPrompt] = useState(() => bootSession.prompt || "");
   const [busy, setBusy] = useState(false);
+  /** Live transcript line while a chat turn is in flight. */
+  const [chatStatus, setChatStatus] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState(() => bootSession.result ?? null);
   const [batchResults, setBatchResults] = useState(() =>
@@ -2917,6 +2934,7 @@ export default function App() {
     const sessionId = activeIdRef.current;
     const userText = text || session.goal || examplePrompt;
     setBusy(true);
+    setChatStatus("Thinking");
     setError("");
     setSavedMsg("");
     try {
@@ -2926,9 +2944,8 @@ export default function App() {
         setSession((prev) => ({ ...prev, goal: prev.goal || userText }));
         setPrompt("");
       }
-      const data = await api("/v1/chat", {
-        method: "POST",
-        body: JSON.stringify(chatBody(userText, extra)),
+      const data = await postChat(chatBody(userText, extra), (status) => {
+        if (activeIdRef.current === sessionId) setChatStatus(status);
       });
       if (activeIdRef.current !== sessionId) return;
       applyChatResponse(data, userText);
@@ -2938,6 +2955,7 @@ export default function App() {
     } catch (e) {
       if (activeIdRef.current === sessionId) setError(e.message);
     } finally {
+      setChatStatus("");
       if (activeIdRef.current === sessionId) setBusy(false);
     }
   };
@@ -4229,6 +4247,7 @@ export default function App() {
     ideas.length,
     pendingPlan,
     pendingQuestion,
+    chatStatus,
   ]);
 
   const hasTimeline =
@@ -4465,6 +4484,109 @@ export default function App() {
         </div>
       )}
 
+      {(needsSignIn || needsOpenRouter || authCta) && !mock && (
+        <div className={`auth-banner${needsSignIn ? " auth-banner-lock" : ""}`} role="status">
+          <span className="auth-banner-mark">{needsSignIn ? "Sign in" : "Setup"}</span>
+          <span className="auth-banner-text">
+            {needsSignIn
+              ? authStatus?.note || "Sign in required."
+              : needsOpenRouter
+                ? "OpenRouter key required — add it under Settings."
+                : authCta}
+          </span>
+          <div className="auth-banner-actions">
+            {needsSignIn && (
+              <button
+                type="button"
+                className="ghost auth-banner-btn"
+                onClick={() => setShowLogin(true)}
+              >
+                Sign in
+              </button>
+            )}
+            {needsOpenRouter && (
+              <button
+                type="button"
+                className="ghost auth-banner-btn"
+                onClick={() => setTab("settings")}
+              >
+                Open Settings
+              </button>
+            )}
+            {signedIn && (
+              <button type="button" className="ghost auth-banner-btn" onClick={signOut}>
+                Sign out
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {showLogin && !mock && (
+        <div className="login-overlay" role="dialog" aria-modal="true" aria-label="Studio sign in">
+          <form className="login-card" onSubmit={submitLogin}>
+            <h2 className="login-title">Sign in</h2>
+            <label className="login-field">
+              Username
+              <input
+                value={loginUser}
+                onChange={(e) => setLoginUser(e.target.value)}
+                autoComplete="username"
+                disabled={loginBusy}
+              />
+            </label>
+            <label className="login-field">
+              Password
+              <input
+                type="password"
+                value={loginPass}
+                onChange={(e) => setLoginPass(e.target.value)}
+                autoComplete="current-password"
+                disabled={loginBusy}
+              />
+            </label>
+            {loginError && <p className="err">{loginError}</p>}
+            <div className="login-actions">
+              <button type="submit" className="primary" disabled={loginBusy || !loginPass.trim()}>
+                {loginBusy ? "Signing in…" : "Sign in"}
+              </button>
+              <button
+                type="button"
+                className="ghost"
+                disabled={loginBusy}
+                onClick={() => setShowLogin(false)}
+              >
+                Cancel
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {needsGuidelinesAck && !showLogin && (
+        <div
+          className="login-overlay guidelines-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="User guidelines"
+        >
+          <div className="login-card guidelines-card">
+            <h2 className="login-title">Guidelines</h2>
+            <p className="guidelines-lead">
+              Before you continue, acknowledge that you understand how Freya works and who is
+              responsible for what you generate.
+            </p>
+            <GuidelinesBody compact />
+            <div className="login-actions">
+              <button type="button" className="primary" onClick={acceptGuidelines}>
+                Accept &amp; continue
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {chatStatus && <ChatPointer />}
       <header className="topbar">
         <div className="brand-lockup">
           <span className="brand-mark" aria-hidden="true">
@@ -4759,15 +4881,14 @@ export default function App() {
               </article>
             ))}
 
-            {session.sessionNote && (
-              <article className="t-entry t-note">
-                <span className="t-kind">Session note</span>
-                <p>{session.sessionNote}</p>
-              </article>
+            {chatStatus && (
+              <p className="t-live-status" role="status">
+                {chatStatus}
+              </p>
             )}
 
-            {pendingPlan && pendingPlan.status === "plan" && (
-              <aside className="pending-plan" aria-label="Session plan">
+            {pendingPlan && (pendingPlan.status === "plan" || pendingPlan.actions?.length) && (
+              <aside className="pending-plan" aria-label="Proposed tools">
                 <div className="pending-plan-head">
                   <h3>Session plan</h3>
                   <button type="button" className="ghost" onClick={dismissPending}>
