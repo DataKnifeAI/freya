@@ -1615,9 +1615,51 @@ function lookupSameAsset(local, search) {
   const lv = cardVersionId(local);
   const sv = cardVersionId(search);
   if (lv && sv) return lv === sv;
-  const localKeys = [assetLabelKey(local.name), assetLabelKey(local.path)].filter(Boolean);
+  const localKeys = [
+    assetLabelKey(local.name),
+    assetLabelKey(local.path),
+    assetLabelKey(local.fileName),
+  ].filter(Boolean);
   const searchKeys = [assetLabelKey(search.name), assetLabelKey(search.fileName)].filter(Boolean);
   return localKeys.some((lk) => searchKeys.includes(lk));
+}
+
+/** Query text that is a Civitai version id (the whole query, or a 4+ digit token). */
+function queryHitsVersion(query, item) {
+  const vid = cardVersionId(item);
+  if (!vid || !query) return false;
+  const q = String(query).trim();
+  if (q === String(vid)) return true;
+  return q.split(/[^0-9]+/).some((tok) => tok.length >= 4 && Number(tok) === vid);
+}
+
+/** Search hit from this chat lookup. A worker-library row is not a search hit unless stamped. */
+function isLookupSearchCard(card) {
+  if (!card) return false;
+  if (card.fromChatSearch) return true;
+  if (card.path) return false;
+  return (
+    resolveCivitaiModelId(card) != null ||
+    cardVersionId(card) != null ||
+    Boolean(card.downloadUrl || card.civitaiUrl || card.thumbnailUrl || card.imageUrls?.length)
+  );
+}
+
+/** Installed file matches the chat lookup by name, filename, version id, or a search hit. */
+function installedMatchesLookup(local, query, searchHits) {
+  if (!local) return false;
+  const q = String(query || "").trim();
+  if (q) {
+    if (queryHitsLabel(q, local.name)) return true;
+    if (queryHitsLabel(q, local.path)) return true;
+    if (queryHitsLabel(q, local.fileName)) return true;
+    if (queryHitsVersion(q, local)) return true;
+  }
+  return (searchHits || []).some(
+    (c) =>
+      lookupSameAsset(local, c) ||
+      Boolean(local.path && c?.path && local.path === c.path),
+  );
 }
 
 function findInstalledMatch(item, installed) {
@@ -1646,6 +1688,7 @@ function mergeInstalledCard(card, live) {
     triggerWord: live?.triggerWord || card?.triggerWord,
     civitaiUrl: live?.civitaiUrl || card?.civitaiUrl,
     downloadUrl: live?.downloadUrl || card?.downloadUrl,
+    fromChatSearch: Boolean(card?.fromChatSearch || live?.fromChatSearch),
     installed: true,
   };
 }
@@ -1657,7 +1700,11 @@ function lookupCardKey(item) {
   return `n:${assetLabelKey(item?.name)}:${item?.id ?? ""}`;
 }
 
-/** Installed name/version matches first. Other search hits stay in `fresh`. */
+/**
+ * Installed rows: only worker files that match this chat lookup
+ * (name, filename, or version id — or the same asset as a search hit).
+ * Other search hits stay in `fresh`. A full library dump is not listed.
+ */
 function presentLookup(cards, installed, query) {
   const existing = [];
   const fresh = [];
@@ -1669,36 +1716,44 @@ function presentLookup(cards, installed, query) {
     existing.push(item);
   };
   const list = Array.isArray(cards) ? cards.filter(Boolean) : [];
-  if (query && installed?.length) {
-    for (const local of installed) {
-      if (queryHitsLabel(query, local?.name) || queryHitsLabel(query, local?.path)) {
-        const hit = list.find((c) => lookupSameAsset(local, c));
-        pushExisting(mergeInstalledCard(hit || local, local));
-      }
+  const searchHits = list.filter(isLookupSearchCard);
+  const q = String(query || "").trim();
+  const candidates = [];
+  const seenPath = new Set();
+  const pushCandidate = (asset) => {
+    if (!asset) return;
+    if (asset.path) {
+      if (seenPath.has(asset.path)) return;
+      seenPath.add(asset.path);
     }
-  }
+    candidates.push(asset);
+  };
+  for (const local of installed || []) pushCandidate(local);
   for (const card of list) {
-    const live = findInstalledMatch(card, installed);
-    if (live) {
-      pushExisting(mergeInstalledCard(card, live));
+    if (card.path) pushCandidate(card);
+  }
+  for (const local of candidates) {
+    const searchedFile = Boolean(local.fromChatSearch && local.path);
+    if (!searchedFile && !installedMatchesLookup(local, q, searchHits)) continue;
+    if (
+      existing.some(
+        (e) => lookupSameAsset(e, local) || (local.path && e.path === local.path),
+      )
+    ) {
       continue;
     }
-    if (card.installed === true || card.path) {
-      pushExisting({ ...card, installed: true });
-      continue;
-    }
+    const hit = searchHits.find((c) => c !== local && lookupSameAsset(local, c));
+    pushExisting(mergeInstalledCard(hit || local, local));
+  }
+  for (const card of searchHits) {
+    if (card.path && existing.some((e) => e.path === card.path)) continue;
     if (existing.some((e) => lookupSameAsset(e, card))) continue;
     const key = lookupCardKey(card);
-    if (seen.has(key)) continue;
+    if (!key || seen.has(key)) continue;
     seen.add(key);
     fresh.push({ ...card, installed: false });
   }
   return { existing, fresh };
-}
-
-function lookupQueryFor(cards, query) {
-  const searchish = (cards || []).some((c) => c && !c.path && c.installed !== true);
-  return searchish ? query || "" : "";
 }
 
 /** Prefer the search payload (already installed-first). Otherwise list installed/local. */
@@ -1707,7 +1762,11 @@ function cardsFromChatPayload(data) {
   const searches = actions.filter(
     (a) => a?.type === "search_civitai" && a.status === "executed" && Array.isArray(a.result?.loras),
   );
-  if (searches.length) return searches.flatMap((a) => a.result.loras);
+  if (searches.length) {
+    return searches.flatMap((a) =>
+      a.result.loras.filter(Boolean).map((c) => ({ ...c, fromChatSearch: true })),
+    );
+  }
   const listed = [];
   for (const a of actions) {
     if (a?.status !== "executed" || !a.result) continue;
@@ -3411,16 +3470,15 @@ export default function App() {
     const ideasNext = Array.isArray(data.ideas) ? data.ideas : [];
     const query = data.civitaiQuery || "";
     const sourceCards = cardsFromChatPayload(data);
-    const presented = presentLookup(
-      sourceCards,
-      installedAssets,
-      lookupQueryFor(sourceCards, query),
-    );
+    const presented = presentLookup(sourceCards, installedAssets, query || "");
     const lorasNext = [...presented.existing, ...presented.fresh];
 
     if (ideasNext.length) setIdeas(ideasNext);
     if (lorasNext.length) {
-      setSuggestedLoras(lorasNext);
+      const fromSearch = sourceCards.some((c) => c.fromChatSearch);
+      // Search payload keeps version ids so installed rows can match them.
+      // A worker listing is stored only after that lookup filter.
+      setSuggestedLoras(fromSearch ? sourceCards : lorasNext);
       // Search results are browsed on Styles. A turn that also made images stays put.
       if (!artifacts.length) setTab("styles");
     }
@@ -5068,21 +5126,25 @@ export default function App() {
     );
   };
 
-  const renderAssetLookup = (cards, query) => {
-    const { existing, fresh } = presentLookup(cards, installedAssets, query || "");
+  const renderAssetLookup = ({ existing, fresh }) => {
     if (!existing.length && !fresh.length) return null;
-    const section = (label, items) => (
-      <div className="asset-match-group" role="rowgroup" aria-label={label}>
-        <div className="asset-match-label">{label}</div>
-        {items.map((item) => renderLoraCard(item, { layout: "row" }))}
-      </div>
-    );
+    const rows = (items) => items.map((item) => renderLoraCard(item, { layout: "row" }));
     return (
-      <div className="asset-match-scroll">
-        <div className="asset-match-table" role="table" aria-label="Civitai matches">
-          {existing.length > 0 && section("Installed", existing)}
-          {fresh.length > 0 && section("Other Civitai matches", fresh)}
-        </div>
+      <div className="asset-match-table" role="table" aria-label="Civitai matches">
+        {existing.length > 0 && (
+          <div className="asset-match-group" role="rowgroup" aria-label="Installed">
+            <div className="asset-match-label">Installed</div>
+            {rows(existing)}
+          </div>
+        )}
+        {fresh.length > 0 && (
+          <div className="asset-match-group" role="rowgroup" aria-label="Other Civitai matches">
+            <div className="asset-match-label">Other Civitai matches</div>
+            <div className="asset-match-scroll">
+              <div className="asset-match-group">{rows(fresh)}</div>
+            </div>
+          </div>
+        )}
       </div>
     );
   };
@@ -5107,8 +5169,11 @@ export default function App() {
           : []) || [];
   const detailRelated = civitaiDetail?.related || [];
 
+  const chatLookup = presentLookup(suggestedLoras, installedAssets, civitaiQuery || "");
+  const chatLookupCount = chatLookup.existing.length + chatLookup.fresh.length;
+
   const showAssistPanel =
-    ideas.length > 0 || suggestedLoras.length > 0 || suggestNote || civitaiQuery;
+    ideas.length > 0 || chatLookupCount > 0 || suggestNote || civitaiQuery;
 
   const ModeIcon = MODE_ICONS[automationMode] || IconSliders;
   const modeOptions = AUTOMATION_MODES.map((id) => {
@@ -5779,14 +5844,13 @@ export default function App() {
                     ))}
                   </div>
                 )}
-                {suggestedLoras.length > 0 && (
+                {chatLookupCount > 0 && (
                   <p className="hint">
-                    {suggestedLoras.length} match{suggestedLoras.length === 1 ? "" : "es"} on{" "}
+                    {chatLookupCount} match{chatLookupCount === 1 ? "" : "es"} on{" "}
                     <button type="button" className="linkish" onClick={() => setTab("styles")}>
                       Styles
                     </button>
-                    . Installed ones are listed first. Nothing is pinned or downloaded until you
-                    choose.
+                    . Installed rows match this lookup by name, filename, or version id.
                   </p>
                 )}
               </aside>
@@ -6301,7 +6365,7 @@ export default function App() {
 
       {tab === "styles" && (
         <section className="panel style-rail">
-          {suggestedLoras.length > 0 && (
+          {chatLookupCount > 0 && (
             <div className="style-matches">
               <div className="style-matches-head">
                 <div>
@@ -6319,10 +6383,10 @@ export default function App() {
                 </button>
               </div>
               <p className="hint">
-                Installed matches first, then other Civitai hits. One asset per row. Pin or install
-                only if you want to — nothing is downloaded automatically.
+                Installed rows match this lookup by name, filename, or version id. Other Civitai
+                hits stay in the list below. Nothing is downloaded until you choose.
               </p>
-              {renderAssetLookup(suggestedLoras, lookupQueryFor(suggestedLoras, civitaiQuery))}
+              {renderAssetLookup(chatLookup)}
             </div>
           )}
           {styles.map((s) => (
