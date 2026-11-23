@@ -386,6 +386,167 @@ export async function mockApi(path, opts = {}) {
     return { items: state.styles };
   }
 
+  if (p === "/v1/models" && method === "GET") {
+    const align = String(state.settings?.alignment?.modelAlignment || "balanced").toLowerCase();
+    const zdr = Boolean(state.settings?.privacy?.zeroDataRetention);
+    const allowNsfw = Boolean(state.settings?.alignment?.allowNsfwLocal);
+    const chatAll = [
+      {
+        id: "anthropic/claude-sonnet-5.5",
+        name: "Anthropic: Claude Sonnet 5.5",
+        backend: "openrouter",
+        modality: "chat",
+        moderated: true,
+        major: true,
+      },
+      {
+        id: "google/gemini-4-neon",
+        name: "Google: Gemini 4 Neon",
+        backend: "openrouter",
+        modality: "chat",
+        moderated: true,
+        major: true,
+      },
+      {
+        id: "openai/gpt-4.1-mini",
+        name: "OpenAI: GPT-4.1 Mini",
+        backend: "openrouter",
+        modality: "chat",
+        moderated: true,
+        major: true,
+      },
+      {
+        id: "deepseek/deepseek-v4.1-flash-1017",
+        name: "DeepSeek: DeepSeek V4.1 Flash",
+        backend: "openrouter",
+        modality: "chat",
+        moderated: false,
+        major: false,
+      },
+      {
+        id: "cognitivecomputations/dolphin-llama-3-70b",
+        name: "Dolphin Llama 3 70B (uncensored)",
+        backend: "openrouter",
+        modality: "chat",
+        moderated: false,
+        major: false,
+        uncensored: true,
+      },
+    ];
+    const available = [
+      ...new Set(
+        chatAll
+          .map((m) => String(m.id || "").split("/")[0]?.toLowerCase())
+          .filter(Boolean),
+      ),
+    ].sort();
+    const cp = state.settings?.privacy?.chatProviders || {};
+    const excluded = Array.isArray(cp.excluded)
+      ? cp.excluded.map((s) => String(s).toLowerCase())
+      : [];
+    const legacyOnly = Array.isArray(cp.legacyOnly)
+      ? cp.legacyOnly.map((s) => String(s).toLowerCase())
+      : null;
+    const vendorOk = (id) => {
+      const v = String(id || "").split("/")[0]?.toLowerCase() || "";
+      if (legacyOnly && legacyOnly.length) return legacyOnly.includes(v);
+      return !excluded.includes(v);
+    };
+    let chat = chatAll.filter((m) => {
+      if (!vendorOk(m.id)) return false;
+      if (align === "safety") return Boolean(m.major || m.moderated) && !m.uncensored;
+      if (align === "uncensored") return Boolean(m.uncensored) || !m.moderated;
+      return true;
+    });
+    // ZDR catalog shrink — mock stands in for OpenRouter `?zdr=true`.
+    if (zdr) {
+      chat = chat.filter((m) => m.major || m.id.startsWith("anthropic/"));
+    }
+    let openrouter = [
+      {
+        id: "black-forest-labs/flux.2-klein-4b",
+        name: "FLUX.2 Klein 4B",
+        backend: "openrouter",
+        modality: "image",
+        zdr: false,
+      },
+      {
+        id: "google/gemini-2.5-flash-image",
+        name: "Google: Gemini 2.5 Flash Image",
+        backend: "openrouter",
+        modality: "image",
+        zdr: true,
+      },
+      {
+        id: "openai/gpt-image-1-mini",
+        name: "OpenAI: GPT Image 1 Mini",
+        backend: "openrouter",
+        modality: "image",
+        zdr: false,
+      },
+      {
+        id: "bytedance-seed/seedream-5-5",
+        name: "ByteDance Seed: Seedream 5.5",
+        backend: "openrouter",
+        modality: "image",
+        zdr: false,
+      },
+    ];
+    let video = [
+      {
+        id: "google/veo-3.1",
+        name: "Google: Veo 3.1",
+        backend: "openrouter",
+        modality: "video",
+        zdr: true,
+        supportedDurations: [4, 6, 8],
+        supportedResolutions: ["720p", "1080p"],
+        supportedAspectRatios: ["16:9", "9:16"],
+      },
+      {
+        id: "bytedance/seedance-2.5-flash",
+        name: "ByteDance: Seedance 2.5 Flash",
+        backend: "openrouter",
+        modality: "video",
+        zdr: false,
+        supportedDurations: [4, 5],
+        supportedResolutions: ["720p"],
+        supportedAspectRatios: ["16:9", "9:16"],
+      },
+    ];
+    if (zdr) {
+      openrouter = openrouter.filter((m) => m.zdr);
+      video = video.filter((m) => m.zdr);
+    }
+    // Same rows the worker list endpoints return — not a frozen demo catalog.
+    const installedLocal = (state.localAssets || []).map((a) => ({
+      id: a.id,
+      name: a.name,
+      backend: "local",
+      kind: a.kind || "checkpoint",
+      path: a.path,
+      baseModel: a.baseModel || null,
+      modelType: a.modelType || null,
+    }));
+    const local = allowNsfw
+      ? installedLocal
+      : installedLocal.filter(
+          (m) => !/nsfw|xxx|porn|explicit/i.test(`${m.id} ${m.name} ${m.path}`),
+        );
+    return {
+      openrouter: openrouter.map(({ zdr: _z, ...row }) => row),
+      chat: chat.map(({ moderated: _m, major: _j, uncensored: _u, ...row }) => row),
+      router: chat.map(({ moderated: _m, major: _j, uncensored: _u, ...row }) => row),
+      video: video.map(({ zdr: _z, ...row }) => row),
+      local,
+      chatProviders: {
+        available,
+        excluded,
+        legacyOnly,
+      },
+    };
+  }
+
   if (p === "/v1/settings" && method === "GET") {
     return { ...state.settings };
   }
@@ -399,7 +560,276 @@ export async function mockApi(path, opts = {}) {
     }
     if (body.chatModel) state.settings.chatModel = body.chatModel;
     if (body.imageModel) state.settings.imageModel = body.imageModel;
-    return { ...state.settings };
+    if (body.routerModel) state.settings.routerModel = body.routerModel;
+    if (body.privacy && typeof body.privacy === "object") {
+      const next = {
+        ...state.settings.privacy,
+        ...body.privacy,
+      };
+      if (body.privacy.chatProviders && typeof body.privacy.chatProviders === "object") {
+        const cp = body.privacy.chatProviders;
+        const excluded = Array.isArray(cp.excluded)
+          ? [...new Set(cp.excluded.map((s) => String(s || "").trim().toLowerCase()).filter(Boolean))].sort()
+          : [];
+        const legacyOnly =
+          Array.isArray(cp.legacyOnly) && cp.legacyOnly.length
+            ? [...new Set(cp.legacyOnly.map((s) => String(s || "").trim().toLowerCase()).filter(Boolean))].sort()
+            : null;
+        next.chatProviders = { excluded, legacyOnly };
+        delete next.providerOnly;
+        delete next.providerIgnore;
+      }
+      state.settings.privacy = next;
+    }
+    if (body.autoFallbacks && typeof body.autoFallbacks === "object") {
+      state.settings.autoFallbacks = {
+        ...state.settings.autoFallbacks,
+        ...body.autoFallbacks,
+      };
+    }
+    if (body.alignment && typeof body.alignment === "object") {
+      state.settings.alignment = {
+        ...state.settings.alignment,
+        ...body.alignment,
+      };
+    }
+    if (body.instructionOverrides && typeof body.instructionOverrides === "object") {
+      if (!state.instructionOverrides) state.instructionOverrides = {};
+      for (const [id, text] of Object.entries(body.instructionOverrides)) {
+        if (text == null || !String(text).trim()) {
+          delete state.instructionOverrides[id];
+        } else {
+          state.instructionOverrides[id] = String(text);
+        }
+      }
+    }
+    const instructions = (state.settings.instructions || []).map((row) => {
+      const ov = state.instructionOverrides?.[row.id];
+      const overridden = Boolean(ov && String(ov).trim());
+      return {
+        ...row,
+        text: overridden ? ov : row.defaultText,
+        overridden,
+      };
+    });
+    state.settings.instructions = instructions;
+    return { ...state.settings, instructions, persisted: true };
+  }
+
+  if (p === "/v1/auth/status" && method === "GET") {
+    return {
+      authRequired: Boolean(state.settings.authRequired),
+      adminLoginConfigured: Boolean(state.settings.adminLoginConfigured),
+      apiTokenConfigured: Boolean(state.settings.apiTokenConfigured),
+      openRouterConfigured: Boolean(state.settings.openRouterConfigured),
+      adminUsername: state.mockAdminUser || "admin",
+      note: "Mock mode — sign-in optional.",
+    };
+  }
+
+  if (p === "/v1/auth/login" && method === "POST") {
+    const body = parseBody(opts);
+    if (
+      body.username !== state.mockAdminUser ||
+      body.password !== state.mockAdminPass
+    ) {
+      const err = new Error("Invalid username or password");
+      err.status = 401;
+      throw err;
+    }
+    const bytes = new Uint8Array(32);
+    if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+      crypto.getRandomValues(bytes);
+    } else {
+      for (let i = 0; i < bytes.length; i++) bytes[i] = (Math.random() * 256) | 0;
+    }
+    const token = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    state.mockApiToken = token;
+    state.settings.apiTokenConfigured = true;
+    return {
+      token,
+      username: state.mockAdminUser,
+      note: "Signed in.",
+    };
+  }
+
+  if (p === "/v1/auth/token" && method === "POST") {
+    const rotated = Boolean(state.mockApiToken);
+    const bytes = new Uint8Array(32);
+    if (typeof crypto !== "undefined" && crypto.getRandomValues) {
+      crypto.getRandomValues(bytes);
+    } else {
+      for (let i = 0; i < bytes.length; i++) bytes[i] = (Math.random() * 256) | 0;
+    }
+    const token = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+    state.mockApiToken = token;
+    state.settings.apiTokenConfigured = true;
+    return {
+      token,
+      rotated,
+      persisted: true,
+      secretSynced: false,
+      note: "Machine API token created.",
+      syncCommands: null,
+    };
+  }
+
+  if (p === "/v1/worker/stats" && method === "GET") {
+    const configured = Boolean(state.settings.diffusionWorkerUrl);
+    const enabled = state.settings.workerEnabled !== false;
+    return {
+      ok: true,
+      enabled,
+      configured,
+      url: state.settings.diffusionWorkerUrl || null,
+      reachable: configured && enabled,
+      runtime: state.workerRuntime,
+      vram: null,
+      host: null,
+      loras: configured ? 2 : null,
+      checkpoints: configured ? 1 : null,
+      uptimeSec: configured ? 42 : null,
+      modelLoaded: configured
+        ? {
+            model: "checkpoints/mock-sdxl.safetensors",
+            baseModel: "SDXL 1.0",
+            loadedInVram: false,
+            engine: "diffusers",
+          }
+        : null,
+      modelsDir: configured ? "/models" : null,
+      modelsDirHost: configured ? "/mnt/game2/freya/models" : null,
+      engine: configured
+        ? {
+            ok: true,
+            engine: "diffusers",
+            cuda: true,
+            loadedInVram: false,
+            keepLoaded: false,
+          }
+        : null,
+      vramBehavior: configured
+        ? "on-demand load during generate; unload after unless FREYA_ENGINE_KEEP_LOADED=1"
+        : null,
+      layout: {
+        loras: "loras/*.safetensors",
+        checkpoints: "checkpoints/*.safetensors",
+        activeBase: "active-base.json",
+      },
+      storage: {
+        gallery: {
+          path: "/data/gallery",
+          usedBytes: 1.2 * 1024 ** 3,
+          freeBytes: 18.8 * 1024 ** 3,
+          totalBytes: 20 * 1024 ** 3,
+          usedPercent: 6,
+        },
+        models: configured
+          ? {
+              path: "/mnt/game2/freya/models",
+              usedBytes: 48 * 1024 ** 3,
+              freeBytes: 452 * 1024 ** 3,
+              totalBytes: 500 * 1024 ** 3,
+              usedPercent: 10,
+            }
+          : null,
+      },
+      worker: {},
+    };
+  }
+
+  if (p === "/v1/worker/checkpoints" && method === "GET") {
+    // Only return what was actually installed in this mock session — no seed/demo cards.
+    return {
+      data: (state.localAssets || []).filter((a) => a.kind === "checkpoint"),
+    };
+  }
+
+  if (p === "/v1/worker/loras" && method === "GET") {
+    return { data: (state.localAssets || []).filter((a) => a.kind === "lora") };
+  }
+
+  if (p === "/v1/worker/embeddings" && method === "GET") {
+    return {
+      data: (state.localAssets || []).filter(
+        (a) => a.kind === "embedding" || a.kind === "textualinversion",
+      ),
+    };
+  }
+
+  if (p === "/v1/worker/vae" && method === "GET") {
+    return { data: (state.localAssets || []).filter((a) => a.kind === "vae") };
+  }
+
+  if (p === "/v1/worker/assets" && method === "DELETE") {
+    const body = parseBody(opts);
+    state.localAssets = (state.localAssets || []).filter((a) => a.path !== body.path);
+    if (state.activeBaseModel === body.path) {
+      state.activeBaseModel = "";
+      state.activeBaseFamily = "";
+    }
+    return { ok: true, path: body.path };
+  }
+
+  if (p === "/v1/worker/base-model" && method === "GET") {
+    return {
+      ok: true,
+      model: state.activeBaseModel || "",
+      baseModel: state.activeBaseFamily || null,
+      modelsDir: "/mnt/game2/freya/models",
+    };
+  }
+
+  if (p === "/v1/worker/base-model" && method === "PUT") {
+    const body = parseBody(opts);
+    state.activeBaseModel = body.model || state.activeBaseModel || "checkpoints/mock-sdxl.safetensors";
+    state.activeBaseFamily = body.baseModel || state.activeBaseFamily || "SDXL 1.0";
+    return {
+      ok: true,
+      model: state.activeBaseModel,
+      baseModel: state.activeBaseFamily,
+      loadedInVram: false,
+      engine: "stub",
+    };
+  }
+
+  if (p === "/v1/base-models" && method === "GET") {
+    return {
+      items: [
+        {
+          baseModel: "SDXL 1.0",
+          family: "SDXL",
+          suggestedModel: "stabilityai/stable-diffusion-xl-base-1.0",
+          note: "mock",
+          localOnly: true,
+        },
+        {
+          baseModel: "Pony",
+          family: "Pony",
+          suggestedModel: "checkpoints/pony-diffusion-v6-xl.safetensors",
+          note: "mock",
+          localOnly: true,
+        },
+      ],
+      note: "mock catalog",
+    };
+  }
+
+  if (p === "/v1/worker/start" && method === "POST") {
+    state.workerRuntime = { kind: "mock", name: "mock", running: true, detail: "mock start" };
+    return { ok: true, runtime: state.workerRuntime };
+  }
+  if (p === "/v1/worker/stop" && method === "POST") {
+    state.workerRuntime = { kind: "mock", name: "mock", running: false, detail: "mock stop" };
+    return { ok: true, runtime: state.workerRuntime };
+  }
+  if (p === "/v1/worker/enable" && method === "POST") {
+    state.settings.workerEnabled = true;
+    return { ok: true, enabled: true };
+  }
+  if (p === "/v1/worker/disable" && method === "POST") {
+    state.settings.workerEnabled = false;
+    return { ok: true, enabled: false };
   }
 
   if (p === "/v1/gallery" && method === "GET") {
@@ -589,7 +1019,123 @@ export async function mockApi(path, opts = {}) {
       );
     }
     const body = parseBody(opts);
-    return { ok: true, destPath: body.destPath, name: body.name };
+    const dest = body.destPath || "";
+    const activeDup = (state.installJobs || []).find(
+      (j) =>
+        j.destPath === dest && ["queued", "downloading"].includes(j.status),
+    );
+    if (activeDup) {
+      throw new Error(
+        `already downloading to ${dest} — wait or cancel the existing job`,
+      );
+    }
+    if ((state.localAssets || []).some((a) => a.path === dest)) {
+      throw new Error(`already installed at ${dest} — delete it first`);
+    }
+    const jobId = `mock-${Date.now()}`;
+    const job = {
+      id: jobId,
+      status: "queued",
+      destPath: body.destPath,
+      name: body.name,
+      baseModel: body.baseModel,
+      modelType: body.modelType,
+      bytesDone: 0,
+      bytesTotal: 1024 * 1024,
+      percent: 0,
+      createdAt: Math.floor(Date.now() / 1000),
+      updatedAt: Math.floor(Date.now() / 1000),
+    };
+    state.installJobs = [job, ...(state.installJobs || [])].slice(0, 40);
+    setTimeout(() => {
+      const j = (state.installJobs || []).find((x) => x.id === jobId);
+      if (!j || j.status === "cancelled") return;
+      j.status = "downloading";
+      j.bytesDone = 512 * 1024;
+      j.percent = 50;
+      j.updatedAt = Math.floor(Date.now() / 1000);
+      setTimeout(() => {
+        const done = (state.installJobs || []).find((x) => x.id === jobId);
+        if (!done || done.status === "cancelled") return;
+        done.status = "succeeded";
+        done.bytesDone = done.bytesTotal;
+        done.percent = 100;
+        done.updatedAt = Math.floor(Date.now() / 1000);
+        state.localAssets = state.localAssets || [];
+        const mt = String(body.modelType || "LORA").toLowerCase();
+        const path = String(body.destPath || "");
+        const kind = path.startsWith("checkpoints/") || mt.includes("checkpoint")
+          ? "checkpoint"
+          : path.startsWith("embeddings/") || mt.includes("textual")
+            ? "embedding"
+            : path.startsWith("vae/") || mt === "vae"
+              ? "vae"
+              : "lora";
+        state.localAssets.push({
+          id: (body.name || "asset").replace(/\W+/g, "_"),
+          name: body.name || "asset",
+          kind,
+          path: body.destPath,
+          baseModel: body.baseModel,
+          modelType: body.modelType,
+          modelId: body.modelId ?? null,
+          versionId: body.versionId ?? null,
+          thumbnailUrl: body.thumbnailUrl ?? null,
+          sizeBytes: done.bytesTotal,
+          source: "civitai",
+        });
+        if (kind === "checkpoint" && !state.activeBaseModel) {
+          state.activeBaseModel = path;
+          state.activeBaseFamily = body.baseModel || "";
+        }
+      }, 800);
+    }, 400);
+    return {
+      ok: true,
+      queued: true,
+      jobId,
+      status: "queued",
+      job,
+      destPath: body.destPath,
+      name: body.name,
+    };
+  }
+
+  if (p === "/v1/civitai/jobs" && method === "GET") {
+    return { data: state.installJobs || [] };
+  }
+
+  if (p === "/v1/civitai/jobs/clear" && method === "POST") {
+    const includeQueued = Boolean(body?.includeQueued);
+    const before = state.installJobs || [];
+    const next = before.filter((j) => {
+      const st = String(j?.status || "").toLowerCase();
+      if (["succeeded", "failed", "cancelled"].includes(st)) return false;
+      if (includeQueued && st === "queued") return false;
+      return true;
+    });
+    const removed = before.length - next.length;
+    state.installJobs = next;
+    return { ok: true, removed, data: next };
+  }
+
+  if (p.startsWith("/v1/civitai/jobs/") && p.endsWith("/cancel") && method === "POST") {
+    const id = decodeURIComponent(p.slice("/v1/civitai/jobs/".length, -"/cancel".length));
+    const job = (state.installJobs || []).find((j) => j.id === id);
+    if (!job) throw new Error("job not found");
+    if (["queued", "downloading"].includes(job.status)) {
+      job.status = "cancelled";
+      job.error = "cancelled";
+      job.updatedAt = Math.floor(Date.now() / 1000);
+    }
+    return { ok: true, job };
+  }
+
+  if (p.startsWith("/v1/civitai/jobs/") && method === "GET") {
+    const id = decodeURIComponent(p.slice("/v1/civitai/jobs/".length));
+    const job = (state.installJobs || []).find((j) => j.id === id);
+    if (!job) throw new Error("job not found");
+    return { job };
   }
 
   if (p === "/v1/health" || p === "/healthz") {

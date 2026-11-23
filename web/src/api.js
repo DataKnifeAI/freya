@@ -20,7 +20,12 @@ export async function api(path, opts) {
     return data;
   }
 
+  // Pass opts.signal through so callers can AbortController-cancel (e.g. Civitai search).
+  // GET lists (worker checkpoints/LoRAs, /v1/models) must not stick in the HTTP cache
+  // after an install or delete. Callers can still override `cache`.
+  const method = String(opts?.method || "GET").toUpperCase();
   const res = await fetch(path, {
+    cache: method === "GET" || method === "HEAD" ? "no-store" : undefined,
     ...opts,
     headers: {
       "Content-Type": "application/json",

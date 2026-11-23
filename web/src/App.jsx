@@ -1042,8 +1042,23 @@ export default function App() {
     () =>
       (typeof localStorage !== "undefined" && localStorage.getItem("freya.apiToken")) || "",
   );
-  const [workerUrl, setWorkerUrl] = useState("");
-  const [civitaiQ, setCivitaiQ] = useState(BEGINNER_CIVITAI_QUERY);
+  const [generatedToken, setGeneratedToken] = useState(null);
+  const [tokenBusy, setTokenBusy] = useState(false);
+  const [tokenCopyMsg, setTokenCopyMsg] = useState("");
+  const [setupCmdCopyMsg, setSetupCmdCopyMsg] = useState("");
+  const [workerHost, setWorkerHost] = useState(DEFAULT_WORKER_HOST);
+  const [workerPort, setWorkerPort] = useState(DEFAULT_WORKER_PORT);
+  const [workerUrlOverride, setWorkerUrlOverride] = useState("");
+  const [useWorkerUrlOverride, setUseWorkerUrlOverride] = useState(false);
+  const [workerStats, setWorkerStats] = useState(null);
+  const [workerCtlBusy, setWorkerCtlBusy] = useState(false);
+  const [civitaiQ, setCivitaiQ] = useState("");
+  const installedFingerprintRef = useRef("");
+  const localCheckpointsFpRef = useRef("");
+  const downloadJobsFingerprintRef = useRef("");
+  const enrichAttemptedRef = useRef(new Set());
+  const enrichTimerRef = useRef(null);
+  const lastSucceededJobIdsRef = useRef(new Set());
   const [civitaiItems, setCivitaiItems] = useState([]);
   const [savedMsg, setSavedMsg] = useState("");
   const [ideas, setIdeas] = useState(() =>
@@ -1071,6 +1086,17 @@ export default function App() {
   const storedModels = readStoredModels();
   const [agentModel, setAgentModel] = useState(storedModels.agentModel);
   const [imageModel, setImageModel] = useState(storedModels.imageModel);
+  const [videoModel, setVideoModel] = useState(
+    typeof storedModels.videoModel === "string" && storedModels.videoModel.trim()
+      ? storedModels.videoModel.trim()
+      : AUTO_VIDEO.id,
+  );
+  const [routerModel, setRouterModel] = useState(storedModels.routerModel);
+  const [generateBackend, setGenerateBackend] = useState(readGenerateBackend);
+  const [localCheckpoints, setLocalCheckpoints] = useState([]);
+  const [localBaseModel, setLocalBaseModel] = useState("");
+  const [localBaseFamily, setLocalBaseFamily] = useState("");
+  const [localBaseBusy, setLocalBaseBusy] = useState(false);
   const [pendingPlan, setPendingPlan] = useState(() => bootSession.pendingPlan ?? null);
   const [pendingQuestion, setPendingQuestion] = useState(
     () => bootSession.pendingQuestion ?? null,
@@ -1754,6 +1780,179 @@ export default function App() {
     if (menuOpen === "gen-bundle") setMenuOpen(null);
   };
   const canAutoInstall = () => Boolean(settings?.civitaiConfigured && hasWorker());
+
+  const refreshLocalBases = () => refreshInstalledAssets({ quiet: true });
+
+  useEffect(() => {
+    if (generateBackend !== "local" && !hasWorker()) return undefined;
+    refreshLocalBases();
+    return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [generateBackend, settings?.diffusionWorkerUrl, workerStats?.reachable]);
+
+  const setComposerBaseModel = async (path) => {
+    if (!path?.trim()) return;
+    setLocalBaseBusy(true);
+    setError("");
+    try {
+      const match = localCheckpoints.find((c) => c.path === path);
+      const res = await api("/v1/worker/base-model", {
+        method: "PUT",
+        body: JSON.stringify({
+          model: path.trim(),
+          baseModel: match?.baseModel || undefined,
+        }),
+      });
+      const next = res?.model || path;
+      setLocalBaseModel(next);
+      setActiveBasePath(next);
+      if (typeof res?.baseModel === "string") setLocalBaseFamily(res.baseModel);
+      setSavedMsg(`Active base set to ${next}`);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setLocalBaseBusy(false);
+    }
+  };
+
+  const applyWorkerEndpoint = (url) => {
+    const ep = parseWorkerEndpoint(url || "");
+    setWorkerHost(ep.host);
+    setWorkerPort(ep.port);
+    setWorkerUrlOverride(ep.advancedUrl);
+    setUseWorkerUrlOverride(ep.useAdvanced);
+  };
+
+  const generateApiToken = async () => {
+    setTokenBusy(true);
+    setError("");
+    setSavedMsg("");
+    setTokenCopyMsg("");
+    try {
+      const res = await api("/v1/auth/token", { method: "POST", body: "{}" });
+      const tok = res?.token || "";
+      if (!tok) throw new Error("API returned no token");
+      setGeneratedToken(tok);
+      setStudioToken(tok);
+      localStorage.setItem("freya.apiToken", tok);
+      await refresh();
+      flashSave(
+        "token",
+        res.note ||
+          (res.rotated
+            ? "Machine API token rotated — copy it now."
+            : "Machine API token created — copy it now."),
+      );
+    } catch (e) {
+      setError(
+        e.message === "Unauthorized" || /401|Unauthorized/i.test(e.message || "")
+          ? "Sign in first, then generate a machine API token."
+          : e.message,
+      );
+    } finally {
+      setTokenBusy(false);
+    }
+  };
+
+  const copyGeneratedToken = async () => {
+    if (!generatedToken) return;
+    try {
+      await navigator.clipboard.writeText(generatedToken);
+      setTokenCopyMsg("Copied");
+    } catch {
+      setTokenCopyMsg("Select and copy manually");
+    }
+  };
+
+  /** Prefer freshly generated token, else browser-saved machine token. */
+  const effectiveMachineToken = () =>
+    (generatedToken || studioToken || "").trim();
+
+  const linuxWorkerSetupCmd = () =>
+    buildLinuxWorkerSetupCmd({
+      origin: studioOrigin(),
+      token: effectiveMachineToken(),
+      apiUrl: studioOrigin(),
+    });
+
+  const windowsWorkerSetupCmd = () =>
+    buildWindowsWorkerSetupCmd({
+      origin: studioOrigin(),
+      token: effectiveMachineToken(),
+      apiUrl: studioOrigin(),
+    });
+
+  const copyWorkerSetupCmd = async (which) => {
+    const text = which === "windows" ? windowsWorkerSetupCmd() : linuxWorkerSetupCmd();
+    try {
+      await navigator.clipboard.writeText(text);
+      setSetupCmdCopyMsg(which === "windows" ? "Windows copied" : "Linux copied");
+    } catch {
+      setSetupCmdCopyMsg("Select and copy manually");
+    }
+  };
+
+  const applyLocalWorkerDefaults = () => {
+    setUseWorkerUrlOverride(false);
+    setWorkerUrlOverride("");
+    setWorkerHost(DEFAULT_WORKER_HOST);
+    setWorkerPort(DEFAULT_WORKER_PORT);
+    setSavedMsg(
+      `Local worker endpoint set to http://${DEFAULT_WORKER_HOST}:${DEFAULT_WORKER_PORT} — Save worker to apply.`,
+    );
+  };
+
+  const persistStudioTokenLocal = () => {
+    if (studioToken.trim()) {
+      localStorage.setItem("freya.apiToken", studioToken.trim());
+    } else {
+      localStorage.removeItem("freya.apiToken");
+    }
+  };
+
+  /** Persist machine API token in this browser and reload catalogs. */
+  const applyStudioToken = async () => {
+    persistStudioTokenLocal();
+    setError("");
+    setSavedMsg("");
+    setSaveFlash(null);
+    try {
+      await refresh();
+      flashSave(
+        "token",
+        studioToken.trim() ? "Machine token saved in this browser." : "Machine token cleared.",
+      );
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  const saveWorkerEndpoint = async () => {
+    setBusy(true);
+    setError("");
+    setSavedMsg("");
+    setSaveFlash(null);
+    try {
+      persistStudioTokenLocal();
+      const st = await api("/v1/settings", {
+        method: "PUT",
+        body: JSON.stringify({ diffusionWorkerUrl: composedWorkerUrl() }),
+      });
+      setSettings(st);
+      applyWorkerEndpoint(st.diffusionWorkerUrl || "");
+      await refreshWorkerStats();
+      flashSave(
+        "worker",
+        mock
+          ? "Worker endpoint saved (mock)."
+          : `Worker endpoint saved: ${st.diffusionWorkerUrl || "(cleared — OpenRouter only)"}.`,
+      );
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
   const canCloudGenerate = () => Boolean(settings?.openRouterConfigured);
 
   const pinnedPayload = () =>
@@ -1981,7 +2180,18 @@ export default function App() {
         applyPrivacyAlignmentFromSettings(a.result);
         setSettings((prev) => ({ ...(prev || {}), ...a.result }));
       }
-      if (a.type === "set_base_model" && a.result?.model) setActiveBasePath(a.result.model);
+      if (a.type === "set_base_model" && a.result?.model) {
+        setActiveBasePath(a.result.model);
+        setLocalBaseModel(a.result.model);
+        if (typeof a.result.baseModel === "string") setLocalBaseFamily(a.result.baseModel);
+      }
+      if (a.type === "delete_installed") {
+        void refreshInstalledAssets({ quiet: true });
+      }
+      if (a.type === "install_asset") {
+        if (a.result?.jobId) void refreshDownloadJobs();
+        else if (a.status === "executed") void refreshInstalledAssets({ quiet: true });
+      }
       if (a.type === "gallery_delete" && a.result?.id) {
         const id = a.result.id;
         setGallery((prev) => prev.filter((g) => g.id !== id && g.artifactId !== id));
@@ -2158,6 +2368,281 @@ export default function App() {
       body: JSON.stringify(runBody(nlPrompt)),
     });
     return data;
+  };
+
+  const destPathForAsset = (item) => {
+    const safe = (item.name || "model").replace(/[^a-zA-Z0-9._-]+/g, "_");
+    const ext = fileExtFromVariant(item);
+    const t = (item.modelType || "").toLowerCase();
+    if (t === "lora" || t === "locon" || t === "dora" || t === "lycoris" || t.includes("lora")) {
+      return `loras/${safe}${ext}`;
+    }
+    if (t === "textualinversion") return `embeddings/${safe}${ext}`;
+    if (t === "vae") return `vae/${safe}${ext}`;
+    return `checkpoints/${safe}${ext}`;
+  };
+
+  /** Match card/detail selection to an installed worker asset (path preferred). */
+  const findInstalledForItem = (item) => {
+    if (!item || !installedAssets.length) return null;
+    const dest = destPathForAsset(item);
+    const byDest = installedAssets.find((a) => a?.path && a.path === dest);
+    if (byDest) return byDest;
+    if (item.path) {
+      const byPath = installedAssets.find((a) => a?.path && a.path === item.path);
+      if (byPath) return byPath;
+    }
+    if (item.versionId != null && item.versionId !== "") {
+      const byVer = installedAssets.find(
+        (a) => a?.versionId != null && String(a.versionId) === String(item.versionId),
+      );
+      if (byVer) return byVer;
+    }
+    return null;
+  };
+
+  const activeJobForItem = (item) => {
+    if (!item || !downloadJobs.length) return null;
+    const dest = destPathForAsset(item);
+    return (
+      downloadJobs.find((j) => {
+        const st = String(j?.status || "").toLowerCase();
+        if (!["queued", "downloading"].includes(st)) return false;
+        const jp = j?.destPath || j?.path || "";
+        return jp === dest || (item.path && jp === item.path);
+      }) || null
+    );
+  };
+
+  const formatBytes = (n) => {
+    if (n == null || Number.isNaN(Number(n))) return "";
+    const v = Number(n);
+    if (v < 1024) return `${v} B`;
+    if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`;
+    if (v < 1024 * 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(v / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  };
+
+  const refreshDownloadJobs = async () => {
+    if (!hasWorker()) {
+      if (downloadJobsFingerprintRef.current !== "") {
+        downloadJobsFingerprintRef.current = "";
+        setDownloadJobs([]);
+      }
+      return [];
+    }
+    try {
+      const data = await api("/v1/civitai/jobs");
+      const jobs = Array.isArray(data?.data) ? data.data : [];
+      const fp = downloadJobsFingerprint(jobs);
+      if (fp !== downloadJobsFingerprintRef.current) {
+        downloadJobsFingerprintRef.current = fp;
+        setDownloadJobs(jobs);
+      }
+      return jobs;
+    } catch {
+      return downloadJobs;
+    }
+  };
+
+  const refreshInstalledAssets = async ({ quiet = false } = {}) => {
+    if (!hasWorker()) {
+      if (installedFingerprintRef.current !== "") {
+        installedFingerprintRef.current = "";
+        setInstalledAssets([]);
+      }
+      if (localCheckpointsFpRef.current !== "") {
+        localCheckpointsFpRef.current = "";
+        setLocalCheckpoints([]);
+      }
+      setActiveBasePath("");
+      setLocalBaseModel("");
+      setLocalBaseFamily("");
+      return;
+    }
+    if (!quiet) setInstalledBusy(true);
+    try {
+      const [loras, cps, embeddings, vaes, base] = await Promise.all([
+        api("/v1/worker/loras").catch(() => ({ data: [] })),
+        api("/v1/worker/checkpoints").catch(() => ({ data: [] })),
+        api("/v1/worker/embeddings").catch(() => ({ data: [] })),
+        api("/v1/worker/vae").catch(() => ({ data: [] })),
+        api("/v1/worker/base-model").catch(() => ({})),
+      ]);
+      const list = [
+        ...(Array.isArray(loras?.data) ? loras.data : []),
+        ...(Array.isArray(cps?.data) ? cps.data : []),
+        ...(Array.isArray(embeddings?.data) ? embeddings.data : []),
+        ...(Array.isArray(vaes?.data) ? vaes.data : []),
+      ].map((a) => {
+        const thumb = pickCivitaiThumb(
+          { ...a, modelId: a.modelId ?? null, versionId: a.versionId ?? null },
+          favorites,
+        );
+        return thumb ? { ...a, thumbnailUrl: thumb } : a;
+      });
+      const fp = installedListFingerprint(list);
+      if (fp !== installedFingerprintRef.current) {
+        installedFingerprintRef.current = fp;
+        setInstalledAssets(list);
+      }
+      const cpList = Array.isArray(cps?.data) ? cps.data : [];
+      const cpFp = installedListFingerprint(cpList);
+      if (cpFp !== localCheckpointsFpRef.current) {
+        localCheckpointsFpRef.current = cpFp;
+        setLocalCheckpoints(cpList);
+      }
+      const baseModelPath = typeof base?.model === "string" ? base.model : "";
+      const baseFamily = typeof base?.baseModel === "string" ? base.baseModel : "";
+      setActiveBasePath(baseModelPath);
+      setLocalBaseFamily(baseFamily);
+      if (baseModelPath) setLocalBaseModel(baseModelPath);
+      else if (cpList[0]?.path) setLocalBaseModel(cpList[0].path);
+      else setLocalBaseModel("");
+      // Older sidecars often lack thumbnailUrl — resolve via Civitai when possible.
+      if (settings?.civitaiConfigured) {
+        scheduleEnrichInstalledThumbs(list);
+      }
+    } catch (e) {
+      setError(e.message || "Failed to load installed assets");
+    } finally {
+      if (!quiet) setInstalledBusy(false);
+    }
+  };
+
+  /** Debounced thumb enrich — skip paths already attempted this session. */
+  const scheduleEnrichInstalledThumbs = (list) => {
+    if (enrichTimerRef.current) clearTimeout(enrichTimerRef.current);
+    enrichTimerRef.current = setTimeout(() => {
+      enrichTimerRef.current = null;
+      void enrichInstalledThumbs(list);
+    }, 400);
+  };
+
+  /** Fill missing Installed card thumbs from Civitai model / model-versions. */
+  const enrichInstalledThumbs = async (list) => {
+    const need = (list || []).filter((a) => {
+      if (!a?.path || a.thumbnailUrl) return false;
+      if (enrichAttemptedRef.current.has(a.path)) return false;
+      return a.versionId != null || (a.modelId != null && a.modelId !== "");
+    });
+    if (!need.length) return;
+    for (const a of need) enrichAttemptedRef.current.add(a.path);
+    const concurrency = Math.min(3, need.length);
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < need.length) {
+        const asset = need[cursor++];
+        try {
+          let data;
+          if (asset.modelId != null && asset.modelId !== "") {
+            data = await api(`/v1/civitai/models/${asset.modelId}`);
+          } else {
+            data = await api(`/v1/civitai/model-versions/${asset.versionId}`);
+          }
+          const model = data?.model || data;
+          const thumb = model?.thumbnailUrl || model?.imageUrls?.[0] || null;
+          if (!thumb) continue;
+          const resolvedModelId = model?.id ?? model?.modelId ?? asset.modelId ?? null;
+          rememberCivitaiThumb(
+            {
+              modelId: resolvedModelId,
+              versionId: asset.versionId ?? model?.versionId,
+            },
+            thumb,
+          );
+          setInstalledAssets((prev) => {
+            const next = prev.map((a) =>
+              a.path === asset.path
+                ? {
+                    ...a,
+                    thumbnailUrl: a.thumbnailUrl || thumb,
+                    modelId: a.modelId ?? resolvedModelId,
+                    imageUrls: a.imageUrls?.length ? a.imageUrls : model?.imageUrls,
+                  }
+                : a,
+            );
+            installedFingerprintRef.current = installedListFingerprint(next);
+            return next;
+          });
+        } catch {
+          /* ignore per-asset resolve failures */
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  };
+
+  const cancelDownloadJob = async (id) => {
+    if (!id) return;
+    try {
+      await api(`/v1/civitai/jobs/${encodeURIComponent(id)}/cancel`, {
+        method: "POST",
+      });
+      await refreshDownloadJobs();
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  /** Clear finished jobs (succeeded/failed/cancelled). Does not cancel in-flight downloads. */
+  const clearFinishedDownloadJobs = async () => {
+    if (!hasWorker()) return;
+    const finished = downloadJobs.filter((j) =>
+      ["succeeded", "failed", "cancelled"].includes(String(j?.status || "").toLowerCase()),
+    );
+    if (finished.length === 0) return;
+    try {
+      const data = await api("/v1/civitai/jobs/clear", {
+        method: "POST",
+        body: JSON.stringify({ includeQueued: false }),
+      });
+      const jobs = Array.isArray(data?.data) ? data.data : [];
+      downloadJobsFingerprintRef.current = downloadJobsFingerprint(jobs);
+      setDownloadJobs(jobs);
+    } catch (e) {
+      setError(e.message || "Failed to clear downloads");
+    }
+  };
+
+  const deleteInstalledAsset = async (asset) => {
+    if (!asset?.path) return;
+    if (
+      !window.confirm(
+        `Delete ${asset.name || asset.path} from the worker disk? This cannot be undone.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      await api("/v1/worker/assets", {
+        method: "DELETE",
+        body: JSON.stringify({ path: asset.path }),
+      });
+      if (isPinned(asset)) unpinLora(asset);
+      await refreshInstalledAssets();
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  const setInstalledAsBase = async (asset) => {
+    if (!asset?.path) return;
+    try {
+      await api("/v1/worker/base-model", {
+        method: "PUT",
+        body: JSON.stringify({
+          model: asset.path,
+          baseModel: asset.baseModel || undefined,
+        }),
+      });
+      setActiveBasePath(asset.path);
+      setLocalBaseModel(asset.path);
+      if (typeof asset.baseModel === "string") setLocalBaseFamily(asset.baseModel);
+      setSavedMsg(`Active base → ${asset.name || asset.path}`);
+    } catch (e) {
+      setError(e.message);
+    }
   };
 
   const installOne = async (item) => {
@@ -2547,6 +3032,98 @@ export default function App() {
       setBusy(false);
     }
   };
+
+  // Search-as-you-type on the Civitai tab (debounced; AbortController cancels in-flight).
+  useEffect(() => {
+    if (tab !== "civitai" || civitaiSubview !== "search") return;
+    const q = civitaiQ.trim();
+    if (!q) {
+      const pending = civitaiAbortRef.current;
+      civitaiAbortRef.current = null;
+      pending?.abort();
+      lastCivitaiSearchQRef.current = "";
+      setCivitaiItems([]);
+      setBusy(false);
+      return;
+    }
+    if (q === lastCivitaiSearchQRef.current) return;
+    const t = setTimeout(() => {
+      searchCivitai({ query: q });
+    }, CIVITAI_SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: debounce on query/tab only
+  }, [civitaiQ, tab, civitaiSubview]);
+
+  useEffect(() => {
+    if (tab !== "civitai") return;
+    // Keep installed + jobs warm so search/favorites/detail can flip Install → Delete / Downloading…
+    refreshInstalledAssets();
+    refreshDownloadJobs();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, civitaiSubview]);
+
+  useEffect(() => {
+    if (tab !== "worker") return undefined;
+    refreshInstalledAssets({ quiet: true });
+    return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab]);
+
+  useEffect(() => {
+    if (menuOpen !== "gen-bundle" || generateBackend !== "local") return undefined;
+    refreshInstalledAssets({ quiet: true });
+    return undefined;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [menuOpen, generateBackend]);
+
+  useEffect(() => {
+    const active = downloadJobs.some((j) =>
+      ["queued", "downloading"].includes(j.status),
+    );
+    const onCivitai = tab === "civitai";
+    // Follow in-flight installs from any tab. Success must refresh worker lists
+    // even when this effect restarts because the job just left "downloading".
+    if (!active && !(onCivitai && downloadJobs.length > 0)) return undefined;
+    const tick = async () => {
+      const jobs = await refreshDownloadJobs();
+      if (!Array.isArray(jobs)) return;
+      const newlySucceeded = [];
+      for (const j of jobs) {
+        if (j.status !== "succeeded" || !j.id) continue;
+        if (!lastSucceededJobIdsRef.current.has(j.id)) {
+          lastSucceededJobIdsRef.current.add(j.id);
+          newlySucceeded.push(j.id);
+        }
+      }
+      if (newlySucceeded.length) {
+        await refreshInstalledAssets({ quiet: true });
+      }
+    };
+    const ms = active || (onCivitai && civitaiSubview === "downloads") ? 1500 : 5000;
+    const t = setInterval(tick, ms);
+    const soon = setTimeout(tick, 250);
+    return () => {
+      clearInterval(t);
+      clearTimeout(soon);
+    };
+    // Poll cadence depends on whether anything is active — not on every jobs array identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    tab,
+    civitaiSubview,
+    downloadJobs.some((j) => ["queued", "downloading"].includes(j.status)),
+    downloadJobs.length > 0,
+  ]);
+
+  // Drop legacy pinned checkpoints / VAEs so they are never sent as session LoRAs.
+  useEffect(() => {
+    setSession((prev) => {
+      const pinned = prev.pinnedLoras || [];
+      const next = pinned.filter(isPinnableAsset);
+      if (next.length === pinned.length) return prev;
+      return { ...prev, pinnedLoras: next };
+    });
+  }, [session.pinnedLoras]);
 
   const installCivitai = async (item) => {
     if (!item.downloadUrl) {
@@ -3794,6 +4371,533 @@ export default function App() {
         </section>
       )}
 
+      {tab === "worker" && (
+        <section className="panel settings worker-tab" aria-label="Diffusion worker">
+          <div className="worker-layout">
+            <aside className="worker-setup-panel" aria-label="Setup and connect">
+              <div className="settings-block-head">
+                <span className="label-with-help">
+                  <strong>Setup</strong>
+                  <HelpQ topic="help-worker" label="Worker setup" onOpen={openHelp} />
+                </span>
+              </div>
+              <p className="hint">
+                Local LoRAs / Local generate need a GPU worker on a host (
+                <code>freya-local-worker</code>, default <code>0.0.0.0:{DEFAULT_WORKER_PORT}</code>
+                ). Cloud Generate uses OpenRouter. Models dir: <code>FREYA_MODELS_DIR</code>{" "}
+                (default <code>~/freya/models</code>).
+              </p>
+
+              <div className="worker-setup" aria-label="One-line host setup">
+                <strong className="worker-connect-title">One-line host setup</strong>
+                <p className="hint">
+                  Copy a command onto the GPU machine. It installs/uses Docker, writes{" "}
+                  <code>FREYA_WORKER_TOKEN</code> from your machine token, and starts{" "}
+                  <code>freya-local-worker</code>. Generate a token first if the field below shows
+                  a placeholder.
+                </p>
+                {!effectiveMachineToken() ? (
+                  <p className="hint">
+                    No machine token in this browser — use{" "}
+                    <strong>Generate machine token</strong> (right), then copy again.
+                  </p>
+                ) : null}
+                <label>
+                  Linux / macOS
+                  <textarea
+                    className="worker-setup-cmd"
+                    readOnly
+                    rows={3}
+                    value={linuxWorkerSetupCmd()}
+                    spellCheck={false}
+                  />
+                </label>
+                <div className="row settings-token-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || mock}
+                    onClick={() => copyWorkerSetupCmd("linux")}
+                    title="Copy Linux setup one-liner"
+                  >
+                    Copy Linux
+                  </button>
+                </div>
+                <label>
+                  Windows (PowerShell)
+                  <textarea
+                    className="worker-setup-cmd"
+                    readOnly
+                    rows={3}
+                    value={windowsWorkerSetupCmd()}
+                    spellCheck={false}
+                  />
+                </label>
+                <div className="row settings-token-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || mock}
+                    onClick={() => copyWorkerSetupCmd("windows")}
+                    title="Copy Windows setup one-liner"
+                  >
+                    Copy Windows
+                  </button>
+                  {setupCmdCopyMsg ? <span className="hint">{setupCmdCopyMsg}</span> : null}
+                </div>
+              </div>
+
+              <div className="worker-connect" aria-label="Connect options">
+                <strong className="worker-connect-title">Connect</strong>
+                <p className="hint">
+                  After the worker is running, put its address in Host / Port (or Advanced full
+                  URL), then <strong>Save worker</strong>:
+                </p>
+                <ul className="worker-setup-steps">
+                  <li>
+                    <strong>Host IP + port</strong> — usual from in-cluster Studio: this machine&apos;s
+                    LAN IP, port <code>{DEFAULT_WORKER_PORT}</code>.
+                  </li>
+                  <li>
+                    <strong>Localhost</strong> — API and worker on the same host →{" "}
+                    <em>Use local defaults</em> (
+                    <code>
+                      {DEFAULT_WORKER_HOST}:{DEFAULT_WORKER_PORT}
+                    </code>
+                    ).
+                  </li>
+                  <li>
+                    <strong>Full URL</strong> — Advanced → https / remote FQDN (e.g.{" "}
+                    <code>https://vllm.dataknife.net</code>).
+                  </li>
+                </ul>
+                <p className="hint">
+                  SD / SDXL / Pony / Flux bases belong on the GPU worker — not on a remote text LLM
+                  endpoint.
+                </p>
+              </div>
+            </aside>
+
+            <div className="worker-controls-panel" aria-label="Worker controls">
+              <div className="settings-block-head">
+                <span className="label-with-help">
+                  <strong>Controls</strong>
+                  <HelpQ topic="help-worker-token" label="Machine token" onOpen={openHelp} />
+                </span>
+              </div>
+
+              <div className="settings-block worker-auth-block" aria-label="Machine API token">
+                <div className="settings-block-head">
+                  <strong>Machine API token</strong>
+                  <span className={`key-on-file ${settings?.apiTokenConfigured ? "is-on" : ""}`}>
+                    {settings?.apiTokenConfigured
+                      ? studioToken
+                        ? "Configured · in browser"
+                        : "Configured"
+                      : "Not required (local/dev)"}
+                  </span>
+                </div>
+                <div className="row settings-token-actions">
+                  <button
+                    type="button"
+                    className={`primary btn-save${saveFlash === "token" ? " is-saved" : ""}`}
+                    disabled={busy || tokenBusy || mock}
+                    onClick={generateApiToken}
+                    title="Rotate machine token for MCP / workers"
+                  >
+                    {tokenBusy
+                      ? "Generating…"
+                      : saveFlash === "token"
+                        ? "Saved ✓"
+                        : "Generate machine token"}
+                  </button>
+                </div>
+                {saveFlash === "token" && savedMsg ? (
+                  <p className="save-toast" role="status">
+                    {savedMsg}
+                  </p>
+                ) : null}
+                {generatedToken && (
+                  <div className="token-once">
+                    <label>
+                      New token (copy now — shown once)
+                      <input type="text" readOnly value={generatedToken} autoComplete="off" />
+                    </label>
+                    <div className="row settings-token-actions">
+                      <button type="button" className="ghost" onClick={copyGeneratedToken}>
+                        Copy
+                      </button>
+                      {tokenCopyMsg && <span className="hint">{tokenCopyMsg}</span>}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="worker-panel" aria-label="Diffusion worker status">
+                <div className="worker-panel-head">
+                  <span
+                    className={`status-dot ${
+                      workerStats?.reachable
+                        ? "on"
+                        : workerStats?.configured || composedWorkerUrl()
+                          ? "warn"
+                          : ""
+                    }`}
+                  />
+                  <strong>Status</strong>
+                  <span className="hint">
+                    {mock
+                      ? "mock stats"
+                      : workerStats
+                        ? [
+                            workerStats.reachable
+                              ? "reachable"
+                              : workerStats.configured || composedWorkerUrl()
+                                ? "unreachable"
+                                : "not configured",
+                            workerStats.runtime?.kind && workerStats.runtime.kind !== "none"
+                              ? workerStats.runtime.kind
+                              : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")
+                        : "—"}
+                  </span>
+                </div>
+
+                <div className="row settings-token-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy}
+                    onClick={applyLocalWorkerDefaults}
+                  >
+                    Use local defaults
+                  </button>
+                </div>
+
+                {!useWorkerUrlOverride && (
+                  <div className="worker-endpoint-row" aria-label="Worker host and port">
+                    <label>
+                      Host
+                      <input
+                        autoComplete="off"
+                        placeholder={DEFAULT_WORKER_HOST}
+                        value={workerHost}
+                        onChange={(e) => setWorkerHost(e.target.value)}
+                      />
+                    </label>
+                    <label className="worker-port-field">
+                      Port
+                      <input
+                        autoComplete="off"
+                        inputMode="numeric"
+                        placeholder={DEFAULT_WORKER_PORT}
+                        value={workerPort}
+                        onChange={(e) => setWorkerPort(e.target.value)}
+                      />
+                    </label>
+                  </div>
+                )}
+                <p className="hint">
+                  <code>{composedWorkerUrl() || "(empty)"}</code>
+                </p>
+
+                <button
+                  type="button"
+                  className={`primary btn-save${saveFlash === "worker" ? " is-saved" : ""}`}
+                  disabled={busy}
+                  onClick={saveWorkerEndpoint}
+                >
+                  {saveFlash === "worker" ? "Saved ✓" : "Save worker"}
+                </button>
+                {saveFlash === "worker" && savedMsg ? (
+                  <p className="save-toast" role="status">
+                    {savedMsg}
+                  </p>
+                ) : savedMsg ? (
+                  <p className="hint">{savedMsg}</p>
+                ) : null}
+
+                {(() => {
+                  const vram = workerStats?.vram;
+                  const used = vram?.usedMiB;
+                  const total = vram?.totalMiB;
+                  const pct =
+                    typeof used === "number" && typeof total === "number" && total > 0
+                      ? Math.min(100, Math.round((used / total) * 100))
+                      : null;
+                  const util = vram?.utilPercent;
+                  const storage = workerStats?.storage;
+                  return (
+                    <div className="worker-meters">
+                      <div className="worker-vram">
+                        <div className="worker-vram-meta">
+                          <span>VRAM</span>
+                          <span>
+                            {pct != null
+                              ? `${used} / ${total} MiB (${pct}%)`
+                              : mock
+                                ? "— (mock)"
+                                : "n/a"}
+                            {typeof util === "number" ? ` · GPU ${util}%` : ""}
+                          </span>
+                        </div>
+                        <div
+                          className="worker-vram-bar"
+                          role="progressbar"
+                          aria-valuenow={pct ?? 0}
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                        >
+                          <div className="worker-vram-fill" style={{ width: `${pct ?? 0}%` }} />
+                        </div>
+                      </div>
+                      <StorageMeter
+                        label="Gallery PVC"
+                        disk={storage?.gallery}
+                        fallbackHint={mock ? "— (mock)" : "n/a"}
+                      />
+                      <StorageMeter
+                        label="Models dir"
+                        disk={storage?.models}
+                        fallbackHint={
+                          mock
+                            ? "— (mock)"
+                            : workerStats?.reachable
+                              ? "n/a"
+                              : "worker unreachable"
+                        }
+                      />
+                      {(workerStats?.loras != null || workerStats?.checkpoints != null) && (
+                        <p className="hint">
+                          LoRAs {workerStats.loras ?? "—"} · checkpoints{" "}
+                          {workerStats.checkpoints ?? "—"}
+                          {workerStats.uptimeSec != null
+                            ? ` · up ${workerStats.uptimeSec}s`
+                            : ""}
+                        </p>
+                      )}
+                      {workerStats?.modelLoaded?.model && (
+                        <p className="hint">
+                          Active base: {workerStats.modelLoaded.model}
+                          {workerStats.modelLoaded.baseModel
+                            ? ` (${workerStats.modelLoaded.baseModel})`
+                            : ""}
+                          {activeBaseEngineHint(workerStats.modelLoaded, workerStats)}
+                        </p>
+                      )}
+                      {(() => {
+                        const dirHint = modelsDirHint(workerStats);
+                        return dirHint ? <p className="hint">{dirHint}</p> : null;
+                      })()}
+                    </div>
+                  );
+                })()}
+                <WorkerBaseModelPanel
+                  busy={busy || workerCtlBusy || mock}
+                  hasWorker={hasWorker()}
+                  api={api}
+                  checkpoints={localCheckpoints}
+                  active={{ model: activeBasePath, baseModel: localBaseFamily }}
+                  onRefresh={() => refreshInstalledAssets({ quiet: true })}
+                  onSaved={(msg) => setSavedMsg(msg)}
+                  onError={(msg) => setError(msg)}
+                />
+                <div className="worker-controls">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || workerCtlBusy || mock}
+                    onClick={() => workerControl("start")}
+                    title="Start local docker/systemd worker"
+                  >
+                    ▶ Start
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || workerCtlBusy || mock}
+                    onClick={() => workerControl("stop")}
+                    title="Stop local docker/systemd worker"
+                  >
+                    ■ Stop
+                  </button>
+                </div>
+              </div>
+
+              <details className="settings-advanced">
+                <summary>Advanced</summary>
+                <label>
+                  <span className="settings-label-row">
+                    Machine API token
+                    {studioToken ? (
+                      <span className="key-on-file is-on">In browser</span>
+                    ) : null}
+                  </span>
+                  <input
+                    type="password"
+                    autoComplete="off"
+                    placeholder="Paste machine token"
+                    value={studioToken}
+                    onChange={(e) => setStudioToken(e.target.value)}
+                  />
+                </label>
+                <div className="row settings-token-actions">
+                  <button
+                    type="button"
+                    className={`ghost${saveFlash === "token" ? " is-saved" : ""}`}
+                    disabled={busy || tokenBusy || mock}
+                    onClick={applyStudioToken}
+                    title="Save machine token in this browser"
+                  >
+                    Save token
+                  </button>
+                </div>
+                <label className="settings-check">
+                  <input
+                    type="checkbox"
+                    checked={useWorkerUrlOverride}
+                    onChange={(e) => setUseWorkerUrlOverride(e.target.checked)}
+                  />
+                  Full worker URL
+                </label>
+                {useWorkerUrlOverride && (
+                  <label>
+                    Worker URL
+                    <input
+                      placeholder="https://vllm.dataknife.net"
+                      value={workerUrlOverride}
+                      onChange={(e) => setWorkerUrlOverride(e.target.value)}
+                    />
+                  </label>
+                )}
+              </details>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {tab === "metrics" && (
+        <section className="panel settings metrics-panel" aria-label="OpenRouter metrics">
+          <div className="settings-block-head">
+            <span className="label-with-help">
+              <strong>OpenRouter usage</strong>
+              <HelpQ topic="help-metrics" label="Metrics" onOpen={openHelp} />
+            </span>
+            <button
+              type="button"
+              className="ghost"
+              disabled={orMetricsBusy || busy}
+              onClick={refreshOpenRouterMetrics}
+            >
+              {orMetricsBusy ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+          {!settings?.openRouterConfigured ? (
+            <p className="hint">
+              Add an OpenRouter key in{" "}
+              <button type="button" className="linkish" onClick={() => setTab("settings")}>
+                Settings
+              </button>
+              .
+            </p>
+          ) : orMetricsBusy && !orMetrics ? (
+            <p className="hint">Loading…</p>
+          ) : orMetrics ? (
+            <>
+              {orMetrics.key ? (
+                <div className="metrics-grid" aria-label="Per-key usage">
+                  <div className="metric-card">
+                    <span className="metric-label">Spend today</span>
+                    <span className="metric-value">
+                      {fmtUsd(orMetrics.key.usageDaily)}
+                    </span>
+                  </div>
+                  <div className="metric-card">
+                    <span className="metric-label">This week</span>
+                    <span className="metric-value">
+                      {fmtUsd(orMetrics.key.usageWeekly)}
+                    </span>
+                  </div>
+                  <div className="metric-card">
+                    <span className="metric-label">This month</span>
+                    <span className="metric-value">
+                      {fmtUsd(orMetrics.key.usageMonthly)}
+                    </span>
+                  </div>
+                  <div className="metric-card">
+                    <span className="metric-label">All-time (this key)</span>
+                    <span className="metric-value">{fmtUsd(orMetrics.key.usage)}</span>
+                  </div>
+                  <div className="metric-card">
+                    <span className="metric-label">Key limit remaining</span>
+                    <span className="metric-value">
+                      {orMetrics.key.limitRemaining == null
+                        ? "Unlimited"
+                        : fmtUsd(orMetrics.key.limitRemaining)}
+                    </span>
+                    {orMetrics.key.limit != null ? (
+                      <span className="hint">
+                        Cap {fmtUsd(orMetrics.key.limit)}
+                        {orMetrics.key.limitReset ? ` · resets ${orMetrics.key.limitReset}` : ""}
+                      </span>
+                    ) : null}
+                  </div>
+                  {orMetrics.key.label ? (
+                    <p className="hint metric-key-label">Key: {orMetrics.key.label}</p>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="err">{orMetrics.keyError || "Could not load key usage."}</p>
+              )}
+
+              <div className="settings-block" aria-label="Account credits">
+                <div className="settings-block-head">
+                  <strong>Account credits</strong>
+                </div>
+                {orMetrics.credits ? (
+                  <div className="metrics-grid">
+                    <div className="metric-card">
+                      <span className="metric-label">Remaining</span>
+                      <span className="metric-value">
+                        {fmtUsd(orMetrics.credits.remaining)}
+                      </span>
+                    </div>
+                    <div className="metric-card">
+                      <span className="metric-label">Purchased</span>
+                      <span className="metric-value">
+                        {fmtUsd(orMetrics.credits.totalCredits)}
+                      </span>
+                    </div>
+                    <div className="metric-card">
+                      <span className="metric-label">Used (lifetime)</span>
+                      <span className="metric-value">
+                        {fmtUsd(orMetrics.credits.totalUsage)}
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="hint">
+                    {orMetrics.creditsError || "Needs an OpenRouter Management API key."}
+                  </p>
+                )}
+              </div>
+
+              {Array.isArray(orMetrics.notes) && orMetrics.notes.length > 0 ? (
+                <ul className="metrics-notes hint">
+                  {orMetrics.notes.map((n) => (
+                    <li key={n}>{n}</li>
+                  ))}
+                </ul>
+              ) : null}
+            </>
+          ) : (
+            <p className="hint">No metrics yet — hit Refresh.</p>
+          )}
+        </section>
+      )}
+
       {tab === "settings" && (
         <section className="panel settings">
           <p className="hint">
@@ -4471,6 +5575,405 @@ export default function App() {
         </section>
       </div>
       </div>
+
+      {civitaiDetail && detailModel && (
+        <div
+          className="civitai-modal-backdrop"
+          role="presentation"
+          onClick={closeCivitaiDetail}
+        >
+          <div
+            className="civitai-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label={detailModel.name || "Civitai asset"}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="civitai-modal-head">
+              <div>
+                <span className="lora-type-badge">{detailModel.modelType || "Asset"}</span>
+                <h3>{detailModel.name}</h3>
+                <p className="hint">
+                  {[detailModel.creator && `by ${detailModel.creator}`, detailModel.baseModel, detailModel.versionName]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </p>
+              </div>
+              <button type="button" className="ghost" onClick={closeCivitaiDetail}>
+                Close
+              </button>
+            </div>
+            <div className="civitai-modal-gallery">
+              {detailImages.length > 0 ? (
+                <>
+                  <img
+                    src={detailImages[Math.min(detailImageIdx, detailImages.length - 1)]}
+                    alt=""
+                    onError={(e) => e.currentTarget.classList.add("is-broken")}
+                  />
+                  {detailImages.length > 1 && (
+                    <div className="row civitai-modal-thumbs">
+                      {detailImages.map((url, i) => (
+                        <button
+                          key={url}
+                          type="button"
+                          className={i === detailImageIdx ? "primary" : "ghost"}
+                          onClick={() => setDetailImageIdx(i)}
+                        >
+                          <img src={url} alt="" />
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="lora-card-thumb-fallback">No preview</div>
+              )}
+            </div>
+            <div className="civitai-modal-body">
+              {(civitaiDetailBusy || civitaiDetail.loading) && (
+                <p className="hint">Loading details…</p>
+              )}
+              {civitaiDetail.error && <p className="hint">{civitaiDetail.error}</p>}
+              {detailModel.needsBase && (
+                <p className="civitai-needs-base">{detailModel.needsBase}</p>
+              )}
+              {detailModel.description && <p>{detailModel.description}</p>}
+              {(detailModel.trainedWords?.length || detailModel.triggerWord) && (
+                <p className="hint">
+                  Triggers:{" "}
+                  {(detailModel.trainedWords?.length
+                    ? detailModel.trainedWords
+                    : [detailModel.triggerWord]
+                  ).filter(Boolean).join(" · ")}
+                </p>
+              )}
+              {(detailModel.stats || detailModel.downloadCount != null) && (
+                <p className="hint">
+                  {[
+                    formatStat(detailModel.stats?.downloadCount ?? detailModel.downloadCount) &&
+                      `${formatStat(detailModel.stats?.downloadCount ?? detailModel.downloadCount)} downloads`,
+                    formatStat(detailModel.stats?.thumbsUpCount ?? detailModel.thumbsUp) &&
+                      `${formatStat(detailModel.stats?.thumbsUpCount ?? detailModel.thumbsUp)} likes`,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </p>
+              )}
+              {detailVersions.length > 0 && (
+                <div className="civitai-variant-picks" aria-label="Version and file">
+                  <label>
+                    Version
+                    <select
+                      value={detailSelectedVersion?.id ?? detailModel.versionId ?? ""}
+                      onChange={(e) => {
+                        const vid = Number(e.target.value);
+                        const ver =
+                          detailVersions.find((v) => String(v.id) === String(vid)) ||
+                          detailVersions[0];
+                        const primary = pickPrimaryCivitaiFile(ver?.files || []);
+                        selectCivitaiVariant(vid, primary?.id);
+                      }}
+                    >
+                      {detailVersions.map((v) => (
+                        <option key={v.id} value={v.id}>
+                          {v.name}
+                          {v.baseModel ? ` · ${v.baseModel}` : ""}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  {detailFiles.length > 0 && (
+                    <label>
+                      File
+                      <select
+                        value={detailModel.fileId ?? pickPrimaryCivitaiFile(detailFiles)?.id ?? ""}
+                        onChange={(e) => {
+                          const fid = Number(e.target.value);
+                          selectCivitaiVariant(
+                            detailSelectedVersion?.id ?? detailModel.versionId,
+                            fid,
+                          );
+                        }}
+                      >
+                        {detailFiles.map((f) => {
+                          const size = formatCivitaiFileSize(f);
+                          const fmt = f.format || f.type || "";
+                          return (
+                            <option key={f.id ?? f.name} value={f.id}>
+                              {[f.name || "file", fmt, f.primary ? "primary" : "", size]
+                                .filter(Boolean)
+                                .join(" · ")}
+                            </option>
+                          );
+                        })}
+                      </select>
+                    </label>
+                  )}
+                  {(detailModel.fileName || detailModel.fileFormat) && (
+                    <p className="hint">
+                      Installs as{" "}
+                      <code>{destPathForAsset(detailModel)}</code>
+                    </p>
+                  )}
+                </div>
+              )}
+              {(civitaiDetail.localOnly || detailModel.localAsset || detailModel.path) && (
+                <p className="hint">
+                  {[
+                    detailModel.path && `Path: ${detailModel.path}`,
+                    detailModel.baseModel && `Base: ${detailModel.baseModel}`,
+                    detailModel.sizeBytes != null && `Size: ${formatBytes(detailModel.sizeBytes)}`,
+                    detailModel.kind && `Kind: ${detailModel.kind}`,
+                    detailModel.modelId != null && `Civitai model: ${detailModel.modelId}`,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </p>
+              )}
+              <div className="row lora-card-actions">
+                <button
+                  type="button"
+                  className={`${isFavorite(detailModel) ? "primary" : "ghost"} icon-btn`}
+                  title={
+                    isFavorite(detailModel)
+                      ? "Remove from favorites"
+                      : "Save to favorites library"
+                  }
+                  aria-label={isFavorite(detailModel) ? "Unfavorite" : "Favorite"}
+                  onClick={() => toggleFavorite(detailModel)}
+                >
+                  <IconStar filled={isFavorite(detailModel)} />
+                </button>
+                {isPinnableAsset(detailModel) ? (
+                  <button
+                    type="button"
+                    className={`${isPinned(detailModel) ? "primary" : "ghost"} icon-btn`}
+                    title={
+                      isPinned(detailModel) ? "Unpin from this session" : "Pin to session"
+                    }
+                    aria-label={
+                      isPinned(detailModel) ? "Unpin from session" : "Pin to session"
+                    }
+                    onClick={() =>
+                      isPinned(detailModel)
+                        ? unpinLora(detailModel)
+                        : pinLora(
+                            detailModel,
+                            detailModel.path ? { path: detailModel.path } : undefined,
+                          )
+                    }
+                  >
+                    <IconPin />
+                  </button>
+                ) : null}
+                {renderInstallAction(detailModel)}
+                {(() => {
+                  const installed =
+                    findInstalledForItem(detailModel) ||
+                    (detailModel.path
+                      ? installedAssets.find((a) => a.path === detailModel.path)
+                      : null);
+                  const isCkpt =
+                    installed &&
+                    (installed.kind === "checkpoint" ||
+                      (installed.path || "").startsWith("checkpoints/"));
+                  const isActive = installed && activeBasePath && activeBasePath === installed.path;
+                  if (!isCkpt) return null;
+                  return (
+                    <button
+                      type="button"
+                      className={isActive ? "primary" : "ghost"}
+                      disabled={isActive}
+                      onClick={() => setInstalledAsBase(installed)}
+                    >
+                      {isActive ? "Active base" : "Set as base"}
+                    </button>
+                  );
+                })()}
+                {detailModel.civitaiUrl && (
+                  <a
+                    className="ghost"
+                    href={detailModel.civitaiUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Open on Civitai
+                  </a>
+                )}
+              </div>
+              {(detailModel.needsBase || detailModel.baseModel) && (
+                <p className="hint">
+                  {detailModel.needsBase ||
+                    `LoRA base family: ${detailModel.baseModel}. Install a matching checkpoint to checkpoints/ on the local worker, then set it as active base on the Worker tab.`}
+                </p>
+              )}
+              {detailRelated.length > 0 && (
+                <div className="civitai-related">
+                  <h4>Needs checkpoint / related</h4>
+                  <p className="hint">
+                    Civitai does not expose a hard dependency graph — Freya suggests popular
+                    checkpoints for this base family so you can install and set one as active base.
+                    Install puts weights under FREYA_MODELS_DIR (game drive / PVC); set active base
+                    after.
+                  </p>
+                  <div className="lora-row">
+                    {detailRelated.map((rel) => {
+                      const card = rel?.model || rel;
+                      return renderLoraCard(
+                        {
+                          ...card,
+                          _relationNote: rel?.note || rel?.relation,
+                        },
+                        { compact: true },
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Settings panel: list worker checkpoints + set active base for LoRA-compatible gens.
+ * Checkpoint rows come from the parent refresh so install/delete update this select
+ * without a second mount-only fetch.
+ */
+function WorkerBaseModelPanel({
+  busy,
+  hasWorker,
+  api,
+  checkpoints,
+  active,
+  onRefresh,
+  onSaved,
+  onError,
+}) {
+  const [catalog, setCatalog] = useState([]);
+  const [selected, setSelected] = useState(active?.model || "");
+  const [loading, setLoading] = useState(false);
+  const activeModel = typeof active?.model === "string" ? active.model : "";
+  const prevActiveRef = useRef(activeModel);
+
+  useEffect(() => {
+    if (!hasWorker) {
+      setCatalog([]);
+      return undefined;
+    }
+    let cancelled = false;
+    api("/v1/base-models", { cache: "no-store" })
+      .catch(() => ({ items: [] }))
+      .then((models) => {
+        if (!cancelled) setCatalog(Array.isArray(models?.items) ? models.items : []);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [hasWorker, api]);
+
+  useEffect(() => {
+    const activeChanged = prevActiveRef.current !== activeModel;
+    prevActiveRef.current = activeModel;
+    setSelected((prev) => {
+      const paths = (checkpoints || []).map((c) => c.path);
+      if (activeChanged && activeModel) return activeModel;
+      if (prev && paths.includes(prev)) return prev;
+      if (activeModel) return activeModel;
+      return paths[0] || "";
+    });
+  }, [checkpoints, activeModel]);
+
+  const refresh = async () => {
+    setLoading(true);
+    try {
+      await onRefresh?.();
+    } catch (e) {
+      onError?.(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const setBase = async () => {
+    if (!selected.trim()) return;
+    setLoading(true);
+    try {
+      const match = (checkpoints || []).find((c) => c.path === selected);
+      const catalogHit = catalog.find((c) => c.suggestedModel === selected);
+      const body = {
+        model: selected.trim(),
+        baseModel: match?.baseModel || catalogHit?.baseModel || undefined,
+      };
+      const res = await api("/v1/worker/base-model", {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      if (res?.model) setSelected(res.model);
+      onSaved?.(`Active base set to ${res?.model || selected}`);
+      await onRefresh?.();
+    } catch (e) {
+      onError?.(e.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!hasWorker) {
+    return <p className="hint">Connect a worker to set a base checkpoint.</p>;
+  }
+
+  const checkpointRows = checkpoints || [];
+  const options = [
+    ...checkpointRows.map((c) => ({
+      value: c.path,
+      label: `${c.name || c.id}${c.baseModel ? ` (${c.baseModel})` : ""}`,
+    })),
+    ...catalog
+      .filter((c) => !checkpointRows.some((x) => x.path === c.suggestedModel))
+      .map((c) => ({
+        value: c.suggestedModel,
+        label: `${c.baseModel} hint → ${c.suggestedModel}`,
+      })),
+  ];
+
+  return (
+    <div className="worker-base-panel">
+      <div className="worker-vram-meta">
+        <span>Base checkpoint</span>
+        <button type="button" className="ghost" disabled={busy || loading} onClick={refresh}>
+          Refresh
+        </button>
+      </div>
+      <div className="worker-base-row">
+        <select
+          value={selected}
+          disabled={busy || loading || options.length === 0}
+          onChange={(e) => setSelected(e.target.value)}
+        >
+          {options.length === 0 ? (
+            <option value="">No checkpoints yet — install from Civitai</option>
+          ) : (
+            options.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))
+          )}
+        </select>
+        <button type="button" className="ghost" disabled={busy || loading || !selected} onClick={setBase}>
+          Set active
+        </button>
+      </div>
+      {active?.model && (
+        <p className="hint">
+          Current: {active.model}
+          {active.baseModel ? ` · ${active.baseModel}` : ""}
+        </p>
+      )}
     </div>
   );
 }
