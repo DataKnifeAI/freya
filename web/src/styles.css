@@ -544,45 +544,63 @@ button.linkish:hover { text-decoration-color: var(--ember); }
 }
 .idea-chip:hover { background: var(--celadon-tint); color: var(--ember-deep); }
 
-/* ——— Right pane: tabs first, then LoRA strip, then the hang ——— */
+/* ——— Right pane: tabs first, then the hang ——— */
 .tabs { order: -3; flex: none; display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; align-items: center; padding-bottom: 0.45rem; border-bottom: 1px solid var(--chrome-line); }
 .tabs button { border: none; border-bottom: 2px solid transparent; background: transparent; padding: 0.25rem 0.05rem; font-weight: 700; font-size: 0.72rem; letter-spacing: 0.12em; text-transform: uppercase; color: var(--chrome-muted); }
 .tabs button:hover { color: var(--mist-light); }
 .tabs button.active { background: transparent; color: var(--chrome-text); border-bottom-color: var(--apricot); }
 
-.lora-strip {
-  order: -2; flex: none; padding: 0.65rem 0.75rem 0.75rem; animation: fade 250ms ease both;
-  background: var(--chrome-field); border: 1px solid var(--chrome-line); border-top: 2px solid var(--apricot-line);
-}
-.lora-strip-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.6rem; }
-.lora-strip-head .ghost { padding: 0.18rem 0.5rem; font-size: 0.68rem; }
-.lora-strip .t-kind { color: var(--mist-light); }
-.lora-strip-q { margin: 0.15rem 0 0; font-size: 0.82rem; opacity: 0.85; }
-.lora-strip .hint { color: var(--chrome-muted); opacity: 1; margin: 0.35rem 0 0.55rem; }
 .lora-row { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 0.6rem; }
-.lora-row-strip { display: flex; overflow-x: auto; padding-bottom: 0.35rem; }
-.lora-row-strip .lora-card { flex: 0 0 168px; }
-.lookup-assets { display: grid; gap: 0.55rem; margin-top: 0.45rem; }
-.lookup-assets-label {
-  display: block; margin-bottom: 0.3rem;
+/* Styles-tab match table: one asset per row. Thumb matches the Installed card column (190px, 4/3). */
+.style-matches {
+  display: grid; gap: 0.4rem;
+  padding: 0.15rem 0 0.85rem; margin-bottom: 0.35rem;
+  border-bottom: 1px solid var(--chrome-line);
+}
+.style-matches-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.6rem; }
+.style-matches-head .ghost { padding: 0.18rem 0.5rem; font-size: 0.68rem; }
+.style-matches .t-kind { color: var(--mist-light); }
+.style-matches-q { margin: 0.15rem 0 0; font-size: 0.82rem; }
+.style-matches .hint { margin: 0; color: var(--chrome-muted); opacity: 1; }
+.asset-match-scroll {
+  max-height: min(52vh, 34rem);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.asset-match-table { display: grid; gap: 0.35rem; min-width: 28rem; }
+.asset-match-group {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr) auto;
+  align-items: center;
+}
+.asset-match-label {
+  grid-column: 1 / -1;
+  position: sticky; top: 0; z-index: 1;
+  padding: 0.35rem 0.1rem;
   font-size: 0.68rem; font-weight: 700; letter-spacing: 0.08em;
-  text-transform: uppercase; opacity: 0.72;
+  text-transform: uppercase; color: var(--mist-light);
+  background: var(--wall-bg);
 }
-.lookup-existing-row {
-  display: flex; gap: 0.45rem; overflow-x: auto; padding-bottom: 0.2rem;
+.lora-card.asset-match-row {
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+  align-items: center;
+  gap: 0.45rem 0.7rem;
+  padding: 0.4rem 0.1rem;
 }
-.lookup-existing-row .lora-card { flex: 0 0 168px; }
-.lookup-new-list {
-  max-height: 18rem; overflow-y: auto; display: grid; gap: 0.35rem;
-  padding-right: 0.15rem;
+.lora-card.asset-match-row .lora-card-thumb {
+  width: 190px;
+  aspect-ratio: 4 / 3;
+  height: auto;
 }
-.t-msg .lookup-new-list .lora-card { max-width: 100%; }
-/* Other Civitai matches: row-sized thumbs. Installed cards stay full detail. */
-.lookup-new-list .lora-card-thumb {
-  width: 72px;
-  height: 72px;
-  justify-self: start;
+.lora-card.asset-match-row .lora-card-body { min-width: 0; }
+.lora-card.asset-match-row h4,
+.lora-card.asset-match-row p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
+.lora-card.asset-match-row .lora-card-actions { justify-content: flex-end; flex-wrap: nowrap; }
 .lora-card { border-top: 2px solid var(--apricot-line); padding: 0.55rem 0.1rem 0.3rem; display: grid; gap: 0.4rem; align-content: start; }
 .lora-card h4 { margin: 0; font-size: 0.92rem; font-weight: 600; line-height: 1.25; }
 .lora-card p { margin: 0.1rem 0 0; font-size: 0.74rem; opacity: 0.72; line-height: 1.35; }
@@ -699,5 +717,9 @@ input:focus { outline: none; border-bottom-color: var(--ember); }
   .chrome-chip-v { max-width: 7rem; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .compose, .salon, .panel, .timeline, .lora-strip, .icon-spin { animation: none; }
+  .compose, .salon, .panel, .timeline, .icon-spin { animation: none; }
+  .civitai-subnav .civitai-subnav-end.dl-busy {
+    animation: none;
+    color: var(--coral);
+  }
 }
