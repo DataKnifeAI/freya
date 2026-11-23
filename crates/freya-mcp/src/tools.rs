@@ -170,9 +170,15 @@ pub struct CivitaiImagesArgs {
     /// Version in context. Omit to list images for any version of the model.
     #[serde(default)]
     pub model_version_id: Option<i64>,
-    /// Capped at 12.
+    /// Page size. Default 20. Capped at 100.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Opaque `nextCursor` from the previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Page number when the previous response has `nextPage` and no cursor.
+    #[serde(default)]
+    pub page: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -496,7 +502,7 @@ impl FreyaMcp {
     }
 
     #[tool(
-        description = "Community images made with a Civitai model. modelId required, modelVersionId optional. Up to 12 posts. Each item has prompt, negative, sampler, steps, cfg, seed, resources, checkpoint, checkpointInstalled, checkpointDifferent, and missingResources. Does not download, pin, or change the base. install_asset is a separate call (versionId or modelId). Show NSFW follows Freya settings."
+        description = "Community images made with a Civitai model. modelId required, modelVersionId optional. One page (default 20). Pass cursor or page from nextCursor or nextPage for the next page. Each item has prompt, negative, sampler, steps, cfg, seed, resources, checkpoint, checkpointInstalled, checkpointDifferent, and missingResources. Does not download, pin, or change the base. install_asset is a separate call (versionId or modelId). Show NSFW follows Freya settings."
     )]
     async fn civitai_images(
         &self,
@@ -508,6 +514,16 @@ impl FreyaMcp {
         }
         if let Some(limit) = args.limit {
             q.push(("limit".into(), limit.to_string()));
+        }
+        if let Some(cursor) = args
+            .cursor
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            q.push(("cursor".into(), cursor.to_string()));
+        } else if let Some(page) = args.page.filter(|n| *n > 0) {
+            q.push(("page".into(), page.to_string()));
         }
         let v = self
             .api

@@ -1954,10 +1954,20 @@ async fn execute_chat_action(
                 .args
                 .get("limit")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(12) as u32;
+                .unwrap_or(20) as u32;
+            let cursor = action.args.get("cursor").and_then(|v| v.as_str());
+            let page_no = action
+                .args
+                .get("page")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
             let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
-            match load_community_images(state, model_id, version_id, allow_nsfw, limit).await {
-                Ok(items) => json!({
+            match load_community_images(
+                state, model_id, version_id, allow_nsfw, limit, cursor, page_no,
+            )
+            .await
+            {
+                Ok(page) => json!({
                     "type": ty,
                     "status": "executed",
                     "args": action.args,
@@ -1965,9 +1975,11 @@ async fn execute_chat_action(
                         "modelId": model_id,
                         "modelVersionId": version_id,
                         "nsfw": allow_nsfw,
-                        "count": items.len(),
-                        "items": items,
-                        "note": "Community image posts. Does not download or generate."
+                        "count": page.items.len(),
+                        "items": page.items,
+                        "nextCursor": page.next_cursor,
+                        "nextPage": page.next_page,
+                        "note": "Community image posts. Pass nextCursor or nextPage for another page. Does not download or generate."
                     }
                 }),
                 Err(e) => json!({
@@ -6223,6 +6235,12 @@ pub struct CivitaiImagesQuery {
     pub model_version_id: Option<i64>,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Opaque `nextCursor` from the previous images response.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Page number when metadata has `nextPage` and no cursor.
+    #[serde(default)]
+    pub page: Option<u32>,
 }
 
 fn json_i64(v: Option<&serde_json::Value>) -> Option<i64> {
@@ -6327,18 +6345,20 @@ async fn load_community_images(
     version_id: Option<i64>,
     allow_nsfw: bool,
     limit: u32,
-) -> Result<Vec<crate::civitai::CommunityImage>, anyhow::Error> {
-    let mut items = {
+    cursor: Option<&str>,
+    page: Option<u32>,
+) -> Result<crate::civitai::CommunityImagePage, anyhow::Error> {
+    let mut page = {
         let civ = state.civitai.read().await;
-        civ.community_images(model_id, version_id, allow_nsfw, limit)
+        civ.community_images(model_id, version_id, allow_nsfw, limit, cursor, page)
             .await?
     };
     let inventory = studio_inventory(state).await;
-    crate::civitai::annotate_community_images(&mut items, &inventory);
-    Ok(items)
+    crate::civitai::annotate_community_images(&mut page.items, &inventory);
+    Ok(page)
 }
 
-/// Community images for the model or version in context. Cap 12. Does not download.
+/// Community images for the model or version in context. Pages follow Civitai's cursor.
 pub async fn civitai_images(
     State(state): State<AppState>,
     Query(q): Query<CivitaiImagesQuery>,
@@ -6351,18 +6371,28 @@ pub async fn civitai_images(
         ));
     }
     let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
-    let limit = q.limit.unwrap_or(12);
-    let items = load_community_images(&state, model_id, version_id, allow_nsfw, limit)
-        .await
-        .map_err(ApiError::from)?;
+    let limit = q.limit.unwrap_or(20);
+    let page = load_community_images(
+        &state,
+        model_id,
+        version_id,
+        allow_nsfw,
+        limit,
+        q.cursor.as_deref(),
+        q.page,
+    )
+    .await
+    .map_err(ApiError::from)?;
     Ok(Json(json!({
         "modelId": model_id,
         "modelVersionId": version_id,
         "nsfw": allow_nsfw,
-        "count": items.len(),
-        "items": items,
+        "count": page.items.len(),
+        "items": page.items,
+        "nextCursor": page.next_cursor,
+        "nextPage": page.next_page,
         "upstream": "https://civitai.com/api/v1/images",
-        "note": "Community image posts. Does not download or generate."
+        "note": "Community image posts. Pass nextCursor or nextPage for another page. Does not download or generate."
     })))
 }
 

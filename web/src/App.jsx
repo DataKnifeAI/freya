@@ -81,6 +81,9 @@ function costTierCurrent(value) {
 const GUIDELINES_ACK_STORAGE_KEY = "freya.guidelinesAck";
 /** Persistent Civitai library (survives sessions). Distinct from session Pin. */
 const FAVORITES_STORAGE_KEY = "freya.civitaiFavorites";
+/** Community image favorites. Not Civitai model cards. */
+const IMAGE_FAVORITES_STORAGE_KEY = "freya.communityImageFavorites";
+const COMMUNITY_PAGE_SIZE = 20;
 
 /** Third-party policy links (README + Settings + Guidelines tab stay in sync). */
 const POLICY_LINKS = {
@@ -352,6 +355,63 @@ function writeFavorites(list) {
   } catch {
     /* ignore quota */
   }
+}
+
+function readImageFavorites() {
+  try {
+    const raw = localStorage.getItem(IMAGE_FAVORITES_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((x) => x && x.id != null) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeImageFavorites(list) {
+  try {
+    localStorage.setItem(IMAGE_FAVORITES_STORAGE_KEY, JSON.stringify(list.slice(0, 200)));
+  } catch {
+    /* ignore quota */
+  }
+}
+
+function communityImageFilename(item) {
+  const src = String(item?.url || item?.thumbnailUrl || "");
+  const match = src.toLowerCase().match(/\.([a-z0-9]{2,5})(?:\?|#|$)/);
+  const raw = match ? match[1] : "jpg";
+  const ext = raw === "jpeg" ? "jpg" : raw;
+  const id = String(item?.id || "image").replace(/[^a-z0-9-]/gi, "").slice(0, 16) || "image";
+  return `civitai-${id}.${ext}`;
+}
+
+function communityImageFavorite(item, ctx) {
+  return {
+    id: item.id,
+    url: item.url || item.thumbnailUrl || "",
+    prompt: String(item.prompt || "").slice(0, 4000),
+    negative: String(item.negativePrompt || "").slice(0, 4000),
+    meta: {
+      sampler: item.sampler ?? null,
+      steps: item.steps ?? null,
+      cfg: item.cfg ?? null,
+      seed: item.seed ?? null,
+      clipSkip: item.clipSkip ?? null,
+      size: item.size || null,
+    },
+    nsfw: Boolean(item.nsfw),
+    modelId: ctx?.modelId ?? null,
+    modelVersionId: ctx?.modelVersionId ?? item.modelVersionIds?.[0] ?? null,
+  };
+}
+
+async function copyCommunityInput(item) {
+  const prompt = String(item?.prompt || "").trim();
+  const negative = String(item?.negativePrompt || "").trim();
+  const text = [prompt, negative ? `Negative: ${negative}` : ""].filter(Boolean).join("\n\n");
+  if (!text) throw new Error("This image has no prompt to copy.");
+  if (!navigator.clipboard?.writeText) throw new Error("Clipboard is not available.");
+  await navigator.clipboard.writeText(text);
 }
 
 /** Human-readable byte size for storage meters (Worker tab). */
@@ -1548,6 +1608,20 @@ const IconDownload = () => (
     <path d="M5 19h14" />
   </Svg>
 );
+const IconCopy = () => (
+  <Svg>
+    <rect x="8" y="8" width="12" height="12" />
+    <path d="M4 16V4h12" />
+  </Svg>
+);
+const IconGallery = () => (
+  <Svg>
+    <rect x="3" y="3" width="7.5" height="7.5" />
+    <rect x="13.5" y="3" width="7.5" height="7.5" />
+    <rect x="3" y="13.5" width="7.5" height="7.5" />
+    <rect x="13.5" y="13.5" width="7.5" height="7.5" />
+  </Svg>
+);
 const IconClear = () => (
   <Svg>
     <path d="M5 7h14M9 7V5h6v2M8 7l1 12h6l1-12" />
@@ -2420,6 +2494,12 @@ export default function App() {
   const [communityErr, setCommunityErr] = useState("");
   const [communityNote, setCommunityNote] = useState("");
   const [communityInstallId, setCommunityInstallId] = useState(null);
+  const [communityMore, setCommunityMore] = useState(false);
+  const [communityDetail, setCommunityDetail] = useState(null);
+  const [imageFavorites, setImageFavorites] = useState(readImageFavorites);
+  const communitySentinelRef = useRef(null);
+  const communityPagerRef = useRef({ key: "", cursor: null, page: null, done: true });
+  const communityFlightRef = useRef(false);
   const [civitaiDetailBusy, setCivitaiDetailBusy] = useState(false);
   const [detailImageIdx, setDetailImageIdx] = useState(0);
   const [downloadJobs, setDownloadJobs] = useState([]);
@@ -3166,6 +3246,15 @@ export default function App() {
       modelVersionId,
       name: item.name || "This model",
     });
+  };
+
+  const openAssetGallery = (item, versionId) => {
+    rememberAgentAsset(item, versionId);
+    setCivitaiDetail(null);
+    setDetailImageIdx(0);
+    setCommunityDetail(null);
+    setTab("agent");
+    setAgentFocus("gallery");
   };
 
   const selectCivitaiVariant = (versionId, fileId) => {
@@ -5574,6 +5663,8 @@ export default function App() {
     const thumbUrl = pickCivitaiThumb(item, favorites);
     const cardKey = item.path ? `path:${item.path}` : loraKey(item);
     const row = layout === "row";
+    const canOpenGallery =
+      resolveCivitaiModelId(item) != null || Number(item.versionId || item.modelVersionId) > 0;
     return (
       <article
         key={cardKey}
@@ -5619,6 +5710,17 @@ export default function App() {
           >
             <IconStar filled={favorited} />
           </button>
+          {canOpenGallery ? (
+            <button
+              type="button"
+              className="ghost icon-btn"
+              title="Community images for this model"
+              aria-label="Open community gallery"
+              onClick={() => openAssetGallery(item)}
+            >
+              <IconGallery />
+            </button>
+          ) : null}
           {pinnable || checkpoint ? (
             <button
               type="button"
@@ -5746,40 +5848,71 @@ export default function App() {
       }`
     : "";
 
-  const applyCommunityImage = async (item) => {
-    if (!item) return;
-    if (item.prompt) setPrompt(item.prompt);
-    const form = { ...genMetaRef.current };
-    if (item.sampler) form.sampler = item.sampler;
-    if (item.cfg != null && item.cfg !== "") form.cfg = item.cfg;
-    if (item.steps != null && item.steps !== "") form.steps = item.steps;
-    if (item.clipSkip != null && item.clipSkip !== "") form.clipSkip = item.clipSkip;
-    if (item.negativePrompt != null) form.negativePrompt = item.negativePrompt;
-    if (item.seed != null && item.seed !== "") form.seed = item.seed;
-    if (item.size) form.size = item.size;
-    const resources = (item.resources || [])
-      .map((r) => r?.name)
-      .filter(Boolean)
-      .slice(0, 6);
-    const sourceLabel = [
-      item.id ? `Community image ${item.id}` : "Community image",
-      resources.length ? resources.join(", ") : "",
-    ]
-      .filter(Boolean)
-      .join(" · ")
-      .slice(0, 160);
+  const imageFavorited = (item) =>
+    imageFavorites.some((f) => String(f.id) === String(item?.id));
+
+  const toggleImageFavorite = (item) => {
+    if (!item?.id) return;
+    setImageFavorites((prev) => {
+      const exists = prev.some((f) => String(f.id) === String(item.id));
+      const next = exists
+        ? prev.filter((f) => String(f.id) !== String(item.id))
+        : [communityImageFavorite(item, galleryContext), ...prev].slice(0, 200);
+      writeImageFavorites(next);
+      return next;
+    });
+  };
+
+  const copyImageInput = async (item) => {
     try {
-      const data = await api("/v1/generation-meta", {
-        method: "PUT",
-        body: JSON.stringify({ ...genMetaBody(form), source: "gallery", sourceLabel }),
-      });
-      applyGenMeta(data);
+      await copyCommunityInput(item);
       setCommunityErr("");
-      setCommunityNote("Copied into Meta. The prompt is in the composer. Nothing was generated.");
+      setCommunityNote("Copied the prompt and negative prompt.");
     } catch (e) {
       setCommunityNote("");
-      setCommunityErr(e.message || "Could not save Meta");
+      setCommunityErr(e.message || "Could not copy");
     }
+  };
+
+  const renderCommunityActions = (item) => {
+    const saved = imageFavorited(item);
+    return (
+      <>
+        <button
+          type="button"
+          className={`${saved ? "primary" : "ghost"} icon-btn`}
+          title={saved ? "Remove from image favorites" : "Favorite this image"}
+          aria-label={saved ? "Unfavorite image" : "Favorite image"}
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleImageFavorite(item);
+          }}
+        >
+          <IconStar filled={saved} />
+        </button>
+        <button
+          type="button"
+          className="ghost icon-btn"
+          title="Copy prompt and negative prompt"
+          aria-label="Copy input"
+          onClick={(e) => {
+            e.stopPropagation();
+            void copyImageInput(item);
+          }}
+        >
+          <IconCopy />
+        </button>
+        <MediaDownload
+          src={item.url || item.thumbnailUrl}
+          item={{ ...item, filename: communityImageFilename(item) }}
+          className="ghost icon-btn"
+          onError={(msg) => {
+            setCommunityNote("");
+            setCommunityErr(msg || "Download failed");
+          }}
+        />
+      </>
+    );
   };
 
   /** Queue missing generation resources. Does not pin or change the current base. */
@@ -5836,35 +5969,115 @@ export default function App() {
     }
   };
 
+  const rememberCommunityPage = (data, { key, requested, append, added }) => {
+    const nextCursor = data?.nextCursor ? String(data.nextCursor) : "";
+    const nextPage = Number(data?.nextPage);
+    const hasPage = Number.isFinite(nextPage) && nextPage > 0;
+    const sameCursor = Boolean(requested && nextCursor && requested === nextCursor);
+    communityPagerRef.current = {
+      key,
+      cursor: nextCursor || null,
+      page: nextCursor ? null : hasPage ? nextPage : null,
+      done: (!nextCursor && !hasPage) || sameCursor || (append && added === 0),
+    };
+  };
+
+  const fetchCommunityPage = async (ctx, { cursor, page, append, key }) => {
+    const q = new URLSearchParams();
+    if (ctx.modelId) q.set("modelId", String(ctx.modelId));
+    if (ctx.modelVersionId) q.set("modelVersionId", String(ctx.modelVersionId));
+    q.set("limit", String(COMMUNITY_PAGE_SIZE));
+    if (cursor) q.set("cursor", cursor);
+    else if (page) q.set("page", String(page));
+    const data = await api(`/v1/civitai/images?${q}`);
+    if (communityPagerRef.current.key !== key) return;
+    const incoming = data.items || [];
+    let added = incoming.length;
+    setCommunityImages((prev) => {
+      if (!append) return incoming;
+      const seen = new Set(prev.map((item) => String(item.id)));
+      const extra = incoming.filter((item) => !seen.has(String(item.id)));
+      added = extra.length;
+      return extra.length ? [...prev, ...extra] : prev;
+    });
+    rememberCommunityPage(data, { key, requested: cursor || "", append, added });
+    if (!append) setCommunityNote("");
+  };
+
   useEffect(() => {
     if (tab !== "agent" || agentFocus !== "gallery" || !galleryKey) {
       return undefined;
     }
     const ctx = galleryContext;
     let cancel = false;
+    communityPagerRef.current = { key: galleryKey, cursor: null, page: null, done: true };
+    communityFlightRef.current = true;
     setCommunityBusy(true);
+    setCommunityMore(false);
     setCommunityErr("");
-    const q = new URLSearchParams();
-    if (ctx.modelId) q.set("modelId", String(ctx.modelId));
-    if (ctx.modelVersionId) q.set("modelVersionId", String(ctx.modelVersionId));
-    api(`/v1/civitai/images?${q}`)
-      .then((data) => {
-        if (cancel) return;
-        setCommunityImages(data.items || []);
-        setCommunityNote("");
-      })
+    setCommunityImages([]);
+    setCommunityDetail(null);
+    fetchCommunityPage(ctx, { append: false, key: galleryKey })
       .catch((e) => {
         if (cancel) return;
         setCommunityImages([]);
+        communityPagerRef.current = { key: galleryKey, cursor: null, page: null, done: true };
         setCommunityErr(e.message || "Could not load community images");
       })
       .finally(() => {
-        if (!cancel) setCommunityBusy(false);
+        if (cancel) return;
+        communityFlightRef.current = false;
+        setCommunityBusy(false);
       });
     return () => {
       cancel = true;
+      communityFlightRef.current = false;
     };
   }, [tab, agentFocus, galleryKey]);
+
+  useEffect(() => {
+    if (tab !== "agent" || agentFocus !== "gallery" || !galleryKey) return undefined;
+    const sentinel = communitySentinelRef.current;
+    if (!sentinel) return undefined;
+    const root = sentinel.closest(".pane");
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        const pager = communityPagerRef.current;
+        if (pager.key !== galleryKey || pager.done || communityFlightRef.current) return;
+        if (!pager.cursor && !pager.page) return;
+        const ctx = galleryContext;
+        communityFlightRef.current = true;
+        setCommunityMore(true);
+        fetchCommunityPage(ctx, {
+          cursor: pager.cursor,
+          page: pager.page,
+          append: true,
+          key: galleryKey,
+        })
+          .catch((e) => {
+            setCommunityErr(e.message || "Could not load more community images");
+            communityPagerRef.current = { ...communityPagerRef.current, done: true };
+          })
+          .finally(() => {
+            communityFlightRef.current = false;
+            setCommunityMore(false);
+          });
+      },
+      { root: root || null, rootMargin: "320px" },
+    );
+    io.observe(sentinel);
+    return () => io.disconnect();
+  }, [tab, agentFocus, galleryKey, communityImages.length, communityBusy]);
+
+  useEffect(() => {
+    if (!communityDetail) return undefined;
+    const onKey = (e) => {
+      if (e.key === "Escape") setCommunityDetail(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [communityDetail]);
 
   const openAgentLibrary = (id) => {
     setAgentFocus(id);
@@ -7075,7 +7288,7 @@ export default function App() {
                   galleryContext.modelVersionId
                     ? ` · version ${galleryContext.modelVersionId}`
                     : ""
-                }. Click a row to copy its prompt and settings into Meta. It does not generate.`
+                }. Click an image to open it. Favorite, copy, and download stay on the tile.`
               : "Open a model, or use a suggested or installed row, to list community images for that version."}
           </p>
           {communityBusy && <p className="hint">Loading community images…</p>}
@@ -7086,23 +7299,6 @@ export default function App() {
           )}
           <ul className="agent-gallery-list">
             {communityImages.map((item) => {
-              const process = [
-                item.sampler,
-                item.steps != null ? `${item.steps} steps` : "",
-                item.cfg != null ? `CFG ${item.cfg}` : "",
-                item.seed != null ? `seed ${item.seed}` : "",
-                item.clipSkip != null ? `clip skip ${item.clipSkip}` : "",
-                item.size || "",
-              ]
-                .filter(Boolean)
-                .join(" · ");
-              const resources = (item.resources || [])
-                .filter((r) => !isCheckpointAsset({ modelType: r?.type, type: r?.type }))
-                .map((r) => {
-                  const weight = r.weight != null ? ` ${r.weight}` : "";
-                  return `${r.name}${r.type ? ` (${r.type}${weight})` : ""}`;
-                })
-                .join(", ");
               const checkpointLine = item.checkpoint
                 ? [
                     item.checkpoint,
@@ -7115,69 +7311,160 @@ export default function App() {
               const installableMissing = (item.missingResources || []).filter(
                 (r) => r && r.installable !== false && (r.modelVersionId || r.modelId),
               );
+              const preview = item.thumbnailUrl || item.url;
               return (
-                <li key={item.id} className="agent-gallery-item">
+                <li key={item.id} className="agent-gallery-tile">
                   <button
                     type="button"
-                    className="agent-gallery-row"
-                    onClick={() => void applyCommunityImage(item)}
+                    className="agent-gallery-shot"
+                    onClick={() => setCommunityDetail(item)}
                   >
-                    {item.thumbnailUrl || item.url ? (
-                      <img
-                        className="agent-gallery-thumb"
-                        src={item.thumbnailUrl || item.url}
-                        alt=""
-                      />
+                    {preview ? (
+                      <img src={preview} alt="" />
                     ) : (
-                      <span className="agent-gallery-thumb agent-gallery-thumb-empty" />
+                      <span className="agent-gallery-thumb-empty" />
                     )}
-                    <span className="agent-gallery-copy">
-                      <span className="agent-gallery-prompt">{item.prompt || "No prompt"}</span>
+                  </button>
+                  <div className="agent-gallery-tile-actions">{renderCommunityActions(item)}</div>
+                  {(checkpointLine || installableMissing.length > 0 || item.civitaiUrl) && (
+                    <div className="agent-gallery-tile-foot">
                       {checkpointLine ? (
                         <span className="agent-gallery-checkpoint">{checkpointLine}</span>
                       ) : null}
-                      {item.negativePrompt ? (
-                        <span className="agent-gallery-neg">Negative: {item.negativePrompt}</span>
+                      {installableMissing.length > 0 ? (
+                        <button
+                          type="button"
+                          className="ghost"
+                          disabled={communityInstallId === item.id}
+                          title={`Download ${installableMissing
+                            .map((r) => r.name)
+                            .filter(Boolean)
+                            .join(", ")}. Does not change the base.`}
+                          onClick={() => void installCommunityMissing(item)}
+                        >
+                          {communityInstallId === item.id ? "Queuing…" : "Install missing"}
+                        </button>
                       ) : null}
-                      {process ? <span className="agent-gallery-meta">{process}</span> : null}
-                      {resources ? (
-                        <span className="agent-gallery-resources">Also used: {resources}</span>
+                      {item.civitaiUrl ? (
+                        <a
+                          className={`ghost civitai-open-link ${
+                            item.nsfw ? "civitai-link-nsfw" : "civitai-link-sfw"
+                          }`}
+                          href={item.civitaiUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          Open
+                        </a>
                       ) : null}
-                    </span>
-                  </button>
-                  <span className="agent-gallery-actions">
-                    {installableMissing.length > 0 ? (
-                      <button
-                        type="button"
-                        className="ghost"
-                        disabled={communityInstallId === item.id}
-                        title={`Download ${installableMissing
-                          .map((r) => r.name)
-                          .filter(Boolean)
-                          .join(", ")}. Does not change the base.`}
-                        onClick={() => void installCommunityMissing(item)}
-                      >
-                        {communityInstallId === item.id ? "Queuing…" : "Install missing"}
-                      </button>
-                    ) : null}
-                    {item.civitaiUrl ? (
-                      <a
-                        className={`ghost civitai-open-link ${
-                          item.nsfw ? "civitai-link-nsfw" : "civitai-link-sfw"
-                        }`}
-                        href={item.civitaiUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        Open
-                      </a>
-                    ) : null}
-                  </span>
+                    </div>
+                  )}
                 </li>
               );
             })}
           </ul>
+          <div ref={communitySentinelRef} className="agent-gallery-sentinel" />
+          {communityMore && <p className="hint">Loading more images…</p>}
         </section>
+      )}
+      {tab === "agent" && agentFocus === "gallery" && communityDetail && (
+        <div
+          className="civitai-modal-backdrop"
+          role="presentation"
+          onClick={() => setCommunityDetail(null)}
+        >
+          <div
+            className="civitai-modal community-image-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Community image"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="civitai-modal-head">
+              <h3>Community image</h3>
+              <div className="row lora-card-actions">
+                {renderCommunityActions(communityDetail)}
+                <button type="button" className="ghost" onClick={() => setCommunityDetail(null)}>
+                  Close
+                </button>
+              </div>
+            </div>
+            <div className="civitai-modal-gallery">
+              {communityDetail.url || communityDetail.thumbnailUrl ? (
+                <img src={communityDetail.url || communityDetail.thumbnailUrl} alt="" />
+              ) : (
+                <div className="lora-card-thumb-fallback">No preview</div>
+              )}
+            </div>
+            <div className="civitai-modal-body">
+              <p>{communityDetail.prompt || "No prompt"}</p>
+              {communityDetail.negativePrompt ? (
+                <p className="hint">Negative: {communityDetail.negativePrompt}</p>
+              ) : null}
+              <p className="hint">
+                {[
+                  communityDetail.sampler,
+                  communityDetail.steps != null ? `${communityDetail.steps} steps` : "",
+                  communityDetail.cfg != null ? `CFG ${communityDetail.cfg}` : "",
+                  communityDetail.seed != null ? `seed ${communityDetail.seed}` : "",
+                  communityDetail.clipSkip != null ? `clip skip ${communityDetail.clipSkip}` : "",
+                  communityDetail.size || "",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </p>
+              {communityDetail.checkpoint ? (
+                <p className="agent-gallery-checkpoint">
+                  {[
+                    communityDetail.checkpoint,
+                    communityDetail.checkpointDifferent ? "different" : "",
+                    communityDetail.checkpointInstalled ? "installed" : "not installed",
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                </p>
+              ) : null}
+              {(communityDetail.resources || []).some(
+                (r) => !isCheckpointAsset({ modelType: r?.type, type: r?.type }),
+              ) ? (
+                <p className="hint">
+                  Also used:{" "}
+                  {(communityDetail.resources || [])
+                    .filter((r) => !isCheckpointAsset({ modelType: r?.type, type: r?.type }))
+                    .map((r) => {
+                      const weight = r.weight != null ? ` ${r.weight}` : "";
+                      return `${r.name}${r.type ? ` (${r.type}${weight})` : ""}`;
+                    })
+                    .join(", ")}
+                </p>
+              ) : null}
+              {(communityDetail.missingResources || []).some(
+                (r) => r && r.installable !== false && (r.modelVersionId || r.modelId),
+              ) ? (
+                <button
+                  type="button"
+                  className="ghost"
+                  disabled={communityInstallId === communityDetail.id}
+                  onClick={() => void installCommunityMissing(communityDetail)}
+                >
+                  {communityInstallId === communityDetail.id ? "Queuing…" : "Install missing"}
+                </button>
+              ) : null}
+              {communityDetail.civitaiUrl ? (
+                <a
+                  className={`ghost civitai-open-link ${
+                    communityDetail.nsfw ? "civitai-link-nsfw" : "civitai-link-sfw"
+                  }`}
+                  href={communityDetail.civitaiUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  Open
+                </a>
+              ) : null}
+            </div>
+          </div>
+        </div>
       )}
 
       {tab === "agent" && agentFocus === "meta" && (
@@ -9077,6 +9364,23 @@ export default function App() {
                 >
                   <IconStar filled={isFavorite(detailModel)} />
                 </button>
+                {resolveCivitaiModelId(detailModel) != null ||
+                Number(detailSelectedVersion?.id ?? detailModel.versionId) > 0 ? (
+                  <button
+                    type="button"
+                    className="ghost icon-btn"
+                    title="Community images for this model"
+                    aria-label="Open community gallery"
+                    onClick={() =>
+                      openAssetGallery(
+                        detailModel,
+                        detailSelectedVersion?.id ?? detailModel.versionId,
+                      )
+                    }
+                  >
+                    <IconGallery />
+                  </button>
+                ) : null}
                 {isPinnableAsset(detailModel) || isCheckpointAsset(detailModel) ? (
                   <button
                     type="button"

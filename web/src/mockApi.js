@@ -2380,14 +2380,61 @@ export async function mockApi(path, opts = {}) {
         missingResources: [],
       });
     }
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 20)));
+    const pageIndex = Math.max(
+      1,
+      Number(url.searchParams.get("cursor") || url.searchParams.get("page") || 1) || 1,
+    );
+    for (const item of items) {
+      if (!item.url) item.url = "/empty-gallery.png";
+    }
+    let pageItems = items;
+    if (pageIndex === 1) {
+      while (pageItems.length < limit) {
+        const n = 100 + pageItems.length + 1;
+        pageItems.push({
+          id: n,
+          prompt: `community example ${n}`,
+          negativePrompt: "lowres",
+          url: "/empty-gallery.png",
+          nsfw: false,
+          civitaiUrl: `https://civitai.com/images/${n}${versionQuery}`,
+          resources: [],
+          modelVersionIds: modelVersionId ? [modelVersionId] : [],
+          checkpointDifferent: false,
+          missingResources: [],
+        });
+      }
+    } else if (pageIndex <= 3) {
+      pageItems = Array.from({ length: limit }, (_, i) => {
+        const id = pageIndex * 1000 + i + 1;
+        return {
+          id,
+          prompt: `page ${pageIndex} image ${i + 1}`,
+          negativePrompt: "",
+          url: "/empty-gallery.png",
+          nsfw: false,
+          civitaiUrl: `https://civitai.com/images/${id}${versionQuery}`,
+          resources: [],
+          modelVersionIds: modelVersionId ? [modelVersionId] : [],
+          checkpointDifferent: false,
+          missingResources: [],
+        };
+      });
+    } else {
+      pageItems = [];
+    }
+    const nextCursor = pageIndex >= 3 || pageItems.length === 0 ? null : String(pageIndex + 1);
     return {
       modelId,
       modelVersionId,
       nsfw: allowNsfw,
-      count: items.length,
-      items,
+      count: pageItems.length,
+      items: pageItems,
+      nextCursor,
+      nextPage: null,
       upstream: "https://civitai.com/api/v1/images",
-      note: "Community image posts. Does not download or generate.",
+      note: "Community image posts. Pass nextCursor for another page. Does not download or generate.",
     };
   }
   if (p === "/v1/generation-meta/recommend" && method === "POST") {
