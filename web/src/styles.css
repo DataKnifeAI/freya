@@ -764,6 +764,7 @@ a.civitai-open-link.civitai-link-sfw:hover {
 }
 .lora-card-actions .icon-btn svg { display: block; }
 .civitai-subnav { gap: 0.35rem; align-items: center; flex-wrap: wrap; }
+.favorite-type-nav { margin: 0 0 0.85rem; }
 .civitai-subnav .civitai-subnav-end { margin-left: auto; }
 /* Color-cycle the Downloads label while any install job is queued/downloading. */
 .civitai-subnav button.civitai-subnav-end.dl-busy {
