@@ -3281,19 +3281,26 @@ pub async fn chat(
     };
     // Local + uncensored / Show NSFW: a refusal or empty tool prompt is not a
     // substitute scene. The user's text is what the worker should see.
-    // Auto GIF runs on the worker too; a cloud still does not.
+    // That includes an explicit Local pin, Auto GIF, and Auto with pinned LoRAs
+    // (those still run on the worker). A cloud still does not.
     let worker_ready = state.worker.read().await.is_some();
-    let pinned_local = req
+    let backend_set = req
         .backend
         .as_deref()
-        .is_some_and(|b| b.eq_ignore_ascii_case("local"));
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let pinned_local = backend_set.is_some_and(|b| b.eq_ignore_ascii_case("local"));
+    let auto_backend = backend_set
+        .map(|b| b.eq_ignore_ascii_case("auto"))
+        .unwrap_or(true);
+    let lora_local = auto_backend && worker_ready && !req.loras.is_empty();
     let auto_gif = routes_to_local_worker(
         req.backend.as_deref(),
         crate::router::Modality::Gif,
         worker_ready,
     ) && crate::router::direct_media_ask(&req.message)
         == crate::router::DirectMedia::Gif;
-    if alignment.local_adult_passthrough() && (pinned_local || auto_gif) {
+    if alignment.local_adult_passthrough() && (pinned_local || auto_gif || lora_local) {
         for action in &mut planned {
             restore_refused_local_prompt(action, &req.message);
         }
@@ -3786,14 +3793,19 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
                         final_prompt = text.clone();
                         enhanced = Some(text);
                     } else {
-                        return Err(ApiError::Msg(
-                            "local prompt rewrite did not return a scene prompt".into(),
-                        ));
+                        // A failed or refused rewrite must not abort the generate.
+                        // The worker still receives the user's scene.
+                        tracing::warn!(
+                            first = %p.model,
+                            retry = %retry_model,
+                            "local adult prompt rewrite unusable; using the original scene"
+                        );
                     }
                 } else {
-                    return Err(ApiError::Msg(
-                        "local prompt rewrite did not return a scene prompt".into(),
-                    ));
+                    tracing::warn!(
+                        model = %p.model,
+                        "local adult prompt rewrite unusable; using the original scene"
+                    );
                 }
             } else if let Some(text) = rewritten.as_deref().map(normalize_sd_rewrite) {
                 if !text.is_empty() && !looks_like_model_refusal(&text) {

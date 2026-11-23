@@ -1041,7 +1041,6 @@ pub fn prompt_is_adult_scene(text: &str) -> bool {
         "panties",
         "thong",
         "boobs",
-        "breasts",
         "cock",
         "cocks",
         "dick",
@@ -1096,12 +1095,17 @@ pub fn prompt_is_adult_scene(text: &str) -> bool {
     if TERMS.iter().any(|term| contains_term(&l, term)) {
         return true;
     }
-    // Singular "breast" / "tits" are ordinary in food and bird names.
+    // "breast" / "breasts" / "tits" are ordinary in food and bird names.
     contextual_term(
         &l,
         "breast",
         &["chicken", "turkey", "duck", "goose", "quail"],
         &["pocket", "cancer", "milk"],
+    ) || contextual_term(
+        &l,
+        "breasts",
+        &["chicken", "turkey", "duck", "goose", "quail"],
+        &[],
     ) || contextual_term(
         &l,
         "tits",
@@ -1206,8 +1210,9 @@ fn sanitize_router_model_suggestion(raw: &str) -> Option<String> {
     if s.contains(char::is_whitespace) {
         return None;
     }
-    // Drop a mistaken `openrouter/` prefix. Invented slugs
+    // Strip a mistaken `openrouter/` prefix. Invented slugs
     // (`openrouter/google-gemini-pro-image-1`) become empty and fall through to Auto.
+    // A real first-party id (`openrouter/horizon-alpha`) stays.
     let s = crate::openrouter::canonicalize_catalog_id(s);
     if s.is_empty() {
         return None;
@@ -1218,9 +1223,6 @@ fn sanitize_router_model_suggestion(raw: &str) -> Option<String> {
         return None;
     }
     if is_auto_image(&s) || is_auto_agent(&s) || is_upstream_router(&s) {
-        return None;
-    }
-    if s.to_ascii_lowercase().starts_with("openrouter/") {
         return None;
     }
     Some(s)
@@ -1509,6 +1511,7 @@ mod tests {
     #[test]
     fn ordinary_wording_is_not_an_adult_scene() {
         assert!(!prompt_is_adult_scene("chicken breast on a plate"));
+        assert!(!prompt_is_adult_scene("chicken breasts on a plate"));
         assert!(!prompt_is_adult_scene("a pair of blue tits on a branch"));
         assert!(!prompt_is_adult_scene(
             "explicit instructions for the checkpoint install"
@@ -1666,6 +1669,25 @@ mod tests {
         assert_eq!(
             sanitize_router_model_suggestion("openrouter/google/gemini-3-pro-image").as_deref(),
             Some("google/gemini-3-pro-image")
+        );
+        assert_eq!(
+            sanitize_router_model_suggestion("openrouter/horizon-alpha").as_deref(),
+            Some("openrouter/horizon-alpha")
+        );
+        let first_party = RouteDecision {
+            modality: Modality::Picture,
+            reason: "t".into(),
+            agent_model: Some("openrouter/horizon-alpha".into()),
+            image_model: Some("openrouter/horizon-alpha".into()),
+            source: "t".into(),
+        };
+        assert_eq!(
+            resolve_agent_model(Some(AUTO_AGENT), &first_party).as_deref(),
+            Some("openrouter/horizon-alpha")
+        );
+        assert_eq!(
+            resolve_image_model_choice(Some(AUTO_IMAGE), &first_party, AUTO_IMAGE),
+            DEFAULT_AUTO_IMAGE_MODEL
         );
         let route = RouteDecision {
             modality: Modality::Picture,
