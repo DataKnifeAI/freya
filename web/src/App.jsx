@@ -234,6 +234,31 @@ function activeBaseEngineHint(modelLoaded, workerStats) {
   return ` — selected (${engineName})`;
 }
 
+/** Off when settings or worker stats say so — same signal as the status dots. */
+function workerGenerationOff(settings, workerStats) {
+  return settings?.workerEnabled === false || workerStats?.enabled === false;
+}
+
+/**
+ * An explicit workerEnabled from the API wins. A missing flag must not wipe a
+ * known disabled worker (that greys out Enable while local generation stays off).
+ * Otherwise keep workerStats.enabled.
+ */
+function mergeSettingsWorkerFlag(prev, incoming, workerStats) {
+  if (!incoming || typeof incoming !== "object") return incoming;
+  if (typeof incoming.workerEnabled === "boolean") return incoming;
+  if (prev?.workerEnabled === false || workerStats?.enabled === false) {
+    return { ...incoming, workerEnabled: false };
+  }
+  if (typeof workerStats?.enabled === "boolean") {
+    return { ...incoming, workerEnabled: workerStats.enabled };
+  }
+  if (typeof prev?.workerEnabled === "boolean") {
+    return { ...incoming, workerEnabled: prev.workerEnabled };
+  }
+  return incoming;
+}
+
 /** Label container vs host models path when both are known. */
 function modelsDirHint(workerStats) {
   const dir = workerStats?.modelsDir;
@@ -1051,6 +1076,13 @@ export default function App() {
   const [workerUrlOverride, setWorkerUrlOverride] = useState("");
   const [useWorkerUrlOverride, setUseWorkerUrlOverride] = useState(false);
   const [workerStats, setWorkerStats] = useState(null);
+  const workerStatsRef = useRef(null);
+  workerStatsRef.current = workerStats;
+  const commitSettings = (incoming, statsHint) => {
+    setSettings((prev) =>
+      mergeSettingsWorkerFlag(prev, incoming, statsHint ?? workerStatsRef.current),
+    );
+  };
   const [workerCtlBusy, setWorkerCtlBusy] = useState(false);
   const [civitaiQ, setCivitaiQ] = useState("");
   const installedFingerprintRef = useRef("");
@@ -1393,7 +1425,7 @@ export default function App() {
       ]);
       const items = s.items || [];
       setStyles(items);
-      setSettings(st);
+      commitSettings(st);
       applyPrivacyAlignmentFromSettings(st);
       applyInstructionsFromSettings(st);
       if (typeof st.chatModel === "string" && st.chatModel.trim()) {
@@ -1657,7 +1689,12 @@ export default function App() {
     }
     try {
       const st = await api("/v1/worker/stats");
-      setWorkerStats(st);
+      setWorkerStats((prev) => {
+        if (st && typeof st.enabled !== "boolean" && typeof prev?.enabled === "boolean") {
+          return { ...st, enabled: prev.enabled };
+        }
+        return st;
+      });
     } catch {
       setWorkerStats(null);
     }
@@ -1678,9 +1715,20 @@ export default function App() {
     setError("");
     setSavedMsg("");
     try {
-      await api(`/v1/worker/${action}`, { method: "POST", body: "{}" });
+      const res = await api(`/v1/worker/${action}`, { method: "POST", body: "{}" });
+      let statsHint;
+      if (
+        (action === "enable" || action === "disable") &&
+        typeof res?.enabled === "boolean"
+      ) {
+        const enabled = res.enabled;
+        statsHint = { ...(workerStatsRef.current || {}), enabled };
+        workerStatsRef.current = statsHint;
+        setWorkerStats((prev) => ({ ...(prev || {}), enabled }));
+        setSettings((prev) => ({ ...(prev || {}), workerEnabled: enabled }));
+      }
       const st = await api("/v1/settings");
-      setSettings(st);
+      commitSettings(st, statsHint);
       applyWorkerEndpoint(st.diffusionWorkerUrl || "");
       await refreshWorkerStats();
       const health = await api("/v1/health").catch(() => null);
@@ -1723,7 +1771,7 @@ export default function App() {
         body: JSON.stringify({ routerModel: id }),
       });
       // API flattens SettingsPublic + persisted
-      setSettings(st);
+      commitSettings(st);
     } catch {
       /* offline / unauth — localStorage still holds the pick */
     }
@@ -1736,7 +1784,7 @@ export default function App() {
         method: "PUT",
         body: JSON.stringify(patch),
       });
-      setSettings(st);
+      commitSettings(st);
     } catch {
       /* localStorage still holds the pick */
     }
@@ -1843,6 +1891,7 @@ export default function App() {
   // Prefer persisted URL so default placeholders do not fake a configured worker.
   const hasWorker = () => Boolean(settings?.diffusionWorkerUrl);
   const workerReachable = Boolean(workerStats?.reachable);
+  const workerOff = workerGenerationOff(settings, workerStats);
   const localBackendOk = hasWorker() && workerReachable;
   const localBackendReason = !hasWorker()
     ? "Set a worker URL on the Worker tab first"
@@ -2015,7 +2064,7 @@ export default function App() {
         method: "PUT",
         body: JSON.stringify({ diffusionWorkerUrl: composedWorkerUrl() }),
       });
-      setSettings(st);
+      commitSettings(st);
       applyWorkerEndpoint(st.diffusionWorkerUrl || "");
       await refreshWorkerStats();
       flashSave(
@@ -2251,11 +2300,23 @@ export default function App() {
         if (typeof routerM === "string" && routerM) setRouterModel(routerM);
         if (typeof video === "string" && video) setVideoModel(video);
         persistModels(chat || agentModel, image || imageModel, routerM || routerModel, video || videoModel);
-        setSettings((prev) => ({ ...(prev || {}), ...a.result }));
+        setSettings((prev) =>
+          mergeSettingsWorkerFlag(
+            prev,
+            { ...(prev || {}), ...a.result },
+            workerStatsRef.current,
+          ),
+        );
       }
       if (a.type === "set_privacy" || a.type === "set_alignment" || a.type === "set_cost_tier") {
         applyPrivacyAlignmentFromSettings(a.result);
-        setSettings((prev) => ({ ...(prev || {}), ...a.result }));
+        setSettings((prev) =>
+          mergeSettingsWorkerFlag(
+            prev,
+            { ...(prev || {}), ...a.result },
+            workerStatsRef.current,
+          ),
+        );
       }
       if (a.type === "set_base_model" && a.result?.model) {
         setActiveBasePath(a.result.model);
@@ -3062,6 +3123,44 @@ export default function App() {
     setSavedMsg("Dismissed.");
   };
 
+  const persistApiKeys = async (orKey, civKey, { flash = true } = {}) => {
+    const wroteOr = Boolean(orKey);
+    const wroteCiv = Boolean(civKey);
+    if (!wroteOr && !wroteCiv) return null;
+    persistStudioTokenLocal();
+    const body = {};
+    if (wroteOr) body.openrouterApiKey = orKey;
+    if (wroteCiv) body.civitaiApiKey = civKey;
+    const st = await api("/v1/settings", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    });
+    commitSettings(st);
+    if (wroteOr) setOpenrouterKey("");
+    if (wroteCiv) setCivitaiKey("");
+    await refresh();
+    if (wroteOr) await refreshModels();
+    if (flash) {
+      const parts = [];
+      if (wroteOr) parts.push("OpenRouter");
+      if (wroteCiv) parts.push("Civitai");
+      const which = `${parts.join(" + ")} key${parts.length > 1 ? "s" : ""} saved`;
+      const disk =
+        st?.persisted === false
+          ? " (warning: secrets file write failed — may not survive API restart)"
+          : st?.persisted
+            ? " · on API secrets file"
+            : "";
+      flashSave(
+        "settings",
+        mock
+          ? "Mock API key saved in-memory (reload resets unless you keep this tab open)."
+          : `${which}${disk}.`,
+      );
+    }
+    return st;
+  };
+
   const saveSettings = async () => {
     setBusy(true);
     setError("");
@@ -3080,7 +3179,11 @@ export default function App() {
         method: "PUT",
         body: JSON.stringify(body),
       });
-      setSettings(st);
+      commitSettings(st);
+      applyPrivacyAlignmentFromSettings(st);
+      applyInstructionsFromSettings(st, instructionMode);
+      markPrivacyAlignmentSynced(prefs);
+      // Clear inputs — keys are never echoed; show on-file badges instead of empty "lost" fields.
       setCivitaiKey("");
       setOpenrouterKey("");
       setSavedMsg(
@@ -3095,7 +3198,232 @@ export default function App() {
     }
   };
 
-  const searchCivitai = async () => {
+  const saveInstructionPrompt = async () => {
+    if (!instructionMode) return;
+    setInstructionBusy(true);
+    setError("");
+    setSavedMsg("");
+    try {
+      persistStudioTokenLocal();
+      const st = await api("/v1/settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          instructionOverrides: {
+            [instructionMode]: instructionDraft,
+          },
+        }),
+      });
+      commitSettings(st);
+      applyInstructionsFromSettings(st, instructionMode);
+      const disk =
+        st?.persisted === false
+          ? " (warning: secrets file write failed)"
+          : st?.persisted
+            ? " · on API secrets file"
+            : "";
+      flashSave("settings", `System prompt “${instructionMode}” saved${disk}.`);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setInstructionBusy(false);
+    }
+  };
+
+  const resetInstructionPrompt = async () => {
+    if (!instructionMode) return;
+    setInstructionBusy(true);
+    setError("");
+    setSavedMsg("");
+    try {
+      persistStudioTokenLocal();
+      const st = await api("/v1/settings", {
+        method: "PUT",
+        body: JSON.stringify({
+          instructionOverrides: {
+            [instructionMode]: "",
+          },
+        }),
+      });
+      commitSettings(st);
+      applyInstructionsFromSettings(st, instructionMode);
+      flashSave(
+        "settings",
+        `System prompt “${instructionMode}” reset to pack default.`,
+      );
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setInstructionBusy(false);
+    }
+  };
+
+  const clearApiKey = async (which) => {
+    const label = which === "openrouter" ? "OpenRouter" : "Civitai";
+    if (
+      !window.confirm(
+        `Remove the saved ${label} API key from this Freya API? Generation / search that needs it will stop until you paste a new key.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setSavedMsg("");
+    setSaveFlash(null);
+    cancelPrefsAutosave();
+    try {
+      const body =
+        which === "openrouter"
+          ? { openrouterApiKey: "" }
+          : { civitaiApiKey: "" };
+      const st = await api("/v1/settings", {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      commitSettings(st);
+      if (which === "openrouter") {
+        setOpenrouterKey("");
+        setOrMetrics(null);
+      } else {
+        setCivitaiKey("");
+      }
+      await refresh();
+      if (which === "openrouter") await refreshModels();
+      flashSave(
+        "settings",
+        mock
+          ? `${label} key cleared (mock).`
+          : `${label} key cleared · secrets file updated.`,
+      );
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const refreshOpenRouterMetrics = async () => {
+    setOrMetricsBusy(true);
+    setError("");
+    try {
+      const data = await api("/v1/metrics/openrouter");
+      setOrMetrics(data);
+    } catch (e) {
+      setOrMetrics(null);
+      setError(e.message);
+    } finally {
+      setOrMetricsBusy(false);
+    }
+  };
+
+  useEffect(() => {
+    if (tab !== "metrics") return undefined;
+    if (!mock && !hasBrowserBearer() && authStatus?.authRequired) return undefined;
+    refreshOpenRouterMetrics();
+    return undefined;
+  }, [tab, mock, studioToken, authStatus?.authRequired, settings?.openRouterConfigured]);
+
+  // Debounced auto-save of privacy/alignment → rebuild server catalogs → refresh pickers.
+  useEffect(() => {
+    if (!prefsReadyRef.current) return undefined;
+    const snap = privacyAlignmentSnapshot({
+      privacyZdr,
+      privacyDataCollection,
+      chatProviders,
+      modelAlignment,
+      allowNsfwLocal,
+      instructionTone,
+      autoFallbacks,
+    });
+    const fp = privacyAlignmentFingerprint(snap);
+    if (fp === prefsFpRef.current) return undefined;
+
+    if (prefsDebounceRef.current) clearTimeout(prefsDebounceRef.current);
+    const gen = ++prefsGenRef.current;
+    prefsDebounceRef.current = setTimeout(async () => {
+      prefsDebounceRef.current = null;
+      try {
+        persistStudioTokenLocal();
+        const st = await api("/v1/settings", {
+          method: "PUT",
+          body: JSON.stringify(snap),
+        });
+        if (gen !== prefsGenRef.current) return;
+        commitSettings(st);
+        markPrivacyAlignmentSynced(snap);
+        await refreshModels();
+      } catch (e) {
+        if (gen === prefsGenRef.current) {
+          setError(e.message || "Failed to update model catalog prefs");
+        }
+      }
+    }, PREFS_MODELS_DEBOUNCE_MS);
+
+    return () => {
+      if (prefsDebounceRef.current) {
+        clearTimeout(prefsDebounceRef.current);
+        prefsDebounceRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: debounce catalog prefs only
+  }, [
+    privacyZdr,
+    privacyDataCollection,
+    chatProviders,
+    modelAlignment,
+    allowNsfwLocal,
+    instructionTone,
+    autoFallbacks,
+  ]);
+
+  // Debounced auto-save of pasted API keys (empty fields leave on-file secrets alone).
+  useEffect(() => {
+    const orKey = openrouterKey.trim();
+    const civKey = civitaiKey.trim();
+    if (!orKey && !civKey) return undefined;
+
+    if (apiKeysDebounceRef.current) clearTimeout(apiKeysDebounceRef.current);
+    const gen = ++apiKeysGenRef.current;
+    apiKeysDebounceRef.current = setTimeout(async () => {
+      apiKeysDebounceRef.current = null;
+      try {
+        await persistApiKeys(orKey, civKey);
+      } catch (e) {
+        if (gen === apiKeysGenRef.current) {
+          setError(e.message || "Failed to save API key");
+        }
+      }
+    }, API_KEYS_DEBOUNCE_MS);
+
+    return () => {
+      if (apiKeysDebounceRef.current) {
+        clearTimeout(apiKeysDebounceRef.current);
+        apiKeysDebounceRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: debounce key paste only
+  }, [openrouterKey, civitaiKey]);
+
+  const searchCivitai = async (opts = {}) => {
+    const q = String(opts.query ?? civitaiQ).trim();
+    const immediate = Boolean(opts.immediate);
+
+    if (!q) {
+      const pending = civitaiAbortRef.current;
+      civitaiAbortRef.current = null;
+      pending?.abort();
+      lastCivitaiSearchQRef.current = "";
+      setCivitaiItems([]);
+      setBusy(false);
+      return;
+    }
+    // Skip redundant debounced searches; Enter/button always re-runs.
+    if (!immediate && q === lastCivitaiSearchQRef.current) return;
+
+    civitaiAbortRef.current?.abort();
+    const ac = new AbortController();
+    civitaiAbortRef.current = ac;
+
     setBusy(true);
     setError("");
     try {
@@ -3381,7 +3709,7 @@ export default function App() {
               >
                 <span
                   className={`status-dot ${
-                    settings.workerEnabled === false || workerStats?.enabled === false
+                    workerOff
                       ? ""
                       : workerStats?.reachable
                         ? "on"
@@ -4629,7 +4957,7 @@ export default function App() {
                 <div className="worker-panel-head">
                   <span
                     className={`status-dot ${
-                      settings?.workerEnabled === false || workerStats?.enabled === false
+                      workerOff
                         ? ""
                         : workerStats?.reachable
                           ? "on"
@@ -4644,7 +4972,7 @@ export default function App() {
                       ? "mock stats"
                       : workerStats
                         ? [
-                            settings?.workerEnabled === false || workerStats.enabled === false
+                            workerOff
                               ? "disabled"
                               : workerStats.reachable
                                 ? "reachable"
@@ -4822,7 +5150,7 @@ export default function App() {
                   <button
                     type="button"
                     className="ghost"
-                    disabled={busy || workerCtlBusy || mock || settings?.workerEnabled !== false}
+                    disabled={busy || workerCtlBusy || mock || !workerOff}
                     onClick={() => workerControl("enable")}
                     title="Use the saved worker for local generation"
                   >
@@ -4831,7 +5159,7 @@ export default function App() {
                   <button
                     type="button"
                     className="ghost"
-                    disabled={busy || workerCtlBusy || mock || settings?.workerEnabled === false}
+                    disabled={busy || workerCtlBusy || mock || workerOff}
                     onClick={() => workerControl("disable")}
                     title="Skip local generation. The URL stays saved"
                   >
