@@ -1945,6 +1945,49 @@ async fn execute_chat_action(
                 }),
             }
         }
+        "civitai_images" => {
+            let model_id = json_i64(action.args.get("modelId"));
+            let version_id = json_i64(action.args.get("modelVersionId"));
+            if model_id.filter(|n| *n > 0).is_none() {
+                return json!({
+                    "type": ty,
+                    "status": "error",
+                    "args": action.args,
+                    "error": "modelId is required"
+                });
+            }
+            let limit = action
+                .args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(12) as u32;
+            let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
+            let civ = state.civitai.read().await;
+            match civ
+                .community_images(model_id, version_id, allow_nsfw, limit)
+                .await
+            {
+                Ok(items) => json!({
+                    "type": ty,
+                    "status": "executed",
+                    "args": action.args,
+                    "result": {
+                        "modelId": model_id,
+                        "modelVersionId": version_id,
+                        "nsfw": allow_nsfw,
+                        "count": items.len(),
+                        "items": items,
+                        "note": "Community image posts. Does not download or generate."
+                    }
+                }),
+                Err(e) => json!({
+                    "type": ty,
+                    "status": "error",
+                    "args": action.args,
+                    "error": e.to_string()
+                }),
+            }
+        }
         "generate_image" => {
             let prompt = action
                 .args
@@ -3227,6 +3270,7 @@ fn phase_for_action(ty: &str) -> Option<&'static str> {
         "generate_image" | "generate_video" | "run_session" => Some("Generating"),
         "install_asset" => Some("Downloading"),
         "search_civitai"
+        | "civitai_images"
         | "suggest_ideas"
         | "list_loras"
         | "list_checkpoints"
@@ -3693,6 +3737,7 @@ fn sentence_is_tool_noise(sentence: &str) -> bool {
     let lower = sentence.to_ascii_lowercase();
     lower.contains("freya route")
         || lower.contains("search_civitai")
+        || lower.contains("civitai_images")
         || lower.contains("generate_image")
         || lower.contains("generate_video")
         || lower.contains("run_session")
@@ -5955,6 +6000,59 @@ pub async fn civitai_lookup(
     Ok(Json(value))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CivitaiImagesQuery {
+    /// Civitai model id. Optional when `modelVersionId` is set.
+    #[serde(default)]
+    pub model_id: Option<i64>,
+    #[serde(default)]
+    pub model_version_id: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+fn json_i64(v: Option<&serde_json::Value>) -> Option<i64> {
+    let v = v?;
+    v.as_i64()
+        .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
+        .or_else(|| {
+            v.as_str()
+                .and_then(|s| s.trim().parse().ok())
+                .filter(|n: &i64| *n > 0)
+        })
+}
+
+/// Community images for the model or version in context. Cap 12. Does not download.
+pub async fn civitai_images(
+    State(state): State<AppState>,
+    Query(q): Query<CivitaiImagesQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let model_id = q.model_id.filter(|n| *n > 0);
+    let version_id = q.model_version_id.filter(|n| *n > 0);
+    if model_id.is_none() && version_id.is_none() {
+        return Err(ApiError::Msg(
+            "modelId or modelVersionId is required".into(),
+        ));
+    }
+    let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
+    let limit = q.limit.unwrap_or(12);
+    let civ = state.civitai.read().await;
+    let items = civ
+        .community_images(model_id, version_id, allow_nsfw, limit)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "modelId": model_id,
+        "modelVersionId": version_id,
+        "nsfw": allow_nsfw,
+        "count": items.len(),
+        "items": items,
+        "upstream": "https://civitai.com/api/v1/images",
+        "note": "Community image posts. Does not download or generate."
+    })))
+}
+
 fn civitai_detail_response(detail: crate::civitai::CivitaiModelDetail) -> Json<serde_json::Value> {
     // Recommended checkpoints are the base suggestion rows. Popular-family hits stay the fallback.
     let recommended: Vec<_> = detail
@@ -6374,8 +6472,22 @@ pub async fn generation_meta_put(
         return Err(ApiError::Msg(msg));
     }
     let patch = crate::genmeta::patch_from_value(&body);
+    let source = match body.get("source").and_then(|s| s.as_str()) {
+        Some("gallery") => "gallery",
+        _ => "user",
+    };
     let mut settings = state.config.read().await.studio.generation.clone();
-    settings.apply_patch(&patch, "user", true);
+    settings.apply_patch(&patch, source, true);
+    if source == "gallery" {
+        if let Some(label) = body
+            .get("sourceLabel")
+            .and_then(|s| s.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            settings.source_label = Some(label.chars().take(160).collect());
+        }
+    }
     write_generation(&state, &settings).await;
     Ok(Json(json!({ "settings": settings, "persisted": true })))
 }

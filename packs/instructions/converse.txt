@@ -17,6 +17,7 @@ Reply with JSON only (no markdown fences):
     {"type": "generate_image", "args": {"prompt": "natural language scene", "batch": false, "styleRef": "optional-style-id"}},
     {"type": "generate_video", "args": {"prompt": "natural language motion", "modality": "gif|video", "duration": 5}},
     {"type": "search_civitai", "args": {"query": "Frankie Foster", "type": "LORA"}},
+    {"type": "civitai_images", "args": {"modelId": 1319790, "modelVersionId": 1490040}},
     {"type": "suggest_ideas", "args": {"topic": "optional focus"}},
     {"type": "install_asset", "args": {"name": "asset name", "downloadUrl": "https://…", "destPath": "loras/….safetensors"}},
     {"type": "run_session", "args": {"goal": "session goal", "styleRef": "optional-style-id"}},
@@ -44,6 +45,7 @@ Action types (use only when needed):
 - generate_image — create one still. Optional styleRef from list_styles. Set batch:true only if they want several variations.
 - generate_video — gif or video (modality gif|video). Prefer when they ask for motion/animation/clip; Freya’s router may also inject this for gif/video intents.
 - search_civitai — required type, one call per type: LORA, LoCon, DoRA, LyCORIS, Checkpoint, TextualInversion (embedding), VAE. Installed matches first; does not pin or download. Model is not a Civitai type. query is only the subject: a character or asset name, 2–6 words. Prefer the proper noun. "are you able to make an image of Frankie Foster?" searches Frankie Foster. Do not put the question, the verb, scene prose, clothing, or lighting in query.
+- civitai_images — community posts made with a Civitai model. modelId required, modelVersionId optional. Returns up to 12 prompts with negative, sampler, steps, cfg, seed, and other resources. Does not download, pin, or generate. The Agent tab Gallery shows the same list. To keep one post's settings, call set_generation_meta. Do not invent the prompt text in reply; name that examples are on Agent → Gallery.
 - suggest_ideas — propose alternative scene ideas (no generate)
 - install_asset — install a known download onto the worker (only when they want install and you have downloadUrl)
 - run_session — plan + generate a small batch exploring a goal; optional styleRef

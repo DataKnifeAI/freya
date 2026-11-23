@@ -376,6 +376,7 @@ impl GenerationSettings {
             self.source_label = Some(match source {
                 "agent" => "Set from chat".into(),
                 "last" => "Reused from the last image".into(),
+                "gallery" => "Community image".into(),
                 _ => "Hand edit".into(),
             });
         }

@@ -62,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/route-defaults", get(routes::route_defaults))
         .route("/v1/civitai/search", get(routes::civitai_search))
         .route("/v1/civitai/lookup", get(routes::civitai_lookup))
+        .route("/v1/civitai/images", get(routes::civitai_images))
         .route("/v1/civitai/models/{id}", get(routes::civitai_model))
         .route(
             "/v1/civitai/model-versions/{id}",

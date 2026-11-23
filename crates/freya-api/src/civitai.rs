@@ -359,9 +359,10 @@ impl CivitaiClient {
         Ok(detail)
     }
 
-    /// `GET /api/v1/models/{id}` omits `recommendedResources`. The same API key on
-    /// `model.getById` returns `modelVersions[].recommendedResources`. Failures leave the
-    /// detail usable — we never invent a resource that was not in that payload.
+    /// `GET /api/v1/models/{id}` omits `recommendedResources`. Civitai MCP `get_model` and
+    /// `get_model_version` wrap that same REST document and do not return the list either.
+    /// `model.getById` on tRPC does. Failures leave the detail usable — we never invent a
+    /// resource that was not in that payload.
     async fn attach_recommended(&self, detail: &mut CivitaiModelDetail, allow_nsfw: bool) {
         let mut any = false;
         for ver in &mut detail.model_versions {
@@ -469,6 +470,39 @@ impl CivitaiClient {
         })
     }
 
+    /// Community posts made with a model or version.
+    ///
+    /// `search_images` / `get_image` on `https://mcp.civitai.com/mcp` are public reads, but the
+    /// tool result keeps only image id, post id, and version ids. The text prompt is cut to
+    /// 120 characters and omits negative, sampler, steps, CFG, seed, and resources. `get_image`
+    /// looks at `meta.prompt`, while `GET /images?imageId=` nests that object under `meta.meta`,
+    /// so the prompt is dropped. Those tools also have no NSFW argument: browsing level follows
+    /// the API key only when Cloudflare country headers are present, which this server does not
+    /// invent. The images list with `withMeta=true` is the payload that has the fields, and
+    /// `nsfw` / `browsingLevel` is how Show NSFW is asked. No API key: the read is public.
+    /// File download URLs stay on the version REST used by install.
+    pub async fn community_images(
+        &self,
+        model_id: Option<i64>,
+        version_id: Option<i64>,
+        allow_nsfw: bool,
+        limit: u32,
+    ) -> Result<Vec<CommunityImage>> {
+        let model_id = model_id.filter(|n| *n > 0);
+        let version_id = version_id.filter(|n| *n > 0);
+        if model_id.is_none() && version_id.is_none() {
+            return Err(anyhow!("modelId or modelVersionId is required"));
+        }
+        let url = images_list_url(model_id, version_id, allow_nsfw, limit);
+        let v = self
+            .get_public_json(&url)
+            .await
+            .context("civitai community images")?;
+        let mut items = parse_community_images(&v, version_id, allow_nsfw);
+        items.truncate(12);
+        Ok(items)
+    }
+
     async fn get_json(&self, url: &str) -> Result<Value> {
         self.get_json_timeout(url, std::time::Duration::from_secs(30))
             .await
@@ -488,48 +522,52 @@ impl CivitaiClient {
         if !status.is_success() {
             return Err(anyhow!("civitai {status}: {text}"));
         }
-        let v: Value = serde_json::from_str(&text)?;
-        let mut out = Vec::new();
-        if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
-            for item in items {
-                let id = item.get("id").and_then(|x| x.as_i64()).unwrap_or(0);
-                let name = item
-                    .get("name")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("untitled")
-                    .to_string();
-                let model_type = item
-                    .get("type")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("Checkpoint")
-                    .to_string();
-                let mut download_url = None;
-                let mut version_id = None;
-                let mut example_prompt = None;
-                let mut thumbnail = None;
-                if let Some(versions) = item.get("modelVersions").and_then(|m| m.as_array()) {
-                    if let Some(ver) = versions.first() {
-                        version_id = ver.get("id").and_then(|x| x.as_i64());
-                        if let Some(files) = ver.get("files").and_then(|f| f.as_array()) {
-                            download_url = files
-                                .first()
-                                .and_then(|f| f.get("downloadUrl"))
-                                .and_then(|u| u.as_str())
-                                .map(|s| s.to_string());
-                        }
-                        if let Some(images) = ver.get("images").and_then(|i| i.as_array()) {
-                            if let Some(img) = images.first() {
-                                thumbnail = img
-                                    .get("url")
-                                    .and_then(|u| u.as_str())
-                                    .map(|s| s.to_string());
-                                example_prompt = img
-                                    .pointer("/meta/prompt")
-                                    .and_then(|p| p.as_str())
-                                    .map(|s| s.to_string());
-                            }
-                        }
-                    }
+        serde_json::from_str(&text).context("civitai json")
+    }
+
+    /// Public catalog read. Omits `Authorization` so an account browsing level cannot
+    /// override the explicit `nsfw` / `browsingLevel` query.
+    async fn get_public_json(&self, url: &str) -> Result<Value> {
+        let resp = self
+            .http
+            .get(url)
+            .timeout(std::time::Duration::from_secs(20))
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .context("civitai http")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("civitai {status}: {text}"));
+        }
+        serde_json::from_str(&text).context("civitai json")
+    }
+}
+
+/// Download target resolved from a version (+ optional file) id.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct ResolvedDownload {
+    pub download_url: String,
+    pub version_id: i64,
+    pub version_name: Option<String>,
+    pub base_model: Option<String>,
+    pub file_id: Option<i64>,
+    pub file_name: Option<String>,
+    pub file_format: Option<String>,
+    pub model_id: Option<i64>,
+    pub thumbnail_url: Option<String>,
+}
+
+fn parse_trained_words(ver: &Value) -> Vec<String> {
+    let mut trained_words = Vec::new();
+    if let Some(words) = ver.get("trainedWords").and_then(|w| w.as_array()) {
+        for w in words {
+            if let Some(s) = w.as_str() {
+                let trimmed = s.trim().trim_end_matches(',');
+                if !trimmed.is_empty() {
+                    trained_words.push(trimmed.to_string());
                 }
                 out.push(CivitaiModelCard {
                     id,
@@ -965,6 +1003,300 @@ fn strip_html_brief(html: &str) -> String {
     }
 }
 
+/// Community images for one model or version.
+///
+/// Show NSFW off: `nsfw=false` and browsing level 1 (PG). On: browsing level 31
+/// (PG through XXX) so mature posts are included. `nsfw=true` on this endpoint
+/// returns only mature posts, which would hide SFW examples of the same version.
+fn images_list_url(
+    model_id: Option<i64>,
+    version_id: Option<i64>,
+    allow_nsfw: bool,
+    limit: u32,
+) -> String {
+    let limit = limit.clamp(1, 12);
+    let mut url =
+        format!("https://civitai.com/api/v1/images?limit={limit}&withMeta=true&type=image");
+    if allow_nsfw {
+        url.push_str("&browsingLevel=31");
+    } else {
+        url.push_str("&nsfw=false&browsingLevel=1");
+    }
+    if let Some(id) = model_id {
+        url.push_str(&format!("&modelId={id}"));
+    }
+    if let Some(id) = version_id {
+        url.push_str(&format!("&modelVersionId={id}"));
+    }
+    url
+}
+
+fn parse_community_images(
+    payload: &Value,
+    context_version: Option<i64>,
+    allow_nsfw: bool,
+) -> Vec<CommunityImage> {
+    let Some(items) = payload.get("items").and_then(|i| i.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items {
+        if item.get("type").and_then(|t| t.as_str()) == Some("video") {
+            continue;
+        }
+        let nsfw = image_is_nsfw(item);
+        if nsfw && !allow_nsfw {
+            continue;
+        }
+        let Some(image) = parse_community_image(item, context_version, nsfw) else {
+            continue;
+        };
+        out.push(image);
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    out
+}
+
+fn parse_community_image(
+    item: &Value,
+    context_version: Option<i64>,
+    nsfw: bool,
+) -> Option<CommunityImage> {
+    let id = item.get("id").and_then(value_i64).filter(|n| *n > 0)?;
+    let model_version_ids: Vec<i64> = item
+        .get("modelVersionIds")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(value_i64)
+                .filter(|n| *n > 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    let link_version = context_version
+        .filter(|n| *n > 0)
+        .or_else(|| model_version_ids.first().copied());
+    let meta = image_generation_meta(item);
+    let prompt = meta.and_then(|m| meta_string(m, &["prompt"]));
+    let negative_prompt = meta.and_then(|m| meta_string(m, &["negativeprompt", "negative"]));
+    let sampler = meta.and_then(|m| meta_string(m, &["sampler"]));
+    let steps = meta.and_then(|m| meta_u32(m, &["steps"]));
+    let cfg = meta.and_then(|m| meta_f64(m, &["cfgscale", "cfg"]));
+    let seed = meta.and_then(|m| meta_i64(m, &["seed"]));
+    let clip_skip = meta.and_then(|m| meta_u32(m, &["clipskip"]));
+    let size = meta
+        .and_then(|m| meta_string(m, &["size"]))
+        .or_else(|| image_size(item));
+    let url = item
+        .get("url")
+        .and_then(|u| u.as_str())
+        .map(str::trim)
+        .filter(|s| s.starts_with("https://"))
+        .map(str::to_string);
+    let nsfw_level = match item.get("nsfwLevel") {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    };
+    Some(CommunityImage {
+        id,
+        post_id: item.get("postId").and_then(value_i64).filter(|n| *n > 0),
+        prompt,
+        negative_prompt,
+        sampler,
+        steps,
+        cfg,
+        seed,
+        clip_skip,
+        size,
+        url: url.clone(),
+        thumbnail_url: url.map(|u| u.replace("/original=true/", "/width=256/")),
+        nsfw,
+        nsfw_level,
+        civitai_url: community_image_page(id, link_version, nsfw),
+        resources: meta.map(parse_image_resources).unwrap_or_default(),
+        model_version_ids,
+    })
+}
+
+fn image_generation_meta(item: &Value) -> Option<&Value> {
+    let meta = item.get("meta").filter(|m| m.is_object())?;
+    if meta_has_generation(meta) {
+        return Some(meta);
+    }
+    meta.get("meta")
+        .filter(|m| m.is_object() && meta_has_generation(m))
+}
+
+fn meta_has_generation(meta: &Value) -> bool {
+    meta.get("prompt").is_some()
+        || meta.get("negativePrompt").is_some()
+        || meta.get("sampler").is_some()
+        || meta.get("steps").is_some()
+        || meta.get("resources").is_some()
+        || meta.get("civitaiResources").is_some()
+}
+
+fn image_is_nsfw(item: &Value) -> bool {
+    if item.get("nsfw").and_then(|x| x.as_bool()) == Some(true) {
+        return true;
+    }
+    match item.get("nsfwLevel") {
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(1) > 1,
+        Some(Value::String(s)) => {
+            let l = s.trim().to_ascii_lowercase();
+            !(l.is_empty() || l == "none" || l == "pg" || l == "sfw" || l == "1")
+        }
+        _ => item
+            .get("browsingLevel")
+            .and_then(value_i64)
+            .is_some_and(|n| n > 1),
+    }
+}
+
+fn community_image_page(image_id: i64, version_id: Option<i64>, nsfw: bool) -> String {
+    let host = if nsfw {
+        "https://civitai.red"
+    } else {
+        "https://civitai.com"
+    };
+    match version_id {
+        Some(v) if v > 0 => format!("{host}/images/{image_id}?modelVersionId={v}"),
+        _ => format!("{host}/images/{image_id}"),
+    }
+}
+
+fn parse_image_resources(meta: &Value) -> Vec<CommunityImageResource> {
+    let mut out = Vec::new();
+    if let Some(model) = meta_string(meta, &["model"]) {
+        out.push(CommunityImageResource {
+            name: model,
+            resource_type: "Checkpoint".into(),
+            weight: None,
+            model_version_id: None,
+        });
+    }
+    for key in ["resources", "civitaiResources"] {
+        let Some(arr) = meta.get(key).and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for item in arr {
+            let Some(name) = item
+                .get("name")
+                .and_then(|n| n.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            if out.iter().any(|e| e.name.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            let resource_type = item
+                .get("type")
+                .and_then(|t| t.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("model")
+                .to_string();
+            out.push(CommunityImageResource {
+                name: name.chars().take(120).collect(),
+                resource_type,
+                weight: item.get("weight").and_then(value_f64),
+                model_version_id: item
+                    .get("modelVersionId")
+                    .or_else(|| item.get("versionId"))
+                    .and_then(value_i64)
+                    .filter(|n| *n > 0),
+            });
+        }
+    }
+    out
+}
+
+fn meta_string(meta: &Value, names: &[&str]) -> Option<String> {
+    let obj = meta.as_object()?;
+    for (k, v) in obj {
+        let nk = norm_meta_key(k);
+        if names.iter().any(|n| nk == *n) {
+            let text = v.as_str()?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            return Some(text.chars().take(4000).collect());
+        }
+    }
+    None
+}
+
+fn meta_f64(meta: &Value, names: &[&str]) -> Option<f64> {
+    let obj = meta.as_object()?;
+    for (k, v) in obj {
+        let nk = norm_meta_key(k);
+        if names.iter().any(|n| nk == *n) {
+            return value_f64(v).filter(|n| n.is_finite() && *n >= 0.0);
+        }
+    }
+    None
+}
+
+fn meta_u32(meta: &Value, names: &[&str]) -> Option<u32> {
+    meta_f64(meta, names).and_then(|n| {
+        if n > 0.0 && n <= u32::MAX as f64 {
+            Some(n.round() as u32)
+        } else {
+            None
+        }
+    })
+}
+
+fn meta_i64(meta: &Value, names: &[&str]) -> Option<i64> {
+    let obj = meta.as_object()?;
+    for (k, v) in obj {
+        let nk = norm_meta_key(k);
+        if names.iter().any(|n| nk == *n) {
+            return value_i64(v);
+        }
+    }
+    None
+}
+
+fn norm_meta_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn value_i64(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
+        .or_else(|| {
+            v.as_f64().and_then(|n| {
+                if n.is_finite() {
+                    Some(n.round() as i64)
+                } else {
+                    None
+                }
+            })
+        })
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+fn value_f64(v: &Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_i64().map(|n| n as f64))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+fn image_size(item: &Value) -> Option<String> {
+    let w = item.get("width").and_then(value_i64).filter(|n| *n > 0)?;
+    let h = item.get("height").and_then(value_i64).filter(|n| *n > 0)?;
+    Some(format!("{w}x{h}"))
+}
+
 /// Civitai `GET /api/v1/models` search URL on `civitai.com` (same catalog as `civitai.red`).
 /// Always sends `nsfw`: their default is false, which drops mature models from search
 /// even when `GET /models/{id}` still returns them.
@@ -1191,6 +1523,113 @@ mod tests {
         assert!(!list[0].nsfw);
         assert_eq!(filter_recommended(&list, false).len(), 1);
     }
+
+    #[test]
+    fn community_images_keep_prompt_meta_and_color_the_link() {
+        let sfw_url = images_list_url(Some(1319790), Some(1490040), false, 40);
+        assert!(sfw_url.starts_with("https://civitai.com/api/v1/images?"));
+        assert!(sfw_url.contains("withMeta=true"));
+        assert!(sfw_url.contains("nsfw=false"));
+        assert!(sfw_url.contains("browsingLevel=1"));
+        assert!(sfw_url.contains("modelId=1319790"));
+        assert!(sfw_url.contains("modelVersionId=1490040"));
+        assert!(sfw_url.contains("limit=12"));
+        assert!(!sfw_url.contains("mcp.civitai.com"));
+        let mature = images_list_url(Some(1319790), Some(1490040), true, 12);
+        assert!(mature.contains("browsingLevel=31"));
+        assert!(!mature.contains("nsfw=true"));
+
+        let payload = json!({
+            "items": [
+                {
+                    "id": 11,
+                    "postId": 22,
+                    "type": "image",
+                    "nsfw": false,
+                    "nsfwLevel": "None",
+                    "width": 768,
+                    "height": 1024,
+                    "url": "https://image.civitai.com/x/abc/original=true/abc.jpeg",
+                    "modelVersionIds": [1490040, 1410435],
+                    "meta": {
+                        "prompt": "red hair, smile",
+                        "negativePrompt": "lowres",
+                        "sampler": "Euler a",
+                        "steps": 23,
+                        "cfgScale": 7,
+                        "seed": 3321325136_i64,
+                        "clipSkip": 2,
+                        "Size": "768x1024",
+                        "Model": "example-checkpoint",
+                        "resources": [
+                            {"name": "FrankieXL", "type": "lora", "weight": 1},
+                            {"name": "example-checkpoint", "type": "checkpoint", "weight": 1}
+                        ]
+                    }
+                },
+                {
+                    "id": 12,
+                    "type": "image",
+                    "nsfwLevel": "X",
+                    "url": "https://image.civitai.com/x/def/original=true/def.jpeg",
+                    "meta": { "prompt": "mature post" }
+                },
+                {
+                    "id": 13,
+                    "type": "video",
+                    "meta": { "prompt": "skip me" }
+                }
+            ]
+        });
+        let sfw = parse_community_images(&payload, Some(1490040), false);
+        assert_eq!(sfw.len(), 1);
+        assert_eq!(sfw[0].prompt.as_deref(), Some("red hair, smile"));
+        assert_eq!(sfw[0].negative_prompt.as_deref(), Some("lowres"));
+        assert_eq!(sfw[0].sampler.as_deref(), Some("Euler a"));
+        assert_eq!(sfw[0].steps, Some(23));
+        assert_eq!(sfw[0].cfg, Some(7.0));
+        assert_eq!(sfw[0].seed, Some(3321325136));
+        assert_eq!(sfw[0].clip_skip, Some(2));
+        assert_eq!(sfw[0].size.as_deref(), Some("768x1024"));
+        assert!(sfw[0]
+            .thumbnail_url
+            .as_deref()
+            .unwrap()
+            .contains("/width=256/"));
+        assert_eq!(
+            sfw[0].civitai_url,
+            "https://civitai.com/images/11?modelVersionId=1490040"
+        );
+        assert!(!sfw[0].nsfw);
+        assert!(sfw[0].resources.iter().any(|r| r.name == "FrankieXL"));
+        assert_eq!(
+            sfw[0]
+                .resources
+                .iter()
+                .filter(|r| r.name == "example-checkpoint")
+                .count(),
+            1
+        );
+
+        let both = parse_community_images(&payload, Some(1490040), true);
+        assert_eq!(both.len(), 2);
+        assert_eq!(
+            both[1].civitai_url,
+            "https://civitai.red/images/12?modelVersionId=1490040"
+        );
+        assert!(both[1].nsfw);
+
+        let nested = json!({
+            "items": [{
+                "id": 14,
+                "nsfwLevel": "None",
+                "meta": { "id": 1, "meta": { "prompt": "nested prompt", "sampler": "Euler" } }
+            }]
+        });
+        let nested_items = parse_community_images(&nested, None, false);
+        assert_eq!(nested_items[0].prompt.as_deref(), Some("nested prompt"));
+        assert_eq!(nested_items[0].civitai_url, "https://civitai.com/images/14");
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1380,4 +1819,55 @@ pub struct CivitaiRecommendedResource {
     /// Recommended model is NSFW (`nsfw` true or nsfwLevel > 1).
     #[serde(default)]
     pub nsfw: bool,
+}
+
+/// One other checkpoint or adapter named on a community image.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityImageResource {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub resource_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_version_id: Option<i64>,
+}
+
+/// Community post made with a model version. Bytes stay on Civitai's image host.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityImage {
+    pub id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub negative_prompt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampler: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub steps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cfg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_skip: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumbnail_url: Option<String>,
+    #[serde(default)]
+    pub nsfw: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nsfw_level: Option<String>,
+    pub civitai_url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<CommunityImageResource>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub model_version_ids: Vec<i64>,
 }

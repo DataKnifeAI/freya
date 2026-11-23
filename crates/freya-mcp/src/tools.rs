@@ -164,6 +164,19 @@ pub struct CivitaiSearchArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct CivitaiImagesArgs {
+    /// Civitai model id.
+    pub model_id: i64,
+    /// Version in context. Omit to list images for any version of the model.
+    #[serde(default)]
+    pub model_version_id: Option<i64>,
+    /// Capped at 12.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct StyleRefArgs {
     /// Style pack id from list_styles.
     #[serde(alias = "id")]
@@ -477,6 +490,28 @@ impl FreyaMcp {
         let v = self
             .api
             .get_json_query("/v1/civitai/lookup", &q)
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Community images made with a Civitai model. modelId required, modelVersionId optional. Up to 12 posts with prompt, negative prompt, sampler, steps, cfg, seed, and other resources. Does not download or generate. Show NSFW follows Freya settings."
+    )]
+    async fn civitai_images(
+        &self,
+        Parameters(args): Parameters<CivitaiImagesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut q = vec![("modelId".into(), args.model_id.to_string())];
+        if let Some(version) = args.model_version_id.filter(|n| *n > 0) {
+            q.push(("modelVersionId".into(), version.to_string()));
+        }
+        if let Some(limit) = args.limit {
+            q.push(("limit".into(), limit.to_string()));
+        }
+        let v = self
+            .api
+            .get_json_query("/v1/civitai/images", &q)
             .await
             .map_err(map_err)?;
         json_ok(v)
