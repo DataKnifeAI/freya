@@ -57,6 +57,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/models", get(routes::models))
         .route("/v1/styles", get(routes::styles_list))
         .route("/v1/civitai/search", get(routes::civitai_search))
+        .route("/v1/civitai/lookup", get(routes::civitai_lookup))
+        .route("/v1/civitai/models/{id}", get(routes::civitai_model))
+        .route(
+            "/v1/civitai/model-versions/{id}",
+            get(routes::civitai_model_version),
+        )
         .route("/v1/civitai/install", post(routes::civitai_install))
         .route(
             "/v1/settings",

@@ -129,7 +129,188 @@ function looksLikeSdPrompt(text) {
   return false;
 }
 
-/** Mock Civitai catalog — brand demo query hits winged / fantasy warrior LoRAs. */
+const FREYA_ASSET_TYPES = new Set([
+  "lora",
+  "locon",
+  "dora",
+  "lycoris",
+  "checkpoint",
+  "textualinversion",
+  "vae",
+]);
+
+/** Agent search enum. Model is not a Civitai type. Embedding is TextualInversion. */
+const AGENT_SEARCH_TYPES = [
+  "LORA",
+  "LoCon",
+  "DoRA",
+  "LyCORIS",
+  "Checkpoint",
+  "TextualInversion",
+  "VAE",
+];
+
+function canonicalSearchType(raw) {
+  const text = String(raw || "");
+  if (text.includes(",")) {
+    return {
+      error: `search one type per call. type is one of ${AGENT_SEARCH_TYPES.join(", ")}. Embedding is TextualInversion. Model is not a Civitai type.`,
+    };
+  }
+  const key = text.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const map = {
+    lora: "LORA",
+    loras: "LORA",
+    locon: "LoCon",
+    dora: "DoRA",
+    lycoris: "LyCORIS",
+    lyco: "LyCORIS",
+    checkpoint: "Checkpoint",
+    checkpoints: "Checkpoint",
+    textualinversion: "TextualInversion",
+    embedding: "TextualInversion",
+    embeddings: "TextualInversion",
+    vae: "VAE",
+    vaes: "VAE",
+  };
+  if (key === "model" || key === "models") {
+    return {
+      error:
+        "Model is not a Civitai model type. Search Checkpoint for a base, or one of LORA, LoCon, DoRA, LyCORIS, TextualInversion, VAE.",
+    };
+  }
+  if (!map[key]) {
+    return {
+      error: `type is required, one of ${AGENT_SEARCH_TYPES.join(", ")}. Embedding is TextualInversion. Call once per type. Does not pin or download.`,
+    };
+  }
+  return { type: map[key] };
+}
+
+function mockInstalledMatchesType(asset, canon) {
+  const mt = String(asset?.modelType || "").trim();
+  if (mt) return canonicalSearchType(mt).type === canon;
+  const kind = String(asset?.kind || "").trim();
+  if (kind) {
+    const got = canonicalSearchType(kind).type;
+    const adapters = ["LORA", "LoCon", "DoRA", "LyCORIS"];
+    if (got && adapters.includes(canon) && adapters.includes(got)) return true;
+    if (got) return got === canon;
+  }
+  const path = String(asset?.path || "");
+  if (["LORA", "LoCon", "DoRA", "LyCORIS"].includes(canon)) return path.startsWith("loras/");
+  if (canon === "Checkpoint") return path.startsWith("checkpoints/");
+  if (canon === "TextualInversion") return path.startsWith("embeddings/");
+  if (canon === "VAE") return path.startsWith("vae/");
+  return false;
+}
+
+function isFreyaAssetType(modelType) {
+  return FREYA_ASSET_TYPES.has(String(modelType || "").toLowerCase());
+}
+
+function assetTypeRank(modelType) {
+  const t = String(modelType || "").toLowerCase();
+  if (t === "lora" || t === "locon" || t === "dora" || t === "lycoris" || t.includes("lora")) return 0;
+  if (t === "checkpoint") return 1;
+  if (t === "textualinversion") return 2;
+  if (t === "vae") return 3;
+  return 4;
+}
+
+function mockCard(partial) {
+  const thumb =
+    partial.thumbnailUrl ||
+    svgDataUrl(partial.name.slice(0, 28), partial.modelType || "asset", (partial.id % 300) + 10);
+  const images = partial.imageUrls || [
+    thumb,
+    svgDataUrl(`${partial.name.slice(0, 18)} · 2`, partial.modelType || "", (partial.id % 300) + 40),
+    svgDataUrl(`${partial.name.slice(0, 18)} · 3`, partial.modelType || "", (partial.id % 300) + 80),
+  ];
+  const downloadCount = 1200 + (partial.id % 50) * 137;
+  const thumbsUpCount = 80 + (partial.id % 40) * 11;
+  const versionId = partial.versionId || partial.id * 10 + 1;
+  const downloadUrl =
+    partial.downloadUrl || `https://civitai.com/api/download/models/mock-${partial.id}`;
+  const baseModel = partial.baseModel || "SDXL 1.0";
+  const trainedWords = partial.triggerWord ? [partial.triggerWord] : [];
+  const primaryFile = {
+    id: versionId * 100 + 1,
+    name: `${(partial.name || "model").replace(/[^a-zA-Z0-9._-]+/g, "_")}.safetensors`,
+    sizeKB: 150000 + (partial.id % 20) * 12000,
+    sizeBytes: (150000 + (partial.id % 20) * 12000) * 1024,
+    type: "Model",
+    format: "SafeTensor",
+    primary: true,
+    downloadUrl,
+  };
+  const altFile = {
+    id: versionId * 100 + 2,
+    name: `${(partial.name || "model").replace(/[^a-zA-Z0-9._-]+/g, "_")}.ckpt`,
+    sizeKB: 180000 + (partial.id % 20) * 12000,
+    sizeBytes: (180000 + (partial.id % 20) * 12000) * 1024,
+    type: "Model",
+    format: "PickleTensor",
+    primary: false,
+    downloadUrl: `${downloadUrl}?format=ckpt`,
+  };
+  const v1 = {
+    id: versionId,
+    name: partial.versionName || "v1.0",
+    baseModel,
+    createdAt: "2024-06-01T00:00:00.000Z",
+    trainedWords,
+    files: [primaryFile, altFile],
+    imageUrls: images,
+    examplePrompt: partial.examplePrompt,
+  };
+  const v2 = {
+    id: versionId + 1,
+    name: "v1.1",
+    baseModel,
+    createdAt: "2024-09-15T00:00:00.000Z",
+    trainedWords,
+    files: [
+      {
+        ...primaryFile,
+        id: (versionId + 1) * 100 + 1,
+        name: primaryFile.name.replace(".safetensors", "_v11.safetensors"),
+        downloadUrl: `${downloadUrl}?v=1.1`,
+      },
+    ],
+    imageUrls: images.slice(0, 2),
+    examplePrompt: partial.examplePrompt,
+  };
+  const modelVersions = partial.modelVersions || [v1, v2];
+  const defaultFile = modelVersions[0]?.files?.find((f) => f.primary) || modelVersions[0]?.files?.[0];
+  return {
+    versionName: modelVersions[0]?.name || "v1.0",
+    versionId: modelVersions[0]?.id || versionId,
+    fileId: defaultFile?.id,
+    fileName: defaultFile?.name,
+    fileFormat: defaultFile?.format,
+    creator: "freya-mock",
+    civitaiUrl: `https://civitai.com/models/${partial.id}`,
+    description:
+      partial.description ||
+      `${partial.name} — mock Civitai asset for Freya. Compatible with ${baseModel} bases.`,
+    trainedWords,
+    stats: { downloadCount, thumbsUpCount },
+    modelVersions,
+    ...partial,
+    downloadUrl: partial.downloadUrl || defaultFile?.downloadUrl || downloadUrl,
+    thumbnailUrl: thumb,
+    imageUrls: images,
+    baseModel,
+  };
+}
+
+function toPublicCard(card) {
+  const { tags: _t, ...rest } = card;
+  return rest;
+}
+
+/** Mock Civitai catalog — brand demo query hits winged / fantasy warrior assets. */
 const CIVITAI_CATALOG = [
   {
     id: 901,
@@ -457,8 +638,10 @@ function mockSameAsset(local, search) {
 }
 
 /** Installed name/version first, then Civitai hits that are not that file. */
-function orderMockLookup(query, searchCards) {
-  const installed = state.localAssets || [];
+function orderMockLookup(query, searchCards, assetType) {
+  const installed = (state.localAssets || []).filter((a) =>
+    assetType ? mockInstalledMatchesType(a, assetType) : true,
+  );
   const search = Array.isArray(searchCards) ? searchCards : [];
   const used = new Set();
   const consumed = new Set();
@@ -965,7 +1148,17 @@ function planChatActions(message, body) {
   ) {
     const q =
       (message.split(/\bfor\b/i)[1] || message).trim().slice(0, 80) || BEGINNER_CIVITAI_QUERY;
-    actions.push({ type: "search_civitai", args: { query: q } });
+    const words = m.split(/[^a-z0-9]+/).filter(Boolean);
+    const has = (w) => words.includes(w);
+    let searchType = "LORA";
+    if (has("embedding") || has("embeddings") || m.includes("textual inversion")) {
+      searchType = "TextualInversion";
+    } else if (has("lycoris") || has("lyco")) searchType = "LyCORIS";
+    else if (has("locon")) searchType = "LoCon";
+    else if (has("dora")) searchType = "DoRA";
+    else if (has("vae") || has("vaes")) searchType = "VAE";
+    else if (has("checkpoint") || has("checkpoints")) searchType = "Checkpoint";
+    actions.push({ type: "search_civitai", args: { query: q, type: searchType } });
   }
   const asksSetBase =
     m.includes("set base") ||
@@ -1056,12 +1249,17 @@ async function executeMockChatAction(action, body) {
   }
   if (ty === "search_civitai") {
     const q = (args.query || "").trim() || BEGINNER_CIVITAI_QUERY;
+    const parsed = canonicalSearchType(args.type || args.modelType || args.types || "");
+    if (parsed.error) {
+      return { type: ty, status: "error", args, error: parsed.error };
+    }
     const { loras } = lorasForAssist(q);
+    const typed = loras.filter((c) => canonicalSearchType(c.modelType).type === parsed.type);
     return {
       type: ty,
       status: "executed",
-      args: { ...args, query: q },
-      result: { query: q, loras: orderMockLookup(q, loras) },
+      args: { ...args, query: q, type: parsed.type },
+      result: { query: q, type: parsed.type, loras: orderMockLookup(q, typed, parsed.type) },
     };
   }
   if (ty === "list_loras" || ty === "list_installed") {

@@ -16,7 +16,7 @@ Reply with JSON only (no markdown fences):
   "actions": [
     {"type": "generate_image", "args": {"prompt": "natural language scene", "batch": false, "styleRef": "optional-style-id"}},
     {"type": "generate_video", "args": {"prompt": "natural language motion", "modality": "gif|video", "duration": 5}},
-    {"type": "search_civitai", "args": {"query": "2-6 word search"}},
+    {"type": "search_civitai", "args": {"query": "2-6 word search", "type": "LORA"}},
     {"type": "suggest_ideas", "args": {"topic": "optional focus"}},
     {"type": "install_asset", "args": {"name": "asset name", "downloadUrl": "https://…", "destPath": "loras/….safetensors"}},
     {"type": "run_session", "args": {"goal": "session goal", "styleRef": "optional-style-id"}},
@@ -40,7 +40,7 @@ Reply with JSON only (no markdown fences):
 Action types (use only when needed):
 - generate_image — create one still. Optional styleRef from list_styles. Set batch:true only if they want several variations.
 - generate_video — gif or video (modality gif|video). Prefer when they ask for motion/animation/clip; Freya’s router may also inject this for gif/video intents.
-- search_civitai — look up LoRAs / checkpoints / embeddings on Civitai (after checking Installed)
+- search_civitai — required type, one call per type: LORA, LoCon, DoRA, LyCORIS, Checkpoint, TextualInversion (embedding), VAE. Installed matches first; does not pin or download. Model is not a Civitai type.
 - suggest_ideas — propose alternative scene ideas (no generate)
 - install_asset — install a known download onto the worker (only when they want install and you have downloadUrl)
 - run_session — plan + generate a small batch exploring a goal; optional styleRef

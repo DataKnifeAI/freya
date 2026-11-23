@@ -311,6 +311,100 @@ fn order_lookup_assets(installed: &[Value], search: &[Value], query: &str) -> Ve
     ordered
 }
 
+/// Installed row belongs to this agent search type.
+/// A set `modelType` must match. Untyped adapter files in `loras/` match LoRA / LoCon / DoRA / LyCORIS.
+fn installed_matches_search_type(asset: &Value, canon: &str) -> bool {
+    let mt = asset
+        .get("modelType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if !mt.is_empty() {
+        return crate::civitai::same_search_type(mt, canon);
+    }
+    let kind = asset
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if !kind.is_empty() {
+        if let Ok(got) = crate::civitai::canonical_search_type(kind) {
+            if matches!(canon, "LORA" | "LoCon" | "DoRA" | "LyCORIS")
+                && matches!(got, "LORA" | "LoCon" | "DoRA" | "LyCORIS")
+            {
+                return true;
+            }
+            return got == canon;
+        }
+    }
+    let path = asset.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    match canon {
+        "LORA" | "LoCon" | "DoRA" | "LyCORIS" => path.starts_with("loras/"),
+        "Checkpoint" => path.starts_with("checkpoints/"),
+        "TextualInversion" => path.starts_with("embeddings/"),
+        "VAE" => path.starts_with("vae/"),
+        _ => false,
+    }
+}
+
+fn search_type_arg(args: &Value) -> &str {
+    for key in ["type", "modelType", "types"] {
+        if let Some(t) = args.get(key).and_then(|v| v.as_str()) {
+            let t = t.trim();
+            if !t.is_empty() {
+                return t;
+            }
+        }
+    }
+    ""
+}
+
+/// Search one Civitai type. Installed name/version matches first, then other hits.
+/// Does not pin or download.
+async fn typed_civitai_lookup(
+    state: &AppState,
+    query: &str,
+    type_raw: &str,
+    limit: u32,
+) -> Result<Value, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("missing query".into());
+    }
+    let canon = crate::civitai::canonical_search_type(type_raw)?;
+    let cap = limit.clamp(1, 20) as usize;
+    let fetch = (cap as u32).max(12).min(20);
+    let searched = {
+        let civ = state.civitai.read().await;
+        if !civ.configured() {
+            return Err("Civitai API key not configured".into());
+        }
+        civ.search_types(query, fetch, &[canon]).await
+    };
+    let items = searched.map_err(|e| e.to_string())?;
+    let mut assets: Vec<_> = items
+        .into_iter()
+        .filter(|c| crate::civitai::same_search_type(&c.model_type, canon))
+        .collect();
+    assets.sort_by_key(|c| crate::civitai::asset_type_rank(&c.model_type));
+    let search_vals: Vec<Value> = assets
+        .iter()
+        .map(|c| serde_json::to_value(c).unwrap_or_else(|_| json!({})))
+        .collect();
+    let installed: Vec<Value> = installed_asset_values(state)
+        .await
+        .into_iter()
+        .filter(|a| installed_matches_search_type(a, canon))
+        .collect();
+    let mut loras = order_lookup_assets(&installed, &search_vals, query);
+    loras.truncate(cap);
+    Ok(json!({
+        "query": query,
+        "type": canon,
+        "loras": loras,
+    }))
+}
+
 async fn installed_asset_values(state: &AppState) -> Vec<Value> {
     let Ok(v) = installed_payload(state).await else {
         return Vec::new();
@@ -716,6 +810,31 @@ struct PlannedAction {
     args: serde_json::Value,
 }
 
+/// Keyword fallback only. The converse prompt requires the model to set `type`.
+fn infer_civitai_search_type(message: &str) -> &'static str {
+    let m = message.to_ascii_lowercase();
+    let words: Vec<&str> = m
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has = |w: &str| words.iter().any(|x| *x == w);
+    if has("embedding") || has("embeddings") || m.contains("textual inversion") {
+        "TextualInversion"
+    } else if has("lycoris") || has("lyco") {
+        "LyCORIS"
+    } else if has("locon") {
+        "LoCon"
+    } else if has("dora") {
+        "DoRA"
+    } else if has("vae") || has("vaes") {
+        "VAE"
+    } else if has("checkpoint") || has("checkpoints") {
+        "Checkpoint"
+    } else {
+        "LORA"
+    }
+}
+
 fn wants_image_intent(message: &str) -> bool {
     crate::router::infer_modality(message)
         .modality
@@ -743,9 +862,13 @@ fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
             .map(|(_, rest)| rest.trim())
             .filter(|s| !s.is_empty())
             .unwrap_or(message);
+        let search_type = infer_civitai_search_type(message);
         actions.push(PlannedAction {
             action_type: "search_civitai".into(),
-            args: json!({ "query": query.chars().take(80).collect::<String>() }),
+            args: json!({
+                "query": query.chars().take(80).collect::<String>(),
+                "type": search_type,
+            }),
         });
     }
 
@@ -1726,54 +1849,19 @@ async fn execute_chat_action(
                 .and_then(|q| q.as_str())
                 .unwrap_or("")
                 .trim();
-            if q.is_empty() {
-                return json!({
+            let type_raw = search_type_arg(&action.args);
+            match typed_civitai_lookup(state, q, type_raw, 6).await {
+                Ok(result) => json!({
                     "type": ty,
-                    "status": "error",
+                    "status": "executed",
                     "args": action.args,
-                    "error": "missing query"
-                });
-            }
-            let searched = {
-                let civ = state.civitai.read().await;
-                if !civ.configured() {
-                    return json!({
-                        "type": ty,
-                        "status": "error",
-                        "args": action.args,
-                        "error": "Civitai API key not configured"
-                    });
-                }
-                civ.search(q, 12).await
-            };
-            match searched {
-                Ok(items) => {
-                    let mut assets: Vec<_> = items
-                        .into_iter()
-                        .filter(|c| crate::civitai::is_freya_asset_type(&c.model_type))
-                        .collect();
-                    assets.sort_by_key(|c| crate::civitai::asset_type_rank(&c.model_type));
-                    assets.truncate(6);
-                    let search_vals: Vec<Value> = assets
-                        .iter()
-                        .map(|c| serde_json::to_value(c).unwrap_or_else(|_| json!({})))
-                        .collect();
-                    // Drop the Civitai lock before reading the worker. Installed
-                    // name/version matches stay first; other hits stay in the list.
-                    let installed = installed_asset_values(state).await;
-                    let loras = order_lookup_assets(&installed, &search_vals, q);
-                    json!({
-                        "type": ty,
-                        "status": "executed",
-                        "args": action.args,
-                        "result": { "query": q, "loras": loras }
-                    })
-                }
+                    "result": result
+                }),
                 Err(e) => json!({
                     "type": ty,
                     "status": "error",
                     "args": action.args,
-                    "error": e.to_string()
+                    "error": e
                 }),
             }
         }
@@ -4424,6 +4512,16 @@ pub struct CivitaiSearchQuery {
     pub limit: u32,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CivitaiLookupQuery {
+    pub q: String,
+    /// One agent search type: LORA, LoCon, DoRA, LyCORIS, Checkpoint, TextualInversion, VAE.
+    #[serde(rename = "type")]
+    pub asset_type: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
 fn default_limit() -> u32 {
     20
 }
@@ -4435,6 +4533,62 @@ pub async fn civitai_search(
     let civ = state.civitai.read().await;
     let items = civ.search(&q.q, q.limit).await.map_err(ApiError::from)?;
     Ok(Json(json!({ "items": items })))
+}
+
+/// One Civitai type. Installed matches first, then other hits. Does not pin or download.
+pub async fn civitai_lookup(
+    State(state): State<AppState>,
+    Query(q): Query<CivitaiLookupQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let limit = q.limit.unwrap_or(12).clamp(1, 20);
+    let value = typed_civitai_lookup(&state, &q.q, &q.asset_type, limit)
+        .await
+        .map_err(ApiError::Msg)?;
+    Ok(Json(value))
+}
+
+fn civitai_detail_response(detail: crate::civitai::CivitaiModelDetail) -> Json<serde_json::Value> {
+    // Nested shape for the UI modal: { model, related: [{ model, note }] }.
+    let related: Vec<_> = detail
+        .related
+        .iter()
+        .map(|r| {
+            json!({
+                "relation": "compatible_checkpoint",
+                "note": detail.base_model.as_ref().map(|b| format!("Popular checkpoint for {b}")),
+                "model": r,
+            })
+        })
+        .collect();
+    let mut model = serde_json::to_value(&detail).unwrap_or(json!({}));
+    if let Some(obj) = model.as_object_mut() {
+        // Keep related nested under the response envelope, not duplicated on model.
+        obj.remove("related");
+    }
+    Json(json!({ "model": model, "related": related }))
+}
+
+/// Full Civitai model detail + related compatible checkpoints (when applicable).
+pub async fn civitai_model(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let civ = state.civitai.read().await;
+    let detail = civ.get_model(id).await.map_err(ApiError::from)?;
+    Ok(civitai_detail_response(detail))
+}
+
+/// Resolve Installed assets that only stored `versionId` (no `modelId` in sidecar meta).
+pub async fn civitai_model_version(
+    State(state): State<AppState>,
+    axum::extract::Path(version_id): axum::extract::Path<i64>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let civ = state.civitai.read().await;
+    let detail = civ
+        .get_model_by_version(version_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(civitai_detail_response(detail))
 }
 
 #[derive(Debug, Deserialize)]
@@ -5179,6 +5333,73 @@ mod route_footer_tests {
         assert_eq!(ordered[1]["installed"], json!(false));
         assert_eq!(ordered[1]["name"], "Valkyrie Feather Armor");
         assert_eq!(ordered[1].get("path"), None);
+    }
+
+    #[test]
+    fn installed_filter_keeps_only_the_requested_type() {
+        let lora = json!({
+            "name": "Eagle Wing",
+            "path": "loras/eagle.safetensors",
+            "kind": "lora"
+        });
+        let typed_lora = json!({
+            "name": "Eagle LoRA",
+            "path": "loras/eagle_lora.safetensors",
+            "kind": "lora",
+            "modelType": "LORA"
+        });
+        let locon = json!({
+            "name": "Eagle LoCon",
+            "path": "loras/eagle_locon.safetensors",
+            "kind": "lora",
+            "modelType": "LoCon"
+        });
+        let ckpt = json!({
+            "name": "Eagle Wing",
+            "path": "checkpoints/eagle.safetensors",
+            "kind": "checkpoint",
+            "modelType": "Checkpoint"
+        });
+        let emb = json!({
+            "name": "Eagle Token",
+            "path": "embeddings/eagle.pt",
+            "kind": "embedding"
+        });
+        let vae = json!({
+            "name": "Eagle VAE",
+            "path": "vae/eagle.safetensors",
+            "kind": "vae"
+        });
+        assert!(installed_matches_search_type(&lora, "LORA"));
+        assert!(installed_matches_search_type(&lora, "LoCon"));
+        assert!(installed_matches_search_type(&typed_lora, "LORA"));
+        assert!(!installed_matches_search_type(&typed_lora, "LoCon"));
+        assert!(installed_matches_search_type(&locon, "LoCon"));
+        assert!(!installed_matches_search_type(&locon, "LORA"));
+        assert!(!installed_matches_search_type(&ckpt, "LORA"));
+        assert!(installed_matches_search_type(&ckpt, "Checkpoint"));
+        assert!(installed_matches_search_type(&emb, "TextualInversion"));
+        assert!(!installed_matches_search_type(&emb, "VAE"));
+        assert!(installed_matches_search_type(&vae, "VAE"));
+
+        let installed = vec![lora, ckpt];
+        let kept: Vec<_> = installed
+            .iter()
+            .filter(|a| installed_matches_search_type(a, "LORA"))
+            .cloned()
+            .collect();
+        let search = vec![json!({
+            "id": 901,
+            "name": "Eagle Wing XL",
+            "versionId": 200,
+            "modelType": "LORA"
+        })];
+        let ordered = order_lookup_assets(&kept, &search, "eagle wing");
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0]["installed"], json!(true));
+        assert_eq!(ordered[0]["path"], "loras/eagle.safetensors");
+        assert_eq!(ordered[1]["installed"], json!(false));
+        assert_eq!(ordered[1]["name"], "Eagle Wing XL");
     }
 
     #[test]
