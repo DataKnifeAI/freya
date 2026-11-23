@@ -1104,6 +1104,91 @@ function mockGenerateArtifact(prompt, body = {}) {
   };
 }
 
+function subjectQuery(message) {
+  const raw = String(message || "").trim();
+  if (!raw) return "";
+  const lower = raw.toLowerCase();
+  const tails = [
+    "what should i do for ",
+    "what should i do with ",
+    "help me choose ",
+    "help me with ",
+    "which lora for ",
+    "which base for ",
+    "any assets for ",
+  ];
+  let start = 0;
+  for (const prefix of tails) {
+    if (lower.startsWith(prefix)) {
+      start = prefix.length;
+      break;
+    }
+  }
+  const slice = raw.slice(start).replace(/[?.!"]+$/g, "").trim();
+  const skip = new Set([
+    "a", "an", "the", "please", "me", "my", "of", "to", "and", "or", "with", "for", "on", "in",
+    "it", "this", "that", "image", "picture", "photo",
+  ]);
+  const words = slice
+    .split(/\s+/)
+    .filter((w) => {
+      const key = w.replace(/[^a-z0-9]/gi, "").toLowerCase();
+      return key && !skip.has(key);
+    })
+    .slice(0, 6);
+  const q = words.join(" ") || slice.split(/\s+/).slice(0, 6).join(" ");
+  return q.slice(0, 80);
+}
+
+const MOCK_AGENT_SEARCH_TYPES = [
+  "LORA",
+  "LoCon",
+  "DoRA",
+  "LyCORIS",
+  "Checkpoint",
+  "TextualInversion",
+  "VAE",
+];
+
+function initialLookupActions(message) {
+  const query = subjectQuery(message);
+  if (query.length < 2) return [];
+  return MOCK_AGENT_SEARCH_TYPES.map((type) => ({
+    type: "search_civitai",
+    args: {
+      query,
+      type,
+      limit: type === "LORA" || type === "Checkpoint" ? 4 : 2,
+    },
+  }));
+}
+
+function noteSubjectLookup(reply, modality, loras) {
+  const names = [];
+  for (const card of loras || []) {
+    const name = String(card?.name || "").trim();
+    if (!name || names.some((n) => n.toLowerCase() === name.toLowerCase())) continue;
+    names.push(name);
+    if (names.length >= 2) break;
+  }
+  const text = String(reply || "");
+  if (modality === "chat") {
+    const lower = text.toLowerCase();
+    if (lower.includes("pin") && lower.includes("base") && lower.includes("lora")) return text;
+    const lead =
+      names.length >= 2
+        ? `A couple of matches: ${names[0]} and ${names[1]}.`
+        : names.length === 1
+          ? `A match: ${names[0]}.`
+          : "I looked for a matching LoRA and base.";
+    const pin =
+      " Pin one on the Agent tab to use it. That installs the LoRA if it is not on the worker, then pins it, and installs or selects the matching base checkpoint.";
+    return `${text}\n\n${lead}${pin}`.trim();
+  }
+  if (!names.length || text.toLowerCase().includes("agent tab")) return text;
+  return `${text}\n\nMatching assets are on the Agent tab (${names.join(", ")}) if you want to pin a LoRA or switch the base.`;
+}
+
 function planChatActions(message, body) {
   const m = String(message || "").toLowerCase();
   const actions = [];
@@ -1891,33 +1976,51 @@ export async function mockApi(path, opts = {}) {
     const message = (body.message || "").trim() || BEGINNER_EXAMPLE;
     const mode = String(body.automationMode || "auto").toLowerCase();
     const route = inferModality(message);
+    const initial = !body.confirm && !(Array.isArray(body.messages) && body.messages.length);
+    const lookups = initial ? initialLookupActions(message) : [];
     if ((route.modality === "gif" || route.modality === "video") && !body.confirm) {
+      const actionResults = [];
+      for (const lookup of lookups) {
+        actionResults.push(await executeMockChatAction(lookup, body));
+      }
       const art = mockGenerateArtifact(message, {
         modality: route.modality,
         model: body.imageModel || body.model,
       });
+      actionResults.push({
+        type: "generate_video",
+        status: "executed",
+        args: { prompt: message, modality: route.modality },
+        result: art,
+      });
+      const loras = actionResults
+        .filter((a) => a.type === "search_civitai" && Array.isArray(a.result?.loras))
+        .flatMap((a) => a.result.loras);
+      const query = loras.length ? subjectQuery(message) : "";
       return {
-        reply: `Generating ${route.modality} (mock).`,
-        actions: [
-          {
-            type: "generate_video",
-            status: "executed",
-            args: { prompt: message, modality: route.modality },
-            result: art,
-          },
-        ],
+        reply: noteSubjectLookup(
+          `Generating ${route.modality} (mock).`,
+          route.modality,
+          loras,
+        ),
+        actions: actionResults,
         pendingConfirmation: false,
         question: null,
         ideas: [],
-        loras: [],
-        civitaiQuery: null,
+        loras,
+        civitaiQuery: query || null,
         artifacts: [art],
         automationMode: mode,
         route,
         resolvedModels: { video: art.model },
       };
     }
-    const { reply: plannedReply, actions: planned } = planChatActions(message, body);
+    const plannedChat = planChatActions(message, body);
+    let plannedReply = plannedChat.reply;
+    let planned = plannedChat.actions;
+    if (initial) {
+      planned = [...lookups, ...planned.filter((a) => a.type !== "search_civitai")];
+    }
     let reply = plannedReply;
     const actionResults = [];
     let pendingConfirmation = false;
@@ -1988,6 +2091,7 @@ export async function mockApi(path, opts = {}) {
     const loras = sawSearch ? searchLoras : listed;
 
     reply = enrichMockReplyWithWorker(reply, actionResults);
+    if (initial) reply = noteSubjectLookup(reply, route.modality, loras);
 
     return {
       reply,

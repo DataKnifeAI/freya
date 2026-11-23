@@ -7,6 +7,7 @@ Modalities (pick exactly one):
 - video — they want motion now: a clip, text-to-video, image-to-video, "animate this". Distinct from a single still frame.
 
 Rules:
+- Use the recent conversation, including a "prior tools" block when present (what was installed, which LoRAs are pinned, which base is selected). That block is context, not a new request to render.
 - Use the recent conversation. If the last turn asked what it should look like and this message is the look, that is picture. If this message asks what to do, which base, or which LoRA, that is chat.
 - Do not choose picture only because the text mentions a character, a cartoon, an outfit word, or another visual noun. Do not stay on chat only because they never said generate, draw, or make.
 - A question that hands you the picture ("can you make an image of Frankie Foster?") is picture. A question that asks for help is chat: "what should I do for Frankie Foster?", "did we generate an image of her using the lora?", "which base or LoRA?", "any assets or models that would help?", "how should I prompt this?".
