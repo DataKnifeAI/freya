@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, AUTH_REQUIRED_EVENT, hasBrowserBearer, isMockMode } from "./api.js";
+import { api, AUTH_REQUIRED_EVENT, hasBrowserBearer, isMockMode, postChat } from "./api.js";
 import { BEGINNER_EXAMPLE, demoCivitaiQuery, generateOfferForTurn } from "./mockApi.js";
 
 const AUTOMATION_MODES = ["plan", "auto", "yolo"];
@@ -1319,6 +1319,26 @@ const IconSpinner = () => (
     </Svg>
   </span>
 );
+/** Follows the pointer while a chat turn is in flight. Does not capture clicks. */
+function ChatPointer() {
+  const [pos, setPos] = useState({ x: -40, y: -40 });
+  useEffect(() => {
+    const onMove = (e) => setPos({ x: e.clientX, y: e.clientY });
+    window.addEventListener("pointermove", onMove, { passive: true });
+    document.documentElement.classList.add("chat-busy");
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      document.documentElement.classList.remove("chat-busy");
+    };
+  }, []);
+  return (
+    <span
+      className="chat-pointer"
+      style={{ left: pos.x, top: pos.y }}
+      aria-hidden="true"
+    />
+  );
+}
 const IconBulb = () => (
   <Svg>
     <path d="M9 18h6M10 21h4" />
@@ -2182,6 +2202,8 @@ export default function App() {
   };
   const [prompt, setPrompt] = useState(() => bootSession.prompt || "");
   const [busy, setBusy] = useState(false);
+  /** Live transcript line while a chat turn is in flight. */
+  const [chatStatus, setChatStatus] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState(() => bootSession.result ?? null);
   const [batchResults, setBatchResults] = useState(() =>
@@ -3858,6 +3880,7 @@ export default function App() {
     const sessionId = activeIdRef.current;
     const userText = text || session.goal || examplePrompt;
     setBusy(true);
+    setChatStatus("Thinking");
     setError("");
     setSavedMsg("");
     try {
@@ -3867,9 +3890,8 @@ export default function App() {
         setSession((prev) => ({ ...prev, goal: prev.goal || userText }));
         setPrompt("");
       }
-      const data = await api("/v1/chat", {
-        method: "POST",
-        body: JSON.stringify(chatBody(userText, extra)),
+      const data = await postChat(chatBody(userText, extra), (status) => {
+        if (activeIdRef.current === sessionId) setChatStatus(status);
       });
       if (activeIdRef.current !== sessionId) return;
       applyChatResponse(data, userText);
@@ -3879,6 +3901,7 @@ export default function App() {
     } catch (e) {
       if (activeIdRef.current === sessionId) setError(e.message);
     } finally {
+      setChatStatus("");
       if (activeIdRef.current === sessionId) setBusy(false);
     }
   };
@@ -5287,6 +5310,7 @@ export default function App() {
     ideas.length,
     pendingPlan,
     pendingQuestion,
+    chatStatus,
   ]);
 
   const hasTimeline =
@@ -5654,6 +5678,7 @@ export default function App() {
         </div>
       )}
 
+      {chatStatus && <ChatPointer />}
       <header className="topbar">
         <div className="brand-lockup">
           <span className="brand-mark" aria-hidden="true">
@@ -5988,6 +6013,12 @@ export default function App() {
                 )}
               </article>
             ))}
+
+            {chatStatus && (
+              <p className="t-live-status" role="status">
+                {chatStatus}
+              </p>
+            )}
 
             {pendingPlan && (pendingPlan.status === "plan" || pendingPlan.actions?.length) && (
               <aside className="pending-plan" aria-label="Proposed tools">

@@ -3,13 +3,17 @@ use crate::prefs::{looks_nsfw_label, AlignmentPrefs, AutoFallbacksPrefs, Privacy
 use crate::state::{AppState, RuntimeSecrets};
 use crate::styles::{self, StylePack};
 use crate::worker::LoraWeight;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
+use futures::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::convert::Infallible;
+use tokio::sync::mpsc;
 
 type ApiResult<T> = Result<T, ApiError>;
 
@@ -794,6 +798,9 @@ pub struct ChatRequest {
     /// When true, skip LLM planning and execute `actions` (Plan confirmation).
     #[serde(default)]
     pub confirm: bool,
+    /// NDJSON status lines (`Thinking`, `Searching`, `Generating`, `Downloading`) then one result.
+    #[serde(default)]
+    pub stream: bool,
     #[serde(default)]
     pub actions: Vec<ChatActionIn>,
     #[serde(default)]
@@ -853,16 +860,17 @@ fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
         || m.contains("find loras")
         || m.contains("search civitai")
     {
-        let query = message
-            .split_once("for ")
-            .map(|(_, rest)| rest.trim())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(message);
+        let query = subject_query(message);
+        let query = if query.chars().count() >= 2 {
+            query
+        } else {
+            message.chars().take(80).collect()
+        };
         let search_type = infer_civitai_search_type(message);
         actions.push(PlannedAction {
             action_type: "search_civitai".into(),
             args: json!({
-                "query": query.chars().take(80).collect::<String>(),
+                "query": query,
                 "type": search_type,
             }),
         });
@@ -1303,11 +1311,14 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
     let ty = ar.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let status = ar.get("status").and_then(|s| s.as_str()).unwrap_or("");
     if status == "error" {
-        let err = ar.get("error").and_then(|e| e.as_str()).unwrap_or("error");
-        return Some(format!("{ty} failed: {err}"));
+        // Lookup failures stay in the tool disclosure. Do not paste tool names into the reply.
+        if matches!(ty, "generate_image" | "generate_video" | "run_session") {
+            return Some("I couldn't finish that generation.".into());
+        }
+        return None;
     }
     if status == "proposed" {
-        return Some(format!("Proposed: {ty}"));
+        return None;
     }
     let res = ar.get("result")?;
     match ty {
@@ -1839,29 +1850,35 @@ async fn execute_chat_action(
             }
         }
         "search_civitai" => {
-            let q = action
+            let raw = action
                 .args
                 .get("query")
                 .and_then(|q| q.as_str())
                 .unwrap_or("")
                 .trim();
-            let type_raw = search_type_arg(&action.args);
-            let limit = action
-                .args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(6) as u32;
-            match typed_civitai_lookup(state, q, type_raw, limit).await {
+            let short = subject_query(raw);
+            let q = if short.chars().count() >= 2 {
+                short
+            } else {
+                raw.to_string()
+            };
+            let mut args = action.args.clone();
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("query".to_string(), json!(q));
+            }
+            let type_raw = search_type_arg(&args);
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(6) as u32;
+            match typed_civitai_lookup(state, &q, type_raw, limit).await {
                 Ok(result) => json!({
                     "type": ty,
                     "status": "executed",
-                    "args": action.args,
+                    "args": args,
                     "result": result
                 }),
                 Err(e) => json!({
                     "type": ty,
                     "status": "error",
-                    "args": action.args,
+                    "args": args,
                     "error": e
                 }),
             }
@@ -2476,83 +2493,11 @@ async fn execute_chat_action(
             })
         }
         "get_route_defaults" => {
-            let (cfg_snap, privacy, alignment, auto_fallbacks) = {
-                let cfg = state.config.read().await;
-                let or = state.openrouter.read().await;
-                (
-                    (
-                        cfg.chat_model.clone(),
-                        cfg.image_model.clone(),
-                        cfg.router_model.clone(),
-                        or.configured_chat_model().to_string(),
-                        or.configured_image_model().to_string(),
-                        or.configured_router_model().to_string(),
-                    ),
-                    or.privacy().clone(),
-                    or.alignment().clone(),
-                    or.auto_fallbacks().clone(),
-                )
-            };
-            let (chat_model, image_model, router_model, _or_chat, or_image, or_router) = cfg_snap;
-            let resolved_router = crate::router::resolve_router_model_prefs(
-                &or_router,
-                &privacy,
-                &alignment,
-                &auto_fallbacks,
-            );
-            let auto_image = crate::router::resolve_auto_fallback(
-                crate::router::AutoFallbackKind::Image,
-                &privacy,
-                &alignment,
-                &auto_fallbacks,
-            );
-            let auto_video = crate::router::resolve_auto_fallback(
-                crate::router::AutoFallbackKind::Video,
-                &privacy,
-                &alignment,
-                &auto_fallbacks,
-            );
-            let auto_agent = crate::router::resolve_auto_fallback(
-                crate::router::AutoFallbackKind::Agent,
-                &privacy,
-                &alignment,
-                &auto_fallbacks,
-            );
             json!({
                 "type": ty,
                 "status": "executed",
                 "args": action.args,
-                "result": {
-                    "sentinels": {
-                        "agent": crate::router::AUTO_AGENT,
-                        "image": crate::router::AUTO_IMAGE,
-                        "router": crate::router::AUTO_ROUTER,
-                    },
-                    "configured": {
-                        "chatModel": chat_model,
-                        "imageModel": image_model,
-                        "routerModel": router_model,
-                    },
-                    "auto": {
-                        "router": resolved_router.clone(),
-                        "image": auto_image,
-                        "video": auto_video,
-                        "agent": auto_agent,
-                    },
-                    "autoFallbacks": auto_fallbacks,
-                    "resolved": {
-                        "router": resolved_router,
-                        "imageConfigured": or_image,
-                        "zdr": privacy.zero_data_retention,
-                        "alignment": alignment.model_alignment,
-                    },
-                    "notes": [
-                        "Pin agent/image/router with set_chat_models (persists to Settings).",
-                        "Cloud vs Local is the Studio composer switch (backend), not a chat model pref.",
-                        "Pin video with set_chat_models videoModel (id only). Cloud vs Local is set_generate_backend.",
-                        "Configure Auto fallbacks on the Models tab when the router does not pin a model.",
-                    ],
-                }
+                "result": route_defaults_payload(state).await
             })
         }
         "set_chat_models" => {
@@ -3186,15 +3131,48 @@ async fn civitai_install_inner(
     }))
 }
 
+#[derive(Clone, Default)]
+struct Phase {
+    tx: Option<mpsc::Sender<String>>,
+}
+
+impl Phase {
+    fn emit(&self, status: &str) {
+        let Some(tx) = &self.tx else {
+            return;
+        };
+        let line = json!({ "type": "status", "status": status }).to_string();
+        let _ = tx.try_send(line);
+    }
+}
+
+fn phase_for_action(ty: &str) -> Option<&'static str> {
+    match ty {
+        "generate_image" | "generate_video" | "run_session" => Some("Generating"),
+        "install_asset" => Some("Downloading"),
+        "search_civitai" | "suggest_ideas" | "list_loras" | "list_checkpoints"
+        | "list_installed" | "list_styles" | "list_models" | "list_favorites" | "list_pins"
+        | "list_install_jobs" | "gallery_list" | "gallery_get" | "get_settings"
+        | "get_route_defaults" | "worker_status" | "get_base_model" | "apply_style" => {
+            Some("Searching")
+        }
+        _ => None,
+    }
+}
+
 struct ActionRun {
     loras: Vec<LoraIn>,
     image_model: Option<String>,
     video_model: Option<String>,
     backend: Option<String>,
+    phase: Phase,
 }
 
 impl ActionRun {
     async fn exec(&mut self, state: &AppState, action: &PlannedAction) -> Value {
+        if let Some(label) = phase_for_action(&action.action_type) {
+            self.phase.emit(label);
+        }
         let v = execute_chat_action(
             state,
             action,
@@ -3285,59 +3263,393 @@ fn lora_from_pin_value(v: &Value) -> Option<LoraIn> {
     })
 }
 
-/// Short Civitai query from a first prompt. Guidance prefixes are not the subject.
+const QUERY_INSTRUCTION: &[&str] = &[
+    "a",
+    "an",
+    "the",
+    "please",
+    "me",
+    "my",
+    "of",
+    "to",
+    "and",
+    "or",
+    "with",
+    "for",
+    "on",
+    "in",
+    "at",
+    "it",
+    "this",
+    "that",
+    "image",
+    "images",
+    "picture",
+    "pictures",
+    "photo",
+    "photos",
+    "pic",
+    "are",
+    "you",
+    "your",
+    "able",
+    "can",
+    "could",
+    "would",
+    "should",
+    "make",
+    "makes",
+    "making",
+    "create",
+    "creating",
+    "generate",
+    "generating",
+    "draw",
+    "drawing",
+    "paint",
+    "render",
+    "want",
+    "need",
+    "help",
+    "do",
+    "does",
+    "did",
+    "is",
+    "am",
+    "be",
+    "was",
+    "were",
+    "i",
+    "im",
+    "we",
+    "our",
+    "us",
+    "just",
+    "like",
+    "some",
+    "any",
+    "what",
+    "how",
+    "which",
+    "who",
+    "when",
+    "where",
+    "why",
+    "will",
+    "let",
+    "show",
+    "give",
+    "get",
+    "got",
+    "using",
+    "use",
+    "used",
+    "via",
+    "from",
+    "into",
+    "about",
+    "character",
+    "characters",
+    "style",
+    "reference",
+    "lora",
+    "loras",
+    "checkpoint",
+    "checkpoints",
+    "model",
+    "models",
+    "asset",
+    "assets",
+    "base",
+    "please",
+    "look",
+    "looking",
+    "see",
+    "standing",
+    "sitting",
+    "walking",
+    "holding",
+    "wearing",
+    "wear",
+    "wears",
+    "worn",
+    "dressed",
+    "an",
+    "by",
+    "as",
+    "if",
+    "but",
+    "so",
+    "not",
+    "no",
+    "yes",
+    "now",
+    "then",
+    "here",
+    "there",
+    "also",
+    "really",
+    "very",
+    "prompt",
+    "art",
+    "artwork",
+    "illustration",
+];
+
+/// Clothing, lighting, and scene filler. Dropped unless they are the only name.
+const QUERY_SCENE: &[&str] = &[
+    "dress",
+    "dresses",
+    "shirt",
+    "skirt",
+    "pants",
+    "jeans",
+    "jacket",
+    "coat",
+    "hat",
+    "shoes",
+    "boots",
+    "outfit",
+    "outfits",
+    "clothing",
+    "clothes",
+    "hoodie",
+    "gown",
+    "armor",
+    "armour",
+    "cape",
+    "cloak",
+    "lingerie",
+    "bikini",
+    "stockings",
+    "gloves",
+    "uniform",
+    "costume",
+    "heels",
+    "socks",
+    "shorts",
+    "sweater",
+    "blouse",
+    "suit",
+    "scarf",
+    "helmet",
+    "crown",
+    "necklace",
+    "lighting",
+    "light",
+    "lights",
+    "neon",
+    "cinematic",
+    "shadow",
+    "shadows",
+    "moonlight",
+    "sunlight",
+    "lamp",
+    "lamps",
+    "glow",
+    "glowing",
+    "dark",
+    "night",
+    "bright",
+    "dim",
+    "bokeh",
+    "sunset",
+    "sunrise",
+    "dawn",
+    "dusk",
+    "spotlight",
+    "emerald",
+    "crimson",
+    "scarlet",
+    "pink",
+    "red",
+    "blue",
+    "black",
+    "white",
+    "gold",
+    "golden",
+    "silver",
+    "purple",
+    "violet",
+    "green",
+    "yellow",
+    "orange",
+    "teal",
+    "cyan",
+    "ivory",
+    "nude",
+    "background",
+    "foreground",
+];
+
+fn query_key(word: &str) -> String {
+    word.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn query_display(word: &str) -> &str {
+    word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '\'')
+}
+
+fn query_listed(key: &str, list: &[&str]) -> bool {
+    list.iter().any(|w| *w == key)
+}
+
+struct QueryTok {
+    display: String,
+    key: String,
+    cap: bool,
+}
+
+fn query_tokens(message: &str) -> Vec<QueryTok> {
+    message
+        .split_whitespace()
+        .filter_map(|raw| {
+            let key = query_key(raw);
+            if key.is_empty() {
+                return None;
+            }
+            let cap = raw
+                .chars()
+                .find(|c| c.is_alphabetic())
+                .is_some_and(|c| c.is_uppercase());
+            let display = query_display(raw);
+            if display.is_empty() {
+                return None;
+            }
+            Some(QueryTok {
+                display: display.to_string(),
+                key,
+                cap,
+            })
+        })
+        .collect()
+}
+
+fn finish_query(words: &[String]) -> String {
+    words.join(" ").chars().take(80).collect()
+}
+
+/// Civitai query is the subject (character or asset name, 2–6 words), not the prompt.
+/// Proper nouns win. Question words, scene prose, clothing, and lighting do not.
 fn subject_query(message: &str) -> String {
     let raw = message.trim();
     if raw.is_empty() {
         return String::new();
     }
-    let lower = raw.to_lowercase();
-    let mut start = 0usize;
-    const TAILS: &[&str] = &[
-        "what should i do for ",
-        "what should i do with ",
-        "what can i do for ",
-        "help me choose ",
-        "help me pick ",
-        "help me with ",
-        "which lora for ",
-        "which base for ",
-        "which checkpoint for ",
-        "any assets for ",
-        "any models for ",
-        "any loras for ",
-        "suggest a lora for ",
-        "suggest assets for ",
-    ];
-    for prefix in TAILS {
-        if lower.starts_with(prefix) {
-            start = prefix.len();
-            break;
+    let tokens = query_tokens(raw);
+    let mut spans: Vec<(Vec<String>, bool)> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let mut scene_only = true;
+    let flush =
+        |spans: &mut Vec<(Vec<String>, bool)>, cur: &mut Vec<String>, scene_only: &mut bool| {
+            if !cur.is_empty() {
+                spans.push((std::mem::take(cur), *scene_only));
+                *scene_only = true;
+            }
+        };
+    for tok in &tokens {
+        let instruction = query_listed(&tok.key, QUERY_INSTRUCTION);
+        let scene = query_listed(&tok.key, QUERY_SCENE);
+        if tok.cap && !instruction && cur.len() < 6 {
+            if !scene {
+                scene_only = false;
+            }
+            cur.push(tok.display.clone());
+        } else if !cur.is_empty() && !tok.cap && !instruction && !scene && cur.len() < 6 {
+            scene_only = false;
+            cur.push(tok.display.clone());
+        } else {
+            flush(&mut spans, &mut cur, &mut scene_only);
         }
     }
-    let slice = raw[start..]
-        .trim()
-        .trim_matches(|c: char| c == '?' || c == '.' || c == '!' || c == '"');
-    const SKIP: &[&str] = &[
-        "a", "an", "the", "please", "me", "my", "of", "to", "and", "or", "with", "for", "on",
-        "in", "it", "this", "that", "image", "picture", "photo",
-    ];
-    let words: Vec<&str> = slice
-        .split_whitespace()
-        .filter(|w| {
-            let key = w
-                .trim_matches(|c: char| !c.is_ascii_alphanumeric())
-                .to_lowercase();
-            !key.is_empty() && !SKIP.contains(&key.as_str())
-        })
-        .take(6)
-        .collect();
-    let q = if words.is_empty() {
-        slice.split_whitespace().take(6).collect::<Vec<_>>().join(" ")
+    flush(&mut spans, &mut cur, &mut scene_only);
+    let named: Vec<&(Vec<String>, bool)> = spans.iter().filter(|(_, scene)| !scene).collect();
+    let pool: Vec<&(Vec<String>, bool)> = if named.is_empty() {
+        spans.iter().collect()
     } else {
-        words.join(" ")
+        named
     };
-    q.chars().take(80).collect()
+    if let Some((words, _)) = pool.iter().max_by_key(|(words, _)| words.len()) {
+        if !words.is_empty() {
+            return finish_query(words);
+        }
+    }
+    let strict: Vec<String> = tokens
+        .iter()
+        .filter(|t| !query_listed(&t.key, QUERY_INSTRUCTION) && !query_listed(&t.key, QUERY_SCENE))
+        .take(6)
+        .map(|t| t.display.clone())
+        .collect();
+    if !strict.is_empty() {
+        return finish_query(&strict);
+    }
+    let loose: Vec<String> = tokens
+        .iter()
+        .filter(|t| !query_listed(&t.key, QUERY_INSTRUCTION))
+        .take(4)
+        .map(|t| t.display.clone())
+        .collect();
+    finish_query(&loose)
+}
+
+fn sentence_is_tool_noise(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    lower.contains("freya route")
+        || lower.contains("search_civitai")
+        || lower.contains("generate_image")
+        || lower.contains("generate_video")
+        || lower.contains("run_session")
+        || lower.contains("install_asset")
+}
+
+fn tool_noise_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    if lower.starts_with("proposed:") {
+        return true;
+    }
+    if let Some((head, _)) = lower.split_once(" failed:") {
+        return head.contains('_') && head.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+    }
+    false
+}
+
+fn scrub_sentences(line: &str) -> String {
+    let mut out = String::new();
+    let mut start = 0usize;
+    for (i, ch) in line.char_indices() {
+        if ch == '.' || ch == '!' || ch == '?' {
+            let sentence = line[start..=i].trim();
+            if !sentence.is_empty() && !sentence_is_tool_noise(sentence) {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(sentence);
+            }
+            start = i + ch.len_utf8();
+        }
+    }
+    let tail = line[start..].trim();
+    if !tail.is_empty() && !sentence_is_tool_noise(tail) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(tail);
+    }
+    out
+}
+
+/// Drop tool-call lines and route-machinery sentences from the visible reply.
+fn scrub_tool_noise(reply: &str) -> String {
+    reply
+        .split('\n')
+        .filter(|line| !tool_noise_line(line))
+        .map(scrub_sentences)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn suggestion_names(cards: &[Value], limit: usize) -> Vec<String> {
@@ -3356,7 +3668,9 @@ fn suggestion_names(cards: &[Value], limit: usize) -> Vec<String> {
     };
     for card in cards.iter().filter(|c| {
         c.get("installed").and_then(|v| v.as_bool()) == Some(true)
-            || c.get("path").and_then(|p| p.as_str()).is_some_and(|p| !p.is_empty())
+            || c.get("path")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| !p.is_empty())
     }) {
         push(&mut names, card);
     }
@@ -3456,10 +3770,44 @@ async fn run_initial_subject_lookup(state: &AppState, message: &str) -> Vec<Valu
     out
 }
 
-pub async fn chat(
-    State(state): State<AppState>,
-    Json(mut req): Json<ChatRequest>,
-) -> ApiResult<Json<serde_json::Value>> {
+pub async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
+    if !req.stream {
+        return match chat_run(state, req, Phase::default()).await {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => e.into_response(),
+        };
+    }
+    let (tx, rx) = mpsc::channel(32);
+    let phase = Phase {
+        tx: Some(tx.clone()),
+    };
+    phase.emit("Thinking");
+    tokio::spawn(async move {
+        let line = match chat_run(state, req, phase).await {
+            Ok(v) => json!({ "type": "result", "data": v }).to_string(),
+            Err(e) => json!({ "type": "error", "error": api_err_msg(e) }).to_string(),
+        };
+        let _ = tx.send(line).await;
+    });
+    let body = Body::from_stream(stream::unfold(rx, |mut rx| async move {
+        let line = rx.recv().await?;
+        Some((Ok::<String, Infallible>(format!("{line}\n")), rx))
+    }));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn chat_run(
+    state: AppState,
+    mut req: ChatRequest,
+    phase: Phase,
+) -> ApiResult<serde_json::Value> {
+    phase.emit("Thinking");
     req.loras = session_lora_pins(std::mem::take(&mut req.loras));
     let mode = req
         .automation_mode
@@ -3771,6 +4119,7 @@ pub async fn chat(
     // The fan-out replaces any single search the planner already chose so types are not dropped.
     let lookup_results = if initial_turn {
         planned.retain(|a| a.action_type != "search_civitai");
+        phase.emit("Searching");
         run_initial_subject_lookup(&state, &req.message).await
     } else {
         Vec::new()
@@ -3782,6 +4131,7 @@ pub async fn chat(
         image_model: Some(resolved_image.clone()),
         video_model: Some(resolved_video.clone()),
         backend: req.backend.clone(),
+        phase: phase.clone(),
     };
 
     let side_effects: Vec<_> = planned
@@ -3898,6 +4248,7 @@ pub async fn chat(
 
     // Tool results arrive after the LLM reply — fold worker summaries into reply.
     let reply = enrich_reply_with_worker_results(&reply, &action_results);
+    let reply = scrub_tool_noise(&reply);
     let reply = if initial_turn {
         note_subject_lookup(&reply, route.modality.as_str(), &loras)
     } else {
@@ -3930,7 +4281,7 @@ pub async fn chat(
     );
     let footer_backend = if local_backend { "local" } else { "cloud" };
 
-    Ok(Json(json!({
+    Ok(json!({
         "reply": reply,
         "actions": action_results,
         "pendingConfirmation": pending_confirmation,
@@ -3953,7 +4304,7 @@ pub async fn chat(
             "image": resolved_image,
             "video": resolved_video,
         },
-    })))
+    }))
 }
 
 fn pinned_lora_footer(loras: &[LoraIn]) -> String {
@@ -4890,6 +5241,86 @@ pub async fn models(State(state): State<AppState>) -> ApiResult<Json<serde_json:
     models_payload(&state).await.map(Json)
 }
 
+pub async fn route_defaults(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(route_defaults_payload(&state).await)
+}
+
+async fn route_defaults_payload(state: &AppState) -> Value {
+    let (cfg_snap, privacy, alignment, auto_fallbacks) = {
+        let cfg = state.config.read().await;
+        let or = state.openrouter.read().await;
+        (
+            (
+                cfg.chat_model.clone(),
+                cfg.image_model.clone(),
+                cfg.router_model.clone(),
+                or.configured_chat_model().to_string(),
+                or.configured_image_model().to_string(),
+                or.configured_router_model().to_string(),
+            ),
+            or.privacy().clone(),
+            or.alignment().clone(),
+            or.auto_fallbacks().clone(),
+        )
+    };
+    let (chat_model, image_model, router_model, _or_chat, or_image, or_router) = cfg_snap;
+    let resolved_router = crate::router::resolve_router_model_prefs(
+        &or_router,
+        &privacy,
+        &alignment,
+        &auto_fallbacks,
+    );
+    let auto_image = crate::router::resolve_auto_fallback(
+        crate::router::AutoFallbackKind::Image,
+        &privacy,
+        &alignment,
+        &auto_fallbacks,
+    );
+    let auto_video = crate::router::resolve_auto_fallback(
+        crate::router::AutoFallbackKind::Video,
+        &privacy,
+        &alignment,
+        &auto_fallbacks,
+    );
+    let auto_agent = crate::router::resolve_auto_fallback(
+        crate::router::AutoFallbackKind::Agent,
+        &privacy,
+        &alignment,
+        &auto_fallbacks,
+    );
+    json!({
+        "sentinels": {
+            "agent": crate::router::AUTO_AGENT,
+            "image": crate::router::AUTO_IMAGE,
+            "router": crate::router::AUTO_ROUTER,
+        },
+        "configured": {
+            "chatModel": chat_model,
+            "imageModel": image_model,
+            "routerModel": router_model,
+        },
+        "auto": {
+            "router": resolved_router.clone(),
+            "image": auto_image,
+            "video": auto_video,
+            "agent": auto_agent,
+        },
+        "autoFallbacks": auto_fallbacks,
+        "resolved": {
+            "router": resolved_router,
+            "imageConfigured": or_image,
+            "zdr": privacy.zero_data_retention,
+            "alignment": alignment.model_alignment,
+        },
+        "notes": [
+            "Pin agent/image/router with set_chat_models (persists to Settings).",
+            "Cloud vs Local is the Studio composer switch (backend), not a chat model pref.",
+            "Pin video with set_chat_models videoModel (id only). Cloud vs Local is set_generate_backend.",
+            "Configure Auto fallbacks on the Models tab when the router does not pin a model.",
+        ],
+    })
+}
+
 pub async fn styles_list(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let items = styles::load_styles(&state.packs_dir)
         .await
@@ -5669,6 +6100,7 @@ mod route_footer_tests {
             image_model: Some("google/gemini-2.5-flash-image".into()),
             video_model: Some("google/veo-3.1".into()),
             backend: None,
+            phase: Phase::default(),
         };
         let chat_only = PlannedAction {
             action_type: "set_chat_models".into(),
@@ -5943,10 +6375,33 @@ mod route_footer_tests {
             subject_query("what should I do for Frankie Foster?"),
             "Frankie Foster"
         );
+        assert_eq!(
+            subject_query("are you able to make an image of Frankie Foster?"),
+            "Frankie Foster"
+        );
+        assert_eq!(
+            subject_query("are you able make Frankie Foster"),
+            "Frankie Foster"
+        );
+        assert_eq!(
+            subject_query("Frankie Foster in an emerald dress under neon lighting"),
+            "Frankie Foster"
+        );
+        assert_eq!(subject_query("Emerald Dress"), "Emerald Dress");
         let scene = subject_query("a woman in an emerald dress in a neon diner at night");
-        assert!(scene.to_lowercase().contains("emerald"));
-        assert!(scene.to_lowercase().contains("diner"));
-        assert!(!scene.to_lowercase().contains("generate"));
+        assert_eq!(scene, "woman diner");
+        assert!(!scene.to_lowercase().contains("emerald"));
+        assert!(!scene.to_lowercase().contains("dress"));
+        assert!(!scene.to_lowercase().contains("neon"));
+    }
+
+    #[test]
+    fn scrub_drops_tool_names_and_keeps_the_reply() {
+        let raw = "I can help with Frankie Foster. I see you're on Freya Route mode.\n\nsearch_civitai failed: civitai search";
+        let cleaned = scrub_tool_noise(raw);
+        assert!(cleaned.contains("Frankie Foster"));
+        assert!(!cleaned.to_lowercase().contains("freya route"));
+        assert!(!cleaned.contains("search_civitai"));
     }
 
     #[test]

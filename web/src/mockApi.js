@@ -1209,40 +1209,80 @@ function mockGenerateArtifact(prompt, body = {}) {
   };
 }
 
+const QUERY_INSTRUCTION = new Set([
+  "a", "an", "the", "please", "me", "my", "of", "to", "and", "or", "with", "for", "on", "in",
+  "at", "it", "this", "that", "image", "images", "picture", "pictures", "photo", "photos", "pic",
+  "are", "you", "your", "able", "can", "could", "would", "should", "make", "makes", "making",
+  "create", "creating", "generate", "generating", "draw", "drawing", "paint", "render", "want",
+  "need", "help", "do", "does", "did", "is", "am", "be", "was", "were", "i", "im", "we", "our",
+  "us", "just", "like", "some", "any", "what", "how", "which", "who", "when", "where", "why",
+  "will", "let", "show", "give", "get", "got", "using", "use", "used", "via", "from", "into",
+  "about", "character", "characters", "style", "reference", "lora", "loras", "checkpoint",
+  "checkpoints", "model", "models", "asset", "assets", "base", "look", "looking", "see",
+  "standing", "sitting", "walking", "holding", "wearing", "wear", "wears", "worn", "dressed",
+  "by", "as", "if", "but", "so", "not", "no", "yes", "now", "then", "here", "there", "also",
+  "really", "very", "prompt", "art", "artwork", "illustration",
+]);
+const QUERY_SCENE = new Set([
+  "dress", "dresses", "shirt", "skirt", "pants", "jeans", "jacket", "coat", "hat", "shoes",
+  "boots", "outfit", "outfits", "clothing", "clothes", "hoodie", "gown", "armor", "armour",
+  "cape", "cloak", "lingerie", "bikini", "stockings", "gloves", "uniform", "costume", "heels",
+  "socks", "shorts", "sweater", "blouse", "suit", "scarf", "helmet", "crown", "necklace",
+  "lighting", "light", "lights", "neon", "cinematic", "shadow", "shadows", "moonlight",
+  "sunlight", "lamp", "lamps", "glow", "glowing", "dark", "night", "bright", "dim", "bokeh",
+  "sunset", "sunrise", "dawn", "dusk", "spotlight", "emerald", "crimson", "scarlet", "pink",
+  "red", "blue", "black", "white", "gold", "golden", "silver", "purple", "violet", "green",
+  "yellow", "orange", "teal", "cyan", "ivory", "nude", "background", "foreground",
+]);
+
 function subjectQuery(message) {
   const raw = String(message || "").trim();
   if (!raw) return "";
-  const lower = raw.toLowerCase();
-  const tails = [
-    "what should i do for ",
-    "what should i do with ",
-    "help me choose ",
-    "help me with ",
-    "which lora for ",
-    "which base for ",
-    "any assets for ",
-  ];
-  let start = 0;
-  for (const prefix of tails) {
-    if (lower.startsWith(prefix)) {
-      start = prefix.length;
-      break;
-    }
+  const tokens = raw.split(/\s+/).map((word) => {
+    const key = word.replace(/[^a-z0-9]/gi, "").toLowerCase();
+    const display = word.replace(/^[^a-z0-9'-]+|[^a-z0-9'-]+$/gi, "");
+    const alpha = word.match(/[a-z]/i);
+    const cap = Boolean(alpha && alpha[0] === alpha[0].toUpperCase() && alpha[0] !== alpha[0].toLowerCase());
+    return { key, display, cap };
+  }).filter((t) => t.key && t.display);
+  const spans = [];
+  let cur = [];
+  let sceneOnly = true;
+  const flush = () => {
+    if (cur.length) spans.push({ words: cur, sceneOnly });
+    cur = [];
+    sceneOnly = true;
+  };
+  for (const tok of tokens) {
+    const instruction = QUERY_INSTRUCTION.has(tok.key);
+    const scene = QUERY_SCENE.has(tok.key);
+    if (tok.cap && !instruction && cur.length < 6) {
+      if (!scene) sceneOnly = false;
+      cur.push(tok.display);
+    } else if (cur.length && !tok.cap && !instruction && !scene && cur.length < 6) {
+      sceneOnly = false;
+      cur.push(tok.display);
+    } else flush();
   }
-  const slice = raw.slice(start).replace(/[?.!"]+$/g, "").trim();
-  const skip = new Set([
-    "a", "an", "the", "please", "me", "my", "of", "to", "and", "or", "with", "for", "on", "in",
-    "it", "this", "that", "image", "picture", "photo",
-  ]);
-  const words = slice
-    .split(/\s+/)
-    .filter((w) => {
-      const key = w.replace(/[^a-z0-9]/gi, "").toLowerCase();
-      return key && !skip.has(key);
-    })
-    .slice(0, 6);
-  const q = words.join(" ") || slice.split(/\s+/).slice(0, 6).join(" ");
-  return q.slice(0, 80);
+  flush();
+  const named = spans.filter((s) => !s.sceneOnly);
+  const pool = named.length ? named : spans;
+  let best = null;
+  for (const span of pool) {
+    if (!best || span.words.length >= best.words.length) best = span;
+  }
+  if (best?.words?.length) return best.words.join(" ").slice(0, 80);
+  const strict = tokens
+    .filter((t) => !QUERY_INSTRUCTION.has(t.key) && !QUERY_SCENE.has(t.key))
+    .slice(0, 6)
+    .map((t) => t.display);
+  if (strict.length) return strict.join(" ").slice(0, 80);
+  return tokens
+    .filter((t) => !QUERY_INSTRUCTION.has(t.key))
+    .slice(0, 4)
+    .map((t) => t.display)
+    .join(" ")
+    .slice(0, 80);
 }
 
 const MOCK_AGENT_SEARCH_TYPES = [
@@ -1307,8 +1347,7 @@ function planChatActions(message, body) {
     m.includes("find loras") ||
     m.includes("search civitai")
   ) {
-    const q =
-      (message.split(/\bfor\b/i)[1] || message).trim().slice(0, 80) || BEGINNER_CIVITAI_QUERY;
+    const q = subjectQuery(message) || BEGINNER_CIVITAI_QUERY;
     const words = m.split(/[^a-z0-9]+/).filter(Boolean);
     const has = (w) => words.includes(w);
     let searchType = "LORA";
@@ -1409,7 +1448,9 @@ async function executeMockChatAction(action, body) {
     };
   }
   if (ty === "search_civitai") {
-    const q = (args.query || "").trim() || BEGINNER_CIVITAI_QUERY;
+    const raw = (args.query || "").trim();
+    const short = subjectQuery(raw);
+    const q = short.length >= 2 ? short : raw || BEGINNER_CIVITAI_QUERY;
     const parsed = canonicalSearchType(args.type || args.modelType || args.types || "");
     if (parsed.error) {
       return { type: ty, status: "error", args, error: parsed.error };
@@ -1559,13 +1600,12 @@ function enrichMockReplyWithWorker(reply, actionResults) {
   const lines = [];
   for (const ar of actionResults || []) {
     if (ar.status === "error") {
-      lines.push(`${ar.type} failed: ${ar.error || "error"}`);
+      if (ar.type === "generate_image" || ar.type === "generate_video" || ar.type === "run_session") {
+        lines.push("I couldn't finish that generation.");
+      }
       continue;
     }
-    if (ar.status === "proposed") {
-      lines.push(`Proposed: ${ar.type}`);
-      continue;
-    }
+    if (ar.status === "proposed") continue;
     const res = ar.result || {};
     if (ar.type === "worker_status") {
       const parts = [];
