@@ -1,9 +1,0 @@
-id: ethereal-moon
-displayName: Ethereal Moon Landscape
-tags: [landscape, fantasy, moon]
-examplePrompt: >
-  A mystical landscape under a radiant red moon — a twisted blossoming tree
-  on rocky ground, misty mountains beyond a lake that mirrors the moonlight
-backend: openrouter
-openRouterModel: black-forest-labs/flux.2-klein-4b
-recommendedSize: "1024x1024"

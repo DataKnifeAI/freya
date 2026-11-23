@@ -60,7 +60,6 @@ spec:
 #   wildcard-dataknife-net-tls  (TLS; make kind-tls or gitops cert-sync)
 # Architecture: Studio/operator/MCP/Ingress in k8s (shared cluster OK); GPU worker on host via URL.
 # kind is a local dev path — same CRs work production-shaped on shared k8s. See docs/ARCHITECTURE.md.
-# Optional style pack sample: freya_v1alpha1_freyastyle.yaml (freya.png NL example)
 # Public UI: https://freya.dataknife.net — for kind, run ./scripts/kind-hosts.sh
 # Public MCP (Streamable HTTP): https://freya.dataknife.net/mcp
 # Cursor MCP config example:

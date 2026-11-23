@@ -46,7 +46,7 @@ fn default_backend() -> String {
 pub async fn load_styles(packs_dir: &Path) -> Result<Vec<StylePack>> {
     let dir = packs_dir.join("styles");
     if !dir.exists() {
-        return Ok(builtin_styles());
+        return Ok(Vec::new());
     }
     let mut out = Vec::new();
     let mut rd = fs::read_dir(&dir).await?;
@@ -61,14 +61,7 @@ pub async fn load_styles(packs_dir: &Path) -> Result<Vec<StylePack>> {
             out.push(s);
         }
     }
-    if out.is_empty() {
-        return Ok(builtin_styles());
-    }
-    // Featured brand pack first so UI "Use example" matches freya.png NL seed.
-    out.sort_by(|a, b| {
-        let rank = |id: &str| if id == "freya-winged-warrior" { 0 } else { 1 };
-        rank(&a.id).cmp(&rank(&b.id)).then_with(|| a.id.cmp(&b.id))
-    });
+    out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
 }
 
@@ -148,51 +141,6 @@ pub async fn load_instruction(
     load_instruction_default(packs_dir, mode).await
 }
 
-fn builtin_styles() -> Vec<StylePack> {
-    // NL examples (not SD tag soup). First entry seeds UI "Use example" — freya.png brand art.
-    vec![
-        StylePack {
-            id: "freya-winged-warrior".into(),
-            display_name: "Freya (brand art)".into(),
-            tags: vec!["character".into(), "fantasy".into(), "wings".into()],
-            example_prompt: "A young woman with large brown eagle wings and fantasy leather armor, standing in a green canyon with a waterfall behind her".into(),
-            backend: "openrouter".into(),
-            open_router_model: Some("black-forest-labs/flux.2-klein-4b".into()),
-            local_checkpoint: None,
-            loras: vec![],
-            trigger_words: None,
-            recommended_size: Some("1024x1024".into()),
-            thumbnail_url: None,
-        },
-        StylePack {
-            id: "ethereal-moon".into(),
-            display_name: "Ethereal Moon Landscape".into(),
-            tags: vec!["landscape".into(), "fantasy".into(), "moon".into()],
-            example_prompt: "A mystical landscape under a radiant red moon — a twisted blossoming tree on rocky ground, misty mountains beyond a lake that mirrors the moonlight".into(),
-            backend: "openrouter".into(),
-            open_router_model: Some("black-forest-labs/flux.2-klein-4b".into()),
-            local_checkpoint: None,
-            loras: vec![],
-            trigger_words: None,
-            recommended_size: Some("1024x1024".into()),
-            thumbnail_url: None,
-        },
-        StylePack {
-            id: "anime-portrait".into(),
-            display_name: "Anime Portrait (cloud)".into(),
-            tags: vec!["anime".into(), "portrait".into()],
-            example_prompt: "An anime-style portrait with soft lighting, expressive eyes, and clean colorful linework".into(),
-            backend: "openrouter".into(),
-            open_router_model: Some("black-forest-labs/flux.2-klein-4b".into()),
-            local_checkpoint: None,
-            loras: vec![],
-            trigger_words: None,
-            recommended_size: Some("768x1024".into()),
-            thumbnail_url: None,
-        },
-    ]
-}
-
 pub fn builtin_instruction(mode: &str) -> &'static str {
     match mode {
         "chat" => {
@@ -262,12 +210,34 @@ mod tests {
         assert_eq!(empty, builtin_instruction("chat"));
     }
 
-    #[test]
-    fn builtin_styles_feature_freya_brand_nl() {
-        let styles = builtin_styles();
-        assert_eq!(styles[0].id, "freya-winged-warrior");
-        assert!(styles[0].example_prompt.contains("eagle wings"));
-        // Prose NL, not SD tag soup (no weight syntax).
-        assert!(!styles[0].example_prompt.contains(":1."));
+    #[tokio::test]
+    async fn load_styles_returns_empty_without_sample_packs() {
+        let missing = PathBuf::from("/nonexistent-packs-dir");
+        let styles = load_styles(&missing).await.unwrap();
+        assert!(styles.is_empty());
+
+        let dir = std::env::temp_dir().join(format!("freya-styles-empty-{}", std::process::id()));
+        let styles_dir = dir.join("styles");
+        tokio::fs::create_dir_all(&styles_dir).await.unwrap();
+        let empty = load_styles(&dir).await.unwrap();
+        assert!(empty.is_empty());
+        let dropped = [
+            "freya-winged-warrior",
+            "ethereal-moon",
+            "local-character-lora",
+        ];
+        assert!(empty.iter().all(|s| !dropped.contains(&s.id.as_str())));
+
+        tokio::fs::write(
+            styles_dir.join("atelier.yaml"),
+            "id: atelier\ndisplayName: Atelier\nexamplePrompt: A quiet studio corner\n",
+        )
+        .await
+        .unwrap();
+        let loaded = load_styles(&dir).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "atelier");
+        assert!(!loaded[0].example_prompt.contains(":1."));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
