@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { api, AUTH_REQUIRED_EVENT, hasBrowserBearer, isMockMode, postChat } from "./api.js";
-import { BEGINNER_EXAMPLE, demoCivitaiQuery, generateOfferForTurn } from "./mockApi.js";
+import {
+  BEGINNER_EXAMPLE,
+  demoCivitaiQuery,
+  generateOfferForTurn,
+  partitionAssistantReply,
+  routeLineForMessage,
+} from "./mockApi.js";
 
 const AUTOMATION_MODES = ["plan", "auto", "yolo"];
 const AUTOMATION_LABELS = { plan: "Plan", auto: "Auto", yolo: "YOLO" };
@@ -5894,86 +5900,78 @@ export default function App() {
                       })}
                     </time>
                   )}
-                  {m.role !== "user" && m.route?.modality && (
-                    <span
-                      className="t-route"
-                      title={[
-                        m.resolvedModels?.agent && `agent: ${m.resolvedModels.agent}`,
-                        m.resolvedModels?.router && `router: ${m.resolvedModels.router}`,
-                        (m.routeContext?.backend || m.genBackend) === "local" &&
-                          m.routeContext?.base &&
-                          `base: ${m.routeContext.base}`,
-                        (m.routeContext?.backend || m.genBackend) === "local" &&
-                          m.routeContext?.lora &&
-                          `lora: ${m.routeContext.lora}`,
-                        (m.routeContext?.backend || m.genBackend) !== "local" &&
-                          m.resolvedModels?.image &&
-                          `image: ${m.resolvedModels.image}`,
-                        (m.routeContext?.backend || m.genBackend) !== "local" &&
-                          m.resolvedModels?.video &&
-                          `video: ${m.resolvedModels.video}`,
-                        (m.routeContext?.backend || m.genBackend) &&
-                          `backend: ${m.routeContext?.backend || m.genBackend}`,
-                        m.routeContext?.mode && `mode: ${m.routeContext.mode}`,
-                        m.route?.reason,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
-                    >
-                      {m.route.modality}
-                      {(m.routeContext?.backend || m.genBackend)
-                        ? ` · ${m.routeContext?.backend || m.genBackend}`
-                        : ""}
-                      {(m.routeContext?.backend || m.genBackend) === "local" && m.routeContext?.base
-                        ? ` · ${m.routeContext.base}`
-                        : ""}
-                      {(m.routeContext?.backend || m.genBackend) !== "local" &&
-                      m.resolvedModels?.image &&
-                      m.route.modality === "picture"
-                        ? ` · ${String(m.resolvedModels.image).split("/").pop()}`
-                        : ""}
-                      {(m.routeContext?.backend || m.genBackend) !== "local" &&
-                      m.resolvedModels?.video &&
-                      (m.route.modality === "gif" || m.route.modality === "video")
-                        ? ` · ${String(m.resolvedModels.video).split("/").pop()}`
-                        : ""}
-                    </span>
-                  )}
                 </div>
-                <p className="t-bubble">{m.content}</p>
-                {m.role !== "user" &&
-                  (() => {
-                    const offer = generateOfferForTurn(conversation, i);
-                    if (!offer) return null;
-                    return (
-                      <div className="t-generate-row">
-                        <button
-                          type="button"
-                          className="primary t-generate"
-                          disabled={busy}
-                          onClick={() => runGenerateOffer(offer)}
-                        >
-                          Generate
-                        </button>
-                      </div>
-                    );
-                  })()}
-                {Array.isArray(m.actions) && m.actions.length > 0 && (
-                  <details className="t-tools-disclosure">
-                    <summary>
-                      {m.actions.length} tool{m.actions.length === 1 ? "" : "s"}
-                    </summary>
-                    <ul className="t-tools">
-                      {m.actions.map((a, ai) => (
-                        <li key={`${a.type}-${ai}`} className={`t-tool t-tool-${a.status || "done"}`}>
-                          <span className="t-tool-type">{a.type}</span>
-                          <span className="t-tool-status">{a.status || "done"}</span>
-                          {a.status === "error" && a.error ? ` — ${a.error}` : ""}
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
-                )}
+                {(() => {
+                  const actions = Array.isArray(m.actions) ? m.actions : [];
+                  const debug =
+                    m.role === "user" ? null : partitionAssistantReply(m.content, actions);
+                  const body = debug ? debug.body : m.content;
+                  const routeLine =
+                    (debug && debug.routeLine) ||
+                    (m.role !== "user" ? routeLineForMessage(m) : "");
+                  const extraErrors = (debug?.errorLines || []).filter(
+                    (line) =>
+                      !actions.some(
+                        (a) =>
+                          a?.status === "error" &&
+                          String(line).startsWith(`${a.type} failed:`),
+                      ),
+                  );
+                  const showDebug =
+                    m.role !== "user" &&
+                    (actions.length > 0 || Boolean(routeLine) || extraErrors.length > 0);
+                  return (
+                    <>
+                      {body ? <p className="t-bubble">{body}</p> : null}
+                      {m.role !== "user" &&
+                        (() => {
+                          const offer = generateOfferForTurn(conversation, i);
+                          if (!offer) return null;
+                          return (
+                            <div className="t-generate-row">
+                              <button
+                                type="button"
+                                className="primary t-generate"
+                                disabled={busy}
+                                onClick={() => runGenerateOffer(offer)}
+                              >
+                                Generate
+                              </button>
+                            </div>
+                          );
+                        })()}
+                      {showDebug && (
+                        <details className="t-tools-disclosure">
+                          <summary>
+                            {actions.length > 0
+                              ? `${actions.length} tool${actions.length === 1 ? "" : "s"}`
+                              : "debug"}
+                          </summary>
+                          {routeLine ? <p className="t-debug-route">{routeLine}</p> : null}
+                          {(actions.length > 0 || extraErrors.length > 0) && (
+                            <ul className="t-tools">
+                              {actions.map((a, ai) => (
+                                <li
+                                  key={`${a.type}-${ai}`}
+                                  className={`t-tool t-tool-${a.status || "done"}`}
+                                >
+                                  <span className="t-tool-type">{a.type}</span>
+                                  <span className="t-tool-status">{a.status || "done"}</span>
+                                  {a.status === "error" && a.error ? ` — ${a.error}` : ""}
+                                </li>
+                              ))}
+                              {extraErrors.map((line, ei) => (
+                                <li key={`err-${ei}`} className="t-tool t-tool-error t-tool-line">
+                                  {line}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </details>
+                      )}
+                    </>
+                  );
+                })()}
                 {(m.artifactIds?.length > 0 || referencedAssets(m).length > 0) && (
                   <div className="t-ref-row">
                     {referencedAssets(m).map((item) => (
@@ -8051,7 +8049,8 @@ export default function App() {
             <p>
               Lookups open on <strong>Agent</strong> as a scrollable table: installed matches
               first, then other Civitai hits, one asset per row, Installed-sized thumbs. Chat
-              keeps the prompt and the reply. Tool calls stay behind a collapsed line.
+              keeps the prompt and the reply. The route line and tool calls, including errors,
+              stay behind a collapsed line.
             </p>
           </HelpSection>
 

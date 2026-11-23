@@ -933,6 +933,15 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
   color: var(--mist-light);
 }
 .t-tools-disclosure > summary::-webkit-details-marker { display: none; }
+.t-debug-route {
+  margin: 0.35rem 0 0;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: var(--mist-light);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.t-tool-line { flex: 1 1 100%; white-space: normal; }
 .t-ref-row { display: flex; flex-wrap: wrap; gap: 0.15rem 0.7rem; margin-top: 0.2rem; }
 .t-ref-link { font-size: 0.78rem; padding: 0; }
 .t-tools { list-style: none; margin: 0.35rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.35rem; }
