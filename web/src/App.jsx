@@ -1115,6 +1115,18 @@ function civitaiModelPageUrl(item, versionId) {
   return url;
 }
 
+/** `nsfw` paints the link ember (civitai.red). `sfw` paints it blue (civitai.com). */
+function civitaiLinkTone(url, item) {
+  try {
+    const host = new URL(String(url)).hostname.toLowerCase();
+    if (host === "civitai.red" || host.endsWith(".civitai.red")) return "nsfw";
+    if (host === "civitai.com" || host.endsWith(".civitai.com")) return "sfw";
+  } catch {
+    /* fall through to the image flag */
+  }
+  return item?.nsfw ? "nsfw" : "sfw";
+}
+
 function recommendedResourceCard(rec) {
   if (!rec || rec.id == null || rec.id === "") return null;
   return {
@@ -1396,6 +1408,22 @@ const IconCopy = () => (
   <Svg>
     <rect x="8" y="8" width="12" height="12" />
     <path d="M4 16V4h12" />
+  </Svg>
+);
+/** Install missing files — arrow into a tray, distinct from the file download. */
+const IconInstall = () => (
+  <Svg>
+    <path d="M12 3v8" />
+    <path d="m8 8 4 4 4-4" />
+    <path d="M4 14.5h16V20H4z" />
+  </Svg>
+);
+/** Open the image on Civitai. Color comes from the host, not this glyph. */
+const IconExternal = () => (
+  <Svg>
+    <path d="M14 5h5v5" />
+    <path d="M10 14 19 5" />
+    <path d="M18 13v6H5V6h6" />
   </Svg>
 );
 const IconGallery = () => (
@@ -1714,6 +1742,12 @@ function isCheckpointAsset(item) {
     .toLowerCase()
     .replace(/[\s_-]/g, "");
   return t === "checkpoint" || t === "model" || t === "ckpt";
+}
+
+function communityInstallableMissing(item) {
+  return (item?.missingResources || []).filter(
+    (r) => r && r.installable !== false && (r.modelVersionId || r.modelId),
+  );
 }
 
 function communityInstallType(raw) {
@@ -5147,6 +5181,14 @@ export default function App() {
 
   const renderCommunityActions = (item) => {
     const saved = imageFavorited(item);
+    const installableMissing = communityInstallableMissing(item);
+    const queuing = communityInstallId === item.id;
+    const missingNames = installableMissing
+      .map((r) => r.name)
+      .filter(Boolean)
+      .join(", ");
+    const linkTone = item.civitaiUrl ? civitaiLinkTone(item.civitaiUrl, item) : "sfw";
+    const linkHost = linkTone === "nsfw" ? "civitai.red" : "civitai.com";
     return (
       <>
         <button
@@ -5182,15 +5224,47 @@ export default function App() {
             setCommunityErr(msg || "Download failed");
           }}
         />
+        {installableMissing.length > 0 ? (
+          <button
+            type="button"
+            className="ghost icon-btn"
+            disabled={queuing}
+            title={
+              queuing
+                ? "Queuing…"
+                : `Install missing${missingNames ? `: ${missingNames}` : ""}. Does not change the base.`
+            }
+            aria-label={queuing ? "Queuing install" : "Install missing"}
+            onClick={(e) => {
+              e.stopPropagation();
+              void installCommunityMissing(item);
+            }}
+          >
+            {queuing ? <IconSpinner /> : <IconInstall />}
+          </button>
+        ) : null}
+        {item.civitaiUrl ? (
+          <a
+            className={`ghost icon-btn civitai-open-link ${
+              linkTone === "nsfw" ? "civitai-link-nsfw" : "civitai-link-sfw"
+            }`}
+            href={item.civitaiUrl}
+            target="_blank"
+            rel="noreferrer"
+            title={`Open on ${linkHost}`}
+            aria-label={`Open on ${linkHost}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <IconExternal />
+          </a>
+        ) : null}
       </>
     );
   };
 
   /** Queue missing generation resources. Does not pin or change the current base. */
   const installCommunityMissing = async (item) => {
-    const missing = (item?.missingResources || []).filter(
-      (r) => r && r.installable !== false && (r.modelVersionId || r.modelId),
-    );
+    const missing = communityInstallableMissing(item);
     if (!missing.length) {
       setCommunityNote("");
       setCommunityErr("Those files only have a name or hash, so there is no Civitai download.");
@@ -6514,7 +6588,7 @@ export default function App() {
                   galleryContext.modelVersionId
                     ? ` · version ${galleryContext.modelVersionId}`
                     : ""
-                }. Click an image to open it. Favorite, copy, and download stay on the tile.`
+                }. Click an image to open it. Favorite, copy, download, install, and the Civitai link sit under the image.`
               : "Open a model, or use a suggested or installed row, to list community images for that version."}
           </p>
           {communityBusy && <p className="hint">Loading community images…</p>}
@@ -6534,9 +6608,6 @@ export default function App() {
                     .filter(Boolean)
                     .join(" · ")
                 : "";
-              const installableMissing = (item.missingResources || []).filter(
-                (r) => r && r.installable !== false && (r.modelVersionId || r.modelId),
-              );
               const preview = item.thumbnailUrl || item.url;
               return (
                 <li key={item.id} className="agent-gallery-tile">
@@ -6552,39 +6623,11 @@ export default function App() {
                     )}
                   </button>
                   <div className="agent-gallery-tile-actions">{renderCommunityActions(item)}</div>
-                  {(checkpointLine || installableMissing.length > 0 || item.civitaiUrl) && (
+                  {checkpointLine ? (
                     <div className="agent-gallery-tile-foot">
-                      {checkpointLine ? (
-                        <span className="agent-gallery-checkpoint">{checkpointLine}</span>
-                      ) : null}
-                      {installableMissing.length > 0 ? (
-                        <button
-                          type="button"
-                          className="ghost"
-                          disabled={communityInstallId === item.id}
-                          title={`Download ${installableMissing
-                            .map((r) => r.name)
-                            .filter(Boolean)
-                            .join(", ")}. Does not change the base.`}
-                          onClick={() => void installCommunityMissing(item)}
-                        >
-                          {communityInstallId === item.id ? "Queuing…" : "Install missing"}
-                        </button>
-                      ) : null}
-                      {item.civitaiUrl ? (
-                        <a
-                          className={`ghost civitai-open-link ${
-                            item.nsfw ? "civitai-link-nsfw" : "civitai-link-sfw"
-                          }`}
-                          href={item.civitaiUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          Open
-                        </a>
-                      ) : null}
+                      <span className="agent-gallery-checkpoint">{checkpointLine}</span>
                     </div>
-                  )}
+                  ) : null}
                 </li>
               );
             })}
@@ -6608,7 +6651,7 @@ export default function App() {
           >
             <div className="civitai-modal-head">
               <h3>Community image</h3>
-              <div className="row lora-card-actions">
+              <div className="row lora-card-actions agent-gallery-actions">
                 {renderCommunityActions(communityDetail)}
                 <button type="button" className="ghost" onClick={() => setCommunityDetail(null)}>
                   Close
@@ -6663,30 +6706,6 @@ export default function App() {
                     })
                     .join(", ")}
                 </p>
-              ) : null}
-              {(communityDetail.missingResources || []).some(
-                (r) => r && r.installable !== false && (r.modelVersionId || r.modelId),
-              ) ? (
-                <button
-                  type="button"
-                  className="ghost"
-                  disabled={communityInstallId === communityDetail.id}
-                  onClick={() => void installCommunityMissing(communityDetail)}
-                >
-                  {communityInstallId === communityDetail.id ? "Queuing…" : "Install missing"}
-                </button>
-              ) : null}
-              {communityDetail.civitaiUrl ? (
-                <a
-                  className={`ghost civitai-open-link ${
-                    communityDetail.nsfw ? "civitai-link-nsfw" : "civitai-link-sfw"
-                  }`}
-                  href={communityDetail.civitaiUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                >
-                  Open
-                </a>
               ) : null}
             </div>
           </div>

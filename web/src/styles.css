@@ -707,19 +707,32 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
 }
 .agent-gallery-thumb-empty { border: 1px solid var(--mat-line); }
 .agent-gallery-tile-actions {
-  position: absolute; top: 0.45rem; right: 0.45rem; z-index: 2;
-  display: flex; gap: 0.3rem;
+  display: flex; flex-wrap: wrap; justify-content: flex-start; align-items: center;
+  gap: 0.3rem;
 }
-.agent-gallery-tile-actions .icon-btn {
-  width: 2.1rem; height: 2.1rem; padding: 0;
+/* Mat ink and ember hover, same as the salon controls. The Civitai glyph keeps its host color. */
+.pane-right .agent-gallery-tile-actions .icon-btn,
+.community-image-modal .agent-gallery-actions .icon-btn {
+  width: 2.1rem; height: 2.1rem; padding: 0; flex: none; line-height: 1;
   display: inline-flex; align-items: center; justify-content: center;
-  background: color-mix(in srgb, var(--panel) 90%, transparent);
+  text-decoration: none; border-radius: 2px;
+  background: var(--mat); border: 1px solid var(--mat-line); color: var(--mat-text);
+}
+.pane-right .agent-gallery-tile-actions .icon-btn:not(.civitai-open-link):hover,
+.community-image-modal .agent-gallery-actions .icon-btn:not(.civitai-open-link):hover {
+  color: var(--ember-deep); border-color: var(--ember);
+}
+.pane-right .agent-gallery-tile-actions .icon-btn.primary,
+.community-image-modal .agent-gallery-actions .icon-btn.primary {
+  background: var(--ember); border-color: var(--ember); color: #fff5f2;
+}
+.pane-right .agent-gallery-tile-actions .icon-btn.primary:hover,
+.community-image-modal .agent-gallery-actions .icon-btn.primary:hover {
+  background: var(--ember-deep); border-color: var(--ember-deep); color: #fff5f2;
 }
 .agent-gallery-tile-foot {
   display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center;
 }
-.agent-gallery-tile-foot button,
-.agent-gallery-tile-foot a { font-size: 0.72rem; padding: 0.28rem 0.5rem; }
 .agent-gallery-checkpoint {
   font-size: 0.72rem; line-height: 1.35; color: var(--chrome-muted);
 }
@@ -727,15 +740,21 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
 .community-image-modal { width: min(920px, 100%); }
 .community-image-modal .civitai-modal-gallery > img { max-height: 70vh; }
 .community-image-modal .civitai-modal-head h3 { margin: 0; }
-a.civitai-open-link.civitai-link-nsfw {
+.community-image-modal .civitai-modal-head .agent-gallery-actions {
+  margin-left: auto; justify-content: flex-end;
+}
+a.civitai-open-link.civitai-link-nsfw,
+a.civitai-open-link.civitai-link-nsfw:hover {
   color: var(--ember) !important;
   border-color: color-mix(in srgb, var(--ember) 72%, transparent) !important;
 }
-a.civitai-open-link.civitai-link-sfw {
+a.civitai-open-link.civitai-link-sfw,
+a.civitai-open-link.civitai-link-sfw:hover {
   color: #2f6fdb !important;
   border-color: rgba(47, 111, 219, 0.55) !important;
 }
-:root[data-theme="light"] a.civitai-open-link.civitai-link-sfw {
+:root[data-theme="light"] a.civitai-open-link.civitai-link-sfw,
+:root[data-theme="light"] a.civitai-open-link.civitai-link-sfw:hover {
   color: #1d4e9e !important;
   border-color: rgba(29, 78, 158, 0.45) !important;
 }
