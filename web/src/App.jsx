@@ -3419,7 +3419,11 @@ export default function App() {
     const lorasNext = [...presented.existing, ...presented.fresh];
 
     if (ideasNext.length) setIdeas(ideasNext);
-    if (lorasNext.length) setSuggestedLoras(lorasNext);
+    if (lorasNext.length) {
+      setSuggestedLoras(lorasNext);
+      // Search results are browsed on Styles. A turn that also made images stays put.
+      if (!artifacts.length) setTab("styles");
+    }
     if (settings?.civitaiConfigured) {
       const bare = presented.existing.filter(
         (a) => a?.path && !a.thumbnailUrl && (a.versionId != null || a.modelId != null),
@@ -4987,7 +4991,7 @@ export default function App() {
     (session.pinnedLoras || []).length > 0 ||
     Boolean(session.sessionNote);
 
-  const renderLoraCard = (item, { compact = false, onAfterPin } = {}) => {
+  const renderLoraCard = (item, { compact = false, layout = "card", onAfterPin } = {}) => {
     const pinned = isPinned(item);
     const favorited = isFavorite(item);
     const pinnable = isPinnableAsset(item);
@@ -4995,8 +4999,13 @@ export default function App() {
     const downloads = formatStat(item.stats?.downloadCount);
     const thumbUrl = pickCivitaiThumb(item, favorites);
     const cardKey = item.path ? `path:${item.path}` : loraKey(item);
+    const row = layout === "row";
     return (
-      <article key={cardKey} className={`lora-card${compact ? " compact" : ""}`}>
+      <article
+        key={cardKey}
+        role={row ? "row" : undefined}
+        className={row ? "lora-card asset-match-row" : `lora-card${compact ? " compact" : ""}`}
+      >
         <button
           type="button"
           className="lora-card-thumb lora-card-thumb-btn"
@@ -5062,24 +5071,18 @@ export default function App() {
   const renderAssetLookup = (cards, query) => {
     const { existing, fresh } = presentLookup(cards, installedAssets, query || "");
     if (!existing.length && !fresh.length) return null;
+    const section = (label, items) => (
+      <div className="asset-match-group" role="rowgroup" aria-label={label}>
+        <div className="asset-match-label">{label}</div>
+        {items.map((item) => renderLoraCard(item, { layout: "row" }))}
+      </div>
+    );
     return (
-      <div className="lookup-assets">
-        {existing.length > 0 && (
-          <div className="lookup-existing">
-            <span className="lookup-assets-label">Installed</span>
-            <div className="lookup-existing-row">
-              {existing.map((item) => renderLoraCard(item, { compact: true }))}
-            </div>
-          </div>
-        )}
-        {fresh.length > 0 && (
-          <div className="lookup-new">
-            <span className="lookup-assets-label">Other Civitai matches</span>
-            <div className="lookup-new-list" tabIndex={0}>
-              {fresh.map((item) => renderLoraCard(item, { compact: true }))}
-            </div>
-          </div>
-        )}
+      <div className="asset-match-scroll">
+        <div className="asset-match-table" role="table" aria-label="Civitai matches">
+          {existing.length > 0 && section("Installed", existing)}
+          {fresh.length > 0 && section("Other Civitai matches", fresh)}
+        </div>
       </div>
     );
   };
@@ -5604,8 +5607,22 @@ export default function App() {
                     })}
                   </div>
                 )}
-                {Array.isArray(m.loras) && m.loras.length > 0 &&
-                  renderAssetLookup(m.loras, lookupQueryFor(m.loras, m.civitaiQuery || ""))}
+                {Array.isArray(m.loras) && m.loras.length > 0 && (
+                  <p className="civitai-search-line">
+                    Found {m.loras.length} Civitai match{m.loras.length === 1 ? "" : "es"}
+                    {m.civitaiQuery ? (
+                      <>
+                        {" "}
+                        for <strong>{m.civitaiQuery}</strong>
+                      </>
+                    ) : null}
+                    . Browse them on{" "}
+                    <button type="button" className="linkish" onClick={() => setTab("styles")}>
+                      Styles
+                    </button>
+                    .
+                  </p>
+                )}
                 {Array.isArray(m.ideas) && m.ideas.length > 0 && (
                   <div className="idea-chips">
                     {m.ideas.map((idea) => (
@@ -5764,8 +5781,12 @@ export default function App() {
                 )}
                 {suggestedLoras.length > 0 && (
                   <p className="hint">
-                    Installed matches stay first. Other Civitai hits stay in the list — nothing is
-                    pinned or downloaded until you choose.
+                    {suggestedLoras.length} match{suggestedLoras.length === 1 ? "" : "es"} on{" "}
+                    <button type="button" className="linkish" onClick={() => setTab("styles")}>
+                      Styles
+                    </button>
+                    . Installed ones are listed first. Nothing is pinned or downloaded until you
+                    choose.
                   </p>
                 )}
               </aside>
@@ -6109,31 +6130,6 @@ export default function App() {
         />
 
         <section className="pane pane-right" aria-label="Gallery and results">
-          {suggestedLoras.length > 0 && (
-            <aside className="lora-strip" aria-label="Civitai asset suggestions">
-              <div className="lora-strip-head">
-                <div>
-                  <span className="t-kind">Civitai assets</span>
-                  {civitaiQuery ? (
-                    <p className="lora-strip-q">
-                      Civitai · <strong>{civitaiQuery}</strong>
-                    </p>
-                  ) : (
-                    <p className="lora-strip-q">Suggested for this prompt</p>
-                  )}
-                </div>
-                <button type="button" className="ghost" onClick={clearSuggestions}>
-                  Dismiss
-                </button>
-              </div>
-              <p className="hint">
-                Installed name and version matches come first. Other Civitai hits stay in the
-                list. Pin or install only if you want to — nothing is downloaded automatically.
-              </p>
-              {renderAssetLookup(suggestedLoras, lookupQueryFor(suggestedLoras, civitaiQuery))}
-            </aside>
-          )}
-
       {tab === "gallery" && !previewResult && gallery.length === 0 && batchResults.length === 0 && (
         <div className="gallery-empty">
           <div className="gallery-empty-art">
@@ -6305,6 +6301,30 @@ export default function App() {
 
       {tab === "styles" && (
         <section className="panel style-rail">
+          {suggestedLoras.length > 0 && (
+            <div className="style-matches">
+              <div className="style-matches-head">
+                <div>
+                  <span className="t-kind">Civitai matches</span>
+                  {civitaiQuery ? (
+                    <p className="style-matches-q">
+                      Civitai · <strong>{civitaiQuery}</strong>
+                    </p>
+                  ) : (
+                    <p className="style-matches-q">Suggested for this prompt</p>
+                  )}
+                </div>
+                <button type="button" className="ghost" onClick={clearSuggestions}>
+                  Dismiss
+                </button>
+              </div>
+              <p className="hint">
+                Installed matches first, then other Civitai hits. One asset per row. Pin or install
+                only if you want to — nothing is downloaded automatically.
+              </p>
+              {renderAssetLookup(suggestedLoras, lookupQueryFor(suggestedLoras, civitaiQuery))}
+            </div>
+          )}
           {styles.map((s) => (
             <article
               key={s.id}
@@ -7713,6 +7733,11 @@ export default function App() {
               <strong>Installed</strong> shows assets already on the worker disk as clickable cards
               (same style as Favorites) — open a card for details, pin (adapters only), delete, or
               set base.
+            </p>
+            <p>
+              Chat search results open on <strong>Styles</strong> as a scrollable table: installed
+              matches first, then other Civitai hits, one asset per row. Chat only says what it
+              found.
             </p>
           </HelpSection>
 
