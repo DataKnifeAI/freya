@@ -46,7 +46,7 @@ fn default_backend() -> String {
 pub async fn load_styles(packs_dir: &Path) -> Result<Vec<StylePack>> {
     let dir = packs_dir.join("styles");
     if !dir.exists() {
-        return Ok(builtin_styles());
+        return Ok(Vec::new());
     }
     let mut out = Vec::new();
     let mut rd = fs::read_dir(&dir).await?;
@@ -61,9 +61,7 @@ pub async fn load_styles(packs_dir: &Path) -> Result<Vec<StylePack>> {
             out.push(s);
         }
     }
-    if out.is_empty() {
-        return Ok(builtin_styles());
-    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(out)
 }
 
@@ -96,35 +94,20 @@ pub async fn load_instruction(packs_dir: &Path, mode: &str) -> String {
     builtin_instruction(mode).to_string()
 }
 
-fn builtin_styles() -> Vec<StylePack> {
-    vec![
-        StylePack {
-            id: "ethereal-moon".into(),
-            display_name: "Ethereal Moon Landscape".into(),
-            tags: vec!["landscape".into(), "fantasy".into(), "moon".into()],
-            example_prompt: "ethereal mystical landscape under a radiant red moon, twisted blossoming tree on rocky terrain, misty mountains, serene lake reflecting moonlight, magical atmosphere, highly detailed".into(),
-            backend: "openrouter".into(),
-            open_router_model: Some("black-forest-labs/flux.2-klein-4b".into()),
-            local_checkpoint: None,
-            loras: vec![],
-            trigger_words: None,
-            recommended_size: Some("1024x1024".into()),
-            thumbnail_url: None,
-        },
-        StylePack {
-            id: "anime-portrait".into(),
-            display_name: "Anime Portrait (cloud)".into(),
-            tags: vec!["anime".into(), "portrait".into()],
-            example_prompt: "anime style portrait, soft lighting, expressive eyes, detailed hair, clean linework, vibrant colors".into(),
-            backend: "openrouter".into(),
-            open_router_model: Some("black-forest-labs/flux.2-klein-4b".into()),
-            local_checkpoint: None,
-            loras: vec![],
-            trigger_words: None,
-            recommended_size: Some("768x1024".into()),
-            thumbnail_url: None,
-        },
-    ]
+/// Prefer a non-empty Settings override when present; else pack file / builtin.
+pub async fn load_instruction(
+    packs_dir: &Path,
+    mode: &str,
+    overrides: Option<&std::collections::HashMap<String, String>>,
+) -> String {
+    if let Some(map) = overrides {
+        if let Some(text) = map.get(mode) {
+            if !text.trim().is_empty() {
+                return text.clone();
+            }
+        }
+    }
+    load_instruction_default(packs_dir, mode).await
 }
 
 pub fn builtin_instruction(mode: &str) -> &'static str {
@@ -183,5 +166,47 @@ mod tests {
         let packs = PathBuf::from("/nonexistent-packs-dir");
         let text = load_instruction(&packs, "../../etc/passwd").await;
         assert_eq!(text, builtin_instruction("chat"));
+    }
+
+    #[tokio::test]
+    async fn load_instruction_prefers_override() {
+        let packs = PathBuf::from("/nonexistent-packs-dir");
+        let mut overrides = std::collections::HashMap::new();
+        overrides.insert("chat".into(), "Custom chat system prompt.".into());
+        let text = load_instruction(&packs, "chat", Some(&overrides)).await;
+        assert_eq!(text, "Custom chat system prompt.");
+        let empty = load_instruction(&packs, "chat", None).await;
+        assert_eq!(empty, builtin_instruction("chat"));
+    }
+
+    #[tokio::test]
+    async fn load_styles_returns_empty_without_sample_packs() {
+        let missing = PathBuf::from("/nonexistent-packs-dir");
+        let styles = load_styles(&missing).await.unwrap();
+        assert!(styles.is_empty());
+
+        let dir = std::env::temp_dir().join(format!("freya-styles-empty-{}", std::process::id()));
+        let styles_dir = dir.join("styles");
+        tokio::fs::create_dir_all(&styles_dir).await.unwrap();
+        let empty = load_styles(&dir).await.unwrap();
+        assert!(empty.is_empty());
+        let dropped = [
+            "freya-winged-warrior",
+            "ethereal-moon",
+            "local-character-lora",
+        ];
+        assert!(empty.iter().all(|s| !dropped.contains(&s.id.as_str())));
+
+        tokio::fs::write(
+            styles_dir.join("atelier.yaml"),
+            "id: atelier\ndisplayName: Atelier\nexamplePrompt: A quiet studio corner\n",
+        )
+        .await
+        .unwrap();
+        let loaded = load_styles(&dir).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "atelier");
+        assert!(!loaded[0].example_prompt.contains(":1."));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }

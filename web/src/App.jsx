@@ -5044,24 +5044,25 @@ export default function App() {
               {renderAssetLookup(chatLookup)}
             </div>
           )}
-          {styles.map((s) => (
-            <article
-              key={s.id}
-              className="style-item"
-              onClick={() => {
-                setPrompt(s.examplePrompt);
-                setSession((prev) => ({
-                  ...prev,
-                  goal: prev.goal || s.examplePrompt,
-                }));
-                setTab("gallery");
-              }}
-            >
-              <h3>{s.displayName}</h3>
-              <p>{(s.examplePrompt || "").slice(0, 120)}…</p>
-              <span className="salon-meta">{s.backend}</span>
-            </article>
-          ))}
+          {styles.length > 0 &&
+            styles.map((s) => (
+              <article
+                key={s.id}
+                className="style-item"
+                onClick={() => {
+                  setPrompt(s.examplePrompt);
+                  setSession((prev) => ({
+                    ...prev,
+                    goal: prev.goal || s.examplePrompt,
+                  }));
+                  setTab("gallery");
+                }}
+              >
+                <h3>{s.displayName}</h3>
+                <p>{(s.examplePrompt || "").slice(0, 120)}…</p>
+                <span className="salon-meta">{s.backend}</span>
+              </article>
+            ))}
         </section>
       )}
 

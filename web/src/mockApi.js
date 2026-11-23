@@ -26,26 +26,8 @@ export const BEGINNER_EXAMPLE = FREYA_BRAND_EXAMPLE;
 /** Civitai search that matches freya.png vibe (wings + fantasy armor). */
 export const BEGINNER_CIVITAI_QUERY = "fantasy winged warrior lora";
 
-/** Mock /v1/styles — first entry is the default Use example / empty Suggest seed. */
+/** Mock /v1/styles. Sample brand, moon, and local-LoRA packs are not shipped. */
 const STYLE_PACKS = [
-  {
-    id: "freya-winged-warrior",
-    displayName: "Freya (brand art)",
-    tags: ["character", "fantasy", "wings"],
-    examplePrompt: FREYA_BRAND_EXAMPLE,
-    backend: "openrouter",
-    openRouterModel: "black-forest-labs/flux.2-klein-4b",
-    recommendedSize: "1024x1024",
-  },
-  {
-    id: "ethereal-moon",
-    displayName: "Ethereal Moon Landscape",
-    tags: ["landscape", "fantasy", "moon"],
-    examplePrompt: ETHEREAL_MOON_EXAMPLE,
-    backend: "openrouter",
-    openRouterModel: "black-forest-labs/flux.2-klein-4b",
-    recommendedSize: "1024x1024",
-  },
   {
     id: "harbor-moon",
     displayName: "Harbor Moon (atelier)",
@@ -62,17 +44,6 @@ const STYLE_PACKS = [
     examplePrompt: ANIME_PORTRAIT_EXAMPLE,
     backend: "openrouter",
     recommendedSize: "768x1024",
-  },
-  {
-    id: "local-character-lora",
-    displayName: "Local Character LoRA (worker)",
-    tags: ["lora", "local", "character"],
-    examplePrompt: LOCAL_CHARACTER_EXAMPLE,
-    backend: "local",
-    localCheckpoint: "stabilityai/stable-diffusion-xl-base-1.0",
-    loras: [{ name: "my_character", scale: 0.8 }],
-    triggerWords: "my_character",
-    recommendedSize: "1024x1024",
   },
 ];
 
