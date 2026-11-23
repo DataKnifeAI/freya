@@ -431,6 +431,60 @@ button.linkish {
   flex: 1; min-height: 0;
 }
 .session-list li { margin: 0; }
+.session-list-empty {
+  padding: 0.7rem 0.7rem 0.55rem;
+  font-size: 0.72rem;
+  font-style: italic;
+  color: var(--chrome-muted);
+}
+.session-row {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+}
+.session-row .session-item { flex: 1; min-width: 0; width: auto; }
+.session-row-actions {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  padding: 0.25rem 0.35rem 0.25rem 0;
+}
+.session-row-actions.is-confirm {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.2rem;
+}
+.sessions-sidebar .session-row-actions .icon-btn {
+  width: 26px;
+  height: 26px;
+  border-color: var(--chrome-line);
+  color: var(--chrome-text);
+}
+.sessions-sidebar .session-row-actions .icon-btn:hover {
+  border-color: var(--apricot);
+  color: var(--apricot);
+}
+.sessions-sidebar .session-row-actions .icon-btn.danger-ghost,
+.sessions-sidebar .session-row-actions .session-confirm.danger-ghost {
+  color: var(--err-on-chrome);
+  border-color: color-mix(in srgb, var(--err-on-chrome) 45%, var(--chrome-line));
+}
+.sessions-sidebar .session-row-actions .icon-btn.danger-ghost:hover,
+.sessions-sidebar .session-row-actions .session-confirm.danger-ghost:hover {
+  color: var(--err-on-chrome);
+  border-color: var(--err-on-chrome);
+}
+.sessions-sidebar .session-confirm {
+  height: 26px;
+  padding: 0 0.35rem;
+  font-size: 0.62rem;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  border-color: var(--chrome-line);
+  color: var(--chrome-text);
+}
 .session-item {
   width: 100%; display: grid; gap: 0.18rem; text-align: left;
   padding: 0.5rem 0.65rem; border: none; border-left: 2px solid transparent;
@@ -452,6 +506,33 @@ button.linkish {
   letter-spacing: 0.04em; text-transform: uppercase; opacity: 0.55; font-weight: 600;
 }
 .session-item-meta time { font-variant-numeric: tabular-nums; text-transform: none; letter-spacing: 0; }
+.session-archived {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  max-height: 46%;
+  border-top: 1px solid var(--chrome-line-soft);
+}
+.session-archived-toggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  padding: 0.45rem 0.65rem;
+  border: none;
+  background: transparent;
+  color: var(--chrome-muted);
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.session-archived-toggle:hover { color: var(--chrome-text); }
+.session-archived-count { font-variant-numeric: tabular-nums; letter-spacing: 0; }
+.session-archived .session-list { flex: 1 1 auto; min-height: 0; max-height: 14rem; }
 
 /* ——— Split workspace ——— */
 .workspace {
