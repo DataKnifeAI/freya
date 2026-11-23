@@ -913,6 +913,201 @@ fn keeps_uncensored_agent(id: &str) -> bool {
     MARKERS.iter().any(|m| l.contains(m))
 }
 
+/// Which chat model writes a local checkpoint prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEnhancePath {
+    /// Alignment allows adult scenes and the user text is sexual.
+    pub adult: bool,
+    /// Concrete chat model id. Never the raw user one-liner.
+    pub model: String,
+}
+
+/// Local prompt-sd writer.
+/// Ordinary requests use the balanced Auto agent (the normal matrix cell) or
+/// an explicit chat pin. Adult requests use the uncensored matrix cell
+/// (Cydonia at medium and above, Dolphin Venice at low) unless the pin is
+/// already an uncensored-safe model.
+pub fn local_enhance_path(
+    prompt: &str,
+    alignment: &AlignmentPrefs,
+    pinned_chat: Option<&str>,
+    privacy: &PrivacyPrefs,
+    fallbacks: &AutoFallbacksPrefs,
+) -> LocalEnhancePath {
+    let adult = alignment.local_adult_passthrough() && prompt_is_adult_scene(prompt);
+    let strict = privacy_requires_strict(privacy);
+    let cost = fallbacks.cost_tier.as_str();
+    let model = if adult {
+        match explicit_chat_pin(pinned_chat) {
+            // Adult rewrite only: a pinned Llama, Claude, GPT, or Gemini is
+            // moderated, so the uncensored matrix model writes this checkpoint prompt.
+            Some(id) if !moderated_chat_family(id) && !is_upstream_router(id) => id.to_string(),
+            _ => crate::auto_matrix::model_for("agent", strict, "uncensored", cost),
+        }
+    } else {
+        match explicit_chat_pin(pinned_chat) {
+            Some(id) => id.to_string(),
+            None => crate::auto_matrix::model_for("agent", strict, "balanced", cost),
+        }
+    };
+    LocalEnhancePath { adult, model }
+}
+
+/// Uncensored Auto chat cell for a local adult rewrite (matrix, not the pin).
+pub fn local_adult_matrix_model(privacy: &PrivacyPrefs, fallbacks: &AutoFallbacksPrefs) -> String {
+    crate::auto_matrix::model_for(
+        "agent",
+        privacy_requires_strict(privacy),
+        "uncensored",
+        fallbacks.cost_tier.as_str(),
+    )
+}
+
+fn explicit_chat_pin(pinned: Option<&str>) -> Option<&str> {
+    let p = pinned.map(str::trim).filter(|s| !s.is_empty())?;
+    if is_auto_agent(p) {
+        None
+    } else {
+        Some(p)
+    }
+}
+
+/// Llama, Claude, GPT, and Gemini. Dolphin and Cydonia are not in this set.
+fn moderated_chat_family(id: &str) -> bool {
+    let l = id.trim().to_ascii_lowercase();
+    if l.is_empty() || keeps_uncensored_agent(&l) {
+        return false;
+    }
+    l.contains("llama")
+        || l.contains("claude")
+        || l.starts_with("anthropic/")
+        || l.starts_with("openai/")
+        || l.contains("gpt")
+        || l.contains("gemini")
+}
+
+/// Sexual or adult scene text. Uncensored alignment alone is not a match.
+pub fn prompt_is_adult_scene(text: &str) -> bool {
+    let l = text.to_ascii_lowercase();
+    const TERMS: &[&str] = &[
+        "nsfw",
+        "nude",
+        "nudes",
+        "naked",
+        "topless",
+        "bottomless",
+        "porn",
+        "hentai",
+        "erotic",
+        "erotica",
+        "lewd",
+        "ecchi",
+        "ahegao",
+        "orgasm",
+        "orgasmic",
+        "penis",
+        "vagina",
+        "vulva",
+        "clitoris",
+        "nipple",
+        "nipples",
+        "areola",
+        "genitals",
+        "genitalia",
+        "intercourse",
+        "blowjob",
+        "handjob",
+        "fellatio",
+        "cunnilingus",
+        "bondage",
+        "bdsm",
+        "fetish",
+        "lingerie",
+        "panties",
+        "thong",
+        "boobs",
+        "tits",
+        "breasts",
+        "breast",
+        "cock",
+        "cocks",
+        "dick",
+        "pussy",
+        "cum",
+        "cumshot",
+        "cumming",
+        "fucking",
+        "fuck",
+        "fucked",
+        "sex",
+        "sexual",
+        "sexually",
+        "explicit",
+        "xxx",
+        "undressed",
+        "stripper",
+        "whore",
+        "slut",
+        "dildo",
+        "erection",
+        "hardcore",
+        "softcore",
+        "rule34",
+        "r34",
+        "yaoi",
+        "yuri",
+        "incest",
+        "milf",
+        "anal",
+        "orgy",
+        "threesome",
+        "gangbang",
+        "creampie",
+        "deepthroat",
+        "moaning",
+        "straddling",
+        "making love",
+        "clothes off",
+        "no clothes",
+        "without clothes",
+        "spread legs",
+        "spread her legs",
+        "spread his legs",
+        "in the nude",
+        "adult scene",
+        "adult content",
+        "sex scene",
+        "blow job",
+        "hand job",
+        "jerking off",
+        "get naked",
+        "gets naked",
+        "18+",
+    ];
+    TERMS.iter().any(|term| contains_term(&l, term))
+}
+
+fn contains_term(hay: &str, term: &str) -> bool {
+    let bytes = hay.as_bytes();
+    let needle = term.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let end = i + needle.len();
+            let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 fn sanitize_router_model_suggestion(raw: &str) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() {
@@ -1627,5 +1822,115 @@ mod tests {
         );
         assert_eq!(DEFAULT_AUTO_AGENT_MODEL, DEFAULT_AUTO_AGENT_MODEL_ZDR);
         assert_eq!(DEFAULT_ROUTER_MODEL, DEFAULT_ROUTER_MODEL_ZDR);
+    }
+
+    fn align(alignment: &str, nsfw: bool) -> AlignmentPrefs {
+        AlignmentPrefs {
+            model_alignment: alignment.into(),
+            allow_nsfw_local: nsfw,
+            ..Default::default()
+        }
+        .normalize()
+    }
+
+    fn tier(cost: &str) -> AutoFallbacksPrefs {
+        AutoFallbacksPrefs {
+            cost_tier: cost.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn local_enhance_path_ordinary_vs_adult() {
+        let privacy = PrivacyPrefs::default();
+        let medium = tier("medium");
+        let low = tier("low");
+        let unc = align("uncensored", false);
+        let show = align("safety", true);
+        let balanced = align("balanced", false);
+        let scene = "nude woman on a bed, explicit sex";
+        let barn = "a red barn at sunset";
+
+        let ordinary = local_enhance_path(barn, &unc, Some("auto"), &privacy, &medium);
+        assert!(!ordinary.adult);
+        assert_eq!(ordinary.model, "deepseek/deepseek-v4-pro");
+
+        let ordinary_low = local_enhance_path(barn, &unc, None, &privacy, &low);
+        assert!(!ordinary_low.adult);
+        assert_eq!(ordinary_low.model, "meta-llama/llama-3.1-8b-instruct");
+
+        let show_landscape = local_enhance_path(
+            "portrait of a scientist in a lab coat",
+            &show,
+            Some("auto"),
+            &privacy,
+            &medium,
+        );
+        assert!(!show_landscape.adult);
+        assert_eq!(show_landscape.model, "deepseek/deepseek-v4-pro");
+
+        let not_adult_words = local_enhance_path(
+            "essex countryside, cocktail on the patio, structural analysis",
+            &unc,
+            None,
+            &privacy,
+            &medium,
+        );
+        assert!(!not_adult_words.adult);
+        assert_eq!(not_adult_words.model, "deepseek/deepseek-v4-pro");
+
+        let adult = local_enhance_path(scene, &unc, Some("auto"), &privacy, &medium);
+        assert!(adult.adult);
+        assert_eq!(adult.model, "thedrummer/cydonia-24b-v4.1");
+
+        let adult_low = local_enhance_path(scene, &show, None, &privacy, &low);
+        assert!(adult_low.adult);
+        assert_eq!(
+            adult_low.model,
+            "cognitivecomputations/dolphin-mistral-24b-venice-edition"
+        );
+        assert_eq!(adult_low.model, local_adult_matrix_model(&privacy, &low));
+
+        let adult_high = local_enhance_path(scene, &unc, None, &privacy, &tier("high"));
+        assert_eq!(adult_high.model, "thedrummer/cydonia-24b-v4.1");
+
+        // Sexual text without Uncensored or Show NSFW stays on the baseline writer.
+        let gated = local_enhance_path(scene, &balanced, None, &privacy, &medium);
+        assert!(!gated.adult);
+        assert_eq!(gated.model, "deepseek/deepseek-v4-pro");
+
+        let pinned = local_enhance_path(
+            barn,
+            &unc,
+            Some("mistralai/mistral-small"),
+            &privacy,
+            &medium,
+        );
+        assert!(!pinned.adult);
+        assert_eq!(pinned.model, "mistralai/mistral-small");
+
+        for moderated in [
+            "meta-llama/llama-3.1-8b-instruct",
+            "anthropic/claude-sonnet-5.5",
+            "openai/gpt-5-mini",
+            "google/gemini-4-neon",
+        ] {
+            let path = local_enhance_path(scene, &unc, Some(moderated), &privacy, &medium);
+            assert!(path.adult, "{moderated}");
+            assert_eq!(path.model, "thedrummer/cydonia-24b-v4.1", "{moderated}");
+        }
+
+        let dolphin_pin = local_enhance_path(
+            scene,
+            &unc,
+            Some("cognitivecomputations/dolphin-mistral-24b-venice-edition"),
+            &privacy,
+            &medium,
+        );
+        assert!(dolphin_pin.adult);
+        assert_eq!(
+            dolphin_pin.model,
+            "cognitivecomputations/dolphin-mistral-24b-venice-edition"
+        );
     }
 }

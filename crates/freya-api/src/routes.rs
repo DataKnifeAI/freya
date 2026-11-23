@@ -679,6 +679,36 @@ fn looks_like_model_refusal(text: &str) -> bool {
     MARKERS.iter().any(|m| l.contains(m))
 }
 
+/// Drop a label or fence so the worker sees the keyword prompt.
+fn normalize_sd_rewrite(text: &str) -> String {
+    let mut t = text.trim().trim_matches('`').trim().to_string();
+    if t.len() >= 2 {
+        let bytes = t.as_bytes();
+        let wrap = (bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'');
+        if wrap {
+            t = t[1..t.len() - 1].trim().to_string();
+        }
+    }
+    let lower = t.to_ascii_lowercase();
+    for prefix in ["positive prompt:", "sd prompt:", "prompt:"] {
+        if lower.starts_with(prefix) {
+            t = t[prefix.len()..].trim().to_string();
+            break;
+        }
+    }
+    t
+}
+
+/// Adult local rewrite must be a scene prompt: not a refusal, not the raw line.
+fn adult_rewrite_ok(text: &str, original: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() || looks_like_model_refusal(t) || t.eq_ignore_ascii_case(original.trim()) {
+        return false;
+    }
+    t.contains(',') || t.split_whitespace().count() >= 12
+}
+
 fn restore_refused_local_prompt(action: &mut PlannedAction, user_message: &str) {
     let key = match action.action_type.as_str() {
         "generate_image" | "generate_video" => "prompt",
@@ -3583,22 +3613,90 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
 
     let backend = req.backend.clone().unwrap_or_else(|| "openrouter".into());
     let enhance = req.enhance.clone().unwrap_or_else(|| "auto".into());
-    let alignment = state.config.read().await.alignment_prefs();
+    let (alignment, privacy, auto_fallbacks, chat_pin) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.alignment_prefs(),
+            cfg.privacy_prefs(),
+            cfg.auto_fallbacks_prefs(),
+            cfg.chat_model.clone(),
+        )
+    };
     let mut final_prompt = req.prompt.clone();
     let mut enhanced = None;
 
-    // Local + uncensored / Show NSFW: do not send the prompt through a cloud
-    // rewriter. That call was the path that could soften or refuse adult text
-    // before the worker. Cloud backends still enhance.
-    if crate::prefs::cloud_enhance_enabled(&backend, &enhance, &alignment) {
-        let mode = if enhance == "prompt-sd" || backend == "local" {
+    // Local generate always rewrites when enhance is on. Ordinary text uses the
+    // balanced Auto agent (or an explicit pin). An adult scene uses the
+    // uncensored writer so the worker gets a checkpoint prompt, not a refusal.
+    // Cloud image generation still uses the configured chat model.
+    if crate::prefs::enhance_enabled(&enhance) {
+        let local = backend.eq_ignore_ascii_case("local");
+        let mode = if enhance == "prompt-sd" || local {
             "prompt-sd"
         } else {
             "prompt-prose"
         };
-        let system = styles::load_instruction(&state.packs_dir, mode).await;
+        let mut system = load_instruction_toned(&state, mode).await;
+        let path = if local {
+            Some(crate::router::local_enhance_path(
+                &req.prompt,
+                &alignment,
+                Some(&chat_pin),
+                &privacy,
+                &auto_fallbacks,
+            ))
+        } else {
+            None
+        };
+        if path.as_ref().is_some_and(|p| p.adult) {
+            system.push_str(crate::prefs::LOCAL_ADULT_ENHANCE_CLAUSE);
+        }
         let or = state.openrouter.read().await;
-        if let Ok(text) = or.chat(&system, &req.prompt, None).await {
+        let first = path.as_ref().map(|p| p.model.as_str());
+        let rewritten = match or.chat(&system, &req.prompt, first).await {
+            Ok(text) => Some(text),
+            Err(e) => {
+                tracing::debug!(error = %e, "prompt rewrite failed");
+                None
+            }
+        };
+        if let Some(p) = &path {
+            tracing::info!(adult = p.adult, model = %p.model, "local prompt-sd writer");
+            if p.adult {
+                let accepted = rewritten
+                    .as_deref()
+                    .map(normalize_sd_rewrite)
+                    .filter(|t| adult_rewrite_ok(t, &req.prompt));
+                if let Some(text) = accepted {
+                    final_prompt = text.clone();
+                    enhanced = Some(text);
+                } else {
+                    let matrix = crate::router::local_adult_matrix_model(&privacy, &auto_fallbacks);
+                    let retry = if matrix != p.model {
+                        or.chat(&system, &req.prompt, Some(&matrix)).await.ok()
+                    } else {
+                        None
+                    };
+                    if let Some(text) = retry
+                        .as_deref()
+                        .map(normalize_sd_rewrite)
+                        .filter(|t| adult_rewrite_ok(t, &req.prompt))
+                    {
+                        final_prompt = text.clone();
+                        enhanced = Some(text);
+                    } else {
+                        return Err(ApiError::Msg(
+                            "local prompt rewrite did not return a scene prompt".into(),
+                        ));
+                    }
+                }
+            } else if let Some(text) = rewritten.as_deref().map(normalize_sd_rewrite) {
+                if !text.is_empty() && !looks_like_model_refusal(&text) {
+                    final_prompt = text.clone();
+                    enhanced = Some(text);
+                }
+            }
+        } else if let Some(text) = rewritten {
             enhanced = Some(text.clone());
             final_prompt = text;
         }
