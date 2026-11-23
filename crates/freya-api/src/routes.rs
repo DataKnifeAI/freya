@@ -1363,7 +1363,7 @@ async fn chat_generate_backend(
     {
         return b.to_string();
     }
-    if !pinned.is_empty() && state.worker.read().await.is_some() {
+    if !pinned.is_empty() && local_worker_ready(state).await {
         return "local".into();
     }
     "auto".into()
@@ -3286,7 +3286,7 @@ pub async fn chat(
     // substitute scene. The user's text is what the worker should see.
     // That includes an explicit Local pin, Auto GIF, and Auto with pinned LoRAs
     // (those still run on the worker). A cloud still does not.
-    let worker_ready = state.worker.read().await.is_some();
+    let worker_ready = local_worker_ready(&state).await;
     let backend_set = req
         .backend
         .as_deref()
@@ -3796,7 +3796,7 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     // LoRAs only apply on the local worker — prefer local when weights are pinned and a worker exists.
     if !req.loras.is_empty()
         && (req.backend.is_none() || req.backend.as_deref() == Some("auto"))
-        && state.worker.read().await.is_some()
+        && local_worker_ready(&state).await
     {
         req.backend = Some("local".into());
     }
@@ -3821,7 +3821,7 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     // Cloud image generation still uses the configured chat model.
     if crate::prefs::enhance_enabled(&enhance) {
         let modality_for_writer = resolve_generate_modality(&req);
-        let worker_ready = state.worker.read().await.is_some();
+        let worker_ready = local_worker_ready(&state).await;
         // Local stills, and Auto GIF (the worker path), use the local writer.
         // Ordinary text stays on the baseline model. Adult text uses Cydonia/Dolphin.
         let local =
@@ -3912,6 +3912,9 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     let (bytes, mime, model_used, backend_used) = if modality.is_motion() {
         run_motion_generate(state, &req, &final_prompt, modality).await?
     } else if backend == "local" {
+        if !state.config.read().await.worker_enabled {
+            return Err(ApiError::NoWorker);
+        }
         let worker = state.worker.read().await;
         let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
         // Prefer installed basename for lora_request so it matches on-disk files.
@@ -4057,6 +4060,14 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     }))
 }
 
+/// Local jobs run only when Disable is off and a client is attached.
+async fn local_worker_ready(state: &AppState) -> bool {
+    if !state.config.read().await.worker_enabled {
+        return false;
+    }
+    state.worker.read().await.is_some()
+}
+
 /// Local stills when the composer pinned Local. Auto GIF uses the worker when one is up.
 /// Cloud video and omitted-backend stills stay on OpenRouter.
 fn routes_to_local_worker(
@@ -4099,8 +4110,13 @@ async fn run_motion_generate(
     // Local motion is a worker GIF (the engine has no mp4 T2V). Cloud video stays on OpenRouter.
     // Do not fall through to OpenRouter when the composer pinned Local.
     if pinned_local || (want_gif && backend == "auto") {
+        let enabled = state.config.read().await.worker_enabled;
         let worker = state.worker.read().await;
-        if let Some(client) = worker.as_ref() {
+        if !enabled {
+            if pinned_local {
+                return Err(ApiError::NoWorker);
+            }
+        } else if let Some(client) = worker.as_ref() {
             let gif_model = crate::base_models::filter_local_model(req.model.as_deref());
             match client
                 .generate_gif(
@@ -5010,9 +5026,8 @@ pub async fn settings_put(
                 cfg.diffusion_worker_url = None;
             } else {
                 cfg.diffusion_worker_url = Some(url);
-                // Worker is “on” when a URL is configured — no separate enable UX.
-                cfg.worker_enabled = true;
             }
+            // Saving the endpoint must not undo Disable. Enable is a separate call.
         }
         if let Some(m) = upd.chat_model {
             cfg.chat_model = m;

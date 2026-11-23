@@ -191,5 +191,13 @@ mod tests {
             parse_allowed_hosts(" freya.example, localhost "),
             vec!["freya.example".to_string(), "localhost".into()]
         );
+        // A star in a real list does not open the check or drop the Ingress host.
+        assert_eq!(
+            parse_allowed_hosts("freya.dataknife.net, freya-mcp.freya.svc, *"),
+            vec![
+                "freya.dataknife.net".to_string(),
+                "freya-mcp.freya.svc".into()
+            ]
+        );
     }
 }

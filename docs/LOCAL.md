@@ -174,10 +174,11 @@ Worker health/stats:
 
 | Endpoint | Notes |
 |----------|--------|
-| Worker `GET /health` / `GET /v1/stats` | `{ ok, modelsDir, loras, checkpoints, uptimeSec, vram, host, modelLoaded, layout }` — VRAM from `nvidia-smi` when present (null in GPU-less containers) |
+| Worker `GET /health` | Liveness only: `{ ok, service }`. No GPU, disk, or inventory |
+| Worker `GET /v1/stats` | Authenticated inventory: `{ ok, modelsDir, loras, checkpoints, uptimeSec, vram, host, disk, modelLoaded, layout }` — VRAM from `nvidia-smi` when present (null in GPU-less containers) |
 | Worker `GET /v1/checkpoints` | List installed checkpoints (+ `baseModel` from sidecar) |
 | Worker `GET\|PUT /v1/base-model` | Active base selection (persisted as `active-base.json`) |
-| API `GET /v1/worker/stats` | Proxies worker stats; fills host `nvidia-smi` when worker VRAM is null; includes docker/systemd runtime |
+| API `GET /v1/worker/stats` | Proxies `/v1/stats`. A failed stats call is reachability via `/health` only and does not borrow host `nvidia-smi`. Host VRAM fills in only when stats returned null VRAM |
 | API `GET /v1/worker/checkpoints` | Proxies checkpoint list |
 | API `GET\|PUT /v1/worker/base-model` | Proxies active base |
 | API `GET /v1/base-models` | Static family catalog (SD 1.5 / SDXL / Pony / Flux hints) — no Civitai traffic |
@@ -186,7 +187,7 @@ Worker health/stats:
 
 **Worker tab** (not Settings): host/port (defaults `localhost`/`8091`), Setup copy for LAN / FQDN / k8s DNS bridge, Generate API token, VRAM bar, **active base** picker, Start / Stop / Enable / Disable. Settings keeps OpenRouter/Civitai keys only — the diffusion URL lives on Worker.
 
-**GPU engine (this host):** `./scripts/run-local-worker.sh` (or `make run-local-worker`) builds `Dockerfile.worker` and runs Docker `freya-local-worker` with `--gpus all`. Inside the container, freya-worker proxies generate to a **Diffusers** sidecar (`FREYA_ENGINE_URL=http://127.0.0.1:8092`). Checkpoints + Civitai LoRAs under `FREYA_MODELS_DIR` load **on demand** into VRAM and unload after each generate unless `FREYA_ENGINE_KEEP_LOADED=1`. Health `modelLoaded.loadedInVram` reflects the engine; `nvidia-smi` VRAM appears when the container has GPU access. Compose: `make compose-up-gpu`. Without `FREYA_ENGINE_URL`, generate still returns a stub PNG for wiring tests. CRD `engine: vllm-omni` remains the label for swapping to vLLM-Omni on the same HTTP surface.
+**GPU engine (this host):** `./scripts/run-local-worker.sh` (or `make run-local-worker`) builds `Dockerfile.worker` and runs Docker `freya-local-worker` with `--gpus all`. Inside the container, freya-worker proxies generate to a **Diffusers** sidecar (`FREYA_ENGINE_URL=http://127.0.0.1:8092`). Checkpoints + Civitai LoRAs under `FREYA_MODELS_DIR` load **on demand** into VRAM and unload after each generate unless `FREYA_ENGINE_KEEP_LOADED=1`. Stats `modelLoaded.loadedInVram` reflects the engine; `nvidia-smi` VRAM appears when the container has GPU access. Compose: `make compose-up-gpu`. Without `FREYA_ENGINE_URL`, generate still returns a stub PNG for wiring tests. CRD `engine: vllm-omni` remains the label for swapping to vLLM-Omni on the same HTTP surface.
 
 ### Civitai in the UI
 

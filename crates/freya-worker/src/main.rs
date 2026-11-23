@@ -252,8 +252,7 @@ async fn persist_active_base(models_dir: &Path, active: &ActiveBase) -> Result<(
         .map_err(|e| format!("write active-base.json: {e}"))
 }
 
-/// Health for local ops. Includes GPU/VRAM when `nvidia-smi` is available
-/// (null inside GPU-less containers — freya-api may enrich from the host).
+/// Liveness for probes. GPU, disk, and inventory are on authenticated `GET /v1/stats`.
 async fn health() -> Json<Value> {
     Json(serde_json::json!({ "ok": true, "service": "freya-worker" }))
 }

@@ -73,11 +73,16 @@ impl AppState {
         let gallery = Gallery::open(cfg.gallery_dir.clone()).await?;
         let openrouter = OpenRouterClient::new(&cfg);
         let civitai = CivitaiClient::new(cfg.civitai_api_key.clone());
-        // Client attaches when a worker URL is set (enable flag kept for API compat only).
-        let worker = cfg.diffusion_worker_url.as_ref().map(|u| {
-            DiffusionWorkerClient::new_with_tls(u.clone(), cfg.worker_tls_insecure)
-                .with_token(cfg.worker_token.clone())
-        });
+        // A saved URL is not enough. Disable must leave no client, including
+        // when secrets have not been loaded yet (`FREYA_WORKER_ENABLED=false`).
+        let worker = if cfg.worker_enabled {
+            cfg.diffusion_worker_url.as_ref().map(|u| {
+                DiffusionWorkerClient::new_with_tls(u.clone(), cfg.worker_tls_insecure)
+                    .with_token(cfg.worker_token.clone())
+            })
+        } else {
+            None
+        };
         let packs_dir = cfg.packs_dir.clone();
         let state = Self {
             config: Arc::new(RwLock::new(cfg)),

@@ -75,7 +75,12 @@ impl DiffusionWorkerClient {
         if !resp.status().is_success() {
             return None;
         }
-        resp.json::<Value>().await.ok()
+        let body = resp.json::<Value>().await.ok()?;
+        if inventory_stats(&body) {
+            Some(body)
+        } else {
+            None
+        }
     }
 
     pub async fn list_loras(&self) -> Result<Vec<LocalAsset>> {
@@ -519,6 +524,15 @@ pub struct LocalAsset {
     pub thumbnail_url: Option<String>,
 }
 
+/// True when the JSON is worker inventory, not the liveness `{ok:true}` body.
+pub(crate) fn inventory_stats(v: &Value) -> bool {
+    v.get("modelsDir").is_some()
+        || v.get("loras").is_some()
+        || v.get("checkpoints").is_some()
+        || v.get("vram").is_some()
+        || v.get("disk").is_some()
+}
+
 /// Public HTTPS is verified. Skip only for loopback, private, link-local, or cluster DNS.
 /// Keep in sync with `freya_operator::reconcile::tls_skip_allowed`.
 pub(crate) fn tls_skip_allowed(endpoint: &str) -> bool {
@@ -567,7 +581,18 @@ fn host_is_local_or_private(host: &str) -> bool {
 
 #[cfg(test)]
 mod tls_tests {
-    use super::tls_skip_allowed;
+    use super::{inventory_stats, tls_skip_allowed};
+
+    #[test]
+    fn health_ok_is_not_inventory() {
+        assert!(!inventory_stats(&serde_json::json!({ "ok": true })));
+        assert!(!inventory_stats(
+            &serde_json::json!({ "ok": true, "service": "freya-worker" })
+        ));
+        assert!(inventory_stats(
+            &serde_json::json!({ "ok": true, "vram": null, "loras": 0, "modelsDir": "/models" })
+        ));
+    }
 
     #[test]
     fn public_https_does_not_skip_verify() {

@@ -2804,7 +2804,7 @@ export default function App() {
   }, [tab, mock, studioToken, authStatus?.authRequired]);
 
   const workerControl = async (action) => {
-    if (action !== "start" && action !== "stop") return;
+    if (!["start", "stop", "enable", "disable"].includes(action)) return;
     setWorkerCtlBusy(true);
     setError("");
     setSavedMsg("");
@@ -2815,11 +2815,14 @@ export default function App() {
       applyWorkerEndpoint(st.diffusionWorkerUrl || "");
       await refreshWorkerStats();
       const health = await api("/v1/health").catch(() => null);
-      setSavedMsg(
-        action === "stop"
-          ? `Worker stop requested${health ? ` · health diffusionWorker=${health.diffusionWorker}` : ""}`
-          : `Worker start requested${health ? ` · health diffusionWorker=${health.diffusionWorker}` : ""}`,
-      );
+      const healthNote = health ? ` · health diffusionWorker=${health.diffusionWorker}` : "";
+      const note = {
+        stop: `Worker stop requested${healthNote}`,
+        start: `Worker start requested${healthNote}`,
+        enable: "Worker enabled for local generation.",
+        disable: "Worker disabled. The URL is kept. OpenRouter still works.",
+      }[action];
+      setSavedMsg(note);
     } catch (e) {
       setError(e.message);
     } finally {
@@ -5127,11 +5130,13 @@ export default function App() {
               >
                 <span
                   className={`status-dot ${
-                    workerStats?.reachable
-                      ? "on"
-                      : settings.diffusionWorkerUrl
-                        ? "warn"
-                        : ""
+                    settings.workerEnabled === false || workerStats?.enabled === false
+                      ? ""
+                      : workerStats?.reachable
+                        ? "on"
+                        : settings.diffusionWorkerUrl
+                          ? "warn"
+                          : ""
                   }`}
                 />
                 Worker
@@ -6606,11 +6611,13 @@ export default function App() {
                 <div className="worker-panel-head">
                   <span
                     className={`status-dot ${
-                      workerStats?.reachable
-                        ? "on"
-                        : workerStats?.configured || composedWorkerUrl()
-                          ? "warn"
-                          : ""
+                      settings?.workerEnabled === false || workerStats?.enabled === false
+                        ? ""
+                        : workerStats?.reachable
+                          ? "on"
+                          : workerStats?.configured || composedWorkerUrl()
+                            ? "warn"
+                            : ""
                     }`}
                   />
                   <strong>Status</strong>
@@ -6619,11 +6626,13 @@ export default function App() {
                       ? "mock stats"
                       : workerStats
                         ? [
-                            workerStats.reachable
-                              ? "reachable"
-                              : workerStats.configured || composedWorkerUrl()
-                                ? "unreachable"
-                                : "not configured",
+                            settings?.workerEnabled === false || workerStats.enabled === false
+                              ? "disabled"
+                              : workerStats.reachable
+                                ? "reachable"
+                                : workerStats.configured || composedWorkerUrl()
+                                  ? "unreachable"
+                                  : "not configured",
                             workerStats.runtime?.kind && workerStats.runtime.kind !== "none"
                               ? workerStats.runtime.kind
                               : null,
@@ -6791,6 +6800,24 @@ export default function App() {
                     title="Stop local docker/systemd worker"
                   >
                     ■ Stop
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || workerCtlBusy || mock || settings?.workerEnabled !== false}
+                    onClick={() => workerControl("enable")}
+                    title="Use the saved worker for local generation"
+                  >
+                    Enable
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || workerCtlBusy || mock || settings?.workerEnabled === false}
+                    onClick={() => workerControl("disable")}
+                    title="Skip local generation. The URL stays saved"
+                  >
+                    Disable
                   </button>
                 </div>
               </div>
