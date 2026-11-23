@@ -1,7 +1,9 @@
 id: local-character-lora
 displayName: Local Character LoRA (worker)
 tags: [lora, local, character]
-examplePrompt: character portrait, soft studio light, detailed face
+examplePrompt: >
+  A character portrait in soft studio light with a clear, detailed face —
+  someone you’d recognize across scenes
 backend: local
 localCheckpoint: stabilityai/stable-diffusion-xl-base-1.0
 loras:

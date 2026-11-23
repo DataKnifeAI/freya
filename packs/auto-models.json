@@ -1,0 +1,188 @@
+{
+  "router": {
+    "default": {
+      "balanced": {
+        "low": "meta-llama/llama-3.1-8b-instruct",
+        "medium": "deepseek/deepseek-v4-pro",
+        "high": "google/gemini-4-neon",
+        "max": "meta/muse-wonder"
+      },
+      "safety": {
+        "low": "openai/gpt-5-nano",
+        "medium": "openai/gpt-5-mini",
+        "high": "anthropic/claude-sonnet-5.5",
+        "max": "anthropic/claude-opus-5.5"
+      },
+      "uncensored": {
+        "low": "cognitivecomputations/dolphin-mistral-24b-venice-edition",
+        "medium": "thedrummer/cydonia-24b-v4.1",
+        "high": "thedrummer/cydonia-24b-v4.1",
+        "max": "thedrummer/cydonia-24b-v4.1"
+      }
+    },
+    "zdr": {
+      "balanced": {
+        "low": "meta-llama/llama-3.1-8b-instruct",
+        "medium": "deepseek/deepseek-v4-pro",
+        "high": "google/gemini-4-neon",
+        "max": "meta/muse-wonder"
+      },
+      "safety": {
+        "low": "openai/gpt-5-nano",
+        "medium": "openai/gpt-5-mini",
+        "high": "anthropic/claude-sonnet-5.5",
+        "max": "anthropic/claude-opus-5.5"
+      },
+      "uncensored": {
+        "low": "cognitivecomputations/dolphin-mistral-24b-venice-edition",
+        "medium": "thedrummer/cydonia-24b-v4.1",
+        "high": "thedrummer/cydonia-24b-v4.1",
+        "max": "thedrummer/cydonia-24b-v4.1"
+      }
+    }
+  },
+  "agent": {
+    "default": {
+      "balanced": {
+        "low": "meta-llama/llama-3.1-8b-instruct",
+        "medium": "deepseek/deepseek-v4-pro",
+        "high": "google/gemini-4-neon",
+        "max": "meta/muse-wonder"
+      },
+      "safety": {
+        "low": "openai/gpt-5-nano",
+        "medium": "openai/gpt-5-mini",
+        "high": "anthropic/claude-sonnet-5.5",
+        "max": "anthropic/claude-opus-5.5"
+      },
+      "uncensored": {
+        "low": "cognitivecomputations/dolphin-mistral-24b-venice-edition",
+        "medium": "thedrummer/cydonia-24b-v4.1",
+        "high": "thedrummer/cydonia-24b-v4.1",
+        "max": "thedrummer/cydonia-24b-v4.1"
+      }
+    },
+    "zdr": {
+      "balanced": {
+        "low": "meta-llama/llama-3.1-8b-instruct",
+        "medium": "deepseek/deepseek-v4-pro",
+        "high": "google/gemini-4-neon",
+        "max": "meta/muse-wonder"
+      },
+      "safety": {
+        "low": "openai/gpt-5-nano",
+        "medium": "openai/gpt-5-mini",
+        "high": "anthropic/claude-sonnet-5.5",
+        "max": "anthropic/claude-opus-5.5"
+      },
+      "uncensored": {
+        "low": "cognitivecomputations/dolphin-mistral-24b-venice-edition",
+        "medium": "thedrummer/cydonia-24b-v4.1",
+        "high": "thedrummer/cydonia-24b-v4.1",
+        "max": "thedrummer/cydonia-24b-v4.1"
+      }
+    }
+  },
+  "image": {
+    "default": {
+      "balanced": {
+        "low": "bytedance-seed/seedream-5-0-flash",
+        "medium": "bytedance-seed/seedream-4.5",
+        "high": "bytedance-seed/seedream-5-0-pro",
+        "max": "google/gemini-3-pro-image"
+      },
+      "safety": {
+        "low": "openai/gpt-image-1-mini",
+        "medium": "openai/gpt-image-2",
+        "high": "openai/gpt-5.4-image-2",
+        "max": "openai/gpt-5-image"
+      },
+      "uncensored": {
+        "low": "black-forest-labs/flux-3-image-klein",
+        "medium": "black-forest-labs/flux.2-klein-4b",
+        "high": "black-forest-labs/flux.2-pro",
+        "max": "black-forest-labs/flux-3-image"
+      }
+    },
+    "zdr": {
+      "balanced": {
+        "low": "microsoft/mai-image-2.7-flash",
+        "medium": "microsoft/mai-image-2.7",
+        "high": "microsoft/mai-image-2.5",
+        "max": "microsoft/mai-image-2.5-pro"
+      },
+      "safety": {
+        "low": "google/gemini-3.1-flash-lite-image",
+        "medium": "google/gemini-2.5-flash-image",
+        "high": "google/gemini-3.1-flash-image",
+        "max": "google/gemini-3-pro-image"
+      },
+      "uncensored": {
+        "low": "krea/krea-2-medium-turbo",
+        "medium": "krea/krea-2-medium",
+        "high": "krea/krea-2-large",
+        "max": "krea/krea-2-large"
+      }
+    }
+  },
+  "video": {
+    "default": {
+      "balanced": {
+        "low": "alibaba/wan-3.0",
+        "medium": "bytedance/seedance-2.5-flash",
+        "high": "bytedance/seedance-2.5",
+        "max": "runway/gen-4.5"
+      },
+      "safety": {
+        "low": "google/veo-3.1-lite",
+        "medium": "google/veo-3.1-fast",
+        "high": "google/veo-3.1",
+        "max": "google/veo-3.1"
+      },
+      "uncensored": {
+        "low": "x-ai/grok-imagine-video-1.5-lite",
+        "medium": "x-ai/grok-imagine-video",
+        "high": "x-ai/grok-imagine-video-1.5",
+        "max": "black-forest-labs/flux-3-video"
+      }
+    },
+    "zdr": {
+      "balanced": {
+        "low": "alibaba/wan-3.0",
+        "medium": "bytedance/seedance-2.5-flash",
+        "high": "bytedance/seedance-2.5",
+        "max": "runway/gen-4.5"
+      },
+      "safety": {
+        "low": "google/veo-3.1-lite",
+        "medium": "google/veo-3.1-fast",
+        "high": "google/veo-3.1",
+        "max": "google/veo-3.1"
+      },
+      "uncensored": {
+        "low": "x-ai/grok-imagine-video-1.5-lite",
+        "medium": "x-ai/grok-imagine-video",
+        "high": "x-ai/grok-imagine-video-1.5",
+        "max": "black-forest-labs/flux-3-video"
+      }
+    }
+  },
+  "notes": [
+    "Prices checked against OpenRouter GET /models on 2026-11-22. Chat cost order is prompt price. Image cost order is image_output (prompt is 0 on most still-image ids). Video prompt price is 0 on the API; order uses the public per-second price.",
+    "Safety chat is is_moderated=true and tool+JSON capable: GPT-5 Nano, GPT-5 Mini, Claude Sonnet 5.5, Claude Opus 5.5. Opus is the high-refusal flagship. GPT-5.5 costs more and is not used as max.",
+    "Balanced chat is a capable default with tools and JSON, not an uncensored specialist and not Claude/GPT. Low is Llama 3.1 8B (cheapest that still calls tools). Medium is DeepSeek V4 Pro. High is Gemini 4 Neon. Max is Muse Wonder.",
+    "Uncensored chat: only two catalog ids say uncensored in the name or description — Dolphin Mistral 24B Venice Edition (prompt $0.20/M, response_format, no tools) and Cydonia 24B v4.1 (prompt $0.30/M, response_format and structured_outputs, no tools). Both are on GET /models?zdr=true. No larger uncensored model exists, so high and max repeat Cydonia. Llama-instruct, Claude, and GPT are not in this row.",
+    "Uncensored agent keeps Dolphin and Cydonia even though supported_parameters lacks tools and tool_choice. Tool calls may be weaker. Alignment wins over the tools-only filter for that row.",
+    "Router and agent ZDR columns match default because every chosen chat id is on GET /models?zdr=true.",
+    "Safety image (ZDR off) is moderated GPT Image. gpt-5.4-image-2 shares gpt-image-2's image token price and is the high cell because it adds GPT-5.4. Max is gpt-5-image, the highest GPT image price.",
+    "Safety image ZDR: no is_moderated=true image id is on GET /models?output_modalities=image&zdr=true (GPT Image is moderated but absent). Cells use Google image ids in prompt-price order as the moderated-vendor stand-in, not as uncensored.",
+    "Balanced image (ZDR off) is Seedream, then Gemini 3 Pro Image as max. Flux is reserved for uncensored. GPT Image is reserved for safety.",
+    "Balanced image ZDR is Microsoft MAI (on the ZDR image catalog, not Flux, not GPT). Order follows image_output price: 2.7 Flash, 2.7, 2.5, 2.5 Pro.",
+    "Uncensored image (ZDR off) is Flux, the least-moderated image family. image_output order: FLUX 3 Klein, FLUX.2 Klein 4B, FLUX.2 Pro, FLUX 3 Image. FLUX.2 Max costs more than FLUX 3 Image; max is FLUX 3 Image because it is the flagship, not the pricier older tier.",
+    "Uncensored image ZDR: Flux is not on the ZDR image catalog. Krea is (is_moderated=false). Krea 2 Large is the largest and is described as lighter post-training. No higher Krea tier exists, so max repeats krea-2-large.",
+    "Safety video is Google Veo. Per-second price: Lite $0.05, Fast $0.10, Veo 3.1 $0.40. No Veo above 3.1 exists, so max repeats Veo 3.1.",
+    "Balanced video is general text-to-video that is not Veo and not the uncensored row. Per-second price: Wan 3.0 $0.03, Seedance 2.5 Flash $0.067, Seedance 2.5 $0.103, Runway Gen-4.5 $0.12.",
+    "No video id is named uncensored, and top_provider.is_moderated is false for every video model including Veo. Uncensored video is the least safety-lab ladder: Grok Imagine Video 1.5 Lite $0.02, Grok Imagine Video $0.05, Grok Imagine Video 1.5 $0.08, FLUX.3 Video $0.17.",
+    "GET /models?output_modalities=video&zdr=true returned 0 models, and no video id appears on GET /models?zdr=true. Every video ZDR cell repeats the non-ZDR pick so the cell is not blank. Those ids are not ZDR routes; OpenRouter may reject them when ZDR or deny-collection is on."
+  ]
+}

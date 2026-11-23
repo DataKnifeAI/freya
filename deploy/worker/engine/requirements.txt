@@ -1,0 +1,14 @@
+# Runtime deps on top of a CUDA PyTorch base image (torch already installed).
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+diffusers==0.32.2
+transformers==4.49.0
+accelerate==1.5.2
+safetensors==0.5.3
+Pillow==11.1.0
+sentencepiece==0.2.0
+protobuf==5.29.4
+huggingface-hub==0.29.3
+peft==0.14.0
+# Optional: quieter single-file SDXL loads
+omegaconf==2.3.0

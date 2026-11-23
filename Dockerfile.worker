@@ -1,0 +1,49 @@
+# GPU diffusion worker: freya-worker HTTP facade + Diffusers/CUDA engine.
+# Build: docker build -f Dockerfile.worker -t freya-diffusion-worker:local .
+# Run:   ./scripts/run-local-worker.sh
+#
+# Stub-only (no GPU) remains `Dockerfile` target `worker` for CI/wiring.
+
+FROM rust:1.88-bookworm AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY packs ./packs
+RUN cargo build --release -p freya-worker
+
+# PyTorch CUDA runtime — torch is preinstalled; we add Diffusers + FastAPI.
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+USER root
+ENV DEBIAN_FRONTEND=noninteractive \
+    FREYA_MODELS_DIR=/models \
+    FREYA_WORKER_PORT=8091 \
+    FREYA_ENGINE_HOST=127.0.0.1 \
+    FREYA_ENGINE_PORT=8092 \
+    FREYA_ENGINE_URL=http://127.0.0.1:8092 \
+    FREYA_ENGINE_KEEP_LOADED=0 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HF_HOME=/models/.hf-cache
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY deploy/worker/engine/requirements.txt /opt/freya/engine/requirements.txt
+RUN pip install --no-cache-dir -r /opt/freya/engine/requirements.txt
+
+COPY deploy/worker/engine/server.py /opt/freya/engine/server.py
+COPY deploy/worker/entrypoint.sh /opt/freya/entrypoint.sh
+RUN chmod +x /opt/freya/entrypoint.sh
+
+COPY --from=builder /src/target/release/freya-worker /usr/local/bin/freya-worker
+
+WORKDIR /models
+EXPOSE 8091
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+  CMD curl -sf http://127.0.0.1:8091/health || exit 1
+
+ENTRYPOINT ["/opt/freya/entrypoint.sh"]
+CMD ["--port", "8091", "--models-dir", "/models"]

@@ -74,8 +74,14 @@ async fn install_remote(
     endpoint: &str,
 ) -> Result<(), Error> {
     sanitize_dest_path(&asset.spec.dest_path)?;
+    let tls_insecure = worker
+        .annotations()
+        .get("freya.dataknife.ai/tls-insecure")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
+        .danger_accept_invalid_certs(tls_insecure && super::tls_skip_allowed(endpoint))
         .build()
         .map_err(|e| Error::Http(e.to_string()))?;
 

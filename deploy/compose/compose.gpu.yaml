@@ -1,0 +1,27 @@
+# Optional GPU overlay for freya-worker (nvidia-container-toolkit required).
+# Switches worker image to Dockerfile.worker (Diffusers + CUDA) and reserves a GPU.
+# Usage: make compose-up-gpu
+#    or: docker compose -f deploy/compose/compose.yaml -f deploy/compose/compose.gpu.yaml --env-file deploy/compose/.env up -d --build
+#
+# Standalone GPU host (kind/prd Studio → this box): ./scripts/run-local-worker.sh
+
+services:
+  freya-worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.worker
+    image: ${FREYA_WORKER_IMAGE:-freya-diffusion-worker:local}
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      FREYA_ENGINE_URL: http://127.0.0.1:8092
+      FREYA_ENGINE_KEEP_LOADED: ${FREYA_ENGINE_KEEP_LOADED:-0}
+      HF_TOKEN: ${HF_TOKEN:-}
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${FREYA_GPU_COUNT:-1}
+              capabilities: [gpu]

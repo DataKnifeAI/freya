@@ -1,0 +1,15 @@
+# Curated style pack — NL example from freya.png brand art (not SD tag soup)
+apiVersion: freya.dataknife.ai/v1alpha1
+kind: FreyaStyle
+metadata:
+  name: freya-winged-warrior
+  namespace: freya
+spec:
+  displayName: Freya (brand art)
+  tags: [character, fantasy, wings]
+  examplePrompt: >
+    A young woman with large brown eagle wings and fantasy leather armor,
+    standing in a green canyon with a waterfall behind her
+  backend: openrouter
+  openRouterModel: black-forest-labs/flux.2-klein-4b
+  recommendedSize: "1024x1024"
