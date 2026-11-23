@@ -981,10 +981,109 @@ function offerFromAsk(prompt, ask) {
   return null;
 }
 
+const TOOL_ERROR_RE = /\b([a-z][a-z0-9]*_[a-z0-9_]*) failed:\s*/g;
+
+/** Pull route-footer and tool-error text out of an assistant reply. */
+export function partitionAssistantReply(content, actions = []) {
+  const routeLines = [];
+  let text = String(content || "").replace(/(?:^|\n)\s*(Route:\s*\S[^\n]*)/gi, (_, line) => {
+    routeLines.push(String(line).replace(/\s+/g, " ").trim());
+    return "\n";
+  });
+  text = text.replace(/\s+(Route:\s*\S[^\n]*)$/i, (_, line) => {
+    routeLines.push(String(line).replace(/\s+/g, " ").trim());
+    return "";
+  });
+
+  for (const action of Array.isArray(actions) ? actions : []) {
+    if (action?.status !== "error" || !action.type) continue;
+    const phrase = `${action.type} failed: ${action.error || "error"}`;
+    if (text.includes(phrase)) text = text.split(phrase).join(" ");
+  }
+
+  const errorLines = [];
+  const kept = [];
+  for (const rawLine of text.split("\n")) {
+    const peeled = peelToolErrors(rawLine);
+    errorLines.push(...peeled.errors);
+    if (peeled.text) kept.push(peeled.text);
+  }
+
+  const body = kept
+    .join("\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return {
+    body,
+    routeLine: routeLines.join("\n"),
+    errorLines,
+  };
+}
+
+function peelToolErrors(line) {
+  const hits = [];
+  const re = new RegExp(TOOL_ERROR_RE.source, "g");
+  let match;
+  while ((match = re.exec(line))) {
+    hits.push({ index: match.index, type: match[1], end: re.lastIndex });
+  }
+  if (!hits.length) return { text: line.trim(), errors: [] };
+  const errors = [];
+  let visible = "";
+  let cursor = 0;
+  for (let i = 0; i < hits.length; i++) {
+    visible += line.slice(cursor, hits[i].index);
+    const stop = i + 1 < hits.length ? hits[i + 1].index : line.length;
+    let err = line.slice(hits[i].end, stop);
+    const boundary = err.search(/\s+(?=[A-Z][A-Za-z]{2,}\b)/);
+    if (boundary >= 0) {
+      visible += err.slice(boundary);
+      err = err.slice(0, boundary);
+    }
+    errors.push(`${hits[i].type} failed: ${err.replace(/\s+/g, " ").trim()}`.trim());
+    cursor = stop;
+  }
+  return { text: visible.replace(/\s{2,}/g, " ").trim(), errors: errors.filter(Boolean) };
+}
+
+function shortModelId(id) {
+  const value = String(id || "").trim();
+  if (!value || value === "auto") return "auto";
+  return value.split("/").pop() || "auto";
+}
+
+/** API route footer, rebuilt when a stored turn has route fields but the line was already removed. */
+export function routeLineForMessage(message) {
+  const modality = message?.route?.modality;
+  if (!modality) return "";
+  const agent = shortModelId(message.resolvedModels?.agent);
+  const router = shortModelId(message.resolvedModels?.router);
+  const backendRaw = String(message.routeContext?.backend || message.genBackend || "").toLowerCase();
+  const backend = backendRaw === "openrouter" ? "cloud" : backendRaw;
+  const mode = message.routeContext?.mode;
+  if (backend === "local") {
+    const base = message.routeContext?.base || "none";
+    const lora = message.routeContext?.lora || "none";
+    const modeBit = mode ? ` · mode=${mode}` : "";
+    return `Route: ${modality} · agent=${agent} · router=${router} · base=${base} · lora=${lora}${modeBit} · backend=local`;
+  }
+  if (backend === "cloud") {
+    const image = shortModelId(message.resolvedModels?.image);
+    const video = shortModelId(message.resolvedModels?.video);
+    return `Route: ${modality} · agent=${agent} · router=${router} · image=${image} · video=${video} · backend=cloud`;
+  }
+  const parts = [`Route: ${modality}`, `agent=${agent}`, `router=${router}`];
+  if (mode) parts.push(`mode=${mode}`);
+  if (backend) parts.push(`backend=${backend}`);
+  return parts.join(" · ");
+}
+
 /** Quoted prompt in an assistant reply, when the reply itself is not the thing to draw. */
 export function imagePromptFromReply(text) {
-  const raw = String(text || "");
-  const body = raw.split(/\n\s*Route:/i)[0].trim();
+  const body = partitionAssistantReply(text).body;
   if (!body) return null;
   const re = /["“]([^"”\n]{24,})["”]/g;
   let match;

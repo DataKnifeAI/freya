@@ -78,6 +78,14 @@ export async function postChat(body, onStatus) {
     }
     throw new Error(data.error || res.statusText || `HTTP ${res.status}`);
   }
+  const ct = res.headers.get("content-type") || "";
+  if (!ct.includes("ndjson")) {
+    const data = await res.json().catch(() => ({}));
+    if (data?.error && data.reply == null && !Array.isArray(data.actions)) {
+      throw new Error(data.error);
+    }
+    return data;
+  }
   const reader = res.body?.getReader();
   if (!reader) {
     const data = await res.json();
@@ -107,6 +115,7 @@ export async function postChat(body, onStatus) {
       if (msg.type === "status" && msg.status) onStatus?.(msg.status);
       else if (msg.type === "result") result = msg.data;
       else if (msg.type === "error") throw new Error(msg.error || "Chat failed");
+      else if (msg.reply != null || Array.isArray(msg.actions)) result = msg;
     }
   }
   const tail = buf.trim();
@@ -116,6 +125,7 @@ export async function postChat(body, onStatus) {
       if (msg.type === "status" && msg.status) onStatus?.(msg.status);
       else if (msg.type === "result") result = msg.data;
       else if (msg.type === "error") throw new Error(msg.error || "Chat failed");
+      else if (msg.reply != null || Array.isArray(msg.actions)) result = msg;
     } catch (err) {
       if (err instanceof SyntaxError) {
         /* trailing partial chunk */
