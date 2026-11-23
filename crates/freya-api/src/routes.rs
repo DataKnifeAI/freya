@@ -5010,12 +5010,16 @@ pub async fn gallery_image(
     let bytes = tokio::fs::read(state.gallery.image_path(&meta))
         .await
         .map_err(ApiError::from)?;
-    let ct = if meta.mime.contains("jpeg") {
-        "image/jpeg"
-    } else {
-        "image/png"
-    };
-    Ok(([(axum::http::header::CONTENT_TYPE, ct)], bytes).into_response())
+    // Original file bytes. GIF stays image/gif (no PNG/WebP poster).
+    let ct = crate::gallery::content_type_for_bytes(&bytes, &meta.mime);
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, ct),
+            (axum::http::header::CONTENT_DISPOSITION, "inline"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 pub async fn gallery_remix(

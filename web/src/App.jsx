@@ -504,12 +504,251 @@ const AGENT_MODELS = [
   { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash", short: "Gemini Flash" },
 ];
 
-const IMAGE_MODELS = [
-  { id: "auto", label: "Auto", short: "Auto" },
-  { id: "black-forest-labs/flux.2-klein-4b", label: "FLUX.2 Klein 4B", short: "FLUX Klein" },
-  { id: "black-forest-labs/flux.1-schnell", label: "FLUX.1 Schnell", short: "FLUX Schnell" },
-  { id: "stabilityai/sdxl-turbo", label: "SDXL Turbo", short: "SDXL Turbo" },
-];
+function artifactMime(item) {
+  return (
+    item?.mime ||
+    item?.meta?.mime ||
+    (typeof item?.filename === "string" && item.filename.endsWith(".mp4")
+      ? "video/mp4"
+      : typeof item?.filename === "string" && item.filename.endsWith(".webm")
+        ? "video/webm"
+        : typeof item?.filename === "string" && item.filename.endsWith(".gif")
+          ? "image/gif"
+          : "")
+  );
+}
+
+function mediaSrc(item, src) {
+  return String(src || item?.url || "").toLowerCase().split("#")[0];
+}
+
+function isGifArtifact(item, src) {
+  const m = String(artifactMime(item) || "").toLowerCase();
+  if (m.includes("gif")) return true;
+  const s = mediaSrc(item, src);
+  if (s.startsWith("data:image/gif")) return true;
+  return /\.gif(\?|$)/.test(s);
+}
+
+function isVideoArtifact(item, src) {
+  if (isGifArtifact(item, src)) return false;
+  const m = String(artifactMime(item) || "").toLowerCase();
+  if (m.includes("mp4") || m.includes("webm") || m.startsWith("video/")) return true;
+  const s = mediaSrc(item, src);
+  return /\.mp4(\?|$)/.test(s) || /\.webm(\?|$)/.test(s);
+}
+
+/** Gallery / chat media: animated gif and stills use img; MP4/WebM use video. */
+function MediaFigure({ item, src, alt, className }) {
+  if (isGifArtifact(item, src)) {
+    return <img className={className} src={src} alt={alt || ""} />;
+  }
+  if (isVideoArtifact(item, src)) {
+    return (
+      <video
+        className={className}
+        src={src}
+        controls
+        playsInline
+        loop
+        muted
+        autoPlay
+        preload="auto"
+        aria-label={alt || "Generated video"}
+      />
+    );
+  }
+  return <img className={className} src={src} alt={alt || ""} />;
+}
+const AUTO_ROUTER = { id: "auto", label: "Auto", short: "Auto" };
+const PLACEHOLDER_AGENT_MODELS = [AUTO_AGENT];
+const PLACEHOLDER_IMAGE_MODELS = [AUTO_IMAGE];
+/** @type {{ id: string, label: string, short: string }[]} */
+const EMPTY_VIDEO_CATALOG = PLACEHOLDER_VIDEO_MODELS;
+const PLACEHOLDER_ROUTER_MODELS = [AUTO_ROUTER];
+const MODELS_API_HINT = "LLM API access needed to list models";
+const AUTH_SIGN_IN_HINT = "Sign in required";
+const OPENROUTER_HINT = "OpenRouter key required";
+/** Debounce before auto-saving privacy/alignment so `/v1/models` pickers can refresh. */
+const PREFS_MODELS_DEBOUNCE_MS = 400;
+/** Debounce before auto-saving pasted API keys (empty = leave on-file key alone). */
+const API_KEYS_DEBOUNCE_MS = 600;
+
+/** Normalize chat-provider checkbox prefs (unchecked = excluded). */
+function normalizeChatProviders(raw) {
+  const cp = raw && typeof raw === "object" ? raw : {};
+  const excluded = Array.isArray(cp.excluded)
+    ? [...new Set(cp.excluded.map((s) => String(s || "").trim().toLowerCase()).filter(Boolean))].sort()
+    : [];
+  let legacyOnly = null;
+  if (Array.isArray(cp.legacyOnly) && cp.legacyOnly.length) {
+    legacyOnly = [
+      ...new Set(cp.legacyOnly.map((s) => String(s || "").trim().toLowerCase()).filter(Boolean)),
+    ].sort();
+  }
+  return { excluded, legacyOnly };
+}
+
+/** Normalize privacy + alignment for PUT / fingerprint (catalog-affecting prefs). */
+function privacyAlignmentSnapshot({
+  privacyZdr,
+  privacyDataCollection,
+  chatProviders,
+  modelAlignment,
+  allowNsfwLocal,
+  instructionTone,
+  autoFallbacks,
+}) {
+  return {
+    privacy: {
+      zeroDataRetention: Boolean(privacyZdr),
+      dataCollection: privacyDataCollection === "deny" ? "deny" : "allow",
+      chatProviders: normalizeChatProviders(chatProviders),
+    },
+    alignment: {
+      modelAlignment: String(modelAlignment || "balanced").trim() || "balanced",
+      allowNsfwLocal: Boolean(allowNsfwLocal),
+      instructionTone: String(instructionTone || "warm").trim() || "warm",
+    },
+    autoFallbacks: normalizeAutoFallbacks(autoFallbacks),
+  };
+}
+
+function privacyAlignmentFromSettings(st) {
+  const p = st?.privacy || {};
+  const a = st?.alignment || {};
+  // Migrate any leftover free-text fields from older API responses.
+  let chatProviders = normalizeChatProviders(p.chatProviders);
+  if (
+    !chatProviders.excluded.length &&
+    !chatProviders.legacyOnly &&
+    (typeof p.providerIgnore === "string" || typeof p.providerOnly === "string")
+  ) {
+    const ignore = String(p.providerIgnore || "")
+      .split(/[,\s]+/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    const only = String(p.providerOnly || "")
+      .split(/[,\s]+/)
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    chatProviders = normalizeChatProviders({
+      excluded: ignore,
+      legacyOnly: only.length ? only : null,
+    });
+  }
+  return privacyAlignmentSnapshot({
+    privacyZdr: Boolean(p.zeroDataRetention),
+    privacyDataCollection: p.dataCollection === "deny" ? "deny" : "allow",
+    chatProviders,
+    modelAlignment:
+      typeof a.modelAlignment === "string" && a.modelAlignment.trim()
+        ? a.modelAlignment.trim()
+        : "balanced",
+    allowNsfwLocal: Boolean(a.allowNsfwLocal),
+    instructionTone:
+      typeof a.instructionTone === "string" && a.instructionTone.trim()
+        ? a.instructionTone.trim()
+        : "warm",
+    autoFallbacks: st?.autoFallbacks,
+  });
+}
+
+/** Checked = included in chat picker. */
+function chatProviderIsChecked(slug, chatProviders) {
+  const v = String(slug || "").trim().toLowerCase();
+  if (!v) return false;
+  const cp = normalizeChatProviders(chatProviders);
+  if (cp.legacyOnly) return cp.legacyOnly.includes(v);
+  return !cp.excluded.includes(v);
+}
+
+/** Build prefs after toggling one vendor checkbox (clears legacy-only include). */
+function chatProvidersAfterToggle(available, chatProviders, slug, checked) {
+  const list = Array.isArray(available) ? available : [];
+  const nextChecked = new Set();
+  for (const s of list) {
+    const v = String(s || "").trim().toLowerCase();
+    if (!v) continue;
+    if (chatProviderIsChecked(v, chatProviders)) nextChecked.add(v);
+  }
+  const target = String(slug || "").trim().toLowerCase();
+  if (target) {
+    if (checked) nextChecked.add(target);
+    else nextChecked.delete(target);
+  }
+  const excluded = list
+    .map((s) => String(s || "").trim().toLowerCase())
+    .filter((v) => v && !nextChecked.has(v))
+    .sort();
+  return normalizeChatProviders({ excluded, legacyOnly: null });
+}
+
+function chatProvidersSelectAll(available, allChecked) {
+  const list = (Array.isArray(available) ? available : [])
+    .map((s) => String(s || "").trim().toLowerCase())
+    .filter(Boolean)
+    .sort();
+  if (allChecked) return normalizeChatProviders({ excluded: [], legacyOnly: null });
+  return normalizeChatProviders({ excluded: list, legacyOnly: null });
+}
+
+function privacyAlignmentFingerprint(snap) {
+  return JSON.stringify(snap);
+}
+
+function shortFromName(name, id) {
+  let s = String(name || id || "").trim();
+  const colon = s.indexOf(": ");
+  if (colon > 0 && colon < 32) s = s.slice(colon + 2).trim();
+  if (s.length > 22) s = `${s.slice(0, 20)}…`;
+  return s || id;
+}
+
+/** OpenRouter vendor slug: id prefix before `/` (e.g. `openai/gpt-5.2` → `openai`). */
+function modelVendor(id) {
+  const s = String(id || "");
+  const slash = s.indexOf("/");
+  return slash > 0 ? s.slice(0, slash).toLowerCase() : s.toLowerCase();
+}
+
+/** Sort catalog rows by vendor, then display name, then id. */
+function cmpModelVendorName(a, b) {
+  const va = modelVendor(a.id);
+  const vb = modelVendor(b.id);
+  if (va !== vb) return va < vb ? -1 : 1;
+  const na = String(a.label || a.name || a.id || "").toLowerCase();
+  const nb = String(b.label || b.name || b.id || "").toLowerCase();
+  if (na !== nb) return na < nb ? -1 : 1;
+  const ia = String(a.id || "").toLowerCase();
+  const ib = String(b.id || "").toLowerCase();
+  return ia < ib ? -1 : ia > ib ? 1 : 0;
+}
+
+/** Map API catalog rows → CompactMenu options; Auto first, rest vendor → name. */
+function catalogToOptions(items, { auto }) {
+  const mapped = (Array.isArray(items) ? items : [])
+    .filter((m) => m && m.id)
+    .map((m) => ({
+      id: m.id,
+      label:
+        m.id === UPSTREAM_ROUTER_ID
+          ? "OpenRouter router (upstream)"
+          : m.name || m.id,
+      short:
+        m.id === UPSTREAM_ROUTER_ID
+          ? "OR router"
+          : shortFromName(m.name, m.id),
+    }))
+    .sort(cmpModelVendorName);
+  if (!mapped.length) return [auto];
+  return [auto, ...mapped];
+}
+
+function ensureSelectedOption(list, id) {
+  if (!id || list.some((m) => m.id === id)) return list;
+  return [...list, { id, label: id, short: shortFromName(id, id) }];
+}
 
 const emptySession = () => ({
   goal: "",
@@ -4900,18 +5139,37 @@ export default function App() {
                         batchResults.find((r) => r.artifactId === id) ||
                         (result?.artifactId === id ? result : null) ||
                         gallery.find((g) => g.id === id);
+                      const src = art?.url || `/v1/gallery/${id}/image`;
+                      const label = imageLinkLabel(art, index);
+                      const open = () => {
+                        if (art) selectGalleryPreview(art);
+                        else setTab("gallery");
+                      };
                       return (
-                        <button
-                          key={id}
-                          type="button"
-                          className="linkish t-ref-link"
-                          onClick={() => {
-                            if (art) selectGalleryPreview(art);
-                            else setTab("gallery");
-                          }}
-                        >
-                          {imageLinkLabel(art, index)}
-                        </button>
+                        <span className="t-ref-art" key={id}>
+                          <span
+                            className="t-thumb"
+                            role="button"
+                            tabIndex={0}
+                            title={label}
+                            onClick={open}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                open();
+                              }
+                            }}
+                          >
+                            <MediaFigure item={art} src={src} alt={label} />
+                          </span>
+                          <button
+                            type="button"
+                            className="linkish t-ref-link"
+                            onClick={open}
+                          >
+                            {label}
+                          </button>
+                        </span>
                       );
                     })}
                   </div>

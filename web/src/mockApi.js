@@ -79,6 +79,10 @@ function svgDataUrl(title, subtitle, hue = 28) {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
+/** Two-frame GIF so mock gif previews animate in <img>. */
+const ANIMATED_GIF_DATA_URL =
+  "data:image/gif;base64,R0lGODlhCAAIAJEAABQQDuh4KlqMoPDm0iH/C05FVFNDQVBFMi4wAwEAAAAh+QQEFAAAACwAAAAACAAIAAACB4wPU5fbWwEAIfkEBBQAAAAsAAAAAAgACAAAAgeUD1OX21sBADs=";
+
 function escapeXml(s) {
   return s
     .replace(/&/g, "&amp;")
@@ -1182,11 +1186,14 @@ function mockGenerateArtifact(prompt, body = {}) {
     createdAt: new Date().toISOString(),
     mime,
     modality,
-    url: svgDataUrl(
-      prompt.slice(0, 40) || "Freya",
-      isMotion ? modality : backend,
-      backend === "local" ? 140 : 28 + (id.length % 40),
-    ),
+    url:
+      modality === "gif"
+        ? ANIMATED_GIF_DATA_URL
+        : svgDataUrl(
+            prompt.slice(0, 40) || "Freya",
+            isMotion ? modality : backend,
+            backend === "local" ? 140 : 28 + (id.length % 40),
+          ),
     loras,
   };
   state.gallery.unshift(item);

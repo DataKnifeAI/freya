@@ -524,7 +524,9 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
   overflow-wrap: anywhere;
 }
 .t-tool-line { flex: 1 1 100%; white-space: normal; }
-.t-ref-row { display: flex; flex-wrap: wrap; gap: 0.15rem 0.7rem; margin-top: 0.2rem; }
+.t-ref-row { display: flex; flex-wrap: wrap; gap: 0.45rem 0.7rem; margin-top: 0.2rem; align-items: flex-start; }
+.t-ref-art { display: flex; flex-direction: column; align-items: flex-start; gap: 0.15rem; max-width: 9rem; }
+.t-ref-art .t-ref-link { max-width: 9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .t-ref-link { font-size: 0.78rem; padding: 0; }
 .t-tools { list-style: none; margin: 0.35rem 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.35rem; }
 .t-tool {
@@ -540,7 +542,7 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
 .t-thumbs { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.4rem; }
 .t-thumb-wrap { position: relative; width: 72px; height: 72px; }
 .t-thumb {
-  padding: 0; border: 1px solid var(--line); border-radius: 2px; background: transparent;
+  display: block; padding: 0; border: 1px solid var(--line); border-radius: 2px; background: transparent;
   width: 72px; height: 72px; overflow: hidden; cursor: pointer;
 }
 .t-thumb-dl {
