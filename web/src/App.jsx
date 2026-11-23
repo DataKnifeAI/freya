@@ -525,19 +525,32 @@ function artifactMime(item) {
   );
 }
 
-function isVideoArtifact(item) {
-  const m = String(artifactMime(item) || "").toLowerCase();
-  return m.includes("mp4") || m.includes("webm") || m.startsWith("video/");
+function mediaSrc(item, src) {
+  return String(src || item?.url || "").toLowerCase().split("#")[0];
 }
 
-function isGifArtifact(item) {
+function isGifArtifact(item, src) {
   const m = String(artifactMime(item) || "").toLowerCase();
-  return m.includes("gif");
+  if (m.includes("gif")) return true;
+  const s = mediaSrc(item, src);
+  if (s.startsWith("data:image/gif")) return true;
+  return /\.gif(\?|$)/.test(s);
 }
 
-/** Gallery / chat media: video player, animated gif, or still image. */
+function isVideoArtifact(item, src) {
+  if (isGifArtifact(item, src)) return false;
+  const m = String(artifactMime(item) || "").toLowerCase();
+  if (m.includes("mp4") || m.includes("webm") || m.startsWith("video/")) return true;
+  const s = mediaSrc(item, src);
+  return /\.mp4(\?|$)/.test(s) || /\.webm(\?|$)/.test(s);
+}
+
+/** Gallery / chat media: animated gif and stills use img; MP4/WebM use video. */
 function MediaFigure({ item, src, alt, className }) {
-  if (isVideoArtifact(item)) {
+  if (isGifArtifact(item, src)) {
+    return <img className={className} src={src} alt={alt || ""} />;
+  }
+  if (isVideoArtifact(item, src)) {
     return (
       <video
         className={className}
@@ -546,7 +559,8 @@ function MediaFigure({ item, src, alt, className }) {
         playsInline
         loop
         muted
-        preload="metadata"
+        autoPlay
+        preload="auto"
         aria-label={alt || "Generated video"}
       />
     );
@@ -5993,18 +6007,37 @@ export default function App() {
                         batchResults.find((r) => r.artifactId === id) ||
                         (result?.artifactId === id ? result : null) ||
                         gallery.find((g) => g.id === id);
+                      const src = art?.url || `/v1/gallery/${id}/image`;
+                      const label = imageLinkLabel(art, index);
+                      const open = () => {
+                        if (art) selectGalleryPreview(art);
+                        else setTab("gallery");
+                      };
                       return (
-                        <button
-                          key={id}
-                          type="button"
-                          className="linkish t-ref-link"
-                          onClick={() => {
-                            if (art) selectGalleryPreview(art);
-                            else setTab("gallery");
-                          }}
-                        >
-                          {imageLinkLabel(art, index)}
-                        </button>
+                        <span className="t-ref-art" key={id}>
+                          <span
+                            className="t-thumb"
+                            role="button"
+                            tabIndex={0}
+                            title={label}
+                            onClick={open}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                open();
+                              }
+                            }}
+                          >
+                            <MediaFigure item={art} src={src} alt={label} />
+                          </span>
+                          <button
+                            type="button"
+                            className="linkish t-ref-link"
+                            onClick={open}
+                          >
+                            {label}
+                          </button>
+                        </span>
                       );
                     })}
                   </div>
