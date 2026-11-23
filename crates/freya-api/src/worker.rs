@@ -218,6 +218,128 @@ impl DiffusionWorkerClient {
         }
         Ok(())
     }
+
+    /// Enqueue a background install job; returns worker JSON (`jobId`, `status`, `job`, …).
+    pub async fn enqueue_install(
+        &self,
+        source: &str,
+        url: &str,
+        dest_path: &str,
+        auth_token: Option<&str>,
+        meta: Option<&InstallMeta>,
+    ) -> Result<Value> {
+        let body = self.install_body(source, url, dest_path, auth_token, meta, true);
+        let resp = self
+            .apply_auth(
+                self.http
+                    .post(format!("{}/v1/assets/jobs", self.base))
+                    .json(&body),
+            )
+            .send()
+            .await
+            .context("worker enqueue install")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("enqueue failed: {text}"));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    pub async fn list_install_jobs(&self) -> Result<Value> {
+        let resp = self
+            .apply_auth(self.http.get(format!("{}/v1/assets/jobs", self.base)))
+            .send()
+            .await
+            .context("list install jobs")?;
+        if !resp.status().is_success() {
+            let t = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("list jobs failed: {t}"));
+        }
+        Ok(resp.json().await.unwrap_or(Value::Null))
+    }
+
+    pub async fn get_install_job(&self, id: &str) -> Result<Value> {
+        let url = worker_job_url(&self.base, id, false)?;
+        let resp = self
+            .apply_auth(self.http.get(url))
+            .send()
+            .await
+            .context("get install job")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 404 {
+            return Err(anyhow!("job not found"));
+        }
+        if !status.is_success() {
+            return Err(anyhow!("get job failed: {text}"));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    pub async fn cancel_install_job(&self, id: &str) -> Result<Value> {
+        let url = worker_job_url(&self.base, id, true)?;
+        let resp = self
+            .apply_auth(self.http.post(url))
+            .send()
+            .await
+            .context("cancel install job")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("cancel failed: {text}"));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    /// Clear finished install jobs on the worker (succeeded/failed/cancelled).
+    pub async fn clear_install_jobs(&self, include_queued: bool) -> Result<Value> {
+        let body = serde_json::json!({ "includeQueued": include_queued });
+        let resp = self
+            .apply_auth(
+                self.http
+                    .post(format!("{}/v1/assets/jobs/clear", self.base))
+                    .json(&body),
+            )
+            .send()
+            .await
+            .context("clear install jobs")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("clear jobs failed: {text}"));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+
+    pub async fn delete_asset(&self, path: &str) -> Result<Value> {
+        let body = serde_json::json!({ "path": path });
+        let resp = self
+            .apply_auth(
+                self.http
+                    .delete(format!("{}/v1/assets", self.base))
+                    .json(&body),
+            )
+            .send()
+            .await
+            .context("delete asset")?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("delete failed: {text}"));
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct InstallMeta {
+    pub name: Option<String>,
+    pub base_model: Option<String>,
+    pub version_id: Option<i64>,
+    pub model_id: Option<i64>,
+    pub model_type: Option<String>,
+    pub thumbnail_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,6 +351,43 @@ pub struct LoraWeight {
 
 fn one() -> f32 {
     1.0
+}
+
+/// Single path segment: UUID or `[A-Za-z0-9_-]+`. No `/ ? # % . ..`.
+/// Same rule as freya-mcp. Does not percent-encode.
+fn safe_path_segment(id: &str) -> Result<&str> {
+    let id = id.trim();
+    if id.is_empty()
+        || id.contains('/')
+        || id.contains('?')
+        || id.contains('#')
+        || id.contains('%')
+        || id.contains('.')
+        || id.contains("..")
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(anyhow!("invalid job id"));
+    }
+    Ok(id)
+}
+
+fn worker_job_url(base: &str, id: &str, cancel: bool) -> Result<String> {
+    let id = safe_path_segment(id)?;
+    let base = base.trim_end_matches('/');
+    let suffix = if cancel {
+        format!("/v1/assets/jobs/{id}/cancel")
+    } else {
+        format!("/v1/assets/jobs/{id}")
+    };
+    let url = format!("{base}{suffix}");
+    let parsed = reqwest::Url::parse(&url).context("parse worker job url")?;
+    if parsed.query().is_some() || parsed.fragment().is_some() || !parsed.path().ends_with(&suffix)
+    {
+        return Err(anyhow!("invalid job id"));
+    }
+    Ok(url)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -295,7 +454,7 @@ fn host_is_local_or_private(host: &str) -> bool {
 
 #[cfg(test)]
 mod tls_tests {
-    use super::{inventory_stats, tls_skip_allowed};
+    use super::{inventory_stats, tls_skip_allowed, worker_job_url};
 
     #[test]
     fn health_ok_is_not_inventory() {
@@ -306,6 +465,26 @@ mod tls_tests {
         assert!(inventory_stats(
             &serde_json::json!({ "ok": true, "vram": null, "loras": 0, "modelsDir": "/models" })
         ));
+    }
+
+    #[test]
+    fn job_id_path_rejects_injection() {
+        for id in ["../auth/token", "x?x", "../../worker/start?"] {
+            assert!(worker_job_url("http://worker.internal", id, true).is_err());
+            assert!(worker_job_url("http://worker.internal", id, false).is_err());
+        }
+        let url = worker_job_url(
+            "http://worker.internal",
+            "550e8400-e29b-41d4-a716-446655440000",
+            true,
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        assert_eq!(
+            parsed.path(),
+            "/v1/assets/jobs/550e8400-e29b-41d4-a716-446655440000/cancel"
+        );
+        assert!(parsed.query().is_none());
     }
 
     #[test]

@@ -441,10 +441,29 @@ fn download_client() -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-async fn install(
-    State(app): State<Arc<App>>,
-    Json(req): Json<InstallReq>,
-) -> Result<Json<serde_json::Value>, (axum::http::StatusCode, Json<serde_json::Value>)> {
+/// Client-facing and logged text for a failed download.
+/// `raw_display` is used only to classify redirect-policy failures. It is never
+/// returned or logged: reqwest's Display includes the request URL and query.
+fn download_failure_message(raw_display: &str, status: Option<reqwest::StatusCode>) -> String {
+    if raw_display.contains("redirect to disallowed host") {
+        "download request failed: redirect to disallowed host".to_string()
+    } else if raw_display.contains("too many redirects") {
+        "download request failed: too many redirects".to_string()
+    } else if let Some(status) = status {
+        format!("download failed with HTTP {}", status.as_u16())
+    } else {
+        "download request failed".to_string()
+    }
+}
+
+/// Map reqwest transport errors to safe job messages (never echo URLs / query secrets).
+fn download_request_err(e: reqwest::Error) -> String {
+    let message = download_failure_message(&e.to_string(), e.status());
+    warn!(error = %message, "download request failed");
+    message
+}
+
+fn validate_install(app: &App, req: &InstallReq) -> Result<PathBuf, (StatusCode, Json<Value>)> {
     let dest = resolve_dest(&app.models_dir, &req.dest_path).map_err(|e| {
         (
             axum::http::StatusCode::BAD_REQUEST,
@@ -497,12 +516,10 @@ async fn install(
     Ok(Json(json!({ "ok": true, "path": req.dest_path })))
 }
 
-/// Never return raw transport errors — reqwest Display includes the full URL (and query secrets).
-fn internal(
-    context: &str,
-    e: impl std::fmt::Display,
-) -> (axum::http::StatusCode, Json<serde_json::Value>) {
-    warn!(%context, error = %e, "asset install failed");
+/// Never return or log raw transport errors — reqwest Display includes the full URL.
+#[allow(dead_code)]
+fn internal(context: &str, _detail: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
+    warn!(%context, error = "asset install failed", "asset install failed");
     (
         axum::http::StatusCode::BAD_REQUEST,
         Json(json!({ "error": format!("{context} failed") })),
@@ -521,6 +538,34 @@ mod tests {
         assert!(resolve_dest(&dir, "/etc/passwd").is_err());
         assert!(resolve_dest(&dir, "loras/../../etc/passwd").is_err());
         assert!(resolve_dest(&dir, "loras/ok.safetensors").is_ok());
+    }
+
+    #[test]
+    fn download_failure_log_omits_url() {
+        let leaked = "error sending request for url (https://civitai.com/api/download/models/1?token=secret): connection reset";
+        let msg = download_failure_message(leaked, None);
+        assert_eq!(msg, "download request failed");
+        assert!(!msg.contains("token"));
+        assert!(!msg.contains("http"));
+        assert!(!msg.contains('?'));
+
+        let redir = "error following redirect for url (https://evil.example/x?token=secret): redirect to disallowed host";
+        let msg = download_failure_message(redir, None);
+        assert_eq!(msg, "download request failed: redirect to disallowed host");
+        assert!(!msg.contains("token"));
+        assert!(!msg.contains("http"));
+        assert!(!msg.contains('?'));
+
+        let many = "error following redirect for url (https://huggingface.co/x?token=hf): too many redirects";
+        let msg = download_failure_message(many, None);
+        assert_eq!(msg, "download request failed: too many redirects");
+        assert!(!msg.contains("token"));
+        assert!(!msg.contains("huggingface"));
+
+        let msg = download_failure_message(leaked, Some(reqwest::StatusCode::FORBIDDEN));
+        assert_eq!(msg, "download failed with HTTP 403");
+        assert!(!msg.contains("token"));
+        assert!(!msg.contains("http"));
     }
 
     #[test]
