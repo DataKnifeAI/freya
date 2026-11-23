@@ -378,12 +378,13 @@ async fn typed_civitai_lookup(
     let canon = crate::civitai::canonical_search_type(type_raw)?;
     let cap = limit.clamp(1, 20) as usize;
     let fetch = (cap as u32).max(12).min(20);
+    let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
     let searched = {
         let civ = state.civitai.read().await;
         if !civ.configured() {
             return Err("Civitai API key not configured".into());
         }
-        civ.search_types(query, fetch, &[canon]).await
+        civ.search_types(query, fetch, &[canon], allow_nsfw).await
     };
     let items = searched.map_err(|e| e.to_string())?;
     let mut assets: Vec<_> = items
@@ -729,9 +730,10 @@ pub async fn assist(
                 .filter(|q| !q.is_empty());
             if let Some(q) = query {
                 out["civitaiQuery"] = json!(q);
+                let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
                 let civ = state.civitai.read().await;
                 if civ.configured() {
-                    match civ.search(q, 8).await {
+                    match civ.search(q, 12, allow_nsfw).await {
                         Ok(items) => {
                             let loras: Vec<_> = items
                                 .into_iter()
@@ -5175,7 +5177,15 @@ pub async fn civitai_search(
     Query(q): Query<CivitaiSearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let civ = state.civitai.read().await;
-    let items = civ.search(&q.q, q.limit).await.map_err(ApiError::from)?;
+    let types = parse_civitai_types(q.types.as_deref());
+    let type_refs: Vec<&str> = types.iter().map(String::as_str).collect();
+    let mut items = civ
+        .search_types(&q.q, q.limit, &type_refs, allow_nsfw)
+        .await
+        .map_err(ApiError::from)?;
+    if !allow_nsfw {
+        items.retain(|c| !looks_nsfw_label(&c.name) && !c.nsfw);
+    }
     Ok(Json(json!({ "items": items })))
 }
 
