@@ -1155,7 +1155,10 @@ fn previous_word(hay: &str, at: usize) -> &str {
     let head = hay[..at].trim_end();
     let start = head
         .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '-')
-        .map(|i| i + 1)
+        .map(|i| {
+            let sep = head[i..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+            i + sep
+        })
         .unwrap_or(0);
     &head[start..]
 }
@@ -1524,6 +1527,17 @@ mod tests {
         assert!(prompt_is_adult_scene("nude woman on a bed, explicit sex"));
         assert!(prompt_is_adult_scene("her breasts, soft light"));
         assert!(prompt_is_adult_scene("close crop of her tits"));
+    }
+
+    #[test]
+    fn adult_scene_scan_survives_non_ascii() {
+        assert_eq!(
+            previous_word("sofía breasts", "sofía breasts".find("breasts").unwrap()),
+            "a"
+        );
+        assert!(prompt_is_adult_scene("Sofía breasts"));
+        assert!(prompt_is_adult_scene("café, nude portrait"));
+        assert!(!prompt_is_adult_scene("Sofía plating a chicken breast"));
     }
 
     #[test]
