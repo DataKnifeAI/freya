@@ -125,33 +125,31 @@ impl CivitaiClient {
         !self.api_key.trim().is_empty()
     }
 
-    pub async fn search(&self, query: &str, limit: u32) -> Result<Vec<CivitaiModelCard>> {
-        self.search_types(query, limit, DEFAULT_SEARCH_TYPES).await
+    pub async fn search(
+        &self,
+        query: &str,
+        limit: u32,
+        nsfw: bool,
+    ) -> Result<Vec<CivitaiModelCard>> {
+        self.search_types(query, limit, DEFAULT_SEARCH_TYPES, nsfw)
+            .await
     }
 
     /// Search Civitai, optionally restricting to `types` (passed as repeated `types=` params).
+    /// `nsfw` sets Civitai's `nsfw` query. False is their SFW catalog; true includes mature models.
     pub async fn search_types(
         &self,
         query: &str,
         limit: u32,
         types: &[&str],
+        nsfw: bool,
     ) -> Result<Vec<CivitaiModelCard>> {
         if !self.configured() {
             return Err(anyhow!(
                 "Civitai API key not set — add it in Freya Settings or CIVITAI_API_KEY"
             ));
         }
-        let mut url = format!(
-            "https://civitai.com/api/v1/models?limit={limit}&query={}",
-            urlencoding_lite(query)
-        );
-        for t in types {
-            let trimmed = t.trim();
-            if !trimmed.is_empty() {
-                url.push_str("&types=");
-                url.push_str(&urlencoding_lite(trimmed));
-            }
-        }
+        let url = models_search_url(query, limit, types, nsfw);
         let v = self.get_json(&url).await.context("civitai search")?;
         let mut out = Vec::new();
         if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
@@ -676,6 +674,25 @@ fn strip_html_brief(html: &str) -> String {
     }
 }
 
+/// Civitai `GET /api/v1/models` search URL on `civitai.com` (same catalog as `civitai.red`).
+/// Always sends `nsfw`: their default is false, which drops mature models from search
+/// even when `GET /models/{id}` still returns them.
+fn models_search_url(query: &str, limit: u32, types: &[&str], nsfw: bool) -> String {
+    let mut url = format!(
+        "https://civitai.com/api/v1/models?limit={limit}&nsfw={}&query={}",
+        if nsfw { "true" } else { "false" },
+        urlencoding_lite(query)
+    );
+    for t in types {
+        let trimmed = t.trim();
+        if !trimmed.is_empty() {
+            url.push_str("&types=");
+            url.push_str(&urlencoding_lite(trimmed));
+        }
+    }
+    url
+}
+
 fn urlencoding_lite(s: &str) -> String {
     // Percent-encode UTF-8 bytes (not truncated chars) for non-ASCII queries.
     let mut out = String::with_capacity(s.len() * 3);
@@ -725,6 +742,21 @@ mod tests {
         assert!(canonical_search_type("Upscaler").is_err());
         assert!(same_search_type("Embedding", "TextualInversion"));
         assert!(!same_search_type("Checkpoint", "LORA"));
+    }
+
+    #[test]
+    fn search_url_sends_nsfw_from_show_nsfw() {
+        let off = models_search_url("WAI-illustrious", 12, &["Checkpoint"], false);
+        assert!(off.starts_with("https://civitai.com/api/v1/models?"));
+        assert!(off.contains("nsfw=false"));
+        assert!(!off.contains("nsfw=true"));
+        assert!(off.contains("types=Checkpoint"));
+        assert!(off.contains("query=WAI-illustrious"));
+        let on = models_search_url("WAI-illustrious", 12, &["Checkpoint"], true);
+        assert!(on.contains("nsfw=true"));
+        assert!(!on.contains("nsfw=false"));
+        let spaced = models_search_url("WAI illustrious", 12, &["Checkpoint"], true);
+        assert!(spaced.contains("query=WAI%20illustrious"));
     }
 
     #[test]
