@@ -503,6 +503,104 @@ function relativeTime(iso) {
   return `${d}d ago`;
 }
 
+function SessionRow({
+  title,
+  updatedAt,
+  createdAt,
+  imageCount,
+  active,
+  archived,
+  confirming,
+  onOpen,
+  onArchive,
+  onUnarchive,
+  onAskDelete,
+  onConfirmDelete,
+  onCancelDelete,
+}) {
+  return (
+    <li className={`session-row${active ? " is-active" : ""}`}>
+      <button
+        type="button"
+        role="option"
+        aria-selected={active}
+        className={`session-item${active ? " active" : ""}`}
+        onClick={() => {
+          onCancelDelete();
+          onOpen();
+        }}
+      >
+        <span className="session-item-title">{title}</span>
+        <span className="session-item-meta">
+          <time dateTime={updatedAt || createdAt}>{relativeTime(updatedAt || createdAt)}</time>
+          {imageCount > 0 && (
+            <span>
+              {imageCount} img{imageCount === 1 ? "" : "s"}
+            </span>
+          )}
+        </span>
+      </button>
+      <div className={`session-row-actions${confirming ? " is-confirm" : ""}`}>
+        {confirming ? (
+          <>
+            <button
+              type="button"
+              className="ghost danger-ghost session-confirm"
+              title="Delete this session"
+              aria-label="Confirm delete"
+              onClick={onConfirmDelete}
+            >
+              Delete?
+            </button>
+            <button
+              type="button"
+              className="ghost session-confirm"
+              title="Cancel"
+              aria-label="Cancel delete"
+              onClick={onCancelDelete}
+            >
+              No
+            </button>
+          </>
+        ) : (
+          <>
+            {archived ? (
+              <button
+                type="button"
+                className="ghost icon-btn"
+                title="Unarchive"
+                aria-label="Unarchive session"
+                onClick={onUnarchive}
+              >
+                <IconUnarchive />
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="ghost icon-btn"
+                title="Archive"
+                aria-label="Archive session"
+                onClick={onArchive}
+              >
+                <IconArchive />
+              </button>
+            )}
+            <button
+              type="button"
+              className="ghost danger-ghost icon-btn"
+              title="Delete"
+              aria-label="Delete session"
+              onClick={onAskDelete}
+            >
+              <IconTrash />
+            </button>
+          </>
+        )}
+      </div>
+    </li>
+  );
+}
+
 function blankSessionEntry(id = makeSessionId()) {
   const now = new Date().toISOString();
   return {
@@ -734,6 +832,20 @@ const IconTrash = () => (
   <Svg>
     <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6" />
     <path d="M10 11v6M14 11v6" />
+  </Svg>
+);
+const IconArchive = () => (
+  <Svg>
+    <path d="M4 7h16v4H4z" />
+    <path d="M6 11v8h12v-8" />
+    <path d="M10 15h4" />
+  </Svg>
+);
+const IconUnarchive = () => (
+  <Svg>
+    <path d="M4 7h16v4H4z" />
+    <path d="M6 11v8h12v-8" />
+    <path d="M12 18V13M9.5 15.5 12 13l2.5 2.5" />
   </Svg>
 );
 function MediaDownload({ src, item, className, onError }) {
@@ -975,6 +1087,11 @@ export default function App() {
   const [sessions, setSessions] = useState(() =>
     storedSessions?.sessions?.length ? storedSessions.sessions : [bootSession],
   );
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  const [archivedOpen, setArchivedOpen] = useState(() => {
+    const active = storedSessions?.sessions?.find((s) => s.id === storedSessions.activeId);
+    return !!active?.archived;
+  });
   const sessionsRef = useRef(sessions);
   const activeIdRef = useRef(activeSessionId);
   const timelineRef = useRef(null);
@@ -986,6 +1103,15 @@ export default function App() {
   useEffect(() => {
     activeIdRef.current = activeSessionId;
   }, [activeSessionId]);
+
+  useEffect(() => {
+    if (!confirmDeleteId) return;
+    const onKey = (e) => {
+      if (e.key === "Escape") setConfirmDeleteId(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [confirmDeleteId]);
 
   // Apply theme to <html data-theme>; persistence happens only on toggle,
   // so an unsaved preference keeps following the system.
@@ -1024,14 +1150,16 @@ export default function App() {
   const examplePrompt = styles[0]?.examplePrompt || BEGINNER_EXAMPLE;
   const exampleCivitaiQuery = demoCivitaiQuery(examplePrompt);
 
-  const snapshotCurrent = (id = activeSessionId) => {
+  const snapshotCurrent = (id = activeIdRef.current) => {
     const prev = sessionsRef.current.find((s) => s.id === id);
     const now = new Date().toISOString();
     return {
+      ...(prev || {}),
       id,
       title: sessionTitleFrom(prompt, session),
       createdAt: prev?.createdAt || now,
       updatedAt: now,
+      archived: !!prev?.archived,
       prompt,
       session: {
         goal: session.goal || "",
@@ -1084,8 +1212,14 @@ export default function App() {
   const upsertSessionList = (snap, list = sessionsRef.current) => {
     const idx = list.findIndex((s) => s.id === snap.id);
     if (idx === -1) return [snap, ...list];
+    const prev = list[idx];
     const next = [...list];
-    next[idx] = { ...snap, createdAt: list[idx].createdAt || snap.createdAt };
+    next[idx] = {
+      ...prev,
+      ...snap,
+      createdAt: prev.createdAt || snap.createdAt,
+      archived: snap.archived != null ? !!snap.archived : !!prev.archived,
+    };
     return next;
   };
 
@@ -1097,6 +1231,7 @@ export default function App() {
   };
 
   const startNewSession = () => {
+    setConfirmDeleteId(null);
     const snap = snapshotCurrent();
     const blank = blankSessionEntry();
     const list = [blank, ...upsertSessionList(snap).filter((s) => s.id !== blank.id)];
@@ -1111,12 +1246,83 @@ export default function App() {
     if (!id || id === activeSessionId) return;
     const target = sessionsRef.current.find((s) => s.id === id);
     if (!target) return;
+    setConfirmDeleteId(null);
     const snap = snapshotCurrent();
     const list = upsertSessionList(snap);
     persistAll(id, list);
     setActiveSessionId(id);
     applySessionEntry(target);
+    if (target.archived) setArchivedOpen(true);
     setTab("gallery");
+  };
+
+  /** Hide from the active list. Session record stays in localStorage. */
+  const setSessionArchived = (id, archived) => {
+    if (!id) return;
+    setConfirmDeleteId(null);
+    const now = new Date().toISOString();
+    const currentId = activeIdRef.current;
+    let list = sessionsRef.current;
+    if (id === currentId) {
+      list = upsertSessionList({ ...snapshotCurrent(id), archived: !!archived, updatedAt: now }, list);
+    } else {
+      list = upsertSessionList(snapshotCurrent(currentId), list).map((s) =>
+        s.id === id ? { ...s, archived: !!archived, updatedAt: now } : s,
+      );
+    }
+    if (archived && id === currentId) {
+      const fallback = list.find((s) => s.id !== id && !s.archived);
+      if (fallback) {
+        persistAll(fallback.id, list);
+        setActiveSessionId(fallback.id);
+        applySessionEntry(fallback);
+      } else {
+        const blank = blankSessionEntry();
+        const next = [blank, ...list.filter((s) => s.id !== blank.id)];
+        persistAll(blank.id, next);
+        setActiveSessionId(blank.id);
+        applySessionEntry(blank);
+      }
+      setArchivedOpen(true);
+      setSavedMsg("Archived.");
+      return;
+    }
+    persistAll(currentId, list);
+    if (archived) setArchivedOpen(true);
+    setSavedMsg(archived ? "Archived." : "Unarchived.");
+  };
+
+  /** Drop the session record only. Gallery images stay; they are not owned by the session. */
+  const deleteSession = (id) => {
+    if (!id) return;
+    setConfirmDeleteId(null);
+    const currentId = activeIdRef.current;
+    let list = sessionsRef.current.filter((s) => s.id !== id);
+    if (id !== currentId) {
+      list = upsertSessionList(snapshotCurrent(currentId), list);
+      if (!list.length) list = [blankSessionEntry()];
+      const nextId = list.some((s) => s.id === currentId) ? currentId : list[0].id;
+      persistAll(nextId, list);
+      if (nextId !== currentId) {
+        const next = list.find((s) => s.id === nextId);
+        setActiveSessionId(nextId);
+        if (next) applySessionEntry(next);
+      }
+      setSavedMsg("Deleted.");
+      return;
+    }
+    const fallback = list.find((s) => !s.archived);
+    if (fallback) {
+      persistAll(fallback.id, list);
+      setActiveSessionId(fallback.id);
+      applySessionEntry(fallback);
+    } else {
+      const blank = blankSessionEntry();
+      persistAll(blank.id, [blank, ...list]);
+      setActiveSessionId(blank.id);
+      applySessionEntry(blank);
+    }
+    setSavedMsg("Deleted.");
   };
 
   const setSidebar = (open) => {
@@ -2536,37 +2742,83 @@ export default function App() {
             </button>
           </div>
           <ul className="session-list" role="listbox" aria-label="Sessions">
-            {sessions.map((s) => {
-              const active = s.id === activeSessionId;
-              const imgs = sessionImageCount(s);
-              const title = active
-                ? sessionTitleFrom(prompt, session)
-                : s.title || sessionTitleFrom(s.prompt, s.session);
-              return (
-                <li key={s.id}>
-                  <button
-                    type="button"
-                    role="option"
-                    aria-selected={active}
-                    className={`session-item${active ? " active" : ""}`}
-                    onClick={() => switchSession(s.id)}
-                  >
-                    <span className="session-item-title">{title}</span>
-                    <span className="session-item-meta">
-                      <time dateTime={s.updatedAt || s.createdAt}>
-                        {relativeTime(s.updatedAt || s.createdAt)}
-                      </time>
-                      {imgs > 0 && (
-                        <span>
-                          {imgs} img{imgs === 1 ? "" : "s"}
-                        </span>
-                      )}
-                    </span>
-                  </button>
-                </li>
-              );
-            })}
+            {sessions.some((s) => !s.archived) ? (
+              sessions
+                .filter((s) => !s.archived)
+                .map((s) => {
+                  const active = s.id === activeSessionId;
+                  const title = active
+                    ? sessionTitleFrom(prompt, session)
+                    : s.title || sessionTitleFrom(s.prompt, s.session);
+                  return (
+                    <SessionRow
+                      key={s.id}
+                      title={title}
+                      updatedAt={s.updatedAt}
+                      createdAt={s.createdAt}
+                      imageCount={sessionImageCount(active ? { ...s, session, results: batchResults, result } : s)}
+                      active={active}
+                      confirming={confirmDeleteId === s.id}
+                      onOpen={() => switchSession(s.id)}
+                      onArchive={() => setSessionArchived(s.id, true)}
+                      onAskDelete={() => setConfirmDeleteId(s.id)}
+                      onConfirmDelete={() => deleteSession(s.id)}
+                      onCancelDelete={() => setConfirmDeleteId((cur) => (cur === s.id ? null : cur))}
+                    />
+                  );
+                })
+            ) : (
+              <li className="session-list-empty" role="presentation">No active sessions</li>
+            )}
           </ul>
+          {sessions.some((s) => s.archived) && (
+            <div className="session-archived">
+              <button
+                type="button"
+                className="session-archived-toggle"
+                aria-expanded={archivedOpen}
+                onClick={() => setArchivedOpen((open) => !open)}
+              >
+                <span>Archived</span>
+                <span className="session-archived-count">
+                  {sessions.filter((s) => s.archived).length}
+                </span>
+              </button>
+              {archivedOpen && (
+                <ul className="session-list" role="listbox" aria-label="Archived sessions">
+                  {sessions
+                    .filter((s) => s.archived)
+                    .map((s) => {
+                      const active = s.id === activeSessionId;
+                      const title = active
+                        ? sessionTitleFrom(prompt, session)
+                        : s.title || sessionTitleFrom(s.prompt, s.session);
+                      return (
+                        <SessionRow
+                          key={s.id}
+                          title={title}
+                          updatedAt={s.updatedAt}
+                          createdAt={s.createdAt}
+                          imageCount={sessionImageCount(
+                            active ? { ...s, session, results: batchResults, result } : s,
+                          )}
+                          active={active}
+                          archived
+                          confirming={confirmDeleteId === s.id}
+                          onOpen={() => switchSession(s.id)}
+                          onUnarchive={() => setSessionArchived(s.id, false)}
+                          onAskDelete={() => setConfirmDeleteId(s.id)}
+                          onConfirmDelete={() => deleteSession(s.id)}
+                          onCancelDelete={() =>
+                            setConfirmDeleteId((cur) => (cur === s.id ? null : cur))
+                          }
+                        />
+                      );
+                    })}
+                </ul>
+              )}
+            </div>
+          )}
         </aside>
 
       <div className="workspace">
