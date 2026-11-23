@@ -90,7 +90,7 @@ async fn resolve_worker(
 }
 
 /// Ingress host plus in-cluster Service DNS and port-forward loopback.
-/// Empty or `*` is not used — that disables the MCP Host check.
+/// Empty or `*` on the MCP process is loopback only, so this list is explicit.
 fn mcp_allowed_hosts(studio: &FreyaStudio, name: &str, ns: &str) -> String {
     let svc = format!("{name}-mcp");
     let mut hosts = vec![
