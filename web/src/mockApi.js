@@ -2298,10 +2298,71 @@ export async function mockApi(path, opts = {}) {
     else if (body.seed !== undefined) g.seed = body.seed;
     set("size");
     set("quantity");
-    g.source = "user";
-    g.sourceLabel = "Hand edit";
+    g.source = body.source === "gallery" ? "gallery" : "user";
+    g.sourceLabel =
+      body.source === "gallery"
+        ? String(body.sourceLabel || "Community image").slice(0, 160)
+        : "Hand edit";
     g.locked = true;
     return { settings: g, persisted: true };
+  }
+  if (p === "/v1/civitai/images" && method === "GET") {
+    const allowNsfw = Boolean(state.settings?.alignment?.allowNsfwLocal);
+    const modelId = Number(url.searchParams.get("modelId") || 0) || null;
+    const modelVersionId = Number(url.searchParams.get("modelVersionId") || 0) || null;
+    const versionQuery = modelVersionId ? `?modelVersionId=${modelVersionId}` : "";
+    const items = [
+      {
+        id: 11,
+        postId: 22,
+        prompt: "1girl, red hair, smile, hairclip, ponytail",
+        negativePrompt: "lowres, blurry",
+        sampler: "Euler a",
+        steps: 28,
+        cfg: 7,
+        seed: 1234,
+        clipSkip: 2,
+        size: "832x1216",
+        url: "",
+        nsfw: false,
+        nsfwLevel: "None",
+        civitaiUrl: `https://civitai.com/images/11${versionQuery}`,
+        resources: [
+          { name: "example-checkpoint", type: "Checkpoint" },
+          { name: "example-lora", type: "lora", weight: 0.8 },
+        ],
+        modelVersionIds: modelVersionId ? [modelVersionId] : [],
+      },
+    ];
+    if (allowNsfw) {
+      items.push({
+        id: 12,
+        postId: 23,
+        prompt: "mature community example",
+        negativePrompt: "lowres",
+        sampler: "Euler a",
+        steps: 24,
+        cfg: 6,
+        seed: 99,
+        clipSkip: 2,
+        size: "832x1216",
+        url: "",
+        nsfw: true,
+        nsfwLevel: "X",
+        civitaiUrl: `https://civitai.red/images/12${versionQuery}`,
+        resources: [{ name: "example-checkpoint", type: "Checkpoint" }],
+        modelVersionIds: modelVersionId ? [modelVersionId] : [],
+      });
+    }
+    return {
+      modelId,
+      modelVersionId,
+      nsfw: allowNsfw,
+      count: items.length,
+      items,
+      upstream: "https://civitai.com/api/v1/images",
+      note: "Community image posts. Does not download or generate.",
+    };
   }
   if (p === "/v1/generation-meta/recommend" && method === "POST") {
     state.generation = {

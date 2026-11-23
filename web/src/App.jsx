@@ -2401,6 +2401,12 @@ export default function App() {
   };
   const [favorites, setFavorites] = useState(readFavorites);
   const [civitaiDetail, setCivitaiDetail] = useState(null);
+  /** Last model the Agent Gallery should list community images for. */
+  const [agentAsset, setAgentAsset] = useState(null);
+  const [communityImages, setCommunityImages] = useState([]);
+  const [communityBusy, setCommunityBusy] = useState(false);
+  const [communityErr, setCommunityErr] = useState("");
+  const [communityNote, setCommunityNote] = useState("");
   const [civitaiDetailBusy, setCivitaiDetailBusy] = useState(false);
   const [detailImageIdx, setDetailImageIdx] = useState(0);
   const [downloadJobs, setDownloadJobs] = useState([]);
@@ -3136,12 +3142,27 @@ export default function App() {
     setDetailImageIdx(0);
   };
 
+  const rememberAgentAsset = (item, versionId) => {
+    if (!item) return;
+    const modelId = resolveCivitaiModelId(item);
+    const raw = versionId ?? item.versionId ?? item.modelVersionId;
+    const modelVersionId = raw != null && Number(raw) > 0 ? Number(raw) : null;
+    if (modelId == null && modelVersionId == null) return;
+    setAgentAsset({
+      modelId: modelId ?? null,
+      modelVersionId,
+      name: item.name || "This model",
+    });
+  };
+
   const selectCivitaiVariant = (versionId, fileId) => {
+    let nextModel = null;
     setCivitaiDetail((prev) => {
       if (!prev?.model) return prev;
-      const next = applyCivitaiVariant(prev.model, versionId, fileId);
-      return { ...prev, model: next };
+      nextModel = applyCivitaiVariant(prev.model, versionId, fileId);
+      return { ...prev, model: nextModel };
     });
+    if (nextModel) rememberAgentAsset(nextModel, versionId);
     setDetailImageIdx(0);
   };
 
@@ -3167,6 +3188,7 @@ export default function App() {
       item.versionId,
       item.fileId,
     );
+    rememberAgentAsset(initial, versionId);
     setCivitaiDetail({
       model: initial,
       related: [],
@@ -3232,6 +3254,7 @@ export default function App() {
             ),
           );
         }
+        rememberAgentAsset(merged, merged.versionId ?? versionId);
         setCivitaiDetail({
           model: merged,
           related,
@@ -3880,6 +3903,8 @@ export default function App() {
         if (a.type === "set_base_model")
           return `Set active base to ${a.result?.model || a.args?.model || "—"}`;
         if (a.type === "generate_video") return `Generated ${a.result?.modality || "video"}`;
+        if (a.type === "civitai_images")
+          return `Community images: ${a.result?.count ?? (a.result?.items || []).length ?? 0}`;
         if (a.type === "gallery_list")
           return `Gallery: ${(a.result?.items || []).length || 0} item(s)`;
         if (a.type === "gallery_get") return `Gallery item ${a.result?.id || a.args?.id || "—"}`;
@@ -5676,8 +5701,99 @@ export default function App() {
     : detailRelated;
   const detailSuggestionsAreRecommended = detailSuggestionSource.length > 0;
 
+  const assetContext = (item, versionId) => {
+    if (!item) return null;
+    const modelId = resolveCivitaiModelId(item);
+    const raw = versionId ?? item.versionId ?? item.modelVersionId;
+    const modelVersionId = raw != null && Number(raw) > 0 ? Number(raw) : null;
+    if (modelId == null && modelVersionId == null) return null;
+    return {
+      modelId: modelId ?? null,
+      modelVersionId,
+      name: item.name || "This model",
+    };
+  };
   const chatLookup = presentLookup(suggestedLoras, installedAssets, civitaiQuery || "");
   const chatLookupCount = chatLookup.existing.length + chatLookup.fresh.length;
+  const suggestionAsset =
+    [...chatLookup.existing, ...chatLookup.fresh, ...installedAssets]
+      .map((item) => assetContext(item))
+      .find(Boolean) || null;
+  const galleryContext =
+    (detailModel && assetContext(detailModel, detailSelectedVersion?.id ?? detailModel.versionId)) ||
+    agentAsset ||
+    suggestionAsset;
+  const galleryKey = galleryContext
+    ? `${galleryContext.modelId || ""}:${galleryContext.modelVersionId || ""}:${
+        settings?.alignment?.allowNsfwLocal ? "nsfw" : "sfw"
+      }`
+    : "";
+
+  const applyCommunityImage = async (item) => {
+    if (!item) return;
+    if (item.prompt) setPrompt(item.prompt);
+    const form = { ...genMetaRef.current };
+    if (item.sampler) form.sampler = item.sampler;
+    if (item.cfg != null && item.cfg !== "") form.cfg = item.cfg;
+    if (item.steps != null && item.steps !== "") form.steps = item.steps;
+    if (item.clipSkip != null && item.clipSkip !== "") form.clipSkip = item.clipSkip;
+    if (item.negativePrompt != null) form.negativePrompt = item.negativePrompt;
+    if (item.seed != null && item.seed !== "") form.seed = item.seed;
+    if (item.size) form.size = item.size;
+    const resources = (item.resources || [])
+      .map((r) => r?.name)
+      .filter(Boolean)
+      .slice(0, 6);
+    const sourceLabel = [
+      item.id ? `Community image ${item.id}` : "Community image",
+      resources.length ? resources.join(", ") : "",
+    ]
+      .filter(Boolean)
+      .join(" · ")
+      .slice(0, 160);
+    try {
+      const data = await api("/v1/generation-meta", {
+        method: "PUT",
+        body: JSON.stringify({ ...genMetaBody(form), source: "gallery", sourceLabel }),
+      });
+      applyGenMeta(data);
+      setCommunityErr("");
+      setCommunityNote("Copied into Meta. The prompt is in the composer. Nothing was generated.");
+    } catch (e) {
+      setCommunityNote("");
+      setCommunityErr(e.message || "Could not save Meta");
+    }
+  };
+
+  useEffect(() => {
+    if (tab !== "agent" || agentFocus !== "gallery" || !galleryKey) {
+      return undefined;
+    }
+    const ctx = galleryContext;
+    let cancel = false;
+    setCommunityBusy(true);
+    setCommunityErr("");
+    const q = new URLSearchParams();
+    if (ctx.modelId) q.set("modelId", String(ctx.modelId));
+    if (ctx.modelVersionId) q.set("modelVersionId", String(ctx.modelVersionId));
+    api(`/v1/civitai/images?${q}`)
+      .then((data) => {
+        if (cancel) return;
+        setCommunityImages(data.items || []);
+        setCommunityNote("");
+      })
+      .catch((e) => {
+        if (cancel) return;
+        setCommunityImages([]);
+        setCommunityErr(e.message || "Could not load community images");
+      })
+      .finally(() => {
+        if (!cancel) setCommunityBusy(false);
+      });
+    return () => {
+      cancel = true;
+    };
+  }, [tab, agentFocus, galleryKey]);
 
   const openAgentLibrary = (id) => {
     setAgentFocus(id);
@@ -5693,6 +5809,14 @@ export default function App() {
         onClick={() => setAgentFocus("suggestions")}
       >
         Suggestions
+      </button>
+      <button
+        type="button"
+        className={agentFocus === "gallery" ? "primary" : "ghost"}
+        aria-pressed={agentFocus === "gallery"}
+        onClick={() => setAgentFocus("gallery")}
+      >
+        Gallery
       </button>
       <button
         type="button"
@@ -6871,6 +6995,88 @@ export default function App() {
         ))}
       </nav>
 
+      {tab === "agent" && agentFocus === "gallery" && (
+        <section className="panel agent-gallery" aria-label="Community images">
+          {renderAgentSubnav()}
+          <p className="hint">
+            {galleryContext
+              ? `Community images for ${galleryContext.name}${
+                  galleryContext.modelVersionId
+                    ? ` · version ${galleryContext.modelVersionId}`
+                    : ""
+                }. Click a row to copy its prompt and settings into Meta. It does not generate.`
+              : "Open a model, or use a suggested or installed row, to list community images for that version."}
+          </p>
+          {communityBusy && <p className="hint">Loading community images…</p>}
+          {communityErr && <p className="err">{communityErr}</p>}
+          {communityNote && <p className="hint">{communityNote}</p>}
+          {!communityBusy && galleryContext && communityImages.length === 0 && !communityErr && (
+            <p className="hint">No community images for this version.</p>
+          )}
+          <ul className="agent-gallery-list">
+            {communityImages.map((item) => {
+              const process = [
+                item.sampler,
+                item.steps != null ? `${item.steps} steps` : "",
+                item.cfg != null ? `CFG ${item.cfg}` : "",
+                item.seed != null ? `seed ${item.seed}` : "",
+                item.clipSkip != null ? `clip skip ${item.clipSkip}` : "",
+                item.size || "",
+              ]
+                .filter(Boolean)
+                .join(" · ");
+              const resources = (item.resources || [])
+                .map((r) => {
+                  const weight = r.weight != null ? ` ${r.weight}` : "";
+                  return `${r.name}${r.type ? ` (${r.type}${weight})` : ""}`;
+                })
+                .join(", ");
+              return (
+                <li key={item.id} className="agent-gallery-item">
+                  <button
+                    type="button"
+                    className="agent-gallery-row"
+                    onClick={() => void applyCommunityImage(item)}
+                  >
+                    {item.thumbnailUrl || item.url ? (
+                      <img
+                        className="agent-gallery-thumb"
+                        src={item.thumbnailUrl || item.url}
+                        alt=""
+                      />
+                    ) : (
+                      <span className="agent-gallery-thumb agent-gallery-thumb-empty" />
+                    )}
+                    <span className="agent-gallery-copy">
+                      <span className="agent-gallery-prompt">{item.prompt || "No prompt"}</span>
+                      {item.negativePrompt ? (
+                        <span className="agent-gallery-neg">Negative: {item.negativePrompt}</span>
+                      ) : null}
+                      {process ? <span className="agent-gallery-meta">{process}</span> : null}
+                      {resources ? (
+                        <span className="agent-gallery-resources">Also used: {resources}</span>
+                      ) : null}
+                    </span>
+                  </button>
+                  {item.civitaiUrl ? (
+                    <a
+                      className={`ghost civitai-open-link ${
+                        item.nsfw ? "civitai-link-nsfw" : "civitai-link-sfw"
+                      }`}
+                      href={item.civitaiUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open
+                    </a>
+                  ) : null}
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      )}
+
       {tab === "agent" && agentFocus === "meta" && (
         <section className="panel gen-meta" aria-label="Generation meta">
           <p className="hint gen-meta-source">
@@ -7059,7 +7265,7 @@ export default function App() {
         </section>
       )}
 
-      {tab === "agent" && agentFocus !== "suggestions" && (
+      {tab === "agent" && agentFocus !== "suggestions" && agentFocus !== "gallery" && (
         <section className="panel">
           {renderAgentSubnav()}
           {civitaiSubview === "search" && (

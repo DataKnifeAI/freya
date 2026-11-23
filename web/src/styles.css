@@ -1137,6 +1137,25 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
 }
 .lora-card-actions button,
 .lora-card-actions a.ghost { padding: 0.3rem 0.6rem; font-size: 0.72rem; text-decoration: none; }
+.agent-gallery-list { list-style: none; margin: 0.4rem 0 0; padding: 0; display: grid; gap: 0.55rem; }
+.agent-gallery-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.45rem; align-items: start; }
+.agent-gallery-row {
+  display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 0.55rem;
+  text-align: left; background: transparent; border: 1px solid var(--line);
+  padding: 0.4rem; color: inherit; cursor: pointer; font: inherit;
+}
+.agent-gallery-row:hover { border-color: var(--ember); }
+.agent-gallery-thumb { width: 72px; height: 72px; object-fit: cover; background: var(--mat); display: block; }
+.agent-gallery-thumb-empty { border: 1px solid var(--mat-line); }
+.agent-gallery-copy { display: grid; gap: 0.2rem; min-width: 0; }
+.agent-gallery-prompt {
+  font-size: 0.78rem; line-height: 1.35;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
+.agent-gallery-neg, .agent-gallery-meta, .agent-gallery-resources {
+  font-size: 0.72rem; line-height: 1.35; color: var(--chrome-muted);
+}
+.agent-gallery-resources { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 a.civitai-open-link.civitai-link-nsfw {
   color: var(--ember) !important;
   border-color: color-mix(in srgb, var(--ember) 72%, transparent) !important;
