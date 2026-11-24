@@ -6211,6 +6211,40 @@ pub async fn civitai_images(
     })))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct CivitaiMediaQuery {
+    pub url: String,
+}
+
+/// Proxy Civitai community image/video bytes for same-origin `<video>` playback.
+pub async fn civitai_media(
+    State(state): State<AppState>,
+    Query(q): Query<CivitaiMediaQuery>,
+) -> ApiResult<Response> {
+    let url = q.url.trim();
+    if url.is_empty() || !crate::civitai::civitai_media_url_ok(url) {
+        return Err(ApiError::Msg("url must be https on image.civitai.com".into()));
+    }
+    let civ = state.civitai.read().await;
+    let (bytes, ct) = civ
+        .fetch_media(url)
+        .await
+        .map_err(|e| ApiError::Msg(e.to_string()))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, ct),
+            (header::CONTENT_DISPOSITION, "inline".into()),
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=86400, stale-while-revalidate=604800".into(),
+            ),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".into()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 fn civitai_detail_response(detail: crate::civitai::CivitaiModelDetail) -> Json<serde_json::Value> {
     // Recommended checkpoints are the base suggestion rows. Popular-family hits stay the fallback.
     let recommended: Vec<_> = detail

@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use tracing::debug;
 
 /// Installable weight types Freya surfaces by default (not every Civitai ModelType).
@@ -135,6 +136,30 @@ impl CivitaiClient {
 
     pub fn configured(&self) -> bool {
         !self.api_key.trim().is_empty()
+    }
+
+    /// Stream bytes from an allowlisted Civitai image/video CDN URL (follows redirects).
+    pub async fn fetch_media(&self, url: &str) -> Result<(Vec<u8>, String)> {
+        if !civitai_media_url_ok(url) {
+            return Err(anyhow!("media url not allowed"));
+        }
+        let resp = self
+            .http
+            .get(url.trim())
+            .send()
+            .await
+            .context("civitai media upstream")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("civitai media upstream {}", resp.status()));
+        }
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let bytes = resp.bytes().await.context("civitai media body")?;
+        Ok((bytes.to_vec(), ct))
     }
 
     pub async fn search(
@@ -526,6 +551,7 @@ impl CivitaiClient {
             .await
             .context("civitai community images")?;
         let mut items = parse_community_images_limited(&v, version_id, allow_nsfw, limit as usize);
+        items = dedupe_community_images(items);
         self.fill_resource_ids(&mut items).await;
         let (next_cursor, next_page) = if items.is_empty() {
             (None, None)
@@ -1312,6 +1338,9 @@ fn query_param(url: &str, key: &str) -> Option<String> {
 
 /// Grid preview. The original `url` stays the download and the detail image.
 fn civitai_preview_url(url: &str) -> String {
+    if civitai_video_url(url) {
+        return url.to_string();
+    }
     if let Some(start) = url.find("/width=") {
         let after = &url[start + "/width=".len()..];
         if let Some(slash) = after.find('/') {
@@ -1323,6 +1352,84 @@ fn civitai_preview_url(url: &str) -> String {
         }
     }
     url.replace("/original=true/", "/width=768/")
+}
+
+fn civitai_video_url(url: &str) -> bool {
+    let u = url.to_ascii_lowercase();
+    u.contains(".mp4") || u.contains(".webm") || u.contains(".mov")
+}
+
+/// Stable dedupe key: same Civitai file with thumbnail vs original paths counts once.
+pub fn canonical_community_media_key(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    if s.is_empty() || !s.starts_with("https://") {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(s).ok()?;
+    let host = parsed.host_str()?.to_ascii_lowercase();
+    if !civitai_media_host_ok(&host) {
+        return None;
+    }
+    let path = parsed
+        .path()
+        .replace("/width=768/", "/original=true/")
+        .replace("/width=512/", "/original=true/");
+    let file = path.rsplit('/').next()?.trim();
+    if file.is_empty() {
+        return None;
+    }
+    Some(format!("{host}/{file}").to_ascii_lowercase())
+}
+
+pub fn civitai_media_host_ok(host: &str) -> bool {
+    let h = host.trim().to_ascii_lowercase();
+    h == "image.civitai.com"
+        || h == "image.civitai.red"
+        || h == "blobs-b2.civitai.com"
+        || h.ends_with(".image.civitai.com")
+}
+
+/// Allowlisted Civitai CDN hosts for studio media proxy (`<video>` / download).
+pub fn civitai_media_url_ok(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    parsed
+        .host_str()
+        .is_some_and(civitai_media_host_ok)
+}
+
+pub fn dedupe_community_images(items: Vec<CommunityImage>) -> Vec<CommunityImage> {
+    let mut out = Vec::with_capacity(items.len());
+    let mut seen_ids = HashSet::new();
+    let mut seen_urls = HashSet::new();
+    for image in items {
+        let id_key = image.id.to_string();
+        if seen_ids.contains(&id_key) {
+            continue;
+        }
+        let url_key = canonical_community_media_key(
+            image
+                .url
+                .as_deref()
+                .or(image.thumbnail_url.as_deref()),
+        );
+        if url_key
+            .as_ref()
+            .is_some_and(|k| seen_urls.contains(k))
+        {
+            continue;
+        }
+        seen_ids.insert(id_key);
+        if let Some(k) = url_key {
+            seen_urls.insert(k);
+        }
+        out.push(image);
+    }
+    out
 }
 
 fn parse_community_image(
@@ -2083,6 +2190,95 @@ fn urlencoding_lite(s: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn community_images_dedupe_id_and_canonical_url() {
+        let items = vec![
+            CommunityImage {
+                id: 1,
+                post_id: None,
+                prompt: Some("a".into()),
+                negative_prompt: None,
+                sampler: None,
+                steps: None,
+                cfg: None,
+                seed: None,
+                clip_skip: None,
+                size: None,
+                url: Some(
+                    "https://image.civitai.com/x/a/original=true/a.jpeg".into(),
+                ),
+                thumbnail_url: Some(
+                    "https://image.civitai.com/x/a/width=768/a.jpeg".into(),
+                ),
+                media_type: Some("image".into()),
+                nsfw: false,
+                nsfw_level: None,
+                civitai_url: "https://civitai.com/images/1".into(),
+                resources: vec![],
+                model_version_ids: vec![],
+                checkpoint: None,
+                checkpoint_installed: false,
+                checkpoint_different: false,
+                missing_resources: vec![],
+            },
+            CommunityImage {
+                id: 2,
+                post_id: None,
+                prompt: Some("dup".into()),
+                negative_prompt: None,
+                sampler: None,
+                steps: None,
+                cfg: None,
+                seed: None,
+                clip_skip: None,
+                size: None,
+                url: Some(
+                    "https://image.civitai.com/x/a/width=512/a.jpeg".into(),
+                ),
+                thumbnail_url: None,
+                media_type: Some("image".into()),
+                nsfw: false,
+                nsfw_level: None,
+                civitai_url: "https://civitai.com/images/2".into(),
+                resources: vec![],
+                model_version_ids: vec![],
+                checkpoint: None,
+                checkpoint_installed: false,
+                checkpoint_different: false,
+                missing_resources: vec![],
+            },
+            CommunityImage {
+                id: 1,
+                post_id: None,
+                prompt: Some("repeat id".into()),
+                negative_prompt: None,
+                sampler: None,
+                steps: None,
+                cfg: None,
+                seed: None,
+                clip_skip: None,
+                size: None,
+                url: Some(
+                    "https://image.civitai.com/x/b/original=true/b.jpeg".into(),
+                ),
+                thumbnail_url: None,
+                media_type: Some("image".into()),
+                nsfw: false,
+                nsfw_level: None,
+                civitai_url: "https://civitai.com/images/1".into(),
+                resources: vec![],
+                model_version_ids: vec![],
+                checkpoint: None,
+                checkpoint_installed: false,
+                checkpoint_different: false,
+                missing_resources: vec![],
+            },
+        ];
+        let deduped = dedupe_community_images(items);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].id, 1);
+    }
 
     #[test]
     fn canonical_search_type_is_one_enum_value() {

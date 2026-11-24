@@ -355,7 +355,9 @@ function readImageFavorites() {
     const raw = localStorage.getItem(IMAGE_FAVORITES_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.map(normalizeImageFavorite).filter(Boolean) : [];
+    return dedupeCommunityItems(
+      Array.isArray(parsed) ? parsed.map(normalizeImageFavorite).filter(Boolean) : [],
+    );
   } catch {
     return [];
   }
@@ -367,6 +369,98 @@ function writeImageFavorites(list) {
   } catch {
     /* ignore quota */
   }
+}
+
+/** Civitai thumbnail vs original paths for the same file become one key. */
+function canonicalCommunityMediaUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s.startsWith("https://")) return "";
+  try {
+    const u = new URL(s);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname
+      .replace(/\/width=\d+\//gi, "/original=true/")
+      .replace(/\/original=true\//gi, "/original=true/");
+    const file = path.split("/").filter(Boolean).pop() || "";
+    if (!file) return "";
+    return `${host}/${file}`.toLowerCase();
+  } catch {
+    return s
+      .toLowerCase()
+      .split("#")[0]
+      .split("?")[0]
+      .replace(/\/width=\d+\//gi, "/original=true/");
+  }
+}
+
+function communityMediaKeys(item) {
+  const keys = [];
+  if (item?.id != null && String(item.id).trim() !== "") {
+    keys.push(`id:${item.id}`);
+  }
+  const urlKey = canonicalCommunityMediaUrl(item?.url || item?.thumbnailUrl);
+  if (urlKey) keys.push(`url:${urlKey}`);
+  return keys;
+}
+
+function communityItemsMatch(a, b) {
+  if (!a || !b) return false;
+  const setB = new Set(communityMediaKeys(b));
+  return communityMediaKeys(a).some((k) => setB.has(k));
+}
+
+function dedupeCommunityItems(items) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items || []) {
+    const keys = communityMediaKeys(item);
+    if (!keys.length) continue;
+    if (keys.some((k) => seen.has(k))) continue;
+    keys.forEach((k) => seen.add(k));
+    out.push(item);
+  }
+  return out;
+}
+
+function civitaiStudioMediaSrc(raw) {
+  const s = String(raw || "").trim();
+  if (!s || isMockMode()) return s;
+  if (!/^https:\/\/(image\.civitai\.(com|red)|blobs-b2\.civitai\.com)/i.test(s)) {
+    return s;
+  }
+  return `/v1/civitai/media?url=${encodeURIComponent(s)}`;
+}
+
+/** Load image favorites and migrate legacy community-image rows out of model favorites. */
+function bootstrapImageFavorites() {
+  let images = dedupeCommunityItems(readImageFavorites());
+  try {
+    const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
+    if (!raw) {
+      if (images.length) writeImageFavorites(images);
+      return images;
+    }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      if (images.length) writeImageFavorites(images);
+      return images;
+    }
+    const legacy = parsed
+      .filter((f) => f && f.kind === "community-image")
+      .map(normalizeImageFavorite)
+      .filter(Boolean);
+    const modelOnly = parsed.filter((f) => !f || f.kind !== "community-image");
+    if (legacy.length) {
+      images = dedupeCommunityItems([...legacy, ...images]);
+      writeImageFavorites(images);
+    }
+    if (legacy.length || modelOnly.length !== parsed.length) {
+      writeFavorites(modelOnly.slice(0, 200));
+    }
+  } catch {
+    /* quota / private mode */
+  }
+  return images;
 }
 
 function communityImageFilename(item) {
@@ -641,7 +735,7 @@ function communityPreviewSrc(item) {
   const url = String(item?.url || "");
   const thumb = String(item?.thumbnailUrl || "");
   if (isVideoArtifact(item, url) || isVideoArtifact(item, thumb)) {
-    return url || thumb;
+    return civitaiStudioMediaSrc(url || thumb);
   }
   return thumb || url;
 }
@@ -674,7 +768,8 @@ function CommunityMedia({ item, variant = "tile", className, alt = "" }) {
       <video
         className={className}
         src={src}
-        poster={poster || undefined}
+        crossOrigin="anonymous"
+        poster={poster ? civitaiStudioMediaSrc(poster) : undefined}
         muted
         loop
         playsInline
@@ -2565,7 +2660,7 @@ export default function App() {
   const [communityInstallId, setCommunityInstallId] = useState(null);
   const [communityMore, setCommunityMore] = useState(false);
   const [communityDetail, setCommunityDetail] = useState(null);
-  const [imageFavorites, setImageFavorites] = useState(readImageFavorites);
+  const [imageFavorites, setImageFavorites] = useState(bootstrapImageFavorites);
   const [favoriteType, setFavoriteType] = useState("LORA");
   const communitySentinelRef = useRef(null);
   const communityPagerRef = useRef({ key: "", cursor: null, page: null, done: true });
@@ -5660,8 +5755,7 @@ export default function App() {
       }`
     : "";
 
-  const imageFavorited = (item) =>
-    imageFavorites.some((f) => String(f.id) === String(item?.id));
+  const imageFavorited = (item) => imageFavorites.some((f) => communityItemsMatch(f, item));
 
   const originForContext = (ctx) => {
     if (!ctx) return null;
@@ -5677,17 +5771,22 @@ export default function App() {
   };
 
   const toggleImageFavorite = (item) => {
-    if (!item?.id) return;
+    if (!item) return;
+    const keys = communityMediaKeys(item);
+    if (!keys.length) return;
     setImageFavorites((prev) => {
-      const exists = prev.some((f) => String(f.id) === String(item.id));
+      const exists = prev.some((f) => communityItemsMatch(f, item));
       const ctx = galleryContext || {
         modelId: item.modelId ?? null,
         modelVersionId: item.modelVersionId ?? item.modelVersionIds?.[0] ?? null,
         name: item.modelName || "",
       };
       const next = exists
-        ? prev.filter((f) => String(f.id) !== String(item.id))
-        : [communityImageFavorite(item, ctx, originForContext(ctx)), ...prev].slice(0, 200);
+        ? prev.filter((f) => !communityItemsMatch(f, item))
+        : dedupeCommunityItems([
+            communityImageFavorite(item, ctx, originForContext(ctx)),
+            ...prev,
+          ]).slice(0, 200);
       writeImageFavorites(next);
       return next;
     });
@@ -5903,7 +6002,7 @@ export default function App() {
   const renderCommunityTile = (item) => {
     const checkpointLine = communityCheckpointLine(item);
     return (
-      <li key={item.id} className="agent-gallery-tile">
+      <li key={communityMediaKeys(item).join("|") || item.id} className="agent-gallery-tile">
         <button
           type="button"
           className="agent-gallery-shot"
@@ -5998,11 +6097,12 @@ export default function App() {
     const incoming = data.items || [];
     let added = incoming.length;
     setCommunityImages((prev) => {
-      if (!append) return incoming;
-      const seen = new Set(prev.map((item) => String(item.id)));
-      const extra = incoming.filter((item) => !seen.has(String(item.id)));
-      added = extra.length;
-      return extra.length ? [...prev, ...extra] : prev;
+      const merged = append ? [...prev, ...incoming] : incoming;
+      const next = dedupeCommunityItems(merged);
+      if (append) {
+        added = Math.max(0, next.length - prev.length);
+      }
+      return next;
     });
     rememberCommunityPage(data, { key, requested: cursor || "", append, added });
     if (!append) setCommunityNote("");
