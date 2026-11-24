@@ -5548,8 +5548,13 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
                 );
             }
         }
+        let worker_prompt = if loras.is_empty() {
+            final_prompt.clone()
+        } else {
+            crate::genmeta::strip_a1111_resource_tags(&final_prompt)
+        };
         let call = crate::worker::GenCall {
-            prompt: final_prompt.clone(),
+            prompt: worker_prompt.clone(),
             model: model.clone(),
             loras,
             size: req.size.clone(),
@@ -5632,11 +5637,22 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
         .checkpoint_path
         .as_deref()
         .and_then(|p| crate::reproduce::checkpoint_meta_from_path(p, batch.base_model.as_deref()));
+    let worker_prompt_stored = if backend == "local" && !req.loras.is_empty() {
+        let stripped = crate::genmeta::strip_a1111_resource_tags(&final_prompt);
+        if stripped != final_prompt {
+            Some(stripped)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let mut saved_all = Vec::new();
     for (bytes, seed) in &batch.images {
         let mut meta = ArtifactMeta {
             id: String::new(),
             prompt: req.prompt.clone(),
+            worker_prompt: worker_prompt_stored.clone(),
             enhanced_prompt: enhanced.clone(),
             backend: batch.backend.clone(),
             model: batch.model.clone(),

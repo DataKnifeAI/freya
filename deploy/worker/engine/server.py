@@ -13,6 +13,7 @@ import gc
 import io
 import logging
 import os
+import re
 import secrets
 import threading
 from pathlib import Path
@@ -27,6 +28,7 @@ from pydantic import BaseModel, Field
 LOG = logging.getLogger("freya-engine")
 
 MODELS_DIR = Path(os.environ.get("FREYA_MODELS_DIR", "/models")).resolve()
+_A1111_INLINE_TAG = re.compile(r"<(?:lora|lyco):[^>]+>", re.IGNORECASE)
 KEEP_LOADED = os.environ.get("FREYA_ENGINE_KEEP_LOADED", "0").strip() in (
     "1",
     "true",
@@ -223,7 +225,14 @@ def _apply_loras(pipe: Any, lora_request: list[dict[str, Any]] | None) -> list[s
         if not name:
             continue
         path = _resolve_lora_path(str(name))
-        scale = float(item.get("strength") or item.get("scale") or item.get("weight") or 1.0)
+        scale = float(
+            item.get("lora_scale")
+            or item.get("loraScale")
+            or item.get("strength")
+            or item.get("scale")
+            or item.get("weight")
+            or 1.0
+        )
         adapter = f"lora_{i}"
         LOG.info("load_lora %s -> %s scale=%s", name, path, scale)
         pipe.load_lora_weights(str(path.parent), weight_name=path.name, adapter_name=adapter)
@@ -351,14 +360,26 @@ def _random_seed() -> int:
     return secrets.randbelow(2_147_483_646) or 1
 
 
+def _strip_a1111_resource_tags(prompt: str) -> str:
+    return _A1111_INLINE_TAG.sub("", prompt).rstrip()
+
+
+def _sdxl_pipeline(pipe: Any) -> bool:
+    return pipe.__class__.__name__ == "StableDiffusionXLPipeline"
+
+
 def _call_pipe(pipe: Any, kwargs: dict[str, Any], clip_skip: int | None) -> tuple[Any, bool]:
     """Pass clip_skip when the pipeline accepts it. Never fail the generate over it."""
-    if clip_skip is None or int(clip_skip) <= 0:
+    skip = int(clip_skip) if clip_skip is not None else 0
+    if skip <= 1:
         return pipe(**kwargs), False
     trial = dict(kwargs)
-    trial["clip_skip"] = int(clip_skip)
+    trial["clip_skip"] = skip
     try:
-        return pipe(**trial), True
+        out = pipe(**trial)
+        if _sdxl_pipeline(pipe) and skip > 1:
+            return out, True
+        return out, True
     except TypeError as e:
         LOG.warning("clip_skip unsupported, stored only: %s", e)
     except Exception as e:
@@ -504,6 +525,17 @@ def generate(req: GenerateReq) -> JSONResponse:
     if not model:
         raise HTTPException(status_code=400, detail="model is required")
 
+    prompt = req.prompt.strip()
+    if req.lora_request:
+        cleaned = _strip_a1111_resource_tags(prompt)
+        if cleaned != prompt:
+            LOG.info(
+                "stripped inline lora tags from prompt (%d -> %d chars)",
+                len(prompt),
+                len(cleaned),
+            )
+            prompt = cleaned
+
     width, height = _parse_size(req.size)
     steps = max(1, min(int(req.steps or DEFAULT_STEPS), 80))
     guidance = _guidance(req)
@@ -522,7 +554,7 @@ def generate(req: GenerateReq) -> JSONResponse:
                 seed_i = (base_seed + i) & 0xFFFFFFFF
                 generator = torch.Generator(device=device).manual_seed(seed_i)
                 kwargs: dict[str, Any] = {
-                    "prompt": req.prompt,
+                    "prompt": prompt,
                     "num_inference_steps": steps,
                     "guidance_scale": guidance,
                     "width": width,
@@ -573,6 +605,7 @@ def generate(req: GenerateReq) -> JSONResponse:
                     "seed": base_seed,
                     "quantity": quantity,
                     "negative_prompt": req.negative_prompt,
+                    "workerPrompt": prompt if prompt != req.prompt.strip() else None,
                 }
             )
         except HTTPException:

@@ -40,6 +40,9 @@ pub struct ArtifactCheckpointMeta {
 pub struct ArtifactMeta {
     pub id: String,
     pub prompt: String,
+    /// Prompt after A1111 tag stripping, as sent to the diffusion worker (when it differs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enhanced_prompt: Option<String>,
     pub backend: String,
