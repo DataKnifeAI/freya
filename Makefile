@@ -59,6 +59,10 @@ run-worker: ## Run diffusion worker locally (stub PNG unless FREYA_ENGINE_URL se
 run-local-worker: ## Build/run Docker freya-local-worker with GPU + Diffusers
 	./scripts/run-local-worker.sh
 
+.PHONY: update-local-worker
+update-local-worker: ## Pull CR/image tag and recreate freya-local-worker (GPU host)
+	./scripts/update-local-worker.sh
+
 run-operator: ## Run operator (needs kubeconfig)
 	$(CARGO) run -p freya-operator --bin freya-operator
 

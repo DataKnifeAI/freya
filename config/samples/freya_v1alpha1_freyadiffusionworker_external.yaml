@@ -23,6 +23,12 @@ spec:
   # Public / LAN URL of freya-local-worker (or vLLM-Omni-compatible) — not the Freya UI host.
   externalEndpoint: https://vllm.dataknife.net
   engine: vllm-omni
+  # Desired worker image — patch tag here, then on the GPU host run:
+  #   ./scripts/update-local-worker.sh --from-cr freya-gpu
+  image:
+    repository: harbor.dataknife.net/library/freya-diffusion-worker
+    tag: "4a17ec9"
+    pullPolicy: Always
   # Must match FREYA_WORKER_TOKEN on the remote worker process
   authSecretRef:
     name: freya-worker-token

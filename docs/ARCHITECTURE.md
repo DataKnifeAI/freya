@@ -48,8 +48,8 @@ Never put API keys in CRD string fields — only Secret references.
 
 ## Worker placement
 
-- **external** (recommended) — `status.endpoint` = `spec.externalEndpoint`; API and `FreyaModelAsset` call that URL. Run the worker on the GPU host; do not assume in-cluster `nvidia.com/gpu`.
-- **incluster** (optional) — operator creates Deployment + models PVC + Service when the cluster actually has GPUs.
+- **external** (recommended) — `status.endpoint` = `spec.externalEndpoint`; API and `FreyaModelAsset` call that URL. Run the worker on the GPU host; do not assume in-cluster `nvidia.com/gpu`. Patch `spec.image` for the desired Harbor tag; roll the container on the GPU host with `./scripts/update-local-worker.sh --from-cr` (Studio cannot restart the URL).
+- **incluster** (optional) — operator creates Deployment + models PVC + Service when the cluster actually has GPUs. Changing `spec.image` reconciles the Deployment image and rolls the pod.
 
 How Studio reaches an external worker from pods:
 
