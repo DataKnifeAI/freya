@@ -1002,6 +1002,58 @@ const emptySession = () => ({
   sessionNote: "",
 });
 
+const BLANK_GEN_META = {
+  sampler: "",
+  cfg: "",
+  steps: "",
+  clipSkip: "",
+  negativePrompt: "",
+  seed: "",
+  size: "",
+  quantity: 1,
+  source: "",
+  sourceLabel: "",
+  locked: false,
+  lastSeed: null,
+  samplerApplied: "",
+  samplerNote: "",
+  clipSkipApplied: null,
+  enhance: "",
+};
+
+/** Normalize persisted session: promote legacy turns into chat messages. */
+function normalizeSession(raw) {
+  if (!raw || typeof raw !== "object") return emptySession();
+  const pinnedLoras = Array.isArray(raw.pinnedLoras) ? raw.pinnedLoras : [];
+  const turns = Array.isArray(raw.turns) ? raw.turns : [];
+  let messages = Array.isArray(raw.messages) ? raw.messages : [];
+  if (!messages.length && turns.length) {
+    messages = turns
+      .slice()
+      .reverse()
+      .flatMap((t) => {
+        const at = t.at || new Date().toISOString();
+        const out = [{ role: "user", content: t.prompt || "", at }];
+        if (t.artifactIds?.length) {
+          out.push({
+            role: "assistant",
+            content: `Generated ${t.artifactIds.length} image${t.artifactIds.length === 1 ? "" : "s"}.`,
+            at,
+            artifactIds: t.artifactIds,
+          });
+        }
+        return out;
+      });
+  }
+  return {
+    goal: raw.goal || "",
+    pinnedLoras,
+    turns,
+    messages,
+    sessionNote: raw.sessionNote || "",
+  };
+}
+
 function makeSessionId() {
   return `s_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
 }
@@ -3213,6 +3265,29 @@ export default function App() {
     } catch (e) {
       setError(e.message);
     }
+  };
+
+  /** Wipe composer prompt, Agent Meta, enhance, seed, and pinned LoRAs before a gallery Copy. */
+  const clearReproductionInputs = async () => {
+    setPrompt("");
+    setCommunityErr("");
+    setSavedMsg("");
+    const next = { ...BLANK_GEN_META };
+    genMetaDirtyRef.current = true;
+    genMetaRef.current = next;
+    setGenMeta(next);
+    setSession((prev) => {
+      void persistStudio({ pinnedLoras: [] });
+      return { ...prev, pinnedLoras: [], sessionNote: "" };
+    });
+    try {
+      await saveGenMeta(next);
+    } catch {
+      /* form and session state are already cleared */
+    }
+    setCommunityNote(
+      "Cleared the prompt, negative prompt, generation meta (enhance, seed, sampler fields), and pinned LoRAs.",
+    );
   };
 
   const submitLogin = async (e) => {
@@ -5980,7 +6055,7 @@ export default function App() {
     const promptWithTriggers = appendMissingLoraTriggers(prompt, lorasToPinEarly);
     if (promptWithTriggers) setPrompt(promptWithTriggers);
     const next = {
-      ...genMetaRef.current,
+      ...BLANK_GEN_META,
       sampler: sampler === "" ? "" : String(sampler),
       cfg,
       steps,
@@ -6056,23 +6131,29 @@ export default function App() {
     const postResources = postResourcesEarly;
     const lorasToPin = lorasToPinEarly;
     const pinNames = [];
+    const freshPins = [];
     for (const lora of lorasToPin) {
       const resource = postResourceForLora(lora, postResources);
       const scale = loraScaleDefault(lora, {}, resource?.weight);
-      const pinExtra = {
+      freshPins.push({
+        id: lora.id,
+        name: lora.name,
+        modelType: lora.modelType || lora.kind || "LORA",
+        downloadUrl: lora.downloadUrl,
+        triggerWord: lora.triggerWord || null,
+        baseModel: lora.baseModel || null,
+        path: lora.path || null,
+        versionId:
+          positiveId(resource?.modelVersionId ?? lora.versionId) ?? lora.versionId ?? null,
+        modelId: positiveId(resource?.modelId ?? lora.modelId) ?? lora.modelId ?? null,
         scale,
-        versionId: positiveId(resource?.modelVersionId ?? lora.versionId) ?? undefined,
-        modelId: positiveId(resource?.modelId ?? lora.modelId) ?? undefined,
-      };
-      if (!isPinned(lora)) {
-        pinLora(lora, pinExtra);
-      } else {
-        setPinScale(lora, scale);
-      }
-      pinNames.push(
-        `${lora.name || lora.path || "LoRA"}@${scale}`,
-      );
+      });
+      pinNames.push(`${lora.name || lora.path || "LoRA"}@${scale}`);
     }
+    setSession((prev) => {
+      void persistStudio({ pinnedLoras: freshPins });
+      return { ...prev, pinnedLoras: freshPins };
+    });
     const pinNote = pinNames.length ? ` Pinned ${pinNames.join(", ")}.` : "";
 
     let copied = false;
@@ -6164,6 +6245,18 @@ export default function App() {
           }}
         >
           <IconStar filled={saved} />
+        </button>
+        <button
+          type="button"
+          className="ghost icon-btn"
+          title="Clear prompt, meta, and pinned LoRAs"
+          aria-label="Clear inputs"
+          onClick={(e) => {
+            e.stopPropagation();
+            void clearReproductionInputs();
+          }}
+        >
+          <IconClear />
         </button>
         <button
           type="button"
@@ -7682,7 +7775,7 @@ export default function App() {
                   galleryContext.modelVersionId
                     ? ` · version ${galleryContext.modelVersionId}`
                     : ""
-                }. Click an image to open it. Copy fills the prompt, negative prompt, and generation meta. Favorite, copy, download, install, and the Civitai link sit under the image.`
+                }. Click an image to open it. Clear wipes prompt and meta; Copy fills them from that image. Favorite, copy, download, install, and the Civitai link sit under the image.`
               : "Open a model, or use a suggested or installed row, to list community images for that version."}
           </p>
           {communityBusy && <p className="hint">Loading community images…</p>}
@@ -7911,6 +8004,9 @@ export default function App() {
             <p className="hint">Clip skip {genMeta.clipSkip} is stored. The last generate could not apply it.</p>
           ) : null}
           <div className="row">
+            <button type="button" className="ghost" onClick={() => void clearReproductionInputs()}>
+              Clear
+            </button>
             <button type="button" className="ghost" onClick={() => void useExampleMeta()}>
               Use example
             </button>

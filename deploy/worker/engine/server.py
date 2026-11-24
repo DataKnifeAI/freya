@@ -29,6 +29,8 @@ LOG = logging.getLogger("freya-engine")
 
 MODELS_DIR = Path(os.environ.get("FREYA_MODELS_DIR", "/models")).resolve()
 _A1111_INLINE_TAG = re.compile(r"<(?:lora|lyco):[^>]+>", re.IGNORECASE)
+# Civitai / A1111 emphasis and attention weights — plain Diffusers ignores these.
+_A1111_ATTENTION = re.compile(r"\([^)]*:\s*\d+(?:\.\d+)?\)|\([^):]+\)")
 KEEP_LOADED = os.environ.get("FREYA_ENGINE_KEEP_LOADED", "0").strip() in (
     "1",
     "true",
@@ -368,8 +370,73 @@ def _sdxl_pipeline(pipe: Any) -> bool:
     return pipe.__class__.__name__ == "StableDiffusionXLPipeline"
 
 
+def _needs_a1111_prompt_parse(prompt: str, negative: str | None) -> bool:
+    blob = f"{prompt}\n{negative or ''}"
+    return bool(_A1111_ATTENTION.search(blob))
+
+
+def _encode_a1111_prompts(
+    pipe: Any, prompt: str, negative: str | None, clip_skip: int | None
+) -> dict[str, Any]:
+    """Encode with Compel so (word) and (word:1.2) match A1111-style conditioning."""
+    from compel import Compel, CompelForSDXL, ReturnedEmbeddingsType
+
+    skip = max(1, int(clip_skip) if clip_skip is not None else 1)
+    device = getattr(pipe, "device", _device())
+    if _sdxl_pipeline(pipe):
+        compel = CompelForSDXL(
+            text_encoder=[pipe.text_encoder, pipe.text_encoder_2],
+            tokenizer=[pipe.tokenizer, pipe.tokenizer_2],
+            returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
+            requires_pooled=[False, True],
+            truncate_long_prompts=False,
+            device=device,
+            clip_skip=skip,
+        )
+        pos = compel(prompt)
+        neg = compel(negative or "")
+        return {
+            "prompt_embeds": pos[0],
+            "pooled_prompt_embeds": pos[1],
+            "negative_prompt_embeds": neg[0],
+            "negative_pooled_prompt_embeds": neg[1],
+        }
+    compel = Compel(
+        tokenizer=pipe.tokenizer,
+        text_encoder=pipe.text_encoder,
+        truncate_long_prompts=False,
+        device=device,
+        clip_skip=skip,
+    )
+    out: dict[str, Any] = {"prompt_embeds": compel(prompt)}
+    if negative:
+        out["negative_prompt_embeds"] = compel(negative)
+    return out
+
+
+def _generation_prompt_kwargs(
+    pipe: Any, prompt: str, negative: str | None, clip_skip: int | None
+) -> dict[str, Any]:
+    if not _needs_a1111_prompt_parse(prompt, negative):
+        kwargs: dict[str, Any] = {"prompt": prompt}
+        if negative:
+            kwargs["negative_prompt"] = negative
+        return kwargs
+    try:
+        return _encode_a1111_prompts(pipe, prompt, negative, clip_skip)
+    except Exception as e:
+        LOG.warning("compel encode failed (%s); using raw prompt strings", e)
+        kwargs = {"prompt": prompt}
+        if negative:
+            kwargs["negative_prompt"] = negative
+        return kwargs
+
+
 def _call_pipe(pipe: Any, kwargs: dict[str, Any], clip_skip: int | None) -> tuple[Any, bool]:
     """Pass clip_skip when the pipeline accepts it. Never fail the generate over it."""
+    if kwargs.get("prompt_embeds") is not None:
+        skip = int(clip_skip) if clip_skip is not None else 0
+        return pipe(**kwargs), skip > 1
     skip = int(clip_skip) if clip_skip is not None else 0
     if skip <= 1:
         return pipe(**kwargs), False
@@ -461,15 +528,15 @@ def generate_gif(req: GenerateReq) -> JSONResponse:
             for i in range(frames):
                 gen = torch.Generator(device=device).manual_seed((base_seed + i * 17) & 0xFFFFFFFF)
                 kwargs: dict[str, Any] = {
-                    "prompt": req.prompt,
                     "num_inference_steps": steps,
                     "guidance_scale": guidance,
                     "width": width,
                     "height": height,
                     "generator": gen,
                 }
-                if req.negative_prompt:
-                    kwargs["negative_prompt"] = req.negative_prompt
+                kwargs.update(
+                    _generation_prompt_kwargs(pipe, req.prompt, req.negative_prompt, clip_skip)
+                )
                 out, used_clip = _call_pipe(pipe, kwargs, clip_skip)
                 clip_applied = clip_applied or used_clip
                 images.append(out.images[0])
@@ -554,15 +621,15 @@ def generate(req: GenerateReq) -> JSONResponse:
                 seed_i = (base_seed + i) & 0xFFFFFFFF
                 generator = torch.Generator(device=device).manual_seed(seed_i)
                 kwargs: dict[str, Any] = {
-                    "prompt": prompt,
                     "num_inference_steps": steps,
                     "guidance_scale": guidance,
                     "width": width,
                     "height": height,
                     "generator": generator,
                 }
-                if req.negative_prompt:
-                    kwargs["negative_prompt"] = req.negative_prompt
+                kwargs.update(
+                    _generation_prompt_kwargs(pipe, prompt, req.negative_prompt, clip_skip)
+                )
                 LOG.info(
                     "generate model=%s size=%sx%s steps=%s guidance=%s sampler=%s clip_skip=%s seed=%s i=%s loras=%s",
                     model,
