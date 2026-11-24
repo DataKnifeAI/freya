@@ -2242,6 +2242,11 @@ async fn execute_chat_action(
                 version_id,
                 model_id,
                 file_id: action.args.get("fileId").and_then(|x| x.as_i64()),
+                file_hash: action
+                    .args
+                    .get("fileHash")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string),
                 model_type: action
                     .args
                     .get("modelType")
@@ -3264,7 +3269,11 @@ async fn civitai_install_inner(
             .ok_or_else(|| ApiError::Msg("downloadUrl or versionId required to install".into()))?;
         let civ = state.civitai.read().await;
         let resolved = civ
-            .resolve_version_download(version_id, req.file_id)
+            .resolve_version_download(
+                version_id,
+                req.file_id,
+                req.file_hash.as_deref(),
+            )
             .await
             .map_err(ApiError::from)?;
         req.download_url = resolved.download_url;
@@ -3288,7 +3297,10 @@ async fn civitai_install_inner(
     if req.model_id.is_none() || req.thumbnail_url.is_none() {
         if let Some(version_id) = req.version_id {
             let civ = state.civitai.read().await;
-            if let Ok(resolved) = civ.resolve_version_download(version_id, req.file_id).await {
+            if let Ok(resolved) = civ
+                .resolve_version_download(version_id, req.file_id, req.file_hash.as_deref())
+                .await
+            {
                 if req.model_id.is_none() {
                     req.model_id = resolved.model_id;
                 }
@@ -6544,6 +6556,24 @@ pub struct InstallCivitaiRequest {
     pub dest_path: String,
     #[serde(default)]
     pub name: Option<String>,
+    /// Civitai base family — stored beside the weight for LoRA→checkpoint selection.
+    #[serde(default)]
+    pub base_model: Option<String>,
+    #[serde(default)]
+    pub version_id: Option<i64>,
+    /// Civitai model id — stored in sidecar meta for Installed → detail.
+    #[serde(default)]
+    pub model_id: Option<i64>,
+    #[serde(default)]
+    pub file_id: Option<i64>,
+    /// Civitai AutoV2/AutoV3/SHA256 prefix — selects a file when the version has several.
+    #[serde(default)]
+    pub file_hash: Option<String>,
+    #[serde(default)]
+    pub model_type: Option<String>,
+    /// Preview URL persisted in sidecar for Installed card thumbs.
+    #[serde(default)]
+    pub thumbnail_url: Option<String>,
 }
 
 /// Allowlist Civitai hosts before attaching the API token (never send token to untrusted URLs).

@@ -216,10 +216,40 @@ def _seed_generator(seed: int) -> torch.Generator:
     return gen.manual_seed(int(seed) & 0xFFFFFFFF)
 
 
+def _lora_cache_key(lora_request: list[dict[str, Any]] | None) -> list[str]:
+    """Model + ordered adapter identity including scale (VRAM cache key)."""
+    if not lora_request:
+        return []
+    keys: list[str] = []
+    for item in lora_request:
+        name = (
+            item.get("lora_name")
+            or item.get("loraName")
+            or item.get("name")
+            or item.get("path")
+        )
+        if not name:
+            continue
+        scale = float(
+            item.get("lora_scale")
+            or item.get("loraScale")
+            or item.get("strength")
+            or item.get("scale")
+            or item.get("weight")
+            or 1.0
+        )
+        keys.append(f"{name}@{scale:.4f}")
+    return keys
+
+
 def _apply_loras(pipe: Any, lora_request: list[dict[str, Any]] | None) -> list[str]:
     names: list[str] = []
     if not lora_request:
         return names
+    try:
+        pipe.unload_lora_weights()
+    except Exception:
+        pass
     adapters: list[str] = []
     weights: list[float] = []
     for i, item in enumerate(lora_request):
@@ -248,17 +278,8 @@ def _apply_loras(pipe: Any, lora_request: list[dict[str, Any]] | None) -> list[s
         weights.append(scale)
         names.append(path.stem)
     if adapters:
+        # Scaled PEFT adapters only — never fuse into weights (cached pipelines would stack).
         pipe.set_adapters(adapters, adapter_weights=weights)
-        # A1111 merges LoRA into weights; fuse single-adapter loads for closer conditioning.
-        if len(adapters) == 1:
-            try:
-                pipe.fuse_lora(
-                    adapter_names=adapters,
-                    lora_scale=weights[0],
-                    components=["unet", "text_encoder", "text_encoder_2"],
-                )
-            except Exception as e:
-                LOG.warning("fuse_lora failed (%s); keeping PEFT adapters", e)
     return names
 
 
@@ -268,12 +289,7 @@ def _ensure_pipe(
     lora_request: list[dict[str, Any]] | None,
 ) -> tuple[Any, list[str]]:
     global _pipe, _loaded_model, _loaded_loras
-    want_loras = []
-    if lora_request:
-        for item in lora_request:
-            n = item.get("lora_name") or item.get("loraName") or item.get("name") or item.get("path")
-            if n:
-                want_loras.append(str(n))
+    want_loras = _lora_cache_key(lora_request)
     same = (
         _pipe is not None
         and _loaded_model == model
@@ -392,23 +408,32 @@ def _needs_a1111_prompt_parse(prompt: str, negative: str | None) -> bool:
     return bool(_A1111_ATTENTION.search(blob))
 
 
+def _compel_embeddings_type(clip_skip: int | None, sdxl: bool):
+    from compel import ReturnedEmbeddingsType
+
+    skip = max(1, int(clip_skip) if clip_skip is not None else 1)
+    if skip > 1:
+        if sdxl:
+            return ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED
+        return ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NORMALIZED
+    return ReturnedEmbeddingsType.LAST_HIDDEN_STATES_NORMALIZED
+
+
 def _encode_a1111_prompts(
     pipe: Any, prompt: str, negative: str | None, clip_skip: int | None
 ) -> dict[str, Any]:
     """Encode with Compel so (word) and (word:1.2) match A1111-style conditioning."""
-    from compel import Compel, CompelForSDXL, ReturnedEmbeddingsType
+    from compel import Compel
 
-    skip = max(1, int(clip_skip) if clip_skip is not None else 1)
     device = getattr(pipe, "device", _device())
     if _sdxl_pipeline(pipe):
-        compel = CompelForSDXL(
-            text_encoder=[pipe.text_encoder, pipe.text_encoder_2],
+        compel = Compel(
             tokenizer=[pipe.tokenizer, pipe.tokenizer_2],
-            returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
+            text_encoder=[pipe.text_encoder, pipe.text_encoder_2],
+            returned_embeddings_type=_compel_embeddings_type(clip_skip, sdxl=True),
             requires_pooled=[False, True],
             truncate_long_prompts=False,
             device=device,
-            clip_skip=skip,
         )
         pos = compel(prompt)
         neg = compel(negative or "")
@@ -421,9 +446,9 @@ def _encode_a1111_prompts(
     compel = Compel(
         tokenizer=pipe.tokenizer,
         text_encoder=pipe.text_encoder,
+        returned_embeddings_type=_compel_embeddings_type(clip_skip, sdxl=False),
         truncate_long_prompts=False,
         device=device,
-        clip_skip=skip,
     )
     out: dict[str, Any] = {"prompt_embeds": compel(prompt)}
     if negative:

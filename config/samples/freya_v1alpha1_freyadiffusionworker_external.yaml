@@ -15,7 +15,7 @@ spec:
   #   ./scripts/update-local-worker.sh --from-cr freya-gpu
   image:
     repository: harbor.dataknife.net/library/freya-diffusion-worker
-    tag: "3094a5d"
+    tag: "7aa384c"
     pullPolicy: Always
   # Must match FREYA_WORKER_TOKEN on the remote worker process
   authSecretRef:

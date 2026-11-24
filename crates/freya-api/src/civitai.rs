@@ -276,6 +276,7 @@ impl CivitaiClient {
         &self,
         version_id: i64,
         file_id: Option<i64>,
+        file_hash: Option<&str>,
     ) -> Result<ResolvedDownload> {
         if !self.configured() {
             return Err(anyhow!(
@@ -303,6 +304,9 @@ impl CivitaiClient {
                 .files
                 .iter()
                 .find(|f| f.id == Some(fid))
+                .or_else(|| pick_primary_file(&version.files))
+        } else if let Some(hash) = file_hash.and_then(hash_token) {
+            pick_file_by_hash(&version.files, &hash)
                 .or_else(|| pick_primary_file(&version.files))
         } else {
             pick_primary_file(&version.files)
@@ -696,7 +700,7 @@ impl CivitaiClient {
         let version_id = detail
             .version_id
             .ok_or_else(|| anyhow!("civitai model {model_id}: no version"))?;
-        self.resolve_version_download(version_id, detail.file_id)
+        self.resolve_version_download(version_id, detail.file_id, None)
             .await
     }
 
@@ -809,6 +813,15 @@ fn parse_model_file(f: &Value) -> CivitaiModelFile {
         .get("type")
         .and_then(|x| x.as_str())
         .map(|s| s.to_string());
+    let hashes = f
+        .get("hashes")
+        .and_then(|h| h.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
     CivitaiModelFile {
         id: f.get("id").and_then(|x| x.as_i64()),
         name: f
@@ -824,6 +837,7 @@ fn parse_model_file(f: &Value) -> CivitaiModelFile {
             .get("downloadUrl")
             .and_then(|u| u.as_str())
             .map(|s| s.to_string()),
+        hashes,
     }
 }
 
@@ -1009,6 +1023,14 @@ fn parse_model_version(ver: &Value, image_limit: usize) -> CivitaiModelVersion {
 
 fn pick_primary_file(files: &[CivitaiModelFile]) -> Option<&CivitaiModelFile> {
     files.iter().find(|f| f.primary).or_else(|| files.first())
+}
+
+fn pick_file_by_hash<'a>(files: &'a [CivitaiModelFile], hash: &str) -> Option<&'a CivitaiModelFile> {
+    files.iter().find(|f| {
+        f.hashes
+            .values()
+            .any(|h| hashes_match(h, hash))
+    })
 }
 
 fn parse_model_card(item: &Value, detailed: bool) -> CivitaiModelCard {
@@ -2892,6 +2914,8 @@ pub struct CivitaiModelFile {
     pub primary: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub download_url: Option<String>,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub hashes: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
