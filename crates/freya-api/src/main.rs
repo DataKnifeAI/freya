@@ -9,6 +9,7 @@ mod gpu;
 mod k8s_secret;
 mod openrouter;
 mod prefs;
+mod reproduce;
 mod router;
 mod routes;
 mod state;
@@ -72,6 +73,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/gallery/{id}/image", get(routes::gallery_image))
         .route("/v1/gallery/{id}/remix", post(routes::gallery_remix))
+        .route("/v1/gallery/{id}/apply", post(routes::gallery_apply))
+        .route(
+            "/v1/reproduction/community",
+            post(routes::reproduction_community_apply),
+        )
         .route("/v1/models", get(routes::models))
         .route("/v1/styles", get(routes::styles_list))
         .route("/v1/route-defaults", get(routes::route_defaults))

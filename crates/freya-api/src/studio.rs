@@ -155,6 +155,23 @@ pub fn pin_add(prefs: &mut StudioPrefs, card: &Value) -> Result<Value, String> {
     Ok(card)
 }
 
+/// Pin or update scale on an existing pin without dropping other pin fields.
+pub fn pin_upsert(prefs: &mut StudioPrefs, card: &Value) -> Result<Value, String> {
+    let clean = sanitize_card(card, true)?;
+    let key = card_key(&clean);
+    if let Some(existing) = prefs
+        .pinned_loras
+        .iter_mut()
+        .find(|c| card_key(c) == key)
+    {
+        if let (Some(obj), Some(scale)) = (existing.as_object_mut(), clean.get("scale")) {
+            obj.insert("scale".into(), scale.clone());
+        }
+        return Ok(existing.clone());
+    }
+    pin_add(prefs, &clean)
+}
+
 pub fn pin_remove(prefs: &mut StudioPrefs, card: &Value) -> bool {
     let before = prefs.pinned_loras.len();
     prefs
@@ -241,7 +258,7 @@ pub fn sanitize_card(card: &Value, pin: bool) -> Result<Value, String> {
         }
     }
     if !out.contains_key("scale") && pin {
-        out.insert("scale".into(), json!(0.8));
+        out.insert("scale".into(), json!(1.0));
     }
     let has_id = out.contains_key("id") || out.contains_key("path") || out.contains_key("name");
     if !has_id {

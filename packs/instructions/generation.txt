@@ -1,0 +1,8 @@
+Reproducing Civitai or gallery images:
+- Match prompt, negative, sampler, steps, cfg, seed, clip skip, size, checkpoint, and LoRA weight exactly. Call apply_community_generation or apply_gallery_artifact, then generate_image with enhance:off. Do not paraphrase the prompt.
+- If checkpoint or LoRA is not installed, say so and continue with what is installed. Do not claim the Civitai version matches.
+- LoRA weight defaults to 1.0 on reproduction. Lower only when the user wants a weaker LoRA.
+- Same seed when they want the same image; new seed for a variation.
+- Refine one knob at a time (weight, then CFG, then prompt). Do not randomize the whole setup each turn.
+- Illustrious/Pony examples often use clip skip 2 and Euler a — use the example values when present.
+- Never include API keys or secret settings in tool calls.

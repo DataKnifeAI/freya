@@ -1,3 +1,4 @@
+use crate::civitai::CommunityImage;
 use crate::gallery::ArtifactMeta;
 use crate::prefs::{looks_nsfw_label, AlignmentPrefs, AutoFallbacksPrefs, PrivacyPrefs};
 use crate::state::{AppState, RuntimeSecrets};
@@ -1218,6 +1219,8 @@ fn is_side_effect_action(ty: &str) -> bool {
             | "set_automation_mode"
             | "set_generation_meta"
             | "recommend_generation_meta"
+            | "apply_gallery_artifact"
+            | "apply_community_generation"
             | "favorite_asset"
             | "unfavorite_asset"
             | "pin_lora"
@@ -2819,7 +2822,7 @@ async fn execute_chat_action(
             let mut err = None;
             {
                 let mut cfg = state.config.write().await;
-                if let Err(e) = crate::studio::pin_add(&mut cfg.studio, &card) {
+                if let Err(e) = crate::studio::pin_upsert(&mut cfg.studio, &card) {
                     err = Some(e);
                 }
             }
@@ -3093,21 +3096,117 @@ async fn execute_chat_action(
                 return action_error(ty, &action.args, msg);
             }
             let patch = crate::genmeta::patch_from_value(&action.args);
-            if !patch.any() {
+            let pin_weights = action
+                .args
+                .get("loraWeights")
+                .or_else(|| action.args.get("lora_weights"))
+                .and_then(|v| v.as_array());
+            if !patch.any() && pin_weights.is_none() {
                 return action_error(
                     ty,
                     &action.args,
-                    "provide sampler, cfg, steps, clipSkip, negativePrompt, seed, size, or quantity",
+                    "provide sampler, cfg, steps, clipSkip, negativePrompt, seed, size, quantity, enhance, or loraWeights",
                 );
             }
             let mut settings = state.config.read().await.studio.generation.clone();
-            settings.apply_patch(&patch, "agent", true);
-            write_generation(state, &settings).await;
+            if patch.any() {
+                settings.apply_patch(&patch, "agent", true);
+                write_generation(state, &settings).await;
+            }
+            if let Some(weights) = pin_weights {
+                let mut cfg = state.config.write().await;
+                for w in weights {
+                    let name = w.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+                    let path = w.get("path").and_then(|p| p.as_str()).unwrap_or("").trim();
+                    let scale = w.get("scale").and_then(|s| s.as_f64());
+                    if name.is_empty() && path.is_empty() {
+                        continue;
+                    }
+                    let mut card = json!({ "name": name, "path": path });
+                    if let Some(s) = scale {
+                        card["scale"] = json!(s);
+                    }
+                    let _ = crate::studio::pin_upsert(&mut cfg.studio, &card);
+                }
+                let _ = state.persist_secrets().await;
+            }
+            let pins = state.config.read().await.studio.pinned_loras.clone();
             action_ok(
                 ty,
                 &action.args,
-                json!({ "settings": settings, "persisted": true }),
+                json!({ "settings": settings, "pinnedLoras": pins, "persisted": true }),
             )
+        }
+        "apply_gallery_artifact" => {
+            let id = action
+                .args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(id) = id else {
+                return action_error(ty, &action.args, "missing id");
+            };
+            let meta = match state.gallery.get(id).await {
+                Ok(Some(m)) => m,
+                Ok(None) => return action_error(ty, &action.args, "gallery artifact not found"),
+                Err(e) => return action_error(ty, &action.args, e.to_string()),
+            };
+            let inventory = studio_inventory(state).await;
+            let mut settings = state.config.read().await.studio.generation.clone();
+            let mut studio = state.config.read().await.studio.clone();
+            let out = crate::reproduce::apply_gallery_meta(&meta, &inventory, &mut settings, &mut studio);
+            {
+                let mut cfg = state.config.write().await;
+                cfg.studio.generation = settings.clone();
+                cfg.studio.pinned_loras = studio.pinned_loras.clone();
+            }
+            let _ = state.persist_secrets().await;
+            if let Some(ck) = meta.checkpoint.as_ref().and_then(|c| c.path.as_deref()) {
+                if inventory
+                    .installed
+                    .iter()
+                    .any(|a| a.path == ck)
+                {
+                    if let Some(w) = state.worker.read().await.as_ref() {
+                        let family = meta
+                            .base_model
+                            .as_deref()
+                            .or_else(|| meta.checkpoint.as_ref().map(|c| c.name.as_str()));
+                        let _ = w.set_active_base(ck, family).await;
+                    }
+                }
+            }
+            write_generation(state, &settings).await;
+            action_ok(ty, &action.args, serde_json::to_value(&out).unwrap_or(json!({})))
+        }
+        "apply_community_generation" => {
+            let image: CommunityImage = match serde_json::from_value(action.args.clone()) {
+                Ok(i) => i,
+                Err(e) => {
+                    return action_error(ty, &action.args, format!("invalid community image: {e}"));
+                }
+            };
+            let inventory = studio_inventory(state).await;
+            let mut settings = state.config.read().await.studio.generation.clone();
+            let mut studio = state.config.read().await.studio.clone();
+            let out =
+                crate::reproduce::apply_community_image(&image, &inventory, &mut settings, &mut studio);
+            {
+                let mut cfg = state.config.write().await;
+                cfg.studio.generation = settings.clone();
+                cfg.studio.pinned_loras = studio.pinned_loras.clone();
+            }
+            let _ = state.persist_secrets().await;
+            if let Some(base) = crate::reproduce::installed_checkpoint_for_image(&image, &inventory) {
+                if let Some(w) = state.worker.read().await.as_ref() {
+                    let _ = w
+                        .set_active_base(&base.path, image.checkpoint.as_deref())
+                        .await;
+                }
+            }
+            write_generation(state, &settings).await;
+            action_ok(ty, &action.args, serde_json::to_value(&out).unwrap_or(json!({})))
         }
         other => json!({
             "type": other,
@@ -3411,7 +3510,7 @@ fn lora_from_pin_value(v: &Value) -> Option<LoraIn> {
     }
     Some(LoraIn {
         name: name.to_string(),
-        scale: v.get("scale").and_then(|s| s.as_f64()).unwrap_or(0.8) as f32,
+        scale: v.get("scale").and_then(|s| s.as_f64()).unwrap_or(1.0) as f32,
         path: v.get("path").and_then(|p| p.as_str()).map(str::to_string),
         base_model: v
             .get("baseModel")
@@ -5273,7 +5372,22 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     req.quantity = Some(prepared.quantity);
 
     let backend = req.backend.clone().unwrap_or_else(|| "openrouter".into());
-    let enhance = req.enhance.clone().unwrap_or_else(|| "auto".into());
+    let enhance = {
+        let from_req = req
+            .enhance
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Some(e) = from_req {
+            e
+        } else {
+            let gen = state.config.read().await.studio.generation.enhance.clone();
+            gen.filter(|e| !e.trim().is_empty())
+                .unwrap_or_else(|| "auto".into())
+        }
+    };
+    let enhance_on = crate::prefs::enhance_enabled(&enhance);
     let (alignment, privacy, auto_fallbacks, chat_pin) = {
         let cfg = state.config.read().await;
         (
@@ -5386,6 +5500,7 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
         model: String,
         backend: String,
         base_model: Option<String>,
+        checkpoint_path: Option<String>,
         sampler_applied: Option<String>,
         sampler_note: Option<String>,
         clip_skip_applied: bool,
@@ -5430,6 +5545,7 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
             model: motion.model,
             backend: motion.backend,
             base_model: None,
+            checkpoint_path: None,
             sampler_applied: applied,
             sampler_note: note,
             clip_skip_applied: clip_ok,
@@ -5542,6 +5658,7 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
             model: model.clone().unwrap_or_else(|| "local".into()),
             backend: "local".into(),
             base_model: active_base_label,
+            checkpoint_path: model.clone(),
             sampler_applied: result.scheduler.clone().or(result.sampler.clone()),
             sampler_note: result.sampler_note.clone(),
             clip_skip_applied: result.clip_skip_applied.unwrap_or(false),
@@ -5576,6 +5693,7 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
             model: model.unwrap_or(default_image),
             backend: "openrouter".into(),
             base_model: None,
+            checkpoint_path: None,
             sampler_applied: None,
             sampler_note: Some(note.into()),
             clip_skip_applied: false,
@@ -5585,6 +5703,21 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     };
 
     let lora_names: Vec<String> = req.loras.iter().map(|l| l.name.clone()).collect();
+    let lora_pins: Vec<crate::gallery::ArtifactLoraMeta> = req
+        .loras
+        .iter()
+        .map(|l| crate::gallery::ArtifactLoraMeta {
+            name: l.name.clone(),
+            path: l.path.clone(),
+            scale: l.scale,
+            model_id: l.model_id,
+            version_id: l.version_id,
+        })
+        .collect();
+    let checkpoint = batch
+        .checkpoint_path
+        .as_deref()
+        .and_then(|p| crate::reproduce::checkpoint_meta_from_path(p, batch.base_model.as_deref()));
     let mut saved_all = Vec::new();
     for (bytes, seed) in &batch.images {
         let mut meta = ArtifactMeta {
@@ -5595,6 +5728,9 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
             model: batch.model.clone(),
             style_ref: req.style_ref.clone(),
             loras: lora_names.clone(),
+            lora_pins: lora_pins.clone(),
+            checkpoint: checkpoint.clone(),
+            enhance_on: Some(enhance_on),
             created_at: String::new(),
             mime: batch.mime.clone(),
             filename: String::new(),
@@ -5950,7 +6086,70 @@ pub async fn gallery_remix(
         "model": meta.model,
         "styleRef": meta.style_ref,
         "loras": meta.loras,
+        "loraPins": meta.lora_pins,
+        "checkpoint": meta.checkpoint,
     })))
+}
+
+/// Load sidecar meta into generation settings, pins, and enhance-off (does not download).
+pub async fn gallery_apply(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let meta = state
+        .gallery
+        .get(&id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or(ApiError::NotFound)?;
+    let inventory = studio_inventory(&state).await;
+    let mut settings = state.config.read().await.studio.generation.clone();
+    let mut studio = state.config.read().await.studio.clone();
+    let out = crate::reproduce::apply_gallery_meta(&meta, &inventory, &mut settings, &mut studio);
+    {
+        let mut cfg = state.config.write().await;
+        cfg.studio.generation = settings.clone();
+        cfg.studio.pinned_loras = studio.pinned_loras.clone();
+    }
+    let persisted = state.persist_secrets().await.is_ok();
+    if let Some(ck) = meta.checkpoint.as_ref().and_then(|c| c.path.as_deref()) {
+        if inventory.installed.iter().any(|a| a.path == ck) {
+            if let Some(w) = state.worker.read().await.as_ref() {
+                let family = meta
+                    .base_model
+                    .as_deref()
+                    .or_else(|| meta.checkpoint.as_ref().map(|c| c.name.as_str()));
+                let _ = w.set_active_base(ck, family).await;
+            }
+        }
+    }
+    write_generation(&state, &settings).await;
+    Ok(Json(json!({ "applied": out, "meta": meta, "persisted": persisted })))
+}
+
+pub async fn reproduction_community_apply(
+    State(state): State<AppState>,
+    Json(image): Json<CommunityImage>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let inventory = studio_inventory(&state).await;
+    let mut settings = state.config.read().await.studio.generation.clone();
+    let mut studio = state.config.read().await.studio.clone();
+    let out = crate::reproduce::apply_community_image(&image, &inventory, &mut settings, &mut studio);
+    {
+        let mut cfg = state.config.write().await;
+        cfg.studio.generation = settings.clone();
+        cfg.studio.pinned_loras = studio.pinned_loras.clone();
+    }
+    let persisted = state.persist_secrets().await.is_ok();
+    if let Some(base) = crate::reproduce::installed_checkpoint_for_image(&image, &inventory) {
+        if let Some(w) = state.worker.read().await.as_ref() {
+            let _ = w
+                .set_active_base(&base.path, image.checkpoint.as_deref())
+                .await;
+        }
+    }
+    write_generation(&state, &settings).await;
+    Ok(Json(json!({ "applied": out, "persisted": persisted })))
 }
 
 async fn models_payload(state: &AppState) -> ApiResult<serde_json::Value> {
@@ -6867,7 +7066,9 @@ pub async fn generation_meta_put(
         _ => "user",
     };
     let mut settings = state.config.read().await.studio.generation.clone();
-    settings.apply_patch(&patch, source, true);
+    if patch.any() {
+        settings.apply_patch(&patch, source, true);
+    }
     if source == "gallery" {
         if let Some(label) = body
             .get("sourceLabel")
@@ -6878,8 +7079,32 @@ pub async fn generation_meta_put(
             settings.source_label = Some(label.chars().take(160).collect());
         }
     }
-    write_generation(&state, &settings).await;
-    Ok(Json(json!({ "settings": settings, "persisted": true })))
+    let pin_weights = body
+        .get("loraWeights")
+        .or_else(|| body.get("lora_weights"))
+        .and_then(|v| v.as_array());
+    if pin_weights.is_some() || patch.any() {
+        write_generation(&state, &settings).await;
+    }
+    if let Some(weights) = pin_weights {
+        let mut cfg = state.config.write().await;
+        for w in weights {
+            let name = w.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+            let path = w.get("path").and_then(|p| p.as_str()).unwrap_or("").trim();
+            let scale = w.get("scale").and_then(|s| s.as_f64());
+            if name.is_empty() && path.is_empty() {
+                continue;
+            }
+            let mut card = json!({ "name": name, "path": path });
+            if let Some(s) = scale {
+                card["scale"] = json!(s);
+            }
+            let _ = crate::studio::pin_upsert(&mut cfg.studio, &card);
+        }
+        let _ = state.persist_secrets().await;
+    }
+    let pins = state.config.read().await.studio.pinned_loras.clone();
+    Ok(Json(json!({ "settings": settings, "pinnedLoras": pins, "persisted": true })))
 }
 
 pub async fn studio_get(State(state): State<AppState>) -> Json<crate::studio::StudioPrefs> {

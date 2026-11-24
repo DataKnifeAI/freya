@@ -2338,7 +2338,7 @@ export async function mockApi(path, opts = {}) {
         civitaiUrl: `https://civitai.com/images/11${versionQuery}`,
         resources: [
           { name: "waiNSFWIllustrious_v100", type: "Checkpoint", hash: "7e87327f89" },
-          { name: "example-lora", type: "lora", weight: 0.8, modelVersionId: 1490040 },
+          { name: "example-lora", type: "lora", weight: 1, modelVersionId: 1490040 },
         ],
         modelVersionIds: modelVersionId ? [modelVersionId] : [],
         checkpoint: "waiNSFWIllustrious_v100",

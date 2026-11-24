@@ -87,6 +87,21 @@ pub struct GenerationMetaArgs {
     pub size: Option<String>,
     #[serde(default)]
     pub quantity: Option<u32>,
+    /// `auto` | `off` | `on` | `prompt-prose` | `prompt-sd`. Use `off` when reproducing a Civitai or gallery image.
+    #[serde(default)]
+    pub enhance: Option<String>,
+    #[serde(default)]
+    pub lora_weights: Option<Vec<LoraWeightPatch>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LoraWeightPatch {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    pub scale: f64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -94,6 +109,20 @@ pub struct GenerationMetaArgs {
 pub struct GalleryGetArgs {
     /// Artifact UUID from gallery_list / generate_image.
     pub id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GalleryApplyArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityApplyArgs {
+    /// Community image object from civitai_images (prompt, resources, sampler, …).
+    #[serde(flatten)]
+    pub image: Value,
 }
 
 /// One Civitai model type. Call `civitai_search` again to search a different type.
@@ -426,7 +455,7 @@ impl FreyaMcp {
     }
 
     #[tool(
-        description = "Generate an image via Freya (OpenRouter by default, or local worker when backend=local)"
+        description = "Generate an image via Freya (OpenRouter by default, or local worker when backend=local). To reproduce a Civitai or gallery image, call apply_community_generation or apply_gallery_artifact first, then generate with enhance=off and the exact prompt — do not paraphrase."
     )]
     async fn generate_image(
         &self,
@@ -469,13 +498,47 @@ impl FreyaMcp {
         json_ok(v)
     }
 
-    #[tool(description = "Get one Freya gallery artifact metadata by id")]
+    #[tool(
+        description = "Get one Freya gallery artifact metadata by id (full sidecar: sampler, seed, LoRA pins with scale, checkpoint, enhance flag)."
+    )]
     async fn gallery_get(
         &self,
         Parameters(args): Parameters<GalleryGetArgs>,
     ) -> Result<CallToolResult, McpError> {
         let path = crate::api::bind_path_segment("/v1/gallery", &args.id, "").map_err(map_err)?;
         let v = self.api.get_json(&path).await.map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Load a gallery artifact into generation meta, session LoRA pins (installed only), and enhance:off. Returns prompt to pass verbatim to generate_image. Does not download missing files."
+    )]
+    async fn apply_gallery_artifact(
+        &self,
+        Parameters(args): Parameters<GalleryApplyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let path =
+            crate::api::bind_path_segment("/v1/gallery", &args.id, "/apply").map_err(map_err)?;
+        let v = self
+            .api
+            .post_json(&path, &json!({}))
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Load a Civitai community post into generation meta, pins (installed LoRAs at post weight, default 1), and enhance:off. Pass one item from civitai_images. Then generate_image with enhance=off and the returned prompt unchanged."
+    )]
+    async fn apply_community_generation(
+        &self,
+        Parameters(args): Parameters<CommunityApplyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .api
+            .post_json("/v1/reproduction/community", &args.image)
+            .await
+            .map_err(map_err)?;
         json_ok(v)
     }
 
@@ -876,7 +939,7 @@ impl FreyaMcp {
     }
 
     #[tool(
-        description = "Read generation meta (sampler, cfg, steps, clip skip, negative, seed, size, quantity). No secrets. Fills a recommendation from the selected Civitai example when the store is empty."
+        description = "Read generation meta (sampler, cfg, steps, clip skip, negative, seed, size, quantity, enhance). Combine with list_pins for LoRA weights. No secrets."
     )]
     async fn get_generation_meta(&self) -> Result<CallToolResult, McpError> {
         let v = self
@@ -888,7 +951,7 @@ impl FreyaMcp {
     }
 
     #[tool(
-        description = "Set generation meta used by the next local generate and shown on Agent → Meta. No secrets. Seed omitted stays as stored; clearSeed true makes the next seed random."
+        description = "Set generation meta and optional LoRA weights (loraWeights). Use enhance=off when reproducing. No secrets."
     )]
     async fn set_generation_meta(
         &self,
@@ -920,6 +983,18 @@ impl FreyaMcp {
         }
         if let Some(n) = args.quantity {
             body.insert("quantity".into(), json!(n));
+        }
+        if let Some(e) = args.enhance {
+            body.insert("enhance".into(), json!(e));
+        }
+        if let Some(weights) = args.lora_weights {
+            let arr: Vec<Value> = weights
+                .iter()
+                .map(|w| json!({ "name": w.name, "path": w.path, "scale": w.scale }))
+                .collect();
+            if !arr.is_empty() {
+                body.insert("loraWeights".into(), json!(arr));
+            }
         }
         let v = self
             .api

@@ -98,6 +98,9 @@ pub struct GenerationSettings {
     pub sampler_note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clip_skip_applied: Option<bool>,
+    /// `auto` | `off` | `on` | `prompt-prose` | `prompt-sd`. `off` skips prompt enhance on the next generate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enhance: Option<String>,
 }
 
 impl Default for GenerationSettings {
@@ -119,6 +122,7 @@ impl Default for GenerationSettings {
             sampler_applied: None,
             sampler_note: None,
             clip_skip_applied: None,
+            enhance: None,
         }
     }
 }
@@ -139,6 +143,8 @@ pub struct GenPatch {
     pub size: Option<String>,
     pub clear_size: bool,
     pub quantity: Option<u32>,
+    pub enhance: Option<String>,
+    pub clear_enhance: bool,
 }
 
 impl GenPatch {
@@ -157,6 +163,8 @@ impl GenPatch {
             || self.size.is_some()
             || self.clear_size
             || self.quantity.is_some()
+            || self.enhance.is_some()
+            || self.clear_enhance
     }
 }
 
@@ -370,6 +378,16 @@ impl GenerationSettings {
         if let Some(n) = patch.quantity {
             self.quantity = Some(clamp_quantity(n));
         }
+        if patch.clear_enhance {
+            self.enhance = None;
+        } else if let Some(e) = patch.enhance.as_deref() {
+            let t = e.trim();
+            self.enhance = if t.is_empty() {
+                None
+            } else {
+                Some(t.chars().take(32).collect())
+            };
+        }
         if lock {
             self.locked = true;
             self.source = Some(source.to_string());
@@ -499,6 +517,14 @@ pub fn patch_from_value(v: &Value) -> GenPatch {
         let raw = obj.get("quantity").or_else(|| obj.get("n"));
         if let Some(n) = raw.and_then(num_u32) {
             p.quantity = Some(n);
+        }
+    }
+    if obj.contains_key("enhance") {
+        match obj.get("enhance") {
+            Some(Value::Null) => p.clear_enhance = true,
+            Some(Value::String(s)) if s.trim().is_empty() => p.clear_enhance = true,
+            Some(Value::String(s)) => p.enhance = Some(s.clone()),
+            _ => {}
         }
     }
     p
