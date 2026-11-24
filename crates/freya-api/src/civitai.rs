@@ -1964,7 +1964,7 @@ fn checkpoint_of(image: &CommunityImage) -> Option<&CommunityImageResource> {
     found
 }
 
-fn resource_matches(resource: &CommunityImageResource, asset: &InstalledAssetMatch) -> bool {
+pub fn resource_matches(resource: &CommunityImageResource, asset: &InstalledAssetMatch) -> bool {
     match (
         resource.model_version_id.filter(|n| *n > 0),
         asset.version_id.filter(|n| *n > 0),

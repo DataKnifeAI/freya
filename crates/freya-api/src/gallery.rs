@@ -7,6 +7,36 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ArtifactLoraMeta {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default = "lora_scale_one")]
+    pub scale: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<i64>,
+}
+
+fn lora_scale_one() -> f32 {
+    1.0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactCheckpointMeta {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ArtifactMeta {
     pub id: String,
     pub prompt: String,
@@ -18,6 +48,13 @@ pub struct ArtifactMeta {
     pub style_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loras: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lora_pins: Vec<ArtifactLoraMeta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<ArtifactCheckpointMeta>,
+    /// False when the prompt was sent unchanged (enhance off or reproduction).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enhance_on: Option<bool>,
     pub created_at: String,
     pub mime: String,
     pub filename: String,

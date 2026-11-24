@@ -2273,6 +2273,20 @@ function resourceLooksLikeLora(resource) {
   return kindBucket(resource?.type || resource?.modelType) === "lora";
 }
 
+function loraScaleDefault(item, extra = {}, resourceWeight) {
+  const candidates = [
+    extra.scale,
+    item?.scale,
+    item?.weight,
+    item?.strength,
+    resourceWeight,
+  ];
+  for (const c of candidates) {
+    if (c != null && c !== "" && !Number.isNaN(Number(c))) return Number(c);
+  }
+  return 1.0;
+}
+
 /** Installed LoRAs named on a community post — does not download missing files. */
 function installedLorasFromPostResources(item, installed) {
   const pinnable = (installed || []).filter(isPinnableAsset);
@@ -2641,6 +2655,7 @@ export default function App() {
     samplerApplied: "",
     samplerNote: "",
     clipSkipApplied: null,
+    enhance: "",
   });
   const genMetaRef = useRef(genMeta);
   genMetaRef.current = genMeta;
@@ -3099,6 +3114,7 @@ export default function App() {
       samplerApplied: s.samplerApplied || "",
       samplerNote: s.samplerNote || "",
       clipSkipApplied: s.clipSkipApplied ?? null,
+      enhance: s.enhance || "",
     };
     genMetaDirtyRef.current = false;
     genMetaRef.current = next;
@@ -3125,6 +3141,7 @@ export default function App() {
       clearSeed: form.seed === "" || form.seed == null,
       size: form.size || null,
       quantity: num(form.quantity) || 1,
+      enhance: form.enhance === "off" ? "off" : null,
     };
     if (extra.source) body.source = extra.source;
     if (extra.sourceLabel) body.sourceLabel = extra.sourceLabel;
@@ -3813,7 +3830,7 @@ export default function App() {
         name: l.path
           ? String(l.path).split("/").pop().replace(/\.safetensors$/i, "")
           : l.name,
-        scale: l.scale ?? 0.8,
+        scale: l.scale ?? 1.0,
         path: l.path || undefined,
         baseModel: l.baseModel || undefined,
         versionId: positiveId(l.versionId) ?? undefined,
@@ -3832,7 +3849,10 @@ export default function App() {
         modelType: item.modelType,
         downloadUrl: item.downloadUrl,
         triggerWord: item.triggerWord || null,
-        scale: 0.8,
+        baseModel: item.baseModel || null,
+        path: extra.path || item.path || null,
+        versionId: item.versionId || null,
+        scale: loraScaleDefault(item, extra),
       };
       const baseHint = item.baseModel
         ? ` Needs base family “${item.baseModel}” on the local worker (Worker → active base / install checkpoint).`
@@ -3848,6 +3868,18 @@ export default function App() {
       };
     });
     setSavedMsg(`Pinned ${item.name} for this session.`);
+  };
+
+  const setPinScale = (item, scale) => {
+    const n = Number(scale);
+    if (Number.isNaN(n) || n < 0 || n > 2) return;
+    setSession((prev) => {
+      const pinnedLoras = (prev.pinnedLoras || []).map((p) =>
+        loraKey(p) === loraKey(item) ? { ...p, scale: n } : p,
+      );
+      void persistStudio({ pinnedLoras });
+      return { ...prev, pinnedLoras };
+    });
   };
 
   const unpinLora = (item) => {
@@ -4234,8 +4266,12 @@ export default function App() {
     // Pinned LoRAs only apply on the local worker — prefer local when a worker is set.
     const body = {
       prompt: nlPrompt,
-      enhance: "auto",
-      backend: loras.length && hasWorker() ? "local" : "auto",
+      enhance: genMetaRef.current?.enhance === "off" ? "off" : "auto",
+      backend: wantLocal
+        ? "local"
+        : loras.length && hasWorker() && !looksGif && !looksVideo
+          ? "local"
+          : "openrouter",
       loras,
       automationMode,
     };
@@ -5901,6 +5937,7 @@ export default function App() {
       seed,
       size: size ? String(size) : "",
       negativePrompt: negative,
+      enhance: "off",
       source: "gallery",
       sourceLabel: "Community image",
       locked: true,
@@ -5965,14 +6002,26 @@ export default function App() {
       baseNote = ` Checkpoint “${item.checkpoint}” is not installed.`;
     }
 
+    const postResources = Array.isArray(item?.resources) ? item.resources : [];
     const contextLora = installedGalleryContextLora(galleryContext, installedAssets);
     const lorasToPin = contextLora
       ? [contextLora]
       : installedLorasFromPostResources(item, installedAssets);
     const pinNames = [];
     for (const lora of lorasToPin) {
-      if (!isPinned(lora)) pinLora(lora);
-      pinNames.push(lora.name || lora.path || "LoRA");
+      const resource =
+        postResources.find(
+          (r) => resourceLooksLikeLora(r) && findInstalledResource(r, [lora]),
+        ) || null;
+      const scale = loraScaleDefault(lora, {}, resource?.weight);
+      if (!isPinned(lora)) {
+        pinLora(lora, { scale });
+      } else {
+        setPinScale(lora, scale);
+      }
+      pinNames.push(
+        `${lora.name || lora.path || "LoRA"}@${scale}`,
+      );
     }
     const pinNote = pinNames.length ? ` Pinned ${pinNames.join(", ")}.` : "";
 
@@ -5985,8 +6034,27 @@ export default function App() {
     setCommunityErr("");
     const clip = copied ? " Copied the prompt and negative prompt." : "";
     setCommunityNote(
-      `Filled the prompt, negative prompt, and generation meta.${pinNote}${baseNote}${clip}`,
+      `Filled the prompt, negative prompt, and generation meta. Enhance off — prompt as-is.${pinNote}${baseNote}${clip}`,
     );
+  };
+
+  const applyGalleryArtifact = async (item) => {
+    const id = item?.artifactId || item?.id;
+    if (!id) return;
+    try {
+      const data = await api(`/v1/gallery/${id}/apply`, { method: "POST", body: "{}" });
+      const applied = data.applied || {};
+      if (applied.prompt) setPrompt(applied.prompt);
+      if (applied.settings) applyGenMeta({ settings: applied.settings });
+      if (Array.isArray(applied.pinnedLoras)) {
+        setSession((prev) => ({ ...prev, pinnedLoras: applied.pinnedLoras }));
+        void persistStudio({ pinnedLoras: applied.pinnedLoras });
+      }
+      if (applied.baseNote) setSavedMsg(applied.baseNote);
+      await refreshInstalledAssets({ quiet: true });
+    } catch (e) {
+      setError(e.message);
+    }
   };
 
   const renderCommunityActions = (item) => {
@@ -6713,6 +6781,18 @@ export default function App() {
                       <span>
                         {l.name}
                         {l.triggerWord ? ` · ${l.triggerWord}` : ""}
+                        {" · weight "}
+                        <input
+                          type="number"
+                          className="pin-weight"
+                          min="0"
+                          max="2"
+                          step="0.05"
+                          value={l.scale ?? 1}
+                          onChange={(e) => setPinScale(l, e.target.value)}
+                          title="LoRA weight"
+                          aria-label={`Weight for ${l.name}`}
+                        />
                       </span>
                       <button type="button" className="ghost" onClick={() => unpinLora(l)}>
                         Unpin
@@ -7426,6 +7506,14 @@ export default function App() {
                   <button
                     type="button"
                     className="ghost remix-btn"
+                    onClick={() => void applyGalleryArtifact(previewResult)}
+                    title="Load sampler, weights, and prompt as-is into the composer"
+                  >
+                    Load settings
+                  </button>
+                  <button
+                    type="button"
+                    className="ghost remix-btn"
                     onClick={async () => {
                       const remix = await api(
                         `/v1/gallery/${previewResult.artifactId}/remix`,
@@ -7455,6 +7543,71 @@ export default function App() {
               <p>{modelBrief}</p>
             </details>
           )}
+          {previewResult?.meta || previewResult?.sampler ? (
+            <details className="gallery-sidecar" open>
+              <summary>Generation settings</summary>
+              <dl className="sidecar-dl">
+                {previewResult.meta?.sampler || previewResult.sampler ? (
+                  <>
+                    <dt>Sampler</dt>
+                    <dd>{previewResult.meta?.sampler || previewResult.sampler}</dd>
+                  </>
+                ) : null}
+                {previewResult.meta?.steps != null ? (
+                  <>
+                    <dt>Steps</dt>
+                    <dd>{previewResult.meta.steps}</dd>
+                  </>
+                ) : null}
+                {previewResult.meta?.cfg != null ? (
+                  <>
+                    <dt>CFG</dt>
+                    <dd>{previewResult.meta.cfg}</dd>
+                  </>
+                ) : null}
+                {previewResult.meta?.clipSkip != null ? (
+                  <>
+                    <dt>Clip skip</dt>
+                    <dd>{previewResult.meta.clipSkip}</dd>
+                  </>
+                ) : null}
+                {previewResult.meta?.seed != null ? (
+                  <>
+                    <dt>Seed</dt>
+                    <dd>{previewResult.meta.seed}</dd>
+                  </>
+                ) : null}
+                {previewResult.meta?.size ? (
+                  <>
+                    <dt>Size</dt>
+                    <dd>{previewResult.meta.size}</dd>
+                  </>
+                ) : null}
+                {previewResult.meta?.checkpoint ? (
+                  <>
+                    <dt>Checkpoint</dt>
+                    <dd>
+                      {previewResult.meta.checkpoint.name}
+                      {previewResult.meta.checkpoint.versionId
+                        ? ` · v${previewResult.meta.checkpoint.versionId}`
+                        : ""}
+                    </dd>
+                  </>
+                ) : null}
+              </dl>
+              {(previewResult.meta?.loraPins || []).length > 0 && (
+                <p className="hint">
+                  LoRAs:{" "}
+                  {previewResult.meta.loraPins
+                    .map((l) => `${l.name}@${l.scale ?? 1}`)
+                    .join(", ")}
+                </p>
+              )}
+              {previewResult.meta?.enhanceOn === false ? (
+                <p className="hint">Prompt was sent unchanged (enhance off).</p>
+              ) : null}
+            </details>
+          ) : null}
         </section>
       )}
 
@@ -7582,8 +7735,20 @@ export default function App() {
                   ? "Set from chat"
                   : "Sampler, CFG, steps, and clip skip for the next local generate.")}
             {genMeta.locked ? " · kept until you use the example again" : ""}
+            {genMeta.enhance === "off" ? " · enhance off (prompt as-is)" : ""}
           </p>
           <div className="gen-meta-grid">
+            <label>
+              Enhance
+              <select
+                value={genMeta.enhance === "off" ? "off" : "auto"}
+                onChange={(e) => patchGenMeta({ enhance: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              >
+                <option value="auto">Auto</option>
+                <option value="off">Off (reproduce)</option>
+              </select>
+            </label>
             <label>
               Sampler
               <input
@@ -7669,6 +7834,25 @@ export default function App() {
               />
             </label>
           </div>
+          {(session.pinnedLoras || []).length > 0 && (
+            <ul className="pin-list gen-meta-pins" aria-label="Pinned LoRA weights">
+              {(session.pinnedLoras || []).map((l) => (
+                <li key={`meta-${loraKey(l)}`}>
+                  <span>{l.name}</span>
+                  <input
+                    type="number"
+                    className="pin-weight"
+                    min="0"
+                    max="2"
+                    step="0.05"
+                    value={l.scale ?? 1}
+                    onChange={(e) => setPinScale(l, e.target.value)}
+                    aria-label={`Weight ${l.name}`}
+                  />
+                </li>
+              ))}
+            </ul>
+          )}
           {genMeta.lastSeed != null && genMeta.lastSeed !== "" && (
             <p className="hint">Last seed {genMeta.lastSeed}</p>
           )}

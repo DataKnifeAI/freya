@@ -81,17 +81,30 @@ pub async fn load_instruction(packs_dir: &Path, mode: &str) -> String {
     let dir = packs_dir.join("instructions");
     let path = dir.join(format!("{mode}.txt"));
     // Containment: refuse anything that resolves outside the instructions dir.
+    let mut base = String::new();
     if let (Ok(dir_c), Ok(path_c)) = (fs::canonicalize(&dir).await, fs::canonicalize(&path).await) {
         if path_c.starts_with(&dir_c) {
             if let Ok(s) = fs::read_to_string(path_c).await {
-                return s;
+                base = s;
             }
         }
     } else if let Ok(s) = fs::read_to_string(&path).await {
-        // Dir may not exist yet — safe basename already enforced above.
-        return s;
+        base = s;
     }
-    builtin_instruction(mode).to_string()
+    if base.is_empty() {
+        base = builtin_instruction(mode).to_string();
+    }
+    if mode == "converse" {
+        let gen_path = dir.join("generation.txt");
+        if let Ok(gen) = fs::read_to_string(&gen_path).await {
+            let g = gen.trim();
+            if !g.is_empty() {
+                base.push_str("\n\n");
+                base.push_str(g);
+            }
+        }
+    }
+    base
 }
 
 /// Prefer a non-empty Settings override when present; else pack file / builtin.
