@@ -78,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/civitai/search", get(routes::civitai_search))
         .route("/v1/civitai/lookup", get(routes::civitai_lookup))
         .route("/v1/civitai/images", get(routes::civitai_images))
+        .route("/v1/civitai/media", get(routes::civitai_media))
         .route("/v1/civitai/models/{id}", get(routes::civitai_model))
         .route(
             "/v1/civitai/model-versions/{id}",
@@ -196,8 +197,10 @@ async fn require_api_token(
     if method == Method::OPTIONS {
         return Ok(next.run(req).await);
     }
-    // UUID gallery ids are unguessable; list/detail/search still require the bearer.
-    if matches!(method, Method::GET | Method::HEAD) && is_gallery_image_path(req.uri().path()) {
+    // UUID gallery ids are unguessable; Civitai media proxy is CDN-host allowlisted.
+    if matches!(method, Method::GET | Method::HEAD)
+        && (is_gallery_image_path(req.uri().path()) || is_civitai_media_path(req.uri().path()))
+    {
         return Ok(next.run(req).await);
     }
 
@@ -272,6 +275,10 @@ fn is_gallery_image_path(path: &str) -> bool {
     )
 }
 
+fn is_civitai_media_path(path: &str) -> bool {
+    path.trim_end_matches('/') == "/v1/civitai/media"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +290,7 @@ mod tests {
         assert!(!is_gallery_image_path("/v1/gallery"));
         assert!(!is_gallery_image_path("/v1/gallery/abc-123"));
         assert!(!is_gallery_image_path("/v1/civitai/search"));
+        assert!(is_civitai_media_path("/v1/civitai/media"));
+        assert!(is_civitai_media_path("/v1/civitai/media/"));
     }
 }
