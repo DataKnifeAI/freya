@@ -407,6 +407,7 @@ function communityImageFavorite(item, ctx, origin) {
     id: item.id,
     url: item.url || item.thumbnailUrl || "",
     thumbnailUrl: item.thumbnailUrl || item.url || "",
+    mediaType: item.mediaType || item.type || null,
     prompt,
     negativePrompt: negative,
     negative,
@@ -606,9 +607,13 @@ function artifactMime(item) {
       ? "video/mp4"
       : typeof item?.filename === "string" && item.filename.endsWith(".webm")
         ? "video/webm"
-        : typeof item?.filename === "string" && item.filename.endsWith(".gif")
-          ? "image/gif"
-          : "")
+        : typeof item?.filename === "string" && item.filename.endsWith(".mov")
+          ? "video/quicktime"
+          : typeof item?.filename === "string" && item.filename.endsWith(".gif")
+            ? "image/gif"
+            : item?.mediaType === "video"
+              ? "video/mp4"
+              : "")
   );
 }
 
@@ -626,10 +631,68 @@ function isGifArtifact(item, src) {
 
 function isVideoArtifact(item, src) {
   if (isGifArtifact(item, src)) return false;
+  const kind = String(item?.mediaType || item?.type || "").toLowerCase();
+  if (kind === "video") return true;
   const m = String(artifactMime(item) || "").toLowerCase();
-  if (m.includes("mp4") || m.includes("webm") || m.startsWith("video/")) return true;
+  if (m.includes("mp4") || m.includes("webm") || m.includes("quicktime") || m.startsWith("video/"))
+    return true;
   const s = mediaSrc(item, src);
-  return /\.mp4(\?|$)/.test(s) || /\.webm(\?|$)/.test(s);
+  return (
+    /\.mp4(\?|$)/.test(s) ||
+    /\.webm(\?|$)/.test(s) ||
+    /\.mov(\?|$)/.test(s)
+  );
+}
+
+function communityPreviewSrc(item) {
+  const url = String(item?.url || "");
+  const thumb = String(item?.thumbnailUrl || "");
+  if (isVideoArtifact(item, url) || isVideoArtifact(item, thumb)) {
+    return url || thumb;
+  }
+  return thumb || url;
+}
+
+/** Still poster for community video when Civitai sends a separate image preview. */
+function communityVideoPoster(item) {
+  const candidates = [item?.thumbnailUrl, item?.url].filter(Boolean);
+  const hasVideo = candidates.some((s) => isVideoArtifact(item, s));
+  if (!hasVideo) return undefined;
+  const still = candidates.find((s) => !isVideoArtifact(item, s));
+  return still || undefined;
+}
+
+/** Civitai community gallery: gif/stills in img; MP4/WebM/MOV in video. */
+function CommunityMedia({ item, variant = "tile", className, alt = "" }) {
+  const src = communityPreviewSrc(item);
+  if (!src) {
+    return variant === "tile" ? (
+      <span className="agent-gallery-thumb-empty" />
+    ) : (
+      <div className="lora-card-thumb-fallback">No preview</div>
+    );
+  }
+  if (isGifArtifact(item, src)) {
+    return <img className={className} src={src} alt={alt} />;
+  }
+  if (isVideoArtifact(item, src)) {
+    const poster = communityVideoPoster(item);
+    return (
+      <video
+        className={className}
+        src={src}
+        poster={poster || undefined}
+        muted
+        loop
+        playsInline
+        autoPlay
+        preload="auto"
+        controls={variant === "modal"}
+        aria-label={variant === "modal" ? alt || "Community video" : undefined}
+      />
+    );
+  }
+  return <img className={className} src={src} alt={alt} />;
 }
 
 /** Gallery / chat media: animated gif and stills use img; MP4/WebM use video. */
@@ -2386,6 +2449,7 @@ function normalizeImageFavorite(item) {
     id: item.id,
     url: item.url || item.thumbnailUrl || "",
     thumbnailUrl: item.thumbnailUrl || item.url || "",
+    mediaType: item.mediaType || item.type || null,
     prompt: String(item.prompt || ""),
     negativePrompt: negative,
     negative,
@@ -6562,7 +6626,6 @@ export default function App() {
 
   const renderCommunityTile = (item) => {
     const checkpointLine = communityCheckpointLine(item);
-    const preview = item.thumbnailUrl || item.url;
     return (
       <li key={item.id} className="agent-gallery-tile">
         <button
@@ -6570,7 +6633,7 @@ export default function App() {
           className="agent-gallery-shot"
           onClick={() => setCommunityDetail(item)}
         >
-          {preview ? <img src={preview} alt="" /> : <span className="agent-gallery-thumb-empty" />}
+          <CommunityMedia item={item} variant="tile" alt="" />
         </button>
         <div className="agent-gallery-tile-actions">{renderCommunityActions(item)}</div>
         {checkpointLine ? (
@@ -8013,11 +8076,7 @@ export default function App() {
               </div>
             </div>
             <div className="civitai-modal-gallery">
-              {communityDetail.url || communityDetail.thumbnailUrl ? (
-                <img src={communityDetail.url || communityDetail.thumbnailUrl} alt="" />
-              ) : (
-                <div className="lora-card-thumb-fallback">No preview</div>
-              )}
+              <CommunityMedia item={communityDetail} variant="modal" alt="" />
             </div>
             <div className="civitai-modal-body">
               <p>{communityDetail.prompt || "No prompt"}</p>

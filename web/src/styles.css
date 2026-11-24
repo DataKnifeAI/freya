@@ -1149,6 +1149,7 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
 }
 .agent-gallery-shot:hover { border-color: var(--ember); }
 .agent-gallery-shot img,
+.agent-gallery-shot video,
 .agent-gallery-thumb-empty {
   width: 100%; min-height: 320px; max-height: 640px; object-fit: contain;
   background: #111; display: block;
@@ -1186,7 +1187,8 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
 }
 .agent-gallery-sentinel { height: 1px; }
 .community-image-modal { width: min(920px, 100%); }
-.community-image-modal .civitai-modal-gallery > img { max-height: 70vh; }
+.community-image-modal .civitai-modal-gallery > img,
+.community-image-modal .civitai-modal-gallery > video { max-height: 70vh; }
 .community-image-modal .civitai-modal-head h3 { margin: 0; }
 .community-image-modal .civitai-modal-head .agent-gallery-actions {
   margin-left: auto; justify-content: flex-end;

@@ -1236,7 +1236,14 @@ fn parse_community_images_limited(
     let mut out = Vec::new();
     for item in items {
         if item.get("type").and_then(|t| t.as_str()) == Some("video") {
-            continue;
+            let has_url = item
+                .get("url")
+                .and_then(|u| u.as_str())
+                .map(|s| s.starts_with("https://"))
+                .unwrap_or(false);
+            if !has_url {
+                continue;
+            }
         }
         let nsfw = image_is_nsfw(item);
         if nsfw && !allow_nsfw {
@@ -1350,6 +1357,12 @@ fn parse_community_image(
         Some(Value::Number(n)) => Some(n.to_string()),
         _ => None,
     };
+    let media_type = item
+        .get("type")
+        .and_then(|t| t.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     Some(CommunityImage {
         id,
         post_id: item.get("postId").and_then(value_i64).filter(|n| *n > 0),
@@ -1363,6 +1376,7 @@ fn parse_community_image(
         size,
         url: url.clone(),
         thumbnail_url: url.as_deref().map(civitai_preview_url),
+        media_type,
         nsfw,
         nsfw_level,
         civitai_url: community_image_page(id, link_version, nsfw),
@@ -2304,11 +2318,22 @@ mod tests {
                     "id": 13,
                     "type": "video",
                     "meta": { "prompt": "skip me" }
+                },
+                {
+                    "id": 14,
+                    "type": "video",
+                    "nsfw": false,
+                    "url": "https://image.civitai.com/xG1nkqKTMzGDvpLrqFT7WA/2bfe830d-46ae-40f8-8d6f-6166e09ac559/original=true/61422271.mp4",
+                    "meta": { "prompt": "walking loop" }
                 }
             ]
         });
         let sfw = parse_community_images(&payload, Some(1490040), false);
-        assert_eq!(sfw.len(), 1);
+        let ids: Vec<i64> = sfw.iter().map(|i| i.id).collect();
+        assert!(ids == vec![11, 14], "unexpected ids: {ids:?}");
+        let video = sfw.iter().find(|i| i.id == 14).expect("mp4 video post");
+        assert_eq!(video.media_type.as_deref(), Some("video"));
+        assert!(video.url.as_deref().unwrap().ends_with("61422271.mp4"));
         assert_eq!(sfw[0].prompt.as_deref(), Some("red hair, smile"));
         assert_eq!(sfw[0].negative_prompt.as_deref(), Some("lowres"));
         assert_eq!(sfw[0].sampler.as_deref(), Some("Euler a"));
@@ -2338,12 +2363,13 @@ mod tests {
         );
 
         let both = parse_community_images(&payload, Some(1490040), true);
-        assert_eq!(both.len(), 2);
+        assert_eq!(both.len(), 3);
         assert_eq!(
             both[1].civitai_url,
             "https://civitai.red/images/12?modelVersionId=1490040"
         );
         assert!(both[1].nsfw);
+        assert_eq!(both[2].id, 14);
 
         let nested = json!({
             "items": [{
@@ -2356,9 +2382,9 @@ mod tests {
         assert_eq!(nested_items[0].prompt.as_deref(), Some("nested prompt"));
         assert_eq!(nested_items[0].civitai_url, "https://civitai.com/images/14");
 
-        let paged = images_list_url(Some(1), None, false, 20, Some("next cursor"), Some(4));
+        let paged = images_list_url(Some(1), None, false, 20, Some("next-cursor"), Some(4));
         assert!(paged.contains("limit=20"));
-        assert!(paged.contains("cursor=next%20cursor"));
+        assert!(paged.contains("cursor=next-cursor"));
         assert!(!paged.contains("page="));
         let by_page = images_list_url(Some(1), None, true, 20, None, Some(2));
         assert!(by_page.contains("page=2"));
@@ -2876,6 +2902,9 @@ pub struct CommunityImage {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thumbnail_url: Option<String>,
+    /// Civitai item type (`image`, `video`, …) when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
     #[serde(default)]
     pub nsfw: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
