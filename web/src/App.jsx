@@ -5504,6 +5504,79 @@ export default function App() {
 
   const gallerySrc = (g) => g.url || `/v1/gallery/${g.id}/image`;
 
+  /** Map a gallery row into the session `result` preview shape. */
+  const galleryToResult = (g) => {
+    if (!g) return null;
+    const id = g.artifactId || g.id;
+    return {
+      ...g,
+      artifactId: id,
+      url: g.url || gallerySrc(g),
+    };
+  };
+
+  /** Main preview: explicit selection/generation, else latest gallery item. */
+  const previewResult = result || galleryToResult(gallery[0]);
+  const previewIsLatest =
+    !!previewResult &&
+    (!result ||
+      previewResult.artifactId === gallery[0]?.id ||
+      previewResult.artifactId === gallery[0]?.artifactId);
+
+  /** Items already shown in the feature / session-set preview — omit from the wall below. */
+  const galleryPreviewIds = new Set();
+  if (batchResults.length > 1) {
+    for (const r of batchResults) {
+      if (r?.artifactId) galleryPreviewIds.add(r.artifactId);
+    }
+  } else if (previewResult?.artifactId) {
+    galleryPreviewIds.add(previewResult.artifactId);
+  }
+  const galleryWallItems = gallery.filter((g) => {
+    const id = g.id || g.artifactId;
+    return id && !galleryPreviewIds.has(id);
+  });
+
+  const selectGalleryPreview = (g) => {
+    const next = galleryToResult(g);
+    if (!next) return;
+    setResult(next);
+    setModelBrief(g.enhancedPrompt || "");
+    setTab("gallery");
+  };
+
+  const deleteGalleryItem = async (id) => {
+    if (!id) return;
+    if (
+      !window.confirm(
+        "Delete this generation from the gallery? This cannot be undone.",
+      )
+    ) {
+      return;
+    }
+    try {
+      await api(`/v1/gallery/${id}`, { method: "DELETE" });
+      setGallery((prev) =>
+        prev.filter((g) => g.id !== id && g.artifactId !== id),
+      );
+      setBatchResults((prev) => prev.filter((r) => r.artifactId !== id));
+      setResult((prev) => (prev?.artifactId === id ? null : prev));
+      setSession((prev) => ({
+        ...prev,
+        turns: (prev.turns || []).map((t) => ({
+          ...t,
+          artifactIds: (t.artifactIds || []).filter((aid) => aid !== id),
+        })),
+        messages: (prev.messages || []).map((m) => ({
+          ...m,
+          artifactIds: (m.artifactIds || []).filter((aid) => aid !== id),
+        })),
+      }));
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
   const leaveMock = () => {
     localStorage.removeItem("freya.mock");
     const u = new URL(window.location.href);
@@ -7329,7 +7402,7 @@ export default function App() {
         </section>
       )}
 
-      {tab === "gallery" && result && (
+      {tab === "gallery" && previewResult && batchResults.length <= 1 && (
         <section className="salon salon-single">
           <div className="salon-head">
             <span className="t-kind">{batchResults.length > 1 ? "Selected variation" : "Latest image"}</span>
@@ -7946,7 +8019,7 @@ export default function App() {
       {tab === "gallery" && (
         <section className="panel salon">
           <div className="salon-wall salon-wall-gallery">
-            {gallery.map((g) => (
+            {galleryWallItems.map((g) => (
               <article
                 key={g.id}
                 className="salon-work"
