@@ -915,10 +915,51 @@ fn trailing_u32(s: &str) -> Option<u32> {
     }
 }
 
+/// Remove A1111-style `<lora:…>` / `<lyco:…>` tags when LoRAs are loaded via adapters.
+pub fn strip_a1111_resource_tags(prompt: &str) -> String {
+    let mut out = String::with_capacity(prompt.len());
+    let mut rest = prompt;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let pos = ["<lora:", "<lyco:"]
+            .iter()
+            .filter_map(|tag| lower.find(tag))
+            .min();
+        match pos {
+            None => {
+                out.push_str(rest);
+                break;
+            }
+            Some(p) => {
+                out.push_str(&rest[..p]);
+                let tail = &rest[p..];
+                if let Some(end) = tail.find('>') {
+                    rest = &tail[end + 1..];
+                } else {
+                    out.push_str(tail);
+                    break;
+                }
+            }
+        }
+    }
+    while out.ends_with(' ') || out.ends_with('\t') {
+        out.pop();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn strip_a1111_lora_tags() {
+        let p = "foo bar\n<lora:FrankieXL:1>";
+        assert_eq!(strip_a1111_resource_tags(p), "foo bar\n");
+        let mixed = "a <LyCo:Test:0.8> b";
+        assert_eq!(strip_a1111_resource_tags(mixed), "a  b");
+    }
 
     #[test]
     fn family_rows_are_small() {
