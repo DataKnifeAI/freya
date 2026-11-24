@@ -1,12 +1,32 @@
 /** In-memory Freya API mock for UI design without backend. */
 
-const delay = (ms = 400) => new Promise((r) => setTimeout(r, ms));
+function abortError() {
+  const err = new Error("Aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+/** Resolves after ms, or rejects with AbortError if signal aborts (search-as-you-type). */
+const delay = (ms = 400, signal) =>
+  new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+    const t = setTimeout(resolve, ms);
+    if (!signal) return;
+    const onAbort = () => {
+      clearTimeout(t);
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 
 /**
  * Repo image sources for mock examples (viewed on disk):
  * - freya.png — README brand art: winged warrior, eagle feathers, leather armor, canyon waterfall
  * - freya-ui.png — legacy SwarmUI chrome (not used as a prompt seed)
- * - web HeroCanvas — foggy moonlit harbor silhouette (atelier chrome / gallery mood)
+ * - web/public/empty-gallery.png — opaque wink/parchment empty-gallery placeholder
  *
  * Style examplePrompts below are beginner NL aimed at recreating those looks — not pack tag soup.
  */
@@ -291,54 +311,59 @@ function toPublicCard(card) {
 
 /** Mock Civitai catalog — brand demo query hits winged / fantasy warrior assets. */
 const CIVITAI_CATALOG = [
-  {
+  mockCard({
     id: 901,
     name: "Eagle Wing Warrior",
     modelType: "LORA",
+    baseModel: "SDXL 1.0",
     downloadUrl: "https://civitai.com/api/download/models/mock-901",
     examplePrompt: FREYA_BRAND_EXAMPLE,
-    thumbnailUrl: null,
+    thumbnailUrl: svgDataUrl("Eagle Wing Warrior", "LORA · fantasy", 28),
     triggerWord: "eaglewingwar",
     tags: ["fantasy", "winged", "warrior", "eagle", "wings", "armor", "character", "lora"],
-  },
-  {
+  }),
+  mockCard({
     id: 902,
     name: "Valkyrie Feather Armor",
     modelType: "LORA",
+    baseModel: "SDXL 1.0",
     downloadUrl: "https://civitai.com/api/download/models/mock-902",
     examplePrompt:
       "A valkyrie in feathered wings and leather armor standing before a waterfall canyon",
-    thumbnailUrl: null,
+    thumbnailUrl: svgDataUrl("Valkyrie Feather", "LORA · armor", 42),
     triggerWord: "valkfeather",
     tags: ["fantasy", "valkyrie", "winged", "warrior", "feathers", "armor", "canyon", "lora"],
-  },
-  {
+  }),
+  mockCard({
     id: 903,
     name: "Canyon Waterfall Scenic",
     modelType: "LORA",
+    baseModel: "SDXL 1.0",
     downloadUrl: "https://civitai.com/api/download/models/mock-903",
     examplePrompt: "A lush green canyon with a multi-tier waterfall and wildflowers",
-    thumbnailUrl: null,
+    thumbnailUrl: svgDataUrl("Canyon Waterfall", "LORA · landscape", 145),
     triggerWord: "canyonfall",
     tags: ["landscape", "canyon", "waterfall", "fantasy", "nature", "warrior", "lora"],
-  },
-  {
+  }),
+  mockCard({
     id: 101,
     name: "Yamer's Anime Illustrator",
     modelType: "Checkpoint",
+    baseModel: "SDXL 1.0",
     downloadUrl: "https://civitai.com/api/download/models/mock-101",
     examplePrompt: ANIME_PORTRAIT_EXAMPLE,
-    thumbnailUrl: null,
+    thumbnailUrl: svgDataUrl("Anime Illustrator", "Checkpoint", 310),
     triggerWord: null,
-    tags: ["anime", "illustration", "portrait", "soft"],
-  },
-  {
+    tags: ["anime", "illustration", "portrait", "soft", "checkpoint"],
+  }),
+  mockCard({
     id: 202,
     name: "Studio Soft Light",
     modelType: "LORA",
+    baseModel: "SD 1.5",
     downloadUrl: "https://civitai.com/api/download/models/mock-202",
     examplePrompt: "A portrait with soft studio light and shallow depth of field",
-    thumbnailUrl: null,
+    thumbnailUrl: svgDataUrl("Studio Soft Light", "LORA · portrait", 200),
     triggerWord: "softstudiolight",
     tags: ["portrait", "studio", "light", "soft", "lighting", "photo", "character"],
     recommendedResources: [
@@ -355,45 +380,117 @@ const CIVITAI_CATALOG = [
     id: 303,
     name: "Red Moon Landscape",
     modelType: "LORA",
+    baseModel: "SDXL 1.0",
     downloadUrl: "https://civitai.com/api/download/models/mock-303",
     examplePrompt: ETHEREAL_MOON_EXAMPLE,
-    thumbnailUrl: null,
+    thumbnailUrl: svgDataUrl("Red Moon", "LORA · night", 5),
     triggerWord: "redmoonscape",
     tags: ["landscape", "moon", "fantasy", "night", "mist", "ethereal"],
-  },
-  {
+  }),
+  mockCard({
     id: 404,
     name: "Harbor Fog Atmosphere",
     modelType: "LORA",
+    baseModel: "SDXL 1.0",
     downloadUrl: "https://civitai.com/api/download/models/mock-404",
     examplePrompt: HARBOR_MOON_EXAMPLE,
-    thumbnailUrl: null,
+    thumbnailUrl: svgDataUrl("Harbor Fog", "LORA · fog", 210),
     triggerWord: "harborfog",
     tags: ["harbor", "fog", "atmospheric", "water", "night", "moon"],
-  },
-  {
+  }),
+  mockCard({
     id: 505,
     name: "Ink Wash Drama",
     modelType: "LoCon",
+    baseModel: "SDXL 1.0",
     downloadUrl: "https://civitai.com/api/download/models/mock-505",
     examplePrompt: "An ink wash painting with bold brush strokes",
-    thumbnailUrl: null,
+    thumbnailUrl: svgDataUrl("Ink Wash Drama", "LoCon", 250),
     triggerWord: "inkwash",
     tags: ["ink", "painting", "drama", "illustration", "east"],
-  },
-  {
+  }),
+  mockCard({
     id: 606,
     name: "Character Consistency Pack",
     modelType: "LORA",
+    baseModel: "Pony",
     downloadUrl: "https://civitai.com/api/download/models/mock-606",
     examplePrompt: LOCAL_CHARACTER_EXAMPLE,
-    thumbnailUrl: null,
+    thumbnailUrl: svgDataUrl("Character Pack", "LORA", 180),
     triggerWord: "charpack",
     tags: ["character", "portrait", "consistency", "local", "studio"],
-  },
+  }),
+  mockCard({
+    id: 707,
+    name: "Winged Hero Embedding",
+    modelType: "TextualInversion",
+    baseModel: "SDXL 1.0",
+    downloadUrl: "https://civitai.com/api/download/models/mock-707",
+    examplePrompt: FREYA_BRAND_EXAMPLE,
+    thumbnailUrl: svgDataUrl("Winged Hero", "Embedding", 35),
+    triggerWord: "wingedhero-ti",
+    tags: ["fantasy", "winged", "warrior", "embedding", "character"],
+  }),
+  mockCard({
+    id: 808,
+    name: "Soft Detail VAE",
+    modelType: "VAE",
+    baseModel: "SD 1.5",
+    downloadUrl: "https://civitai.com/api/download/models/mock-808",
+    examplePrompt: "Clean color and soft detail reconstruction",
+    thumbnailUrl: svgDataUrl("Soft Detail VAE", "VAE", 160),
+    triggerWord: null,
+    tags: ["vae", "detail", "soft", "portrait", "anime"],
+  }),
+  mockCard({
+    id: 909,
+    name: "Fantasy Base XL",
+    modelType: "Checkpoint",
+    baseModel: "SDXL 1.0",
+    downloadUrl: "https://civitai.com/api/download/models/mock-909",
+    examplePrompt: FREYA_BRAND_EXAMPLE,
+    thumbnailUrl: svgDataUrl("Fantasy Base XL", "Checkpoint", 55),
+    triggerWord: null,
+    tags: ["fantasy", "winged", "warrior", "checkpoint", "xl", "base"],
+  }),
+  mockCard({
+    id: 910,
+    name: "Pony Diffusion Mock",
+    modelType: "Checkpoint",
+    baseModel: "Pony",
+    downloadUrl: "https://civitai.com/api/download/models/mock-910",
+    examplePrompt: LOCAL_CHARACTER_EXAMPLE,
+    thumbnailUrl: svgDataUrl("Pony Diffusion", "Checkpoint", 90),
+    triggerWord: null,
+    tags: ["pony", "checkpoint", "character", "base"],
+  }),
 ];
 
+function catalogPublic(c) {
+  return toPublicCard(c);
+}
+
+function relatedFor(card) {
+  if (!card || String(card.modelType).toLowerCase() === "checkpoint") return [];
+  const base = card.baseModel;
+  if (!base) return [];
+  return CIVITAI_CATALOG.filter(
+    (c) =>
+      c.id !== card.id &&
+      String(c.modelType).toLowerCase() === "checkpoint" &&
+      c.baseModel === base,
+  )
+    .slice(0, 4)
+    .map((c) => ({
+      relation: "needs_checkpoint",
+      note: `Compatible with ${base}`,
+      model: catalogPublic(c),
+    }));
+}
+
 const state = {
+  installJobs: [],
+  localAssets: [],
   settings: {
     openRouterConfigured: true,
     // Mock starts ready so Suggest/session can demo Civitai search + LoRA cards
@@ -488,6 +585,14 @@ const state = {
       },
     ],
   },
+  /** mode → override text (empty/absent = pack default). */
+  instructionOverrides: {},
+  mockApiToken: "",
+  mockAdminUser: "admin",
+  mockAdminPass: "mock-admin",
+  workerRuntime: { kind: "none", name: "mock", running: false, detail: "mock" },
+  activeBaseModel: "",
+  activeBaseFamily: "",
   styles: STYLE_PACKS,
   gallery: [
     {
@@ -533,32 +638,32 @@ function parseBody(opts) {
 
 function matchLoras(query, limit = 6) {
   const q = (query || "").toLowerCase();
-  const words = q.split(/\s+/).filter(Boolean);
-  const scored = CIVITAI_CATALOG.map((c) => {
+  const words = q.split(/\s+/).filter(Boolean).filter((w) => w !== "lora" && w !== "locon");
+  const scored = CIVITAI_CATALOG.filter((c) => isFreyaAssetType(c.modelType)).map((c) => {
     const hay = `${c.name} ${c.modelType} ${(c.tags || []).join(" ")}`.toLowerCase();
     let score = 0;
     for (const w of words) {
       if (hay.includes(w)) score += 1;
     }
-    const isLora =
-      c.modelType.toLowerCase().includes("lora") || c.modelType.toLowerCase() === "locon";
-    // Only boost LoRAs that already matched query terms (avoid unrelated LoRA noise)
-    if (score > 0 && isLora) score += 0.5;
+    // Prefer adapters when they already match the vibe
+    if (score > 0) score += (3 - Math.min(assetTypeRank(c.modelType), 3)) * 0.25;
     return { c, score };
   })
     .filter((x) => x.score > 0)
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return assetTypeRank(a.c.modelType) - assetTypeRank(b.c.modelType);
+    });
 
   const picked = (
     scored.length
       ? scored.map((x) => x.c)
-      : CIVITAI_CATALOG.filter((c) => c.modelType.toLowerCase().includes("lora"))
+      : CIVITAI_CATALOG.filter((c) => isFreyaAssetType(c.modelType)).sort(
+          (a, b) => assetTypeRank(a.modelType) - assetTypeRank(b.modelType),
+        )
   ).slice(0, limit);
 
-  return picked.map(({ tags: _t, triggerWord, ...rest }) => ({
-    ...rest,
-    ...(triggerWord ? { triggerWord } : {}),
-  }));
+  return picked.map(catalogPublic);
 }
 
 /** Map example / goal text → Civitai query. Brand freya.png path is explicit. */
@@ -1734,7 +1839,12 @@ function enrichMockReplyWithWorker(reply, actionResults) {
 }
 
 export async function mockApi(path, opts = {}) {
-  await delay(path.includes("/run") || path.includes("/generate") ? 900 : 280);
+  const signal = opts.signal;
+  await delay(
+    path.includes("/run") || path.includes("/generate") || path.includes("/chat") ? 900 : 280,
+    signal,
+  );
+  if (signal?.aborted) throw abortError();
   const method = (opts.method || "GET").toUpperCase();
   const url = new URL(path, "http://mock.local");
   const p = url.pathname;
@@ -1905,13 +2015,63 @@ export async function mockApi(path, opts = {}) {
   }
 
   if (p === "/v1/settings" && method === "GET") {
-    return { ...state.settings };
+    const instructions = (state.settings.instructions || []).map((row) => {
+      const ov = state.instructionOverrides?.[row.id];
+      const overridden = Boolean(ov && String(ov).trim());
+      return {
+        ...row,
+        text: overridden ? ov : row.defaultText,
+        overridden,
+      };
+    });
+    return { ...state.settings, instructions };
+  }
+
+  if (p === "/v1/metrics/openrouter" && method === "GET") {
+    if (!state.settings.openRouterConfigured) {
+      return {
+        configured: false,
+        keyError: "OpenRouter API key not configured",
+        notes: [
+          "Mock: paste any OpenRouter key in Settings to enable sample metrics.",
+        ],
+      };
+    }
+    return {
+      configured: true,
+      key: {
+        label: "sk-or-…mock",
+        usage: 12.34,
+        usageDaily: 0.42,
+        usageWeekly: 3.1,
+        usageMonthly: 12.34,
+        limit: 50,
+        limitRemaining: 37.66,
+        limitReset: "monthly",
+        isFreeTier: false,
+        isManagementKey: false,
+      },
+      credits: null,
+      creditsError:
+        "Only management keys can perform this operation (mock — normal key).",
+      notes: [
+        "GET /api/v1/key works with Freya’s normal completion key.",
+        "GET /api/v1/credits requires an OpenRouter Management API key.",
+        "OpenRouter does not expose a rich recent-transactions feed for completion keys.",
+      ],
+    };
   }
 
   if (p === "/v1/settings" && method === "PUT") {
     const body = parseBody(opts);
-    if (body.civitaiApiKey) state.settings.civitaiConfigured = true;
-    if (body.openrouterApiKey) state.settings.openRouterConfigured = true;
+    if (body.civitaiApiKey !== undefined) {
+      state.settings.civitaiConfigured = Boolean(String(body.civitaiApiKey || "").trim());
+    }
+    if (body.openrouterApiKey !== undefined) {
+      state.settings.openRouterConfigured = Boolean(
+        String(body.openrouterApiKey || "").trim(),
+      );
+    }
     if (body.diffusionWorkerUrl !== undefined) {
       state.settings.diffusionWorkerUrl = body.diffusionWorkerUrl;
     }
@@ -2364,6 +2524,13 @@ export async function mockApi(path, opts = {}) {
     if (!item) throw new Error("not found");
     return item;
   }
+  if (galleryOne && method === "DELETE") {
+    const id = galleryOne[1];
+    const idx = state.gallery.findIndex((g) => g.id === id);
+    if (idx < 0) throw new Error("not found");
+    state.gallery.splice(idx, 1);
+    return { ok: true, id };
+  }
 
   const galleryImage = p.match(/^\/v1\/gallery\/([^/]+)\/image$/);
   if (galleryImage && method === "GET") {
@@ -2530,9 +2697,11 @@ export async function mockApi(path, opts = {}) {
     const base = (body.message || "").trim() || BEGINNER_EXAMPLE;
     const mode = body.mode || "prompt-prose";
 
-    const agentModel = body.model || state.settings.chatModel || "openrouter/auto";
+    const agentModel = body.model || state.settings.chatModel || "auto";
     const agentEcho =
-      agentModel && agentModel !== "openrouter/auto" ? ` (agent: ${agentModel})` : "";
+      agentModel && agentModel !== "auto" && agentModel !== "openrouter/auto"
+        ? ` (agent: ${agentModel})`
+        : "";
 
     if (mode === "suggest") {
       const ideas = suggestIdeas(base);
@@ -2610,51 +2779,22 @@ export async function mockApi(path, opts = {}) {
 
   if ((p === "/v1/run" || p === "/v1/generate") && method === "POST") {
     const body = parseBody(opts);
-    const prompt = body.prompt || "untitled";
-    const loras = Array.isArray(body.loras) ? body.loras : [];
-    const loraBrief =
-      loras.length > 0
-        ? ` LoRAs: ${loras.map((l) => `${l.name}@${l.scale ?? 0.8}`).join(", ")}.`
-        : "";
-    const enhanced = modelBriefFor(prompt, loraBrief);
-    const id = `mock-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    // Worker optional: OpenRouter when no worker (or backend auto/openrouter). Local only when
-    // explicitly requested or LoRAs are applied on a configured worker.
-    const wantLocal =
-      body.backend === "local" ||
-      (body.backend !== "openrouter" &&
-        loras.length > 0 &&
-        Boolean(state.settings.diffusionWorkerUrl));
-    const backend = wantLocal ? "local" : "openrouter";
-    const specificImage =
-      body.model && body.model !== "auto" ? body.model : null;
-    const item = {
-      id,
-      prompt,
-      enhancedPrompt: enhanced,
-      backend,
-      model:
-        backend === "local"
-          ? "local-worker-stub"
-          : specificImage || state.settings.imageModel || "black-forest-labs/flux.2-klein-4b",
-      createdAt: new Date().toISOString(),
-      url: svgDataUrl(
-        prompt.slice(0, 40) || "Freya",
-        backend,
-        backend === "local" ? 140 : 28 + (id.length % 40),
-      ),
-      loras,
-    };
-    state.gallery.unshift(item);
-    return {
-      artifactId: id,
-      backend: item.backend,
-      model: item.model,
-      enhancedPrompt: enhanced,
-      url: item.url,
-      meta: item,
-      loras,
-    };
+    const route = inferModality(body.prompt || "");
+    const modality = body.modality || route.modality;
+    const isMotion = modality === "gif" || modality === "video";
+    const model =
+      body.model && body.model !== "auto"
+        ? body.model
+        : isMotion
+          ? "bytedance/seedance-2.5-flash"
+          : state.settings.imageModel === "auto"
+            ? "black-forest-labs/flux.2-klein-4b"
+            : state.settings.imageModel;
+    return mockGenerateArtifact(body.prompt || "untitled", {
+      ...body,
+      model,
+      modality,
+    });
   }
 
   if (p === "/v1/civitai/search" && method === "GET") {
@@ -2662,14 +2802,79 @@ export async function mockApi(path, opts = {}) {
       throw new Error("Civitai API key not set — add it in Freya Settings");
     }
     const q = (url.searchParams.get("q") || "").toLowerCase();
-    const items = CIVITAI_CATALOG.filter(
+    const typesRaw = (url.searchParams.get("types") || "").trim();
+    const typeFilter = typesRaw
+      ? new Set(
+          typesRaw
+            .split(",")
+            .map((t) => t.trim().toLowerCase())
+            .filter(Boolean),
+        )
+      : null;
+    const inType = (c) =>
+      typeFilter ? typeFilter.has(String(c.modelType || "").toLowerCase()) : isFreyaAssetType(c.modelType);
+    const matched = CIVITAI_CATALOG.filter(
       (c) =>
-        !q ||
-        c.name.toLowerCase().includes(q) ||
-        c.modelType.toLowerCase().includes(q) ||
-        (c.tags || []).some((t) => t.includes(q)),
-    ).map(({ tags: _t, ...rest }) => rest);
-    return { items: items.length ? items : CIVITAI_CATALOG.map(({ tags: _t, ...rest }) => rest) };
+        inType(c) &&
+        (!q ||
+          c.name.toLowerCase().includes(q) ||
+          c.modelType.toLowerCase().includes(q) ||
+          (c.tags || []).some((t) => t.includes(q)) ||
+          q.split(/\s+/).some((w) => w && (c.tags || []).some((t) => t.includes(w)))),
+    ).sort((a, b) => assetTypeRank(a.modelType) - assetTypeRank(b.modelType));
+    const fallback = CIVITAI_CATALOG.filter(inType).sort(
+      (a, b) => assetTypeRank(a.modelType) - assetTypeRank(b.modelType),
+    );
+    const items = (matched.length ? matched : fallback).map(catalogPublic);
+    return { items };
+  }
+
+  {
+    const m = p.match(/^\/v1\/civitai\/models\/(\d+)$/);
+    if (m && method === "GET") {
+      if (!state.settings.civitaiConfigured) {
+        throw new Error("Civitai API key not set — add it in Freya Settings");
+      }
+      const id = Number(m[1]);
+      const card = CIVITAI_CATALOG.find((c) => c.id === id);
+      if (!card) throw new Error(`No model with id ${id}`);
+      const needsBase =
+        String(card.modelType).toLowerCase() === "checkpoint" || !card.baseModel
+          ? null
+          : `Needs base model family: ${card.baseModel}`;
+      return {
+        model: { ...catalogPublic(card), needsBase },
+        related: relatedFor(card),
+      };
+    }
+  }
+
+  {
+    const m = p.match(/^\/v1\/civitai\/model-versions\/(\d+)$/);
+    if (m && method === "GET") {
+      if (!state.settings.civitaiConfigured) {
+        throw new Error("Civitai API key not set — add it in Freya Settings");
+      }
+      const versionId = Number(m[1]);
+      const card =
+        CIVITAI_CATALOG.find((c) => Number(c.versionId) === versionId) ||
+        CIVITAI_CATALOG.find((c) =>
+          (c.modelVersions || []).some((v) => Number(v.id) === versionId),
+        );
+      if (!card) throw new Error(`No model version with id ${versionId}`);
+      const needsBase =
+        String(card.modelType).toLowerCase() === "checkpoint" || !card.baseModel
+          ? null
+          : `Needs base model family: ${card.baseModel}`;
+      return {
+        model: {
+          ...catalogPublic(card),
+          versionId,
+          needsBase,
+        },
+        related: relatedFor(card),
+      };
+    }
   }
 
   if (p === "/v1/civitai/install" && method === "POST") {

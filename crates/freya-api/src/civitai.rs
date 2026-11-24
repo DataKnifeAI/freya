@@ -717,7 +717,7 @@ impl CivitaiClient {
             .header("Authorization", format!("Bearer {}", self.api_key))
             .send()
             .await
-            .context("civitai search")?;
+            .context("civitai http")?;
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -779,15 +779,6 @@ fn parse_trained_words(ver: &Value) -> Vec<String> {
                 if !trimmed.is_empty() {
                     trained_words.push(trimmed.to_string());
                 }
-                out.push(CivitaiModelCard {
-                    id,
-                    name,
-                    model_type,
-                    version_id,
-                    download_url,
-                    thumbnail_url: thumbnail,
-                    example_prompt,
-                });
             }
         }
     }
@@ -2951,6 +2942,15 @@ pub struct CivitaiModelCard {
     pub model_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version_name: Option<String>,
+    /// Selected file within the default (or chosen) version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub download_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

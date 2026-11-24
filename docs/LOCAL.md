@@ -120,21 +120,21 @@ make mock-ui
 
 Also: open the normal UI with `?mock=1`, or click **Remember mock** in the banner (stores `localStorage.freya.mock=1`).
 
-Mock covers Generate, Enhance, Styles, Civitai search/install flow, Gallery remix, and Settings — in-memory with SVG placeholders.
+Mock covers Generate, Enhance, Styles, Civitai search/install flow, Gallery remix, Settings, and agentic **Plan / Auto / YOLO** sessions — in-memory with SVG placeholders. Featured “Use example” is the `freya.png` brand NL prompt (winged warrior / canyon waterfall).
 
 ## Full local stack
 
 ```bash
-cp .env.example .env   # fill keys
-export $(grep -v '^#' .env | xargs)
+cp .env.example .env   # fill OPENROUTER_API_KEY (required); others optional
+set -a && source .env && set +a
 
 make run-api
 # other terminal
 cd web && npm i && npm run dev
 
-# optional
+# GPU worker on this host (recommended; out of cluster)
 make run-worker
-# Settings → worker URL http://127.0.0.1:8091
+# Worker tab → Host/Port → http://127.0.0.1:8091 (or LAN IP / FQDN from in-cluster Studio)
 # Settings → paste Civitai API key → Civitai tab → Install to worker
 ```
 
@@ -218,15 +218,19 @@ By default `FREYA_API_TOKEN` / `FREYA_WORKER_TOKEN` are empty and `/v1` routes a
 
 ```bash
 export FREYA_API_TOKEN='long-random-secret'
-export FREYA_WORKER_TOKEN='long-random-secret'   # same value on API + worker
+export FREYA_WORKER_TOKEN='long-random-secret'   # same value on freya-api + freya-worker
 # optional: restrict browser origins (comma-separated)
 export FREYA_CORS_ORIGINS='https://freya.example.com,http://127.0.0.1:5173'
 # optional for Vite UI: VITE_FREYA_API_TOKEN=$FREYA_API_TOKEN
-# or paste the same value in UI Settings → Studio API token
+# or Settings → Generate API token (preferred) / Advanced paste
 ```
 
-Send `Authorization: Bearer $FREYA_API_TOKEN` on `/v1` calls. The UI forwards a token from Settings / `VITE_FREYA_API_TOKEN` / `localStorage.freya.apiToken` (nginx does not inject one). Gallery image GETs stay open so `<img src>` works; list/search/settings require the bearer when the token is set.
+**UI:** Worker tab → **Generate API token** calls `POST /v1/auth/token` (rotates in-memory + `FREYA_SECRETS_FILE`). The UI **re-applies** the bearer to `localStorage.freya.apiToken` immediately so this tab does not 401 after rotate. In-cluster the operator sets `FREYA_SECRETS_FILE=/data/gallery/.freya-runtime.json` on the gallery PVC so rotates survive API pod restarts, and wires `FREYA_API_TOKEN_SECRET_NAME` so the API **patches** Secret `freya-api-token` when RBAC is present. If Secret and runtime file diverge (classic 401 for MCP/curl), run `./scripts/sync-api-token-from-pvc.sh` then `kubectl -n freya rollout restart deploy/freya-mcp`. Other browsers: Worker → Advanced → paste → **Apply token**.
 
-In-cluster: set `FreyaStudio.spec.apiTokenSecretRef` and `FreyaDiffusionWorker.spec.authSecretRef`.
+Send `Authorization: Bearer $FREYA_API_TOKEN` on `/v1` calls. The UI forwards a token from Worker/Settings / `VITE_FREYA_API_TOKEN` / `localStorage.freya.apiToken` (nginx does not inject one). Gallery image GETs stay open so `<img src>` works; list/search/settings require the bearer when the token is set.
+
+**Worker tab endpoint:** host + port (defaults `localhost` / `8091` via Use local defaults) composed to `http://host:port` — same forms as `FreyaDiffusionWorker.spec.externalEndpoint` (LAN IP, FQDN, localhost, optional k8s DNS bridge). Full URL override is under Advanced (https).
+
+In-cluster Studio: set `FreyaStudio.spec.apiTokenSecretRef` and `FreyaDiffusionWorker.spec.authSecretRef`. Container UI proxies via `FREYA_API_UPSTREAM` (operator sets this; see `web/nginx.conf`).
 
 `make ci` runs fmt, clippy, and tests.

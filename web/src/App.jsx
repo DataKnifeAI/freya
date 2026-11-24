@@ -12,8 +12,15 @@ const AUTOMATION_MODES = ["plan", "auto", "yolo"];
 const AUTOMATION_LABELS = { plan: "Plan", auto: "Auto", yolo: "YOLO" };
 const AUTOMATION_STORAGE_KEY = "freya.automationMode";
 const MODELS_STORAGE_KEY = "freya.models";
+/** Composer generation path: `cloud` (OpenRouter) | `local` (worker). */
+const GENERATE_BACKEND_STORAGE_KEY = "freya.generateBackend";
 const SESSIONS_STORAGE_KEY = "freya.sessions";
 const SIDEBAR_STORAGE_KEY = "freya.sidebarOpen";
+const WORKSPACE_SPLIT_STORAGE_KEY = "freya.workspaceSplit";
+/** Default / clamp for left chat pane width as % of `.workspace`. */
+const WORKSPACE_SPLIT_DEFAULT = 45;
+const WORKSPACE_SPLIT_MIN_LEFT_PX = 340;
+const WORKSPACE_SPLIT_MIN_RIGHT_PX = 280;
 const THEME_STORAGE_KEY = "freya.theme";
 const TAB_STORAGE_KEY = "freya.tab";
 /** Top-level Studio tabs (nav + restore must stay in sync). */
@@ -683,17 +690,17 @@ function resolveInitialTheme() {
 }
 
 const MODE_HINTS = {
-  plan: "Plan only — steps, Civitai query, LoRAs, batch prompts. No generate or install.",
-  auto: "Run & ask when unsure — pauses on ambiguous LoRAs. Installs only if a worker is set; otherwise generates via OpenRouter.",
-  yolo: "Full auto — search, install only when a worker is set, otherwise generate via OpenRouter. No questions.",
+  plan: "Plan — Freya proposes tool calls (generate/install). Confirm before they run.",
+  auto: "Auto — Freya runs tools, but asks when installs are ambiguous.",
+  yolo: "YOLO — Freya runs tools freely (generate, search, install when a worker is set).",
 };
 
-const AGENT_MODELS = [
-  { id: "openrouter/auto", label: "Auto", short: "Auto" },
-  { id: "anthropic/claude-sonnet-4", label: "Claude Sonnet 4", short: "Sonnet 4" },
-  { id: "openai/gpt-4.1-mini", label: "GPT-4.1 Mini", short: "GPT-4.1 Mini" },
-  { id: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash", short: "Gemini Flash" },
-];
+/** Auto-only placeholders until live lists arrive from GET /v1/models. */
+const AUTO_AGENT = { id: "auto", label: "Auto", short: "Auto" };
+const UPSTREAM_ROUTER_ID = "openrouter/auto";
+const AUTO_IMAGE = { id: "auto", label: "Auto", short: "Auto" };
+const AUTO_VIDEO = { id: "auto", label: "Auto", short: "Auto" };
+const PLACEHOLDER_VIDEO_MODELS = [AUTO_VIDEO];
 
 function artifactMime(item) {
   return (
@@ -1008,6 +1015,7 @@ const emptySession = () => ({
   goal: "",
   pinnedLoras: [],
   turns: [],
+  messages: [],
   sessionNote: "",
 });
 
@@ -1229,6 +1237,24 @@ function readStoredSidebarOpen() {
   return true;
 }
 
+function readStoredWorkspaceSplit() {
+  try {
+    const n = Number(localStorage.getItem(WORKSPACE_SPLIT_STORAGE_KEY));
+    if (Number.isFinite(n) && n >= 15 && n <= 85) return n;
+  } catch {
+    /* ignore */
+  }
+  return WORKSPACE_SPLIT_DEFAULT;
+}
+
+function persistWorkspaceSplit(pct) {
+  try {
+    localStorage.setItem(WORKSPACE_SPLIT_STORAGE_KEY, String(Math.round(pct * 10) / 10));
+  } catch {
+    /* ignore */
+  }
+}
+
 function readStoredSessions() {
   try {
     const raw = localStorage.getItem(SESSIONS_STORAGE_KEY);
@@ -1257,6 +1283,7 @@ function persistSessionsStore(activeId, sessions) {
 }
 
 function loraKey(l) {
+  if (l?.path) return `path:${l.path}`;
   return String(l.id ?? l.name);
 }
 
@@ -1457,19 +1484,60 @@ function readStoredModels() {
     const raw = localStorage.getItem(MODELS_STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
-      return {
-        agentModel: AGENT_MODELS.some((m) => m.id === parsed.agentModel)
-          ? parsed.agentModel
-          : "openrouter/auto",
-        imageModel: IMAGE_MODELS.some((m) => m.id === parsed.imageModel)
-          ? parsed.imageModel
-          : "auto",
-      };
+      let agent =
+        typeof parsed.agentModel === "string" && parsed.agentModel.trim()
+          ? parsed.agentModel.trim()
+          : AUTO_AGENT.id;
+      // Old Auto sentinel was the upstream router. Migrate once so Auto is internal.
+      try {
+        if (!localStorage.getItem("freya.migratedUpstreamAuto")) {
+          if (agent === UPSTREAM_ROUTER_ID) agent = AUTO_AGENT.id;
+          localStorage.setItem("freya.migratedUpstreamAuto", "1");
+        }
+      } catch {
+        /* ignore */
+      }
+      const image =
+        typeof parsed.imageModel === "string" && parsed.imageModel.trim()
+          ? parsed.imageModel.trim()
+          : AUTO_IMAGE.id;
+      const router =
+        typeof parsed.routerModel === "string" && parsed.routerModel.trim()
+          ? parsed.routerModel.trim()
+          : AUTO_ROUTER.id;
+      const video =
+        typeof parsed.videoModel === "string" && parsed.videoModel.trim()
+          ? parsed.videoModel.trim()
+          : AUTO_VIDEO.id;
+      return { agentModel: agent, imageModel: image, routerModel: router, videoModel: video };
     }
   } catch {
     /* ignore */
   }
-  return { agentModel: "openrouter/auto", imageModel: "auto" };
+  return {
+    agentModel: AUTO_AGENT.id,
+    imageModel: AUTO_IMAGE.id,
+    routerModel: AUTO_ROUTER.id,
+    videoModel: AUTO_VIDEO.id,
+  };
+}
+
+function readGenerateBackend() {
+  try {
+    const v = localStorage.getItem(GENERATE_BACKEND_STORAGE_KEY);
+    if (v === "local" || v === "cloud") return v;
+  } catch {
+    /* ignore */
+  }
+  return "cloud";
+}
+
+function persistGenerateBackend(value) {
+  try {
+    localStorage.setItem(GENERATE_BACKEND_STORAGE_KEY, value);
+  } catch {
+    /* ignore */
+  }
 }
 
 function artifactExt(item, src) {
@@ -1525,7 +1593,85 @@ async function downloadArtifact(src, item) {
 }
 
 function installableLoras(loras = []) {
-  return (loras || []).filter((l) => l.downloadUrl);
+  return (loras || []).filter((l) => l.downloadUrl || l.versionId);
+}
+
+function pickPrimaryCivitaiFile(files = []) {
+  return files.find((f) => f.primary) || files[0] || null;
+}
+
+/** Dest filename extension from selected file name/format (not hardcoded safetensors). */
+function fileExtFromVariant(item) {
+  const name = item?.fileName || "";
+  const m = String(name).match(/(\.[A-Za-z0-9]+)$/);
+  if (m) return m[1].toLowerCase();
+  const fmt = String(item?.fileFormat || "").toLowerCase();
+  if (fmt.includes("safe")) return ".safetensors";
+  if (fmt.includes("ckpt") || fmt.includes("pickl")) return ".ckpt";
+  if (fmt === "pt" || fmt.includes("pytorch")) return ".pt";
+  if (fmt.includes("gguf")) return ".gguf";
+  return ".safetensors";
+}
+
+function formatCivitaiFileSize(file) {
+  if (file?.sizeBytes != null && !Number.isNaN(Number(file.sizeBytes))) {
+    const v = Number(file.sizeBytes);
+    if (v >= 1024 * 1024 * 1024) return `${(v / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+    if (v >= 1024 * 1024) return `${(v / (1024 * 1024)).toFixed(1)} MB`;
+    if (v >= 1024) return `${(v / 1024).toFixed(1)} KB`;
+    return `${v} B`;
+  }
+  if (file?.sizeKB != null && !Number.isNaN(Number(file.sizeKB))) {
+    const kb = Number(file.sizeKB);
+    if (kb >= 1024 * 1024) return `${(kb / (1024 * 1024)).toFixed(2)} GB`;
+    if (kb >= 1024) return `${(kb / 1024).toFixed(1)} MB`;
+    return `${Math.round(kb)} KB`;
+  }
+  return "";
+}
+
+/** Apply version + file selection onto a model card (updates downloadUrl / baseModel / etc.). */
+function applyCivitaiVariant(model, versionId, fileId) {
+  if (!model) return model;
+  const versions = model.modelVersions || [];
+  if (!versions.length) return model;
+  const ver =
+    versions.find((v) => String(v.id) === String(versionId)) ||
+    versions.find((v) => String(v.id) === String(model.versionId)) ||
+    versions[0];
+  if (!ver) return model;
+  const files = ver.files || [];
+  const file =
+    (fileId != null && files.find((f) => String(f.id) === String(fileId))) ||
+    pickPrimaryCivitaiFile(files);
+  const baseModel = ver.baseModel || model.baseModel;
+  const isCheckpoint = String(model.modelType || "").toLowerCase() === "checkpoint";
+  let needsBase = model.needsBase;
+  if (isCheckpoint) {
+    needsBase = null;
+  } else if (baseModel) {
+    needsBase = `Needs base model family: ${baseModel}`;
+  }
+  return {
+    ...model,
+    versionId: ver.id,
+    versionName: ver.name,
+    baseModel,
+    downloadUrl: file?.downloadUrl || model.downloadUrl,
+    fileId: file?.id ?? null,
+    fileName: file?.name || null,
+    fileFormat: file?.format || file?.type || null,
+    trainedWords: ver.trainedWords?.length ? ver.trainedWords : model.trainedWords,
+    triggerWord: ver.trainedWords?.[0] || model.triggerWord,
+    imageUrls: ver.imageUrls?.length ? ver.imageUrls : model.imageUrls,
+    thumbnailUrl:
+      (ver.imageUrls?.length ? ver.imageUrls[0] : null) ||
+      model.thumbnailUrl ||
+      model.imageUrls?.[0] ||
+      null,
+    examplePrompt: ver.examplePrompt || model.examplePrompt,
+    needsBase: needsBase || undefined,
+  };
 }
 
 function modelLabel(list, id) {
@@ -1554,11 +1700,33 @@ const Svg = ({ children, filled = false }) => (
     {children}
   </svg>
 );
-const IconPlay = () => (
-  <Svg filled>
-    <path d="M8 5.5v13l11-6.5z" stroke="none" />
+/** Up-arrow submit — modern chat send control (not a right-pointing “send”). */
+const IconSend = () => (
+  <Svg>
+    <path d="M12 19V5M5 12l7-7 7 7" />
   </Svg>
 );
+/** Plan mode — checklist / proposed steps. */
+const IconPlan = () => (
+  <Svg>
+    <path d="M9 6h11M9 12h11M9 18h11" />
+    <path d="M4.5 6.5 5.5 7.5 7 5.5M4.5 12.5 5.5 13.5 7 11.5M4.5 18.5 5.5 19.5 7 17.5" />
+  </Svg>
+);
+/** Auto mode — refresh / autonomous loop. */
+const IconAuto = () => (
+  <Svg>
+    <path d="M20 12a8 8 0 1 1-2.3-5.7" />
+    <path d="M20 4v5h-5" />
+  </Svg>
+);
+/** YOLO mode — lightning / unrestricted run. */
+const IconYolo = () => (
+  <Svg>
+    <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
+  </Svg>
+);
+const MODE_ICONS = { plan: IconPlan, auto: IconAuto, yolo: IconYolo };
 const IconSpinner = () => (
   <span className="icon-spin">
     <Svg>
@@ -1616,6 +1784,21 @@ const IconImage = () => (
     <rect x="3" y="5" width="18" height="14" rx="2" />
     <circle cx="8.5" cy="10" r="1.4" />
     <path d="M21 15.5 16 11l-8.5 8" />
+  </Svg>
+);
+/** Video modality — film frame + play triangle (distinct from Image landscape). */
+const IconVideo = () => (
+  <Svg>
+    <rect x="2.5" y="6" width="13" height="12" rx="1.5" />
+    <path d="m15.5 10 5.5-3.2v10.4L15.5 14z" />
+  </Svg>
+);
+const IconRouter = () => (
+  <Svg>
+    <circle cx="6" cy="12" r="2" />
+    <circle cx="18" cy="6" r="2" />
+    <circle cx="18" cy="18" r="2" />
+    <path d="M8 12h6M14 8.5 12 12l2 3.5" />
   </Svg>
 );
 const IconChevron = () => (
@@ -2731,11 +2914,149 @@ function CompactMenu({
                   onOpen(false);
                 }}
               >
-                {opt.label}
+                {opt.icon ? (
+                  <span className="chrome-menu-opt-icon" aria-hidden="true">
+                    {opt.icon}
+                  </span>
+                ) : null}
+                <span className="chrome-menu-opt-label">{opt.label}</span>
               </button>
             </li>
           ))}
+          {menuNote ? (
+            <li className="chrome-menu-note" role="note">
+              {menuNote}
+            </li>
+          ) : null}
         </ul>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Icon trigger → popover above with accordion option groups
+ * (Agent + Router + Mode, or Image + Video / Base).
+ * Section lists stay collapsed; click a section row to expand and pick.
+ * Stays open across picks so several settings can be changed in one open.
+ */
+function GroupedChromeMenu({
+  label,
+  valueLabel,
+  icon,
+  title,
+  open,
+  onOpen,
+  sections,
+  /** `end` → popover right-aligned above the trigger (gen / Image+Video). */
+  align = "start",
+  /** Extra class on the menu root (e.g. composer model size bump). */
+  className = "",
+}) {
+  const ref = useRef(null);
+  const [expandedId, setExpandedId] = useState(null);
+  useChromeMenuDismiss(open, onOpen, ref);
+
+  useEffect(() => {
+    if (!open) setExpandedId(null);
+  }, [open]);
+
+  return (
+    <div
+      className={`chrome-menu chrome-menu-grouped${align === "end" ? " chrome-menu-align-end" : ""}${className ? ` ${className}` : ""}`}
+      ref={ref}
+    >
+      <button
+        type="button"
+        className={`ghost icon-btn chrome-chip chrome-chip-icon-only${open ? " open" : ""}`}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        aria-label={`${label}: ${valueLabel}`}
+        title={title || `${label}: ${valueLabel}`}
+        onClick={() => onOpen(!open)}
+      >
+        <span className="chrome-chip-icon" aria-hidden="true">
+          {icon}
+        </span>
+      </button>
+      {open && (
+        <div className="chrome-popover" role="dialog" aria-label={label}>
+          {sections.map((sec) => {
+            const expanded = expandedId === sec.id;
+            return (
+              <div
+                key={sec.id}
+                className={`chrome-popover-section${expanded ? " is-expanded" : ""}`}
+              >
+                <button
+                  type="button"
+                  className="chrome-popover-head"
+                  aria-expanded={expanded}
+                  aria-controls={`chrome-popover-list-${sec.id}`}
+                  id={`chrome-popover-head-${sec.id}`}
+                  onClick={() =>
+                    setExpandedId((cur) => (cur === sec.id ? null : sec.id))
+                  }
+                >
+                  {sec.icon ? (
+                    <span className="chrome-popover-head-icon" aria-hidden="true">
+                      {sec.icon}
+                    </span>
+                  ) : null}
+                  <span className="chrome-popover-head-label">{sec.label}</span>
+                  {sec.valueLabel ? (
+                    <span className="chrome-popover-head-value">{sec.valueLabel}</span>
+                  ) : null}
+                  <span
+                    className={`chrome-popover-head-caret${expanded ? " is-open" : ""}`}
+                    aria-hidden="true"
+                  >
+                    <IconChevron />
+                  </span>
+                </button>
+                {expanded ? (
+                  <>
+                    <ul
+                      id={`chrome-popover-list-${sec.id}`}
+                      className="chrome-popover-list"
+                      role="listbox"
+                      aria-label={sec.label}
+                      aria-labelledby={`chrome-popover-head-${sec.id}`}
+                    >
+                      {sec.options.map((opt) => (
+                        <li key={opt.id}>
+                          <button
+                            type="button"
+                            role="option"
+                            aria-selected={opt.id === sec.value}
+                            className={opt.id === sec.value ? "active" : ""}
+                            disabled={opt.disabled}
+                            onClick={() => {
+                              if (opt.disabled) return;
+                              sec.onChange(opt.id);
+                            }}
+                          >
+                            {opt.icon ? (
+                              <span className="chrome-menu-opt-icon" aria-hidden="true">
+                                {opt.icon}
+                              </span>
+                            ) : null}
+                            <span className="chrome-menu-opt-label">{opt.label}</span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                    {sec.menuNote ? (
+                      <p className="chrome-menu-note chrome-popover-note" role="note">
+                        {sec.menuNote}
+                      </p>
+                    ) : null}
+                  </>
+                ) : null}
+              </div>
+            );
+          })}
+        </div>
       )}
     </div>
   );
@@ -2751,7 +3072,33 @@ export default function App() {
   const [mock] = useState(() => isMockMode());
   /** `make mock-ui` / `npm run dev:mock` bake mock in — Exit cannot leave. */
   const mockLocked = import.meta.env.VITE_FREYA_MOCK === "true";
-  const [tab, setTab] = useState("gallery");
+  const [tab, setTabState] = useState(readStoredTab);
+  const [helpFocus, setHelpFocus] = useState(() => readHelpHash());
+  const setTab = (next) => {
+    setTabState(next);
+    persistTab(next);
+    if (next !== "help") {
+      setHelpFocus(null);
+      try {
+        if (String(window.location.hash || "").startsWith("#help-")) {
+          history.replaceState(null, "", window.location.pathname + window.location.search);
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+  };
+  const openHelp = (topic) => {
+    const id = topic && String(topic).startsWith("help-") ? String(topic) : "help-overview";
+    setHelpFocus(id);
+    setTabState("help");
+    persistTab("help");
+    try {
+      history.replaceState(null, "", `#${id}`);
+    } catch {
+      /* ignore */
+    }
+  };
   const [prompt, setPrompt] = useState(() => bootSession.prompt || "");
   const [busy, setBusy] = useState(false);
   /** Live transcript line while a chat turn is in flight. */
@@ -2766,6 +3113,65 @@ export default function App() {
   const [settings, setSettings] = useState(null);
   const [civitaiKey, setCivitaiKey] = useState("");
   const [openrouterKey, setOpenrouterKey] = useState("");
+  const [orMetrics, setOrMetrics] = useState(null);
+  const [orMetricsBusy, setOrMetricsBusy] = useState(false);
+  const [privacyZdr, setPrivacyZdr] = useState(false);
+  const [privacyDataCollection, setPrivacyDataCollection] = useState("allow");
+  const [chatProviders, setChatProviders] = useState({ excluded: [], legacyOnly: null });
+  const [chatProviderAvailable, setChatProviderAvailable] = useState([]);
+  const [chatProviderSearch, setChatProviderSearch] = useState("");
+  const [modelAlignment, setModelAlignment] = useState("balanced");
+  const [allowNsfwLocal, setAllowNsfwLocal] = useState(false);
+  const [instructionTone, setInstructionTone] = useState("warm");
+  const [autoFallbacks, setAutoFallbacks] = useState(EMPTY_AUTO_FALLBACKS);
+  /** Editable system prompts from GET /v1/settings → instructions[]. */
+  const [instructions, setInstructions] = useState([]);
+  const [instructionMode, setInstructionMode] = useState("converse");
+  const [instructionDraft, setInstructionDraft] = useState("");
+  const [instructionBusy, setInstructionBusy] = useState(false);
+  /** Synced fingerprint of privacy/alignment — skips debounce PUT when unchanged. */
+  const prefsFpRef = useRef("");
+  const prefsReadyRef = useRef(false);
+  const prefsDebounceRef = useRef(null);
+  const prefsGenRef = useRef(0);
+  const apiKeysDebounceRef = useRef(null);
+  const apiKeysGenRef = useRef(0);
+
+  const markPrivacyAlignmentSynced = (snapOrSettings) => {
+    const snap =
+      snapOrSettings?.privacy != null || snapOrSettings?.alignment != null
+        ? privacyAlignmentFromSettings(snapOrSettings)
+        : snapOrSettings;
+    if (!snap) return;
+    prefsFpRef.current = privacyAlignmentFingerprint(snap);
+    prefsReadyRef.current = true;
+  };
+
+  const applyPrivacyAlignmentFromSettings = (st) => {
+    if (!st) return;
+    const snap = privacyAlignmentFromSettings(st);
+    setPrivacyZdr(snap.privacy.zeroDataRetention);
+    setPrivacyDataCollection(snap.privacy.dataCollection);
+    setChatProviders(normalizeChatProviders(snap.privacy.chatProviders));
+    setModelAlignment(snap.alignment.modelAlignment);
+    setAllowNsfwLocal(snap.alignment.allowNsfwLocal);
+    setInstructionTone(snap.alignment.instructionTone);
+    setAutoFallbacks(normalizeAutoFallbacks(snap.autoFallbacks));
+    markPrivacyAlignmentSynced(snap);
+  };
+
+  const applyInstructionsFromSettings = (st, preferredMode) => {
+    const list = Array.isArray(st?.instructions) ? st.instructions : [];
+    setInstructions(list);
+    if (list.length === 0) {
+      setInstructionDraft("");
+      return;
+    }
+    const want = preferredMode || instructionMode;
+    const match = list.find((i) => i.id === want) || list[0];
+    setInstructionMode(match.id);
+    setInstructionDraft(typeof match.text === "string" ? match.text : "");
+  };
   const [studioToken, setStudioToken] = useState(
     () =>
       (typeof localStorage !== "undefined" && localStorage.getItem("freya.apiToken")) || "",
@@ -2866,6 +3272,9 @@ export default function App() {
   const [authCta, setAuthCta] = useState("");
   const [guidelinesAcked, setGuidelinesAcked] = useState(readGuidelinesAck);
   const [savedMsg, setSavedMsg] = useState("");
+  /** Brief UI flash after Settings / Worker save — drives button checkmark + toast. */
+  const [saveFlash, setSaveFlash] = useState(null);
+  const saveFlashTimerRef = useRef(null);
   const [ideas, setIdeas] = useState(() =>
     Array.isArray(bootSession.ideas) ? bootSession.ideas : [],
   );
@@ -2875,18 +3284,7 @@ export default function App() {
   const [suggestNote, setSuggestNote] = useState(() => bootSession.suggestNote || "");
   const [civitaiQuery, setCivitaiQuery] = useState(() => bootSession.civitaiQuery || "");
   const [modelBrief, setModelBrief] = useState(() => bootSession.modelBrief || "");
-  const [session, setSession] = useState(() =>
-    bootSession.session
-      ? {
-          goal: bootSession.session.goal || "",
-          pinnedLoras: Array.isArray(bootSession.session.pinnedLoras)
-            ? bootSession.session.pinnedLoras
-            : [],
-          turns: Array.isArray(bootSession.session.turns) ? bootSession.session.turns : [],
-          sessionNote: bootSession.session.sessionNote || "",
-        }
-      : emptySession(),
-  );
+  const [session, setSession] = useState(() => normalizeSession(bootSession.session));
   const [automationMode, setAutomationMode] = useState(readStoredMode);
   const storedModels = readStoredModels();
   const [agentModel, setAgentModel] = useState(storedModels.agentModel);
@@ -2912,6 +3310,8 @@ export default function App() {
   const [menuOpen, setMenuOpen] = useState(null);
   const [theme, setTheme] = useState(resolveInitialTheme);
   const [sidebarOpen, setSidebarOpen] = useState(readStoredSidebarOpen);
+  const [workspaceSplit, setWorkspaceSplit] = useState(readStoredWorkspaceSplit);
+  const [workspaceResizing, setWorkspaceResizing] = useState(false);
   const [activeSessionId, setActiveSessionId] = useState(
     () => bootSession.id || makeSessionId(),
   );
@@ -3022,6 +3422,7 @@ export default function App() {
         goal: session.goal || "",
         pinnedLoras: session.pinnedLoras || [],
         turns: session.turns || [],
+        messages: session.messages || [],
         sessionNote: session.sessionNote || "",
       },
       ideas,
@@ -3039,18 +3440,7 @@ export default function App() {
 
   const applySessionEntry = (entry) => {
     setPrompt(entry.prompt || "");
-    setSession(
-      entry.session
-        ? {
-            goal: entry.session.goal || "",
-            pinnedLoras: Array.isArray(entry.session.pinnedLoras)
-              ? entry.session.pinnedLoras
-              : [],
-            turns: Array.isArray(entry.session.turns) ? entry.session.turns : [],
-            sessionNote: entry.session.sessionNote || "",
-          }
-        : emptySession(),
-    );
+    setSession(normalizeSession(entry.session));
     setIdeas(Array.isArray(entry.ideas) ? entry.ideas : []);
     setSuggestedLoras(Array.isArray(entry.suggestedLoras) ? entry.suggestedLoras : []);
     setSuggestNote(entry.suggestNote || "");
@@ -3191,6 +3581,73 @@ export default function App() {
     }
   };
 
+  const clampWorkspaceSplit = (clientX) => {
+    const el = workspaceRef.current;
+    if (!el) return workspaceSplitRef.current;
+    const rect = el.getBoundingClientRect();
+    const gutter = 6;
+    const usable = Math.max(1, rect.width - gutter);
+    const minLeftPct = (WORKSPACE_SPLIT_MIN_LEFT_PX / usable) * 100;
+    const minRightPct = (WORKSPACE_SPLIT_MIN_RIGHT_PX / usable) * 100;
+    const raw = ((clientX - rect.left) / usable) * 100;
+    const lo = Math.min(minLeftPct, 85);
+    const hi = Math.max(100 - Math.min(minRightPct, 85), lo);
+    return Math.min(hi, Math.max(lo, raw));
+  };
+
+  const onWorkspaceSplitPointerDown = (e) => {
+    if (e.button != null && e.button !== 0) return;
+    e.preventDefault();
+    const handle = e.currentTarget;
+    handle.setPointerCapture?.(e.pointerId);
+    setWorkspaceResizing(true);
+    const pct = clampWorkspaceSplit(e.clientX);
+    workspaceSplitRef.current = pct;
+    setWorkspaceSplit(pct);
+
+    const onMove = (ev) => {
+      const next = clampWorkspaceSplit(ev.clientX);
+      workspaceSplitRef.current = next;
+      setWorkspaceSplit(next);
+    };
+    const onUp = (ev) => {
+      handle.releasePointerCapture?.(ev.pointerId);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+      setWorkspaceResizing(false);
+      persistWorkspaceSplit(workspaceSplitRef.current);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+  };
+
+  const onWorkspaceSplitKeyDown = (e) => {
+    const step = e.shiftKey ? 5 : 2;
+    let next = workspaceSplitRef.current;
+    if (e.key === "ArrowLeft") next -= step;
+    else if (e.key === "ArrowRight") next += step;
+    else if (e.key === "Home") next = 20;
+    else if (e.key === "End") next = 80;
+    else return;
+    e.preventDefault();
+    const el = workspaceRef.current;
+    if (el) {
+      const rect = el.getBoundingClientRect();
+      const gutter = 6;
+      const usable = Math.max(1, rect.width - gutter);
+      const minLeftPct = (WORKSPACE_SPLIT_MIN_LEFT_PX / usable) * 100;
+      const minRightPct = (WORKSPACE_SPLIT_MIN_RIGHT_PX / usable) * 100;
+      next = Math.min(100 - Math.min(minRightPct, 85), Math.max(Math.min(minLeftPct, 85), next));
+    } else {
+      next = Math.min(80, Math.max(20, next));
+    }
+    workspaceSplitRef.current = next;
+    setWorkspaceSplit(next);
+    persistWorkspaceSplit(next);
+  };
+
   // Keep the active session entry fresh for reload / switch (mock persistence).
   useEffect(() => {
     const snap = snapshotCurrent();
@@ -3215,7 +3672,111 @@ export default function App() {
     sessionLog,
   ]);
 
+  const applyModelCatalog = (models) => {
+    const videoOpts = catalogToOptions(
+      (Array.isArray(models?.video) ? models.video : []).filter(
+        (m) =>
+          m?.id &&
+          !String(m.id).startsWith("openrouter/") &&
+          !String(m.id).includes("heygen") &&
+          !String(m.id).includes("avatar") &&
+          String(m.modality || "video").toLowerCase() === "video",
+      ),
+      { auto: AUTO_VIDEO },
+    );
+    setVideoModels(videoOpts.length ? videoOpts : EMPTY_VIDEO_CATALOG);
+    const chatRows = (Array.isArray(models?.chat) ? models.chat : []).filter(
+      (m) => !m?.modality || String(m.modality).toLowerCase() === "chat",
+    );
+    const routerRows = (Array.isArray(models?.router) ? models.router : []).filter(
+      (m) => !m?.modality || String(m.modality).toLowerCase() === "chat",
+    );
+    const imageRows = (Array.isArray(models?.openrouter) ? models.openrouter : []).filter(
+      (m) => m?.id && !String(m.id).startsWith("openrouter/") && String(m.modality || "image").toLowerCase() === "image",
+    );
+    setAgentModels(catalogToOptions(chatRows, { auto: AUTO_AGENT }));
+    setImageModels(catalogToOptions(imageRows, { auto: AUTO_IMAGE }));
+    setRouterModels(catalogToOptions(routerRows, { auto: AUTO_ROUTER }));
+    const avail = Array.isArray(models?.chatProviders?.available)
+      ? models.chatProviders.available
+          .map((s) => String(s || "").trim().toLowerCase())
+          .filter(Boolean)
+          .sort()
+      : [];
+    if (avail.length) setChatProviderAvailable(avail);
+    setModelsCatalogReady(true);
+  };
+
+  /** GET /v1/models → picker catalogs (privacy/alignment already applied server-side). */
+  const refreshModels = async () => {
+    try {
+      applyModelCatalog(await api("/v1/models"));
+    } catch {
+      /* No auth / OpenRouter / fetch — Auto-only until a real catalog arrives.
+         Persisted agent/image ids stay in state for restore after a successful load. */
+      setAgentModels(PLACEHOLDER_AGENT_MODELS);
+      setImageModels(PLACEHOLDER_IMAGE_MODELS);
+      setRouterModels(PLACEHOLDER_ROUTER_MODELS);
+      setVideoModels([]);
+      setModelsCatalogReady(false);
+    }
+  };
+
+  const cancelPrefsAutosave = () => {
+    if (prefsDebounceRef.current) {
+      clearTimeout(prefsDebounceRef.current);
+      prefsDebounceRef.current = null;
+    }
+    prefsGenRef.current += 1;
+    if (apiKeysDebounceRef.current) {
+      clearTimeout(apiKeysDebounceRef.current);
+      apiKeysDebounceRef.current = null;
+    }
+    apiKeysGenRef.current += 1;
+  };
+
+  const refreshAuthStatus = async () => {
+    if (mock) {
+      const st = {
+        authRequired: false,
+        adminLoginConfigured: true,
+        apiTokenConfigured: false,
+        openRouterConfigured: true,
+        adminUsername: "admin",
+        note: "Mock mode — sign-in optional.",
+      };
+      setAuthStatus(st);
+      return st;
+    }
+    try {
+      const st = await api("/v1/auth/status");
+      setAuthStatus(st);
+      if (st.adminUsername) setLoginUser(st.adminUsername);
+      if (st.authRequired && !hasBrowserBearer()) {
+        setShowLogin(true);
+        setAuthCta(AUTH_SIGN_IN_HINT);
+      }
+      return st;
+    } catch {
+      /* health-only clusters may lack the route during rolling deploys */
+      return null;
+    }
+  };
+
   const refresh = async () => {
+    const st = await refreshAuthStatus();
+    // Without a browser bearer, skip protected calls so the UI stays honest (locked).
+    if (!mock && st?.authRequired && !hasBrowserBearer()) {
+      setModelsCatalogReady(false);
+      setAgentModels(PLACEHOLDER_AGENT_MODELS);
+      setImageModels(PLACEHOLDER_IMAGE_MODELS);
+      setRouterModels(PLACEHOLDER_ROUTER_MODELS);
+      setVideoModels([]);
+      setError("");
+      return;
+    }
+    // Studio payload and OpenRouter catalogs are independent: a 401/failure on
+    // styles/gallery must not skip model discovery once a bearer is present.
     try {
       const [s, st, g] = await Promise.all([
         api("/v1/styles"),
@@ -3683,7 +4244,12 @@ export default function App() {
     try {
       localStorage.setItem(
         MODELS_STORAGE_KEY,
-        JSON.stringify({ agentModel: nextAgent, imageModel: nextImage }),
+        JSON.stringify({
+          agentModel: nextAgent,
+          imageModel: nextImage,
+          routerModel: nextRouter,
+          videoModel: nextVideo,
+        }),
       );
     } catch {
       /* ignore */
@@ -3786,12 +4352,15 @@ export default function App() {
   };
 
   const changeAgentModel = (id) => {
+    // Placeholder Auto chip must not clobber a persisted id before catalog loads.
+    if (!modelsCatalogReady && id === AUTO_AGENT.id) return;
     setAgentModel(id);
     persistModels(id, imageModel, routerModel, videoModel);
     void persistModelPins({ chatModel: id });
   };
 
   const changeImageModel = (id) => {
+    if (!modelsCatalogReady && id === AUTO_IMAGE.id) return;
     setImageModel(id);
     persistModels(agentModel, id, routerModel, videoModel);
     void persistModelPins({ imageModel: id });
@@ -4041,15 +4610,23 @@ export default function App() {
       }));
 
   const isPinned = (item) =>
-    (session.pinnedLoras || []).some((p) => loraKey(p) === loraKey(item));
+    (session.pinnedLoras || []).some(
+      (p) => isPinnableAsset(p) && loraKey(p) === loraKey(item),
+    );
 
-  const pinLora = (item) => {
+  const pinLora = (item, extra = {}) => {
+    if (!isPinnableAsset(item)) {
+      setError(
+        `“${item?.name || "Asset"}” is a checkpoint/base — set it as active base on Worker (or ask the agent), not as a session pin.`,
+      );
+      return;
+    }
     setSession((prev) => {
       if ((prev.pinnedLoras || []).some((p) => loraKey(p) === loraKey(item))) return prev;
       const next = {
         id: item.id,
         name: item.name,
-        modelType: item.modelType,
+        modelType: item.modelType || item.kind || "LORA",
         downloadUrl: item.downloadUrl,
         triggerWord: item.triggerWord || null,
         baseModel: item.baseModel || null,
@@ -4066,11 +4643,10 @@ export default function App() {
         ...prev,
         pinnedLoras,
         sessionNote: item.triggerWord
-          ? `Pinned “${item.name}”. Trigger word “${item.triggerWord}” is optional — Freya keeps your prompt as you wrote it.`
-          : `Pinned “${item.name}” for this session. Your prompt stays as you wrote it.`,
+          ? `Pinned “${item.name}”. Trigger word “${item.triggerWord}” is optional — Freya keeps your prompt as you wrote it.${baseHint}`
+          : `Pinned “${item.name}” for this session. Your prompt stays as you wrote it.${baseHint}`,
       };
     });
-    setSavedMsg(`Pinned ${item.name} for this session.`);
   };
 
   const setPinScale = (item, scale) => {
@@ -4094,13 +4670,25 @@ export default function App() {
   };
 
   const pushTurn = (text, artifactIds = []) => {
+    const at = new Date().toISOString();
     setSession((prev) => ({
       ...prev,
       goal: prev.goal || text,
-      turns: [{ prompt: text, at: new Date().toISOString(), artifactIds }, ...(prev.turns || [])].slice(
-        0,
-        12,
-      ),
+      turns: [{ prompt: text, at, artifactIds }, ...(prev.turns || [])].slice(0, 12),
+      messages: [
+        ...(prev.messages || []),
+        { role: "user", content: text, at },
+        ...(artifactIds?.length
+          ? [
+              {
+                role: "assistant",
+                content: `Generated ${artifactIds.length} image${artifactIds.length === 1 ? "" : "s"}.`,
+                at,
+                artifactIds,
+              },
+            ]
+          : []),
+      ].slice(-40),
     }));
   };
 
@@ -4520,7 +5108,7 @@ export default function App() {
         recentPrompts: (session.turns || []).slice(0, 5).map((t) => t.prompt),
       },
     };
-    if (agentModel && agentModel !== "openrouter/auto") body.model = agentModel;
+    if (agentModel && agentModel !== AUTO_AGENT.id) body.model = agentModel;
     return body;
   };
 
@@ -4835,17 +5423,22 @@ export default function App() {
   };
 
   const installOne = async (item) => {
-    const safe = (item.name || "model").replace(/[^a-zA-Z0-9._-]+/g, "_");
-    const dest =
-      item.modelType === "LORA" || item.modelType === "LoCon"
-        ? `loras/${safe}.safetensors`
-        : `checkpoints/${safe}.safetensors`;
-    await api("/v1/civitai/install", {
+    const dest = destPathForAsset(item);
+    const modelId = resolveCivitaiModelId(item);
+    const thumb = item.thumbnailUrl || item.imageUrls?.[0] || null;
+    if (thumb) rememberCivitaiThumb({ modelId, versionId: item.versionId }, thumb);
+    const res = await api("/v1/civitai/install", {
       method: "POST",
       body: JSON.stringify({
-        downloadUrl: item.downloadUrl,
+        downloadUrl: item.downloadUrl || undefined,
         destPath: dest,
         name: item.name,
+        baseModel: item.baseModel || undefined,
+        versionId: item.versionId || undefined,
+        modelId: modelId ?? undefined,
+        fileId: item.fileId || undefined,
+        modelType: item.modelType || undefined,
+        thumbnailUrl: thumb || undefined,
       }),
     });
     // A plain download never pins. Pin-to-use calls this, then pins or selects the base.
@@ -5036,8 +5629,17 @@ export default function App() {
 
     for (const item of list) {
       try {
-        const dest = await installOne(item);
-        log.push(`Installed “${item.name}” → ${dest}`);
+        if (findInstalledForItem(item)) {
+          log.push(`Already installed “${item.name}” → ${destPathForAsset(item)}`);
+          continue;
+        }
+        if (activeJobForItem(item)) {
+          // Active job → Downloads label color cycle; no chat/composer status line.
+          continue;
+        }
+        const { dest, jobId } = await installOne(item);
+        // Queued jobs use the Downloads label color cycle; only log sync installs.
+        if (!jobId) log.push(`Installed “${item.name}” → ${dest}`);
       } catch (e) {
         log.push(`Install skipped for “${item.name}”: ${e.message}`);
       }
@@ -5080,64 +5682,12 @@ export default function App() {
     };
   };
 
-  const run = async () => {
-    const sessionId = activeIdRef.current;
-    setBusy(true);
-    setError("");
-    setBatchResults([]);
-    try {
-      const data = await runOne(prompt);
-      if (activeIdRef.current !== sessionId) return;
-      setResult(data);
-      setModelBrief(data.enhancedPrompt || "");
-      pushTurn(prompt, data.artifactId ? [data.artifactId] : []);
-      const g = await api("/v1/gallery");
-      if (activeIdRef.current !== sessionId) return;
-      setGallery(g.items || []);
-    } catch (e) {
-      if (activeIdRef.current === sessionId) setError(e.message);
-    } finally {
-      if (activeIdRef.current === sessionId) setBusy(false);
-    }
-  };
-
-  /** Ask Freya for NL alternatives + LoRA recommendations (never auto-installs). */
+  /** Shortcut: inject a suggest request into chat (tool: suggest_ideas). */
   const suggestIdeas = async () => {
-    setBusy(true);
-    setError("");
-    try {
-      const message = prompt.trim() || examplePrompt;
-      if (!prompt.trim()) setPrompt(examplePrompt);
-      const data = await api("/v1/assist", {
-        method: "POST",
-        body: JSON.stringify(assistBody("suggest", message)),
-      });
-      const nextIdeas = Array.isArray(data.ideas)
-        ? data.ideas
-        : typeof data.text === "string"
-          ? data.text
-              .split("\n")
-              .map((l) => l.replace(/^\d+\.\s*/, "").trim())
-              .filter(Boolean)
-          : [];
-      setIdeas(nextIdeas);
-      setSuggestedLoras(Array.isArray(data.loras) ? data.loras : []);
-      setSuggestNote(data.sessionNote || "");
-      setCivitaiQuery(data.civitaiQuery || "");
-      if (data.civitaiQuery) setCivitaiQ(data.civitaiQuery);
-      if (data.sessionNote) {
-        setSession((prev) => ({ ...prev, sessionNote: data.sessionNote }));
-      }
-      if (!settings?.civitaiConfigured && (!data.loras || data.loras.length === 0)) {
-        setSavedMsg(
-          "LoRA suggestions need a Civitai key — add any non-empty value in Settings (mock).",
-        );
-      }
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
-    }
+    const topic = prompt.trim() || session.goal || examplePrompt;
+    const msg = `Suggest ideas for: ${topic}`;
+    setPrompt(msg);
+    await submitChat(msg);
   };
 
   const fetchSessionPlan = async () => {
@@ -5211,11 +5761,14 @@ export default function App() {
     log.push(`Generating ${plan.batchPrompts.length} variations…`);
     await executeBatch(plan.batchPrompts, plan.goal);
     log.push(`Generated ${plan.batchPrompts.length} images for “${plan.goal}”.`);
-    if (agentModel && agentModel !== "openrouter/auto") {
-      log.push(`Agent model: ${modelLabel(AGENT_MODELS, agentModel)}`);
+    if (agentModel && agentModel !== AUTO_AGENT.id) {
+      log.push(`Agent model: ${modelLabel(agentModels, agentModel)}`);
     }
-    if (imageModel && imageModel !== "auto") {
-      log.push(`Image model: ${modelLabel(IMAGE_MODELS, imageModel)}`);
+    if (imageModel && imageModel !== AUTO_IMAGE.id) {
+      log.push(`Image model: ${modelLabel(imageModels, imageModel)}`);
+    }
+    if (routerModel && routerModel !== AUTO_ROUTER.id) {
+      log.push(`Router model: ${modelLabel(routerModels, routerModel)}`);
     }
     setSessionLog(log);
     setPendingPlan(null);
@@ -5227,53 +5780,26 @@ export default function App() {
     );
   };
 
-  /** Agentic session — gated by Plan / Auto / YOLO. */
+  /** Shortcut: inject a run-session request into chat. */
   const runSession = async () => {
-    const sessionId = activeIdRef.current;
-    setBusy(true);
-    setError("");
-    setBatchResults([]);
-    setSessionLog([]);
+    const goal = prompt.trim() || session.goal || examplePrompt;
+    const msg = `Run session for: ${goal}`;
+    setPrompt(msg);
+    await submitChat(msg);
+  };
+
+  const confirmPendingActions = async () => {
+    if (!pendingPlan?.actions?.length) return;
+    await submitChat(pendingPlan.goal || prompt || examplePrompt, {
+      confirm: true,
+      actions: pendingPlan.actions.map((a) => ({
+        type: a.type,
+        args: a.args || {},
+      })),
+    });
+    setPendingPlan(null);
     setPendingQuestion(null);
-    try {
-      const plan = await fetchSessionPlan();
-      if (activeIdRef.current !== sessionId) return;
-
-      if (automationMode === "plan") {
-        setPendingPlan({ ...plan, status: "plan" });
-        setSuggestNote(
-          plan.sessionNote ||
-            "Plan ready — no generate or install. Run pieces manually, or switch to Auto/YOLO and Run session again.",
-        );
-        setSavedMsg("Plan mode — nothing executed yet.");
-        return;
-      }
-
-      if (automationMode === "auto") {
-        const q = detectAutoQuestion(plan);
-        if (q) {
-          setPendingPlan({ ...plan, status: "auto" });
-          setPendingQuestion(q);
-          setSuggestNote(plan.sessionNote || "Freya paused — answer below to continue.");
-          setSavedMsg("Auto mode — waiting on your answer.");
-          return;
-        }
-        setPendingPlan(null);
-        await executePlan(plan, {
-          installs: (plan.pendingInstalls || []).length === 1 ? plan.pendingInstalls : [],
-          yolo: false,
-        });
-        return;
-      }
-
-      // YOLO
-      setPendingPlan(null);
-      await executePlan(plan, { installs: "all", yolo: true });
-    } catch (e) {
-      if (activeIdRef.current === sessionId) setError(e.message);
-    } finally {
-      if (activeIdRef.current === sessionId) setBusy(false);
-    }
+    setSavedMsg("Confirmed — Freya ran the proposed tools.");
   };
 
   const answerQuestion = async (choice) => {
@@ -5281,37 +5807,41 @@ export default function App() {
 
     if (choice.value === "settings") {
       setTab("settings");
-      setSavedMsg("Add a worker URL (and Civitai key) for LoRA installs — OpenRouter still generates without one.");
+      setSavedMsg(
+        "Add a worker URL (and Civitai key) for LoRA installs — OpenRouter still generates without one.",
+      );
       return;
     }
 
-    setBusy(true);
-    setError("");
-    try {
-      let plan = pendingPlan;
-      if (pendingQuestion.kind === "goal" && choice.id === "example") {
-        setPrompt(examplePrompt);
-        plan = { ...plan, goal: examplePrompt };
-      }
-
-      let installs = [];
-      if (pendingQuestion.kind === "lora") {
-        if (choice.value === "all") installs = "all";
-        else if (choice.value == null) installs = [];
-        else installs = [choice.value];
-      } else if (pendingQuestion.kind === "config") {
-        installs = [];
-      } else if ((plan.pendingInstalls || []).length === 1 && canAutoInstall()) {
-        installs = plan.pendingInstalls;
-      }
-
-      await executePlan(plan, { installs, yolo: false });
-      setSavedMsg("Continued after your answer.");
-    } catch (e) {
-      setError(e.message);
-    } finally {
-      setBusy(false);
+    if (choice.value === "skip" || choice.id === "skip") {
+      dismissPending();
+      appendMessages({
+        role: "assistant",
+        content: "Skipped proposed tools — keep chatting whenever you’re ready.",
+        at: new Date().toISOString(),
+      });
+      return;
     }
+
+    if (choice.value === "confirm" || choice.id === "confirm" || choice.id === "all") {
+      await confirmPendingActions();
+      return;
+    }
+
+    // Single LoRA choice — confirm only that install (+ any generate)
+    const actions = (pendingPlan.actions || []).filter((a) => {
+      if (a.type !== "install_asset") return true;
+      if (choice.value && typeof choice.value === "object") {
+        return a.args?.name === choice.value.name || a.args?.downloadUrl === choice.value.downloadUrl;
+      }
+      return false;
+    });
+    await submitChat(pendingPlan.goal || prompt || examplePrompt, {
+      confirm: true,
+      actions: actions.map((a) => ({ type: a.type, args: a.args || {} })),
+    });
+    setPendingPlan(null);
+    setPendingQuestion(null);
   };
 
   const dismissPending = () => {
@@ -5362,16 +5892,30 @@ export default function App() {
     setBusy(true);
     setError("");
     setSavedMsg("");
+    setSaveFlash(null);
+    cancelPrefsAutosave();
     try {
       // Persist studio bearer first so the PUT below authenticates when FREYA_API_TOKEN is set.
-      if (studioToken.trim()) {
-        localStorage.setItem("freya.apiToken", studioToken.trim());
-      } else {
-        localStorage.removeItem("freya.apiToken");
-      }
-      const body = { diffusionWorkerUrl: workerUrl };
-      if (civitaiKey.trim()) body.civitaiApiKey = civitaiKey.trim();
-      if (openrouterKey.trim()) body.openrouterApiKey = openrouterKey.trim();
+      persistStudioTokenLocal();
+      const prefs = privacyAlignmentSnapshot({
+        privacyZdr,
+        privacyDataCollection,
+        chatProviders,
+        modelAlignment,
+        allowNsfwLocal,
+        instructionTone,
+        autoFallbacks,
+      });
+      const body = {
+        routerModel,
+        chatModel: agentModel,
+        imageModel,
+        ...prefs,
+      };
+      const wroteOr = Boolean(openrouterKey.trim());
+      const wroteCiv = Boolean(civitaiKey.trim());
+      if (wroteCiv) body.civitaiApiKey = civitaiKey.trim();
+      if (wroteOr) body.openrouterApiKey = openrouterKey.trim();
       const st = await api("/v1/settings", {
         method: "PUT",
         body: JSON.stringify(body),
@@ -5383,10 +5927,27 @@ export default function App() {
       // Clear inputs — keys are never echoed; show on-file badges instead of empty "lost" fields.
       setCivitaiKey("");
       setOpenrouterKey("");
-      setSavedMsg(
+      // Bearer / OpenRouter key may have just been written — refresh catalogs.
+      await refresh();
+      // Strengthen: prefs affect `/v1/models` — ensure pickers update even if a
+      // styles/gallery failure somehow raced ahead of the models fetch.
+      await refreshModels();
+      const parts = [];
+      if (wroteOr) parts.push("OpenRouter");
+      if (wroteCiv) parts.push("Civitai");
+      const which =
+        parts.length > 0 ? `${parts.join(" + ")} key${parts.length > 1 ? "s" : ""} saved` : "Models saved";
+      const disk =
+        st?.persisted === false
+          ? " (warning: secrets file write failed — may not survive API restart)"
+          : st?.persisted
+            ? " · on API secrets file"
+            : "";
+      flashSave(
+        "models",
         mock
-          ? "Mock settings saved in-memory (reload resets unless you keep this tab open)."
-          : "Settings saved. Provider keys stay on the API; studio bearer stays in this browser.",
+          ? "Mock models saved in-memory (reload resets unless you keep this tab open)."
+          : `${which}${disk}.`,
       );
     } catch (e) {
       setError(e.message);
@@ -5624,12 +6185,22 @@ export default function App() {
     setBusy(true);
     setError("");
     try {
-      const data = await api(`/v1/civitai/search?q=${encodeURIComponent(civitaiQ)}&limit=12`);
+      // Default Freya types on the API; pass explicitly so mock + live stay aligned.
+      const data = await api(
+        `/v1/civitai/search?q=${encodeURIComponent(q)}&limit=12&types=${encodeURIComponent(CIVITAI_SEARCH_TYPES)}`,
+        { signal: ac.signal },
+      );
+      if (ac.signal.aborted) return;
       setCivitaiItems(data.items || []);
+      lastCivitaiSearchQRef.current = q;
     } catch (e) {
+      if (e?.name === "AbortError" || ac.signal.aborted) return;
       setError(e.message);
     } finally {
-      setBusy(false);
+      if (civitaiAbortRef.current === ac) {
+        civitaiAbortRef.current = null;
+        setBusy(false);
+      }
     }
   };
 
@@ -5726,14 +6297,13 @@ export default function App() {
   }, [session.pinnedLoras]);
 
   const installCivitai = async (item) => {
-    if (!item.downloadUrl) {
+    if (!item.downloadUrl && !item.versionId) {
       setError("No download URL on this card");
       return;
     }
     if (!hasWorker()) {
-      pinLora(item);
-      setSavedMsg(
-        `Pinned “${item.name}” for later — Install needs a diffusion worker. Cloud Generate still works via OpenRouter.`,
+      setError(
+        "Install needs a diffusion worker. Pin LoRAs manually if you want them for a later session, or use Cloud Generate via OpenRouter.",
       );
       return;
     }
@@ -5741,16 +6311,72 @@ export default function App() {
       setError("Add a Civitai API key in Settings to install LoRAs onto your worker.");
       return;
     }
+    if (findInstalledForItem(item)) return;
+    const activeJob = activeJobForItem(item);
+    if (activeJob) {
+      setCivitaiSubview("downloads");
+      return;
+    }
     setBusy(true);
     setError("");
     try {
-      const dest = await installOne(item);
-      setSavedMsg(`Queued install of ${item.name} → ${dest} on the diffusion worker. Pinned for session.`);
+      await installOne(item);
+      // Progress is the Downloads label color cycle — no toast / status paragraph.
+      setCivitaiSubview("downloads");
     } catch (e) {
       setError(e.message);
     } finally {
       setBusy(false);
     }
+  };
+
+  /** Install / Delete / Downloading… icon action for Civitai cards + detail. */
+  const renderInstallAction = (item) => {
+    const installed = findInstalledForItem(item);
+    if (installed) {
+      return (
+        <button
+          type="button"
+          className="ghost danger-ghost icon-btn"
+          disabled={busy}
+          title={`Delete ${installed.path} from the worker`}
+          aria-label="Delete"
+          onClick={() => deleteInstalledAsset(installed)}
+        >
+          <IconTrash />
+        </button>
+      );
+    }
+    const activeJob = activeJobForItem(item);
+    if (activeJob) {
+      return (
+        <button
+          type="button"
+          className="ghost icon-btn"
+          disabled
+          title={`Download in progress → ${activeJob.destPath || destPathForAsset(item)}`}
+          aria-label="Downloading"
+        >
+          <IconDownload />
+        </button>
+      );
+    }
+    return (
+      <button
+        type="button"
+        className="ghost icon-btn"
+        disabled={busy}
+        title={
+          hasWorker()
+            ? "Install onto your diffusion worker"
+            : "Needs a worker URL — pin for later, or open the Worker tab"
+        }
+        aria-label={hasWorker() ? "Install" : "Install (needs worker)"}
+        onClick={() => installCivitai(item)}
+      >
+        <IconDownload />
+      </button>
+    );
   };
 
   const gallerySrc = (g) => g.url || `/v1/gallery/${g.id}/image`;
@@ -5854,7 +6480,7 @@ export default function App() {
     setTab("gallery");
   };
 
-  const chronologicalTurns = [...(session.turns || [])].reverse();
+  const conversation = session.messages || [];
 
   // Keep the newest history in view above the pinned composer.
   useEffect(() => {
@@ -5862,7 +6488,7 @@ export default function App() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [
     activeSessionId,
-    chronologicalTurns.length,
+    conversation.length,
     sessionLog.length,
     ideas.length,
     pendingPlan,
@@ -5871,8 +6497,8 @@ export default function App() {
   ]);
 
   const hasTimeline =
+    conversation.length > 0 ||
     Boolean(session.goal) ||
-    chronologicalTurns.length > 0 ||
     (session.pinnedLoras || []).length > 0 ||
     Boolean(session.sessionNote);
 
@@ -5917,32 +6543,21 @@ export default function App() {
           {downloads ? <span className="lora-stat-badge">{downloads}</span> : null}
         </button>
         <div className="lora-card-body">
-          <h4>{item.name}</h4>
-          <p>
-            {item.modelType || "LORA"}
-            {item.triggerWord ? ` · trigger: ${item.triggerWord}` : ""}
-          </p>
+          <button type="button" className="lora-card-title" onClick={() => openCivitaiDetail(item)}>
+            <h4>{item.name}</h4>
+          </button>
+          {item.baseModel ? <p className="lora-card-meta">{item.baseModel}</p> : null}
+          {item.triggerWord ? <p>trigger: {item.triggerWord}</p> : null}
         </div>
         <div className="row lora-card-actions">
           <button
             type="button"
-            className={pinned ? "primary" : "ghost"}
-            onClick={() => (pinned ? unpinLora(item) : pinLora(item))}
+            className={`${favorited ? "primary" : "ghost"} icon-btn`}
+            title={favorited ? "Remove from favorites" : "Save to favorites library"}
+            aria-label={favorited ? "Unfavorite" : "Favorite"}
+            onClick={() => toggleFavorite(item)}
           >
-            {pinned ? "Unpin" : "Pin"}
-          </button>
-          <button
-            type="button"
-            className="ghost"
-            disabled={busy}
-            title={
-              hasWorker()
-                ? "Install onto your diffusion worker"
-                : "Needs a worker URL — pin for later, or add a worker in Settings"
-            }
-            onClick={() => installCivitai(item)}
-          >
-            {hasWorker() ? "Install" : "Install (needs worker)"}
+            <IconStar filled={favorited} />
           </button>
           {canOpenGallery ? (
             <button
@@ -7136,15 +7751,19 @@ export default function App() {
           )}
         </aside>
 
-      <div className="workspace">
+      <div
+        className={`workspace${workspaceResizing ? " is-resizing" : ""}`}
+        ref={workspaceRef}
+        style={{ "--workspace-split": `${workspaceSplit}%` }}
+      >
         <section className="pane pane-left" aria-label="Prompt and session">
-          <div className="timeline" aria-label="Session timeline" ref={timelineRef}>
+          <div className="timeline" aria-label="Conversation" ref={timelineRef}>
             <div className="timeline-head">
-              <h2>Session</h2>
+              <h2>Conversation</h2>
               <span className="timeline-count">
-                {chronologicalTurns.length
-                  ? `${chronologicalTurns.length} turn${chronologicalTurns.length === 1 ? "" : "s"}`
-                  : "no turns yet"}
+                {conversation.length
+                  ? `${conversation.length} message${conversation.length === 1 ? "" : "s"}`
+                  : "no messages yet"}
               </span>
               <button
                 type="button"
@@ -7163,16 +7782,9 @@ export default function App() {
 
             {!hasTimeline && !pendingPlan && !pendingQuestion && sessionLog.length === 0 && (
               <p className="timeline-empty">
-                Your goals, plans, questions and turns will collect here. Try the featured example,
-                then Suggest ideas or Run session.
+                Chat with Freya here. Ask about style, or say “make an image of …” when you want a
+                generate. Suggest and Session shortcuts just send a message.
               </p>
-            )}
-
-            {session.goal && (
-              <article className="t-entry t-goal">
-                <span className="t-kind">Goal</span>
-                <p>{session.goal}</p>
-              </article>
             )}
 
             {(session.pinnedLoras || []).length > 0 && (
@@ -7183,6 +7795,7 @@ export default function App() {
                     <li key={loraKey(l)}>
                       <span>
                         {l.name}
+                        {l.baseModel ? ` · base ${l.baseModel}` : ""}
                         {l.triggerWord ? ` · ${l.triggerWord}` : ""}
                         {" · weight "}
                         <input
@@ -7206,13 +7819,16 @@ export default function App() {
               </article>
             )}
 
-            {chronologicalTurns.map((t, i) => (
-              <article key={`${t.at}-${i}`} className="t-entry t-turn">
+            {conversation.map((m, i) => (
+              <article
+                key={`${m.at || i}-${m.role}-${i}`}
+                className={`t-entry t-msg t-${m.role === "user" ? "user" : "assistant"}`}
+              >
                 <div className="t-meta">
-                  <span className="t-kind">Turn {i + 1}</span>
-                  {t.at && (
+                  <span className="t-kind">{m.role === "user" ? "You" : "Freya"}</span>
+                  {m.at && (
                     <time>
-                      {new Date(t.at).toLocaleTimeString([], {
+                      {new Date(m.at).toLocaleTimeString([], {
                         hour: "numeric",
                         minute: "2-digit",
                       })}
@@ -7358,18 +7974,15 @@ export default function App() {
             {pendingPlan && (pendingPlan.status === "plan" || pendingPlan.actions?.length) && (
               <aside className="pending-plan" aria-label="Proposed tools">
                 <div className="pending-plan-head">
-                  <h3>Session plan</h3>
+                  <h3>Proposed tools</h3>
                   <button type="button" className="ghost" onClick={dismissPending}>
                     Dismiss
                   </button>
                 </div>
-                <p className="pending-goal">
-                  <span className="session-label">Goal</span>
-                  {pendingPlan.goal}
-                </p>
-                {pendingPlan.civitaiQuery && (
-                  <p className="civitai-search-line" role="status">
-                    Proposed Civitai search: <strong>{pendingPlan.civitaiQuery}</strong>
+                {pendingPlan.goal && (
+                  <p className="pending-goal">
+                    <span className="session-label">For</span>
+                    {pendingPlan.goal}
                   </p>
                 )}
                 {pendingPlan.steps?.length > 0 && (
@@ -7386,36 +7999,29 @@ export default function App() {
                       {pendingPlan.pendingInstalls.map((l) => (
                         <li key={loraKey(l)}>
                           “{l.name}”
-                          <button
-                            type="button"
-                            className="ghost"
-                            disabled={busy}
-                            onClick={() => installCivitai(l)}
-                          >
-                            Install
-                          </button>
+                          {renderInstallAction(l)}
                         </li>
                       ))}
                     </ul>
-                    <p className="hint">
-                      Plan mode has no side effects until you Install or Generate yourself — or
-                      switch to Auto/YOLO. Install needs a worker; Generate via OpenRouter does not.
-                    </p>
                   </div>
                 )}
-                {pendingPlan.batchPrompts?.length > 0 && (
-                  <div className="pending-batch">
-                    <span className="session-label">Batch prompts</span>
-                    <ul>
-                      {pendingPlan.batchPrompts.map((bp) => (
-                        <li key={bp}>
-                          <button type="button" className="linkish" onClick={() => setPrompt(bp)}>
-                            {bp.slice(0, 100)}
-                            {bp.length > 100 ? "…" : ""}
-                          </button>
-                        </li>
-                      ))}
-                    </ul>
+                <p className="hint">
+                  Confirm to run, or switch mode.{" "}
+                  <HelpQ topic="help-modes" label="Plan / Auto / YOLO" onOpen={openHelp} />
+                </p>
+                {pendingPlan.actions?.length > 0 && (
+                  <div className="pending-ask-choices">
+                    <button
+                      type="button"
+                      className="primary"
+                      disabled={busy}
+                      onClick={confirmPendingActions}
+                    >
+                      Confirm & run
+                    </button>
+                    <button type="button" className="ghost" disabled={busy} onClick={dismissPending}>
+                      Not now
+                    </button>
                   </div>
                 )}
               </aside>
@@ -7464,7 +8070,7 @@ export default function App() {
           <div className="compose">
             <div className="compose-head">
               <label className="compose-label" htmlFor="freya-prompt">
-                What are you going for?
+                Message Freya
               </label>
               {!prompt.trim() && (
                 <button
@@ -7481,23 +8087,58 @@ export default function App() {
               id="freya-prompt"
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  if (!busy && prompt.trim()) submitChat();
+                }
+              }}
               placeholder={examplePrompt}
               rows={3}
-              title="Everyday language or classic SD prompts (tags, weights, triggers) — one box, Freya handles either"
+              title="Chat with Freya — Enter to send, Shift+Enter for a new line"
               aria-describedby="freya-prompt-hint"
             />
             <p id="freya-prompt-hint" className="sr-only">
-              Everyday language or classic SD prompts (tags, weights, triggers) — one box, Freya
-              handles either. Cloud Generate works with OpenRouter alone; add a worker for LoRAs and
-              custom local looks. {MODE_HINTS[automationMode]}
+              Chat with Freya. Ask to generate only when you want an image. Mode gates tool
+              autonomy. {MODE_HINTS[automationMode]}
             </p>
-            {error && <p className="err compose-status">{error}</p>}
+            {error && (
+              <p className="err compose-status">
+                {/zdr|zero data retention|data-policy|openrouter\.ai\/settings\/privacy/i.test(
+                  error,
+                ) ? (
+                  <>
+                    {error.replace(
+                      /https:\/\/openrouter\.ai\/settings\/privacy/gi,
+                      "",
+                    ).replace(/\s*[—-]\s*Freya Settings.*$/i, "").trim()}{" "}
+                    <button
+                      type="button"
+                      className="linkish"
+                      onClick={() => setTab("settings")}
+                    >
+                      Freya Settings → Privacy
+                    </button>
+                    {" · "}
+                    <a
+                      href="https://openrouter.ai/settings/privacy"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      OpenRouter privacy
+                    </a>
+                  </>
+                ) : (
+                  error
+                )}
+              </p>
+            )}
             {savedMsg && (
               <p className="hint saved-msg compose-status" role="status">
                 {savedMsg}
               </p>
             )}
-            <div className="composer-bar" aria-label="Session controls">
+            <div className="composer-bar" aria-label="Chat controls">
               <div className="compose-actions">
                 <button
                   type="button"
@@ -7717,58 +8358,9 @@ export default function App() {
                 <button
                   type="button"
                   className="ghost icon-btn"
-                  disabled={busy || (!prompt.trim() && !session.goal)}
-                  onClick={runSession}
-                  title={`Run session (${AUTOMATION_LABELS[automationMode]})`}
-                  aria-label="Run session"
-                >
-                  <IconLayers />
-                  <span className="sr-only">Run session</span>
-                </button>
-              </div>
-              <span className="composer-divider" aria-hidden="true" />
-              <div className="chrome-strip" role="toolbar" aria-label="Mode and models">
-                <CompactMenu
-                  label="Mode"
-                  icon={<IconSliders />}
-                  title={`Mode: ${AUTOMATION_LABELS[automationMode]} — ${MODE_HINTS[automationMode]}`}
-                  valueLabel={AUTOMATION_LABELS[automationMode]}
-                  options={modeOptions}
-                  value={automationMode}
-                  onChange={setMode}
-                  open={menuOpen === "mode"}
-                  onOpen={(v) => setMenuOpen(v ? "mode" : null)}
-                />
-                <CompactMenu
-                  label="Agent"
-                  icon={<IconAgent />}
-                  title={`Agent model: ${modelLabel(AGENT_MODELS, agentModel)}`}
-                  valueLabel={modelShortLabel(AGENT_MODELS, agentModel)}
-                  options={AGENT_MODELS}
-                  value={agentModel}
-                  onChange={changeAgentModel}
-                  open={menuOpen === "agent"}
-                  onOpen={(v) => setMenuOpen(v ? "agent" : null)}
-                />
-                <CompactMenu
-                  label="Image"
-                  icon={<IconImage />}
-                  title={`Image model: ${modelLabel(IMAGE_MODELS, imageModel)}`}
-                  valueLabel={modelShortLabel(IMAGE_MODELS, imageModel)}
-                  options={IMAGE_MODELS}
-                  value={imageModel}
-                  onChange={changeImageModel}
-                  open={menuOpen === "image"}
-                  onOpen={(v) => setMenuOpen(v ? "image" : null)}
-                />
-              </div>
-              <div className="composer-primary-cluster" role="group" aria-label="Suggest and generate">
-                <button
-                  type="button"
-                  className="ghost icon-btn"
-                  disabled={busy}
+                  disabled={primaryLocked || busy}
                   onClick={suggestIdeas}
-                  title="Suggest ideas"
+                  title={primaryLocked ? primaryLockReason : "Suggest ideas (sends a chat message)"}
                   aria-label="Suggest ideas"
                 >
                   <IconBulb />
@@ -7776,19 +8368,50 @@ export default function App() {
                 </button>
                 <button
                   type="button"
-                  className="primary icon-btn icon-btn-primary composer-generate"
-                  disabled={busy || !prompt.trim()}
-                  onClick={run}
-                  title={busy ? "Working…" : "Generate"}
-                  aria-label={busy ? "Working" : "Generate"}
+                  className="primary icon-btn icon-btn-primary composer-send"
+                  disabled={primaryLocked || busy || !prompt.trim()}
+                  onClick={() => submitChat()}
+                  title={
+                    primaryLocked ? primaryLockReason : busy ? "Working…" : "Send message"
+                  }
+                  aria-label={busy ? "Working" : "Send message"}
                 >
-                  {busy ? <IconSpinner /> : <IconPlay />}
-                  <span className="sr-only">{busy ? "Working…" : "Generate"}</span>
+                  {busy ? <IconSpinner /> : <IconSend />}
+                  <span className="sr-only">{busy ? "Working…" : "Send"}</span>
+                </button>
+                <button
+                  type="button"
+                  className="ghost icon-btn"
+                  disabled={primaryLocked || busy || (!prompt.trim() && !session.goal)}
+                  onClick={runSession}
+                  title={
+                    primaryLocked
+                      ? primaryLockReason
+                      : `Ask Freya to run a session (${AUTOMATION_LABELS[automationMode]})`
+                  }
+                  aria-label="Run session"
+                >
+                  <IconLayers />
+                  <span className="sr-only">Run session</span>
                 </button>
               </div>
             </div>
           </div>
         </section>
+
+        <button
+          type="button"
+          role="separator"
+          className="workspace-split"
+          aria-orientation="vertical"
+          aria-label="Resize chat and gallery panes"
+          aria-valuemin={15}
+          aria-valuemax={85}
+          aria-valuenow={Math.round(workspaceSplit)}
+          title="Drag to resize"
+          onPointerDown={onWorkspaceSplitPointerDown}
+          onKeyDown={onWorkspaceSplitKeyDown}
+        />
 
         <section className="pane pane-right" aria-label="Gallery and results">
       {tab === "gallery" && !previewResult && gallery.length === 0 && batchResults.length === 0 && (
@@ -7801,38 +8424,6 @@ export default function App() {
               draggable={false}
             />
           </div>
-          <figure className="salon-feature">
-            <img src={gallerySrc(gallery[0])} alt={gallery[0].prompt || "Latest gallery image"} />
-            <figcaption>
-              <span className="salon-caption">{gallery[0].prompt}</span>
-              <span className="salon-meta">
-                {gallery[0].backend}
-                {gallery[0].model ? ` · ${gallery[0].model}` : ""}
-                {mock ? " · mock" : ""}
-              </span>
-              <button
-                type="button"
-                className="ghost remix-btn"
-                onClick={async () => {
-                  const remix = await api(`/v1/gallery/${gallery[0].id}/remix`, {
-                    method: "POST",
-                  });
-                  setPrompt(remix.prompt || "");
-                }}
-              >
-                Remix this prompt
-              </button>
-            </figcaption>
-          </figure>
-        </section>
-      )}
-
-      {tab === "gallery" && !result && gallery.length === 0 && batchResults.length === 0 && (
-        <div className="gallery-empty">
-          <div className="gallery-empty-art" aria-hidden="true">
-            <HeroCanvas />
-          </div>
-          <p>No images yet — Generate or Run session and results will hang here.</p>
         </div>
       )}
 
@@ -7872,7 +8463,25 @@ export default function App() {
       {tab === "gallery" && previewResult && batchResults.length <= 1 && (
         <section className="salon salon-single">
           <div className="salon-head">
-            <span className="t-kind">{batchResults.length > 1 ? "Selected variation" : "Latest image"}</span>
+            <span className="t-kind">
+              {batchResults.length > 1
+                ? "Selected variation"
+                : previewIsLatest
+                  ? "Latest image"
+                  : "Selected image"}
+            </span>
+            {previewResult.artifactId ? (
+              <button
+                type="button"
+                className="ghost salon-head-del"
+                title="Delete from gallery"
+                aria-label="Delete from gallery"
+                onClick={() => deleteGalleryItem(previewResult.artifactId)}
+              >
+                <IconTrash />
+                <span>Delete</span>
+              </button>
+            ) : null}
           </div>
           <figure className="salon-feature">
             <MediaFigure
@@ -7890,7 +8499,7 @@ export default function App() {
       )}
 
       <nav className="tabs" aria-label="Studio sections">
-        {["gallery", "styles", "civitai", "settings"].map((t) => (
+        {STUDIO_TABS.map((t) => (
           <button
             key={t}
             className={tab === t ? "active" : "ghost"}
@@ -8352,27 +8961,28 @@ export default function App() {
                   ),
                 ) ? (
                   <button
-                    className={isPinned(item) ? "primary" : "ghost"}
-                    onClick={() => {
-                      if (isPinned(item)) unpinLora(item);
-                      else pinLora(item);
-                      setTab("gallery");
-                    }}
+                    type="button"
+                    className="ghost icon-btn"
+                    title="Clear finished jobs from the list"
+                    aria-label="Clear finished jobs"
+                    onClick={clearFinishedDownloadJobs}
                   >
-                    {isPinned(item) ? "Unpin" : "Pin to session"}
+                    <IconClear />
                   </button>
-                  <button
-                    className="primary"
-                    disabled={busy}
-                    title={
-                      hasWorker()
-                        ? "Install this LoRA onto your diffusion worker"
-                        : "Needs a worker URL — pin for later, or add a worker in Settings"
-                    }
-                    onClick={() => installCivitai(item)}
-                  >
-                    {hasWorker() ? "Install to worker" : "Install (needs worker)"}
-                  </button>
+                ) : null}
+              </div>
+              {!hasWorker() ? (
+                <p className="hint">Connect a worker to see the download queue.</p>
+              ) : downloadJobs.length === 0 ? (
+                <div className="gallery-empty">
+                  <div className="gallery-empty-art">
+                    <img
+                      src="/empty-downloads.png"
+                      alt="No recent jobs."
+                      className="gallery-empty-img"
+                      draggable={false}
+                    />
+                  </div>
                 </div>
               ) : (
                 <div className="install-job-list">
@@ -9098,26 +9708,91 @@ export default function App() {
 
       {tab === "settings" && (
         <section className="panel settings">
-          <p className="hint">
-            {mock
-              ? "Mock mode: keys are fake flags in memory. Paste anything non-empty to “configure” Civitai/OpenRouter. Agent/image models live in the compose chrome (Mode · Agent · Image)."
-              : "Keys stay on the Freya API (or in your Kubernetes Secrets). They are never shown back in full after save."}{" "}
-            OpenRouter alone is enough for cloud Generate — a worker is only for LoRAs and custom
-            local looks.
-          </p>
+          <aside className="settings-disclaimer" role="note">
+            You are liable for what you generate.{" "}
+            <button type="button" className="linkish" onClick={() => setTab("guidelines")}>
+              Guidelines
+            </button>
+          </aside>
+
           <label>
-            Studio API token
+            <span className="settings-label-row">
+              <span className="label-with-help">
+                OpenRouter API key
+                <HelpQ topic="help-keys" label="API keys" onOpen={openHelp} />
+              </span>
+              {settings?.openRouterConfigured ? (
+                <span className="key-on-file is-on">Saved · configured</span>
+              ) : (
+                <span className="key-on-file">Not configured</span>
+              )}
+            </span>
+            <span className="settings-key-row">
+              <input
+                type="password"
+                autoComplete="off"
+                placeholder={
+                  settings?.openRouterConfigured
+                    ? "••••••••••••  (on file — paste to replace)"
+                    : "sk-or-…"
+                }
+                value={openrouterKey}
+                onChange={(e) => setOpenrouterKey(e.target.value)}
+              />
+              {settings?.openRouterConfigured ? (
+                <button
+                  type="button"
+                  className="ghost danger-ghost"
+                  disabled={busy}
+                  onClick={() => clearApiKey("openrouter")}
+                >
+                  Clear
+                </button>
+              ) : null}
+            </span>
+          </label>
+          <label>
+            <span className="settings-label-row">
+              Civitai API key
+              {settings?.civitaiConfigured ? (
+                <span className="key-on-file is-on">Saved · configured</span>
+              ) : (
+                <span className="key-on-file">Not configured</span>
+              )}
+            </span>
+            <span className="settings-key-row">
+              <input
+                type="password"
+                autoComplete="off"
+                placeholder={
+                  settings?.civitaiConfigured
+                    ? "••••••••••••  (on file — paste to replace)"
+                    : "From civitai.com/user/account"
+                }
+                value={civitaiKey}
+                onChange={(e) => setCivitaiKey(e.target.value)}
+              />
+              {settings?.civitaiConfigured ? (
+                <button
+                  type="button"
+                  className="ghost danger-ghost"
+                  disabled={busy}
+                  onClick={() => clearApiKey("civitai")}
+                >
+                  Clear
+                </button>
+              ) : null}
+            </span>
+          </label>
+          <label className="settings-check" style={{ marginTop: "-0.35rem" }}>
             <input
-              type="password"
-              autoComplete="off"
-              placeholder="Bearer for /v1 when Freya API auth is enabled"
-              value={studioToken}
-              onChange={(e) => setStudioToken(e.target.value)}
+              type="checkbox"
+              checked={allowNsfwLocal}
+              onChange={(e) => setAllowNsfwLocal(e.target.checked)}
             />
-            <span className="hint">
-              Stored only in this browser (localStorage). Required when the API has{" "}
-              <code>FREYA_API_TOKEN</code> / <code>apiTokenSecretRef</code> set. Leave blank for open
-              local/dev.
+            <span className="label-with-help">
+              Show NSFW
+              <HelpQ topic="help-nsfw" label="NSFW" onOpen={openHelp} />
             </span>
           </label>
 

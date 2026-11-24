@@ -6,6 +6,7 @@ use crate::prefs::{AlignmentPrefs, AutoFallbacksPrefs, PrivacyPrefs};
 use crate::studio::StudioPrefs;
 use crate::worker::DiffusionWorkerClient;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -65,6 +66,7 @@ pub struct RuntimeSecrets {
 
 impl AppState {
     pub async fn from_config(cfg: Config) -> anyhow::Result<Self> {
+        crate::auto_matrix::init(&cfg.packs_dir);
         let gallery = Gallery::open(cfg.gallery_dir.clone()).await?;
         let openrouter = OpenRouterClient::new(&cfg);
         let civitai = CivitaiClient::new(cfg.civitai_api_key.clone());
@@ -83,6 +85,7 @@ impl AppState {
             worker: Arc::new(RwLock::new(worker)),
         };
         state.load_secrets_file().await?;
+        state.migrate_legacy_upstream_auto().await?;
         Ok(state)
     }
 

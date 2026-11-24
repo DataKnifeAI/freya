@@ -1,5 +1,6 @@
 use crate::civitai::CommunityImage;
 use crate::gallery::ArtifactMeta;
+use crate::prefs::{looks_nsfw_label, AlignmentPrefs, AutoFallbacksPrefs, PrivacyPrefs};
 use crate::state::{AppState, RuntimeSecrets};
 use crate::styles::{self, StylePack};
 use crate::worker::LoraWeight;
@@ -35,8 +36,8 @@ pub async fn health(State(state): State<AppState>) -> impl IntoResponse {
     };
     Json(json!({
         "ok": true,
-        "openRouter": cfg.openrouter_configured(),
-        "civitai": cfg.civitai_configured(),
+        "openRouter": open_router,
+        "civitai": civitai,
         "diffusionWorker": worker_ok,
         "workerConfigured": worker_url.is_some(),
     }))
@@ -688,7 +689,7 @@ pub async fn assist(
     State(state): State<AppState>,
     Json(req): Json<AssistRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let system = styles::load_instruction(&state.packs_dir, &req.mode).await;
+    let system = load_instruction_toned(&state, &req.mode).await;
     let user_msg = if let Some(sess) = &req.session {
         format!(
             "{}\n\n--- session context ---\n{}",
@@ -737,21 +738,13 @@ pub async fn assist(
                 if civ.configured() {
                     match civ.search(q, 12, allow_nsfw).await {
                         Ok(items) => {
-                            let loras: Vec<_> = items
+                            let mut assets: Vec<_> = items
                                 .into_iter()
-                                .filter(|c| {
-                                    c.model_type.eq_ignore_ascii_case("LORA")
-                                        || c.model_type.eq_ignore_ascii_case("LoCon")
-                                        || c.model_type.to_lowercase().contains("lora")
-                                })
-                                .take(6)
+                                .filter(|c| crate::civitai::is_freya_asset_type(&c.model_type))
                                 .collect();
-                            out["loras"] = json!(if loras.is_empty() {
-                                // fall back to whatever matched the vibe
-                                civ.search(q, 6).await.unwrap_or_default()
-                            } else {
-                                loras
-                            });
+                            assets.sort_by_key(|c| crate::civitai::asset_type_rank(&c.model_type));
+                            assets.truncate(6);
+                            out["loras"] = json!(assets);
                         }
                         Err(e) => {
                             out["civitaiError"] = json!(e.to_string());
@@ -4837,6 +4830,21 @@ fn one() -> f32 {
     1.0
 }
 
+/// Session pins are LoRA/adapter paths only — never treat checkpoints/VAE as LoRAs.
+fn session_lora_pins(loras: Vec<LoraIn>) -> Vec<LoraIn> {
+    loras
+        .into_iter()
+        .filter(|l| {
+            let path = l.path.as_deref().unwrap_or("").to_ascii_lowercase();
+            if path.starts_with("checkpoints/") || path.starts_with("vae/") {
+                return false;
+            }
+            let name = l.name.to_ascii_lowercase();
+            !(name.contains("checkpoint") && path.is_empty())
+        })
+        .collect()
+}
+
 pub async fn generate(
     State(state): State<AppState>,
     Json(req): Json<GenerateRequest>,
@@ -4897,9 +4905,36 @@ pub async fn run(
     State(state): State<AppState>,
     Json(mut req): Json<GenerateRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    // Auto-plan when backend/model unset.
+    let route_system = load_instruction_raw(&state, "route").await;
+    let (route, configured_image, privacy, alignment, auto_fallbacks) = {
+        let or = state.openrouter.read().await;
+        let router_cfg = or.configured_router_model().to_string();
+        let configured_image = or.configured_image_model().to_string();
+        let privacy = or.privacy().clone();
+        let alignment = or.alignment().clone();
+        let auto_fallbacks = or.auto_fallbacks().clone();
+        let route = crate::router::classify_prefs(
+            &or,
+            &route_system,
+            &req.prompt,
+            "",
+            &router_cfg,
+            &privacy,
+            &alignment,
+            &auto_fallbacks,
+        )
+        .await;
+        (route, configured_image, privacy, alignment, auto_fallbacks)
+    };
+    if req.modality.is_none() && route.modality.is_motion() {
+        req.modality = Some(route.modality.as_str().into());
+    }
+
+    // Auto-plan when backend/model unset — still respect Freya router for image model.
+    // Skip cloud model fill when the client already pinned Local (use worker active base).
+    let pinned_local = req.backend.as_deref() == Some("local");
     if req.backend.as_deref().unwrap_or("auto") == "auto" && req.model.is_none() {
-        let system = styles::load_instruction(&state.packs_dir, "plan").await;
+        let system = load_instruction_toned(&state, "plan").await;
         let or = state.openrouter.read().await;
         if let Ok(plan_txt) = or.chat(&system, &req.prompt, None).await {
             if let Ok(plan) = serde_json::from_str::<serde_json::Value>(
@@ -4914,7 +4949,23 @@ pub async fn run(
                     req.backend = Some(b.into());
                 }
                 if let Some(m) = plan.get("model").and_then(|x| x.as_str()) {
-                    req.model = Some(m.into());
+                    let default_image = crate::router::resolve_image_model_choice_prefs(
+                        None,
+                        &route,
+                        &configured_image,
+                        &privacy,
+                        &alignment,
+                        &auto_fallbacks,
+                    );
+                    let resolved = crate::openrouter::resolve_image_model(m, &default_image);
+                    if resolved != m {
+                        tracing::debug!(
+                            planner_model = %m,
+                            resolved = %resolved,
+                            "ignored non-image planner model"
+                        );
+                    }
+                    req.model = Some(resolved);
                 }
                 if let Some(s) = plan.get("styleId").and_then(|x| x.as_str()) {
                     req.style_ref = Some(s.into());
@@ -4926,6 +4977,18 @@ pub async fn run(
                 }
             }
         }
+    }
+    // Local + Auto: leave model unset so run_generate uses the worker active checkpoint.
+    // OpenRouter path still needs a concrete image model id.
+    if req.model.is_none() && !pinned_local && req.backend.as_deref() != Some("local") {
+        req.model = Some(crate::router::resolve_image_model_choice_prefs(
+            None,
+            &route,
+            &configured_image,
+            &privacy,
+            &alignment,
+            &auto_fallbacks,
+        ));
     }
     run_generate(&state, req).await.map(Json)
 }
@@ -5382,6 +5445,7 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
             }
         }
     }
+    req.loras = session_lora_pins(std::mem::take(&mut req.loras));
 
     // LoRAs only apply on the local worker — prefer local when weights are pinned and a worker exists.
     if !req.loras.is_empty()
@@ -5587,12 +5651,23 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     } else if backend == "local" {
         let worker = state.worker.read().await;
         let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
+        // Prefer installed basename for lora_request so it matches on-disk files.
         let loras: Vec<LoraWeight> = req
             .loras
             .iter()
-            .map(|l| LoraWeight {
-                lora_name: l.name.clone(),
-                lora_scale: l.scale,
+            .map(|l| {
+                let lora_name = l
+                    .path
+                    .as_deref()
+                    .and_then(|p| std::path::Path::new(p).file_stem())
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(l.name.as_str())
+                    .to_string();
+                LoraWeight {
+                    lora_name,
+                    lora_scale: l.scale,
+                }
             })
             .collect();
         // Resolve base checkpoint: explicit local path → worker active → LoRA baseModel hint.
@@ -5693,8 +5768,16 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
         }
     } else {
         let or = state.openrouter.read().await;
+        let default_image = or.default_image_model();
+        let model = req.model.as_deref().map(|m| {
+            if crate::router::is_auto_image(m) {
+                default_image.clone()
+            } else {
+                crate::openrouter::resolve_image_model(m, &default_image)
+            }
+        });
         let img = or
-            .generate_image(&final_prompt, req.model.as_deref(), req.size.as_deref())
+            .generate_image(&final_prompt, model.as_deref(), req.size.as_deref())
             .await
             .map_err(ApiError::from)?;
         let bytes = base64::engine::general_purpose::STANDARD
@@ -6191,26 +6274,104 @@ async fn models_payload(state: &AppState) -> ApiResult<serde_json::Value> {
     };
     let or = state.openrouter.read().await;
     let mut cloud = or.list_image_models().await.unwrap_or_default();
+    let chat_catalog = or.list_chat_catalog().await.unwrap_or_default();
+    let mut chat = chat_catalog.models;
+    let mut router_models = chat_catalog.router;
+    let chat_available = chat_catalog.available;
+    let mut video = or.list_video_models().await.unwrap_or_default();
+    // Consistent picker order: vendor (id prefix before `/`) → name → id.
+    crate::openrouter::sort_models_by_vendor_name(&mut cloud);
+    crate::openrouter::sort_models_by_vendor_name(&mut chat);
+    crate::openrouter::sort_models_by_vendor_name(&mut router_models);
+    crate::openrouter::sort_video_models_by_vendor_name(&mut video);
     let mut local = Vec::new();
+    let mut active_base = Value::Null;
     if let Some(w) = state.worker.read().await.as_ref() {
         if let Ok(loras) = w.list_loras().await {
             for a in loras {
+                let name = a.name.clone().unwrap_or_else(|| a.id.clone());
+                if !allow_nsfw
+                    && (looks_nsfw_label(&a.id)
+                        || looks_nsfw_label(&name)
+                        || looks_nsfw_label(&a.path))
+                {
+                    continue;
+                }
                 local.push(json!({
                     "id": a.id,
-                    "name": a.id,
+                    "name": name,
                     "backend": "local",
                     "kind": a.kind,
                     "path": a.path,
+                    "baseModel": a.base_model,
+                    "sizeBytes": a.size_bytes,
+                    "modelType": a.model_type,
                 }));
             }
         }
+        if let Ok(cps) = w.list_checkpoints().await {
+            for a in cps {
+                let name = a.name.clone().unwrap_or_else(|| a.id.clone());
+                if !allow_nsfw
+                    && (looks_nsfw_label(&a.id)
+                        || looks_nsfw_label(&name)
+                        || looks_nsfw_label(&a.path))
+                {
+                    continue;
+                }
+                local.push(json!({
+                    "id": a.id,
+                    "name": name,
+                    "backend": "local",
+                    "kind": "checkpoint",
+                    "path": a.path,
+                    "baseModel": a.base_model,
+                    "sizeBytes": a.size_bytes,
+                    "modelType": a.model_type,
+                }));
+            }
+        }
+        if let Ok(v) = w.get_active_base().await {
+            active_base = v;
+        }
     }
-    Ok(Json(json!({
+    Ok(json!({
+        // Image-capable cloud models (OpenRouter GET /images/models).
         "openrouter": cloud.drain(..).map(|m| json!({
-            "id": m.id, "name": m.name, "backend": m.backend
+            "id": m.id, "name": m.name, "backend": m.backend, "modality": "image"
+        })).collect::<Vec<_>>(),
+        // Tool-calling text models for the Agent picker.
+        "chat": chat.drain(..).map(|m| json!({
+            "id": m.id, "name": m.name, "backend": m.backend, "modality": "chat"
+        })).collect::<Vec<_>>(),
+        // Structured-JSON / tool-calling text models for the Router picker.
+        "router": router_models.drain(..).map(|m| json!({
+            "id": m.id, "name": m.name, "backend": m.backend, "modality": "chat"
+        })).collect::<Vec<_>>(),
+        // Video: OpenRouter async POST /videos (+ poll). Freya generate/chat routes gif|video here.
+        "video": video.drain(..).map(|m| json!({
+            "id": m.id,
+            "name": m.name,
+            "backend": "openrouter",
+            "modality": "video",
+            "supportedDurations": m.supported_durations,
+            "supportedResolutions": m.supported_resolutions,
+            "supportedAspectRatios": m.supported_aspect_ratios,
         })).collect::<Vec<_>>(),
         "local": local,
-    })))
+        "activeBase": active_base,
+        "baseModelCatalog": crate::base_models::catalog(),
+        // Vendor prefixes from denylist-passing chat catalog + current checkbox prefs.
+        "chatProviders": {
+            "available": chat_available,
+            "excluded": chat_providers.excluded,
+            "legacyOnly": chat_providers.legacy_only,
+        },
+    }))
+}
+
+pub async fn models(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
+    models_payload(&state).await.map(Json)
 }
 
 pub async fn route_defaults(State(state): State<AppState>) -> Json<serde_json::Value> {
@@ -6305,6 +6466,10 @@ pub struct CivitaiSearchQuery {
     pub q: String,
     #[serde(default = "default_limit")]
     pub limit: u32,
+    /// Optional comma-separated Civitai ModelTypes (e.g. `LORA,Checkpoint,VAE`).
+    /// Empty / omitted → Freya defaults (adapters, checkpoints, embeddings, VAE).
+    #[serde(default)]
+    pub types: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6321,10 +6486,32 @@ fn default_limit() -> u32 {
     20
 }
 
+fn parse_civitai_types(raw: Option<&str>) -> Vec<String> {
+    let owned: Vec<String> = raw
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if owned.is_empty() {
+        crate::civitai::DEFAULT_SEARCH_TYPES
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    } else {
+        owned
+    }
+}
+
 pub async fn civitai_search(
     State(state): State<AppState>,
     Query(q): Query<CivitaiSearchQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let allow_nsfw = {
+        let cfg = state.config.read().await;
+        cfg.alignment_prefs().allow_nsfw_local
+    };
     let civ = state.civitai.read().await;
     let types = parse_civitai_types(q.types.as_deref());
     let type_refs: Vec<&str> = types.iter().map(String::as_str).collect();
@@ -6639,6 +6826,8 @@ pub async fn civitai_model_version(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InstallCivitaiRequest {
+    /// Direct Civitai download URL. Optional when `versionId` is set (resolved server-side).
+    #[serde(default)]
     pub download_url: String,
     pub dest_path: String,
     #[serde(default)]
@@ -6685,36 +6874,22 @@ pub async fn civitai_install(
     State(state): State<AppState>,
     Json(req): Json<InstallCivitaiRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let cfg = state.config.read().await;
-    if !cfg.civitai_configured() {
-        return Err(ApiError::Msg(
-            "Civitai API key required — set it in Settings".into(),
-        ));
-    }
-    if !civitai_download_url_ok(&req.download_url) {
-        return Err(ApiError::Msg(
-            "downloadUrl must be an http(s) civitai.com URL".into(),
-        ));
-    }
-    let worker = state.worker.read().await;
-    let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
-    // Pass the key as authToken (Bearer on download) — never append to the URL
-    // (reqwest errors include the full URL and would leak the secret).
-    let auth = cfg.civitai_api_key.clone();
-    let url = req.download_url.clone();
-    drop(cfg);
-    client
-        .install_asset("civitai", &url, &req.dest_path, Some(&auth))
-        .await
-        .map_err(ApiError::from)?;
-    Ok(Json(json!({
-        "ok": true,
-        "destPath": req.dest_path,
-        "name": req.name,
-    })))
+    civitai_install_inner(&state, req).await.map(Json)
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstructionSetting {
+    pub id: String,
+    pub label: String,
+    /// Effective text (override if set, else pack/builtin default).
+    pub text: String,
+    /// Pack / builtin default (for Reset UI).
+    pub default_text: String,
+    pub overridden: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsPublic {
     pub open_router_configured: bool,
@@ -6723,6 +6898,7 @@ pub struct SettingsPublic {
     pub diffusion_worker_url: Option<String>,
     /// Agent model (`auto` = internal Auto; `openrouter/auto` is the explicit upstream router).
     pub chat_model: String,
+    /// Image model (`auto` = Auto → Flux NL default).
     pub image_model: String,
     /// Freya intent router model (`auto` = Llama 3.1 8B-class).
     pub router_model: String,
@@ -7227,19 +7403,33 @@ pub struct SettingsUpdate {
     pub chat_model: Option<String>,
     #[serde(default)]
     pub image_model: Option<String>,
+    #[serde(default)]
+    pub router_model: Option<String>,
+    #[serde(default)]
+    pub privacy: Option<PrivacyPrefs>,
+    #[serde(default)]
+    pub alignment: Option<AlignmentPrefs>,
+    #[serde(default)]
+    pub auto_fallbacks: Option<AutoFallbacksPrefs>,
+    /// Partial merge of system-prompt overrides. Empty string for a mode clears that override
+    /// (reset to pack default). Absent keys are left unchanged.
+    #[serde(default)]
+    pub instruction_overrides: Option<std::collections::HashMap<String, String>>,
 }
 
 pub async fn settings_put(
     State(state): State<AppState>,
     Json(upd): Json<SettingsUpdate>,
-) -> ApiResult<Json<SettingsPublic>> {
-    let models_changed = upd.chat_model.is_some() || upd.image_model.is_some();
+) -> ApiResult<Json<SettingsPutResponse>> {
+    let models_changed =
+        upd.chat_model.is_some() || upd.image_model.is_some() || upd.router_model.is_some();
+    let prefs_changed =
+        upd.privacy.is_some() || upd.alignment.is_some() || upd.auto_fallbacks.is_some();
     {
         let mut cfg = state.config.write().await;
         if let Some(url) = upd.diffusion_worker_url {
             if url.is_empty() {
                 cfg.diffusion_worker_url = None;
-                *state.worker.write().await = None;
             } else {
                 cfg.diffusion_worker_url = Some(url);
             }
@@ -7249,6 +7439,30 @@ pub async fn settings_put(
         }
         if let Some(m) = upd.image_model {
             cfg.image_model = m;
+        }
+        if let Some(m) = upd.router_model {
+            cfg.router_model = m;
+        }
+        if let Some(p) = upd.privacy.clone() {
+            cfg.apply_privacy(p);
+        }
+        if let Some(a) = upd.alignment.clone() {
+            cfg.apply_alignment(a);
+        }
+        if let Some(f) = upd.auto_fallbacks.clone() {
+            cfg.apply_auto_fallbacks(f);
+        }
+        if let Some(patch) = upd.instruction_overrides.clone() {
+            for (mode, text) in patch {
+                if !styles::is_editable_instruction_mode(&mode) {
+                    continue;
+                }
+                if text.trim().is_empty() {
+                    cfg.instruction_overrides.remove(&mode);
+                } else {
+                    cfg.instruction_overrides.insert(mode, text);
+                }
+            }
         }
     }
 
@@ -7269,21 +7483,30 @@ pub async fn settings_put(
         studio: None,
     };
     state.apply_secrets(secrets).await;
-    let _ = state.persist_secrets().await;
+    state.rebuild_worker_client().await;
+    let persisted = state.persist_secrets().await.is_ok();
+    if !persisted {
+        tracing::warn!("FREYA_SECRETS_FILE write failed — keys may not survive API restart");
+    }
 
-    // OpenRouterClient captures chat/image model at construction — rebuild after changes.
-    if models_changed {
+    // OpenRouterClient captures models + privacy/alignment at construction — rebuild after changes.
+    if models_changed || prefs_changed {
         let cfg = state.config.read().await;
         let mut or = state.openrouter.write().await;
         *or = crate::openrouter::OpenRouterClient::new(&cfg);
     }
 
-    Ok(settings_get(State(state)).await)
+    Ok(Json(SettingsPutResponse {
+        settings: settings_public_from_state(&state).await,
+        persisted,
+    }))
 }
 
 #[derive(Debug)]
 pub enum ApiError {
     Msg(String),
+    Unauthorized(String),
+    Unavailable(String),
     NotFound,
     NoWorker,
 }
@@ -7309,6 +7532,8 @@ impl IntoResponse for ApiError {
                 "No diffusion worker configured — set worker URL or deploy FreyaDiffusionWorker"
                     .into(),
             ),
+            ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
+            ApiError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             ApiError::Msg(m) => (StatusCode::BAD_REQUEST, m),
         };
         (code, Json(json!({ "error": msg }))).into_response()

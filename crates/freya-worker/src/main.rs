@@ -1,21 +1,30 @@
-//! Minimal diffusion worker: OpenAI-compatible images + asset install for Freya.
-//! Production: replace with vLLM-Omni. This stub enables LoRA install + API wiring.
+//! Freya diffusion worker: OpenAI-compatible images + asset install.
+//! GPU path: Diffusers engine at `FREYA_ENGINE_URL` (see `deploy/worker/`,
+//! `Dockerfile.worker`). Without an engine, generate falls back to a stub PNG
+//! for wiring tests. vLLM-Omni remains the CRD engine label for external swaps.
 
-use axum::extract::{Request, State};
+use axum::extract::{Path as PathParam, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use clap::Parser;
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
 use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 #[derive(Parser, Clone)]
 struct Config {
@@ -23,15 +32,95 @@ struct Config {
     port: u16,
     #[arg(long, env = "FREYA_MODELS_DIR", default_value = "./data/models")]
     models_dir: PathBuf,
+    /// Host path for the models bind-mount (UI hint). Empty = unknown.
+    #[arg(long, env = "FREYA_MODELS_HOST_DIR", default_value = "")]
+    models_dir_host: String,
+    /// Optional default / active base (HF id or relative path under models dir).
+    #[arg(long, env = "FREYA_WORKER_MODEL", default_value = "")]
+    model: String,
     /// Optional bearer token for `/v1/*`. Empty = open (local/dev only).
     #[arg(long, env = "FREYA_WORKER_TOKEN", default_value = "")]
     token: String,
+    /// Diffusers (or compatible) engine base URL. Empty = stub PNG generate.
+    #[arg(long, env = "FREYA_ENGINE_URL", default_value = "")]
+    engine_url: String,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ActiveBase {
+    /// HF id or relative path e.g. `checkpoints/foo.safetensors`.
+    #[serde(default)]
+    model: String,
+    /// Civitai-style family label when known (SDXL 1.0, Pony, …).
+    #[serde(default)]
+    base_model: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstallJob {
+    id: String,
+    status: String,
+    url: String,
+    dest_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
+    bytes_done: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bytes_total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    created_at: u64,
+    updated_at: u64,
+}
+
+struct JobEntry {
+    job: InstallJob,
+    cancel: Arc<AtomicBool>,
+    /// Auth token kept out of serialized job state.
+    auth_token: Option<String>,
+    version_id: Option<i64>,
+    model_id: Option<i64>,
+    thumbnail_url: Option<String>,
+}
+
+struct JobStore {
+    jobs: HashMap<String, JobEntry>,
+    /// Newest-first ids for list (cap recent history).
+    recent: VecDeque<String>,
+}
+
+const JOB_HISTORY_CAP: usize = 100;
 
 #[derive(Clone)]
 struct App {
     models_dir: PathBuf,
+    /// Optional host bind-mount path (FREYA_MODELS_HOST_DIR) for UI.
+    models_dir_host: Option<String>,
     token: String,
+    /// Empty = stub generate (no GPU). Set by GPU image entrypoint.
+    engine_url: String,
+    started: Instant,
+    active: Arc<RwLock<ActiveBase>>,
+    http: reqwest::Client,
+    jobs: Arc<Mutex<JobStore>>,
+    job_tx: mpsc::UnboundedSender<String>,
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[tokio::main]
@@ -53,10 +142,53 @@ async fn main() -> anyhow::Result<()> {
     }
     fs::create_dir_all(cfg.models_dir.join("loras")).await?;
     fs::create_dir_all(cfg.models_dir.join("checkpoints")).await?;
+    let active = load_active_base(&cfg.models_dir, cfg.model.trim()).await;
+    if !active.model.is_empty() {
+        info!(
+            model = %active.model,
+            base = ?active.base_model,
+            "active base model"
+        );
+    }
+    let engine_url = cfg.engine_url.trim().trim_end_matches('/').to_string();
+    let engine_label = if engine_url.is_empty() {
+        "stub"
+    } else {
+        "diffusers"
+    };
+    if engine_url.is_empty() {
+        warn!("FREYA_ENGINE_URL unset — generate returns stub PNGs (no GPU weights)");
+    } else {
+        info!(%engine_url, "FREYA_ENGINE_URL set — generate proxies to Diffusers engine");
+    }
+    let models_dir_host = {
+        let h = cfg.models_dir_host.trim();
+        if h.is_empty() {
+            None
+        } else {
+            Some(h.to_string())
+        }
+    };
+    let (job_tx, job_rx) = mpsc::unbounded_channel::<String>();
+    let jobs = Arc::new(Mutex::new(JobStore {
+        jobs: HashMap::new(),
+        recent: VecDeque::new(),
+    }));
     let state = Arc::new(App {
         models_dir: cfg.models_dir.clone(),
+        models_dir_host,
         token: cfg.token.trim().to_string(),
+        engine_url,
+        started: Instant::now(),
+        active: Arc::new(RwLock::new(active)),
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .expect("reqwest client"),
+        jobs: jobs.clone(),
+        job_tx,
     });
+    spawn_job_worker(state.clone(), job_rx);
     let protected = Router::new()
         .route("/v1/loras", get(list_loras))
         .route("/v1/checkpoints", get(list_checkpoints))
@@ -65,18 +197,29 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/base-model", get(get_base_model).put(put_base_model))
         .route("/v1/stats", get(stats))
         .route("/v1/images/generations", post(generate))
+        .route("/v1/videos/generations", post(generate_video))
         .route("/v1/assets/install", post(install))
+        .route("/v1/assets/jobs", get(list_jobs).post(enqueue_install))
+        .route("/v1/assets/jobs/clear", post(clear_jobs))
+        .route("/v1/assets/jobs/{id}", get(get_job))
+        .route("/v1/assets/jobs/{id}/cancel", post(cancel_job))
+        .route("/v1/assets", delete(delete_asset))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_worker_token,
         ));
     let app = Router::new()
-        .route("/health", get(|| async { Json(json!({"ok": true})) }))
+        .route("/health", get(health))
         .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
     let bind = format!("0.0.0.0:{}", cfg.port);
-    info!(%bind, models = %cfg.models_dir.display(), "freya-worker listening (stub — swap for vLLM-Omni in prod)");
+    info!(
+        %bind,
+        models = %cfg.models_dir.display(),
+        engine = %engine_label,
+        "freya-worker listening (checkpoints + LoRAs on disk; GPU via FREYA_ENGINE_URL)"
+    );
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -344,24 +487,173 @@ async fn require_worker_token(
     Ok(next.run(req).await)
 }
 
-async fn list_loras(State(app): State<Arc<App>>) -> Json<serde_json::Value> {
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct AssetMeta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    base_model: Option<String>,
+    #[serde(default)]
+    version_id: Option<i64>,
+    /// Civitai model id when known (distinct from on-disk file stem `id`).
+    #[serde(default)]
+    model_id: Option<i64>,
+    #[serde(default)]
+    model_type: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    /// Preview image URL (Civitai) for Installed cards.
+    #[serde(default)]
+    thumbnail_url: Option<String>,
+}
+
+async fn read_meta_sidecar(weight_path: &Path) -> Option<AssetMeta> {
+    let meta_path = meta_path_for(weight_path);
+    let bytes = fs::read(&meta_path).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn meta_path_for(weight_path: &Path) -> PathBuf {
+    let mut s = weight_path.as_os_str().to_os_string();
+    s.push(".meta.json");
+    PathBuf::from(s)
+}
+
+async fn list_dir_assets(app: &App, subdir: &str, kind: &str) -> Vec<Value> {
     let mut data = Vec::new();
-    let lora_dir = app.models_dir.join("loras");
-    if let Ok(mut rd) = fs::read_dir(&lora_dir).await {
-        while let Ok(Some(ent)) = rd.next_entry().await {
-            let name = ent.file_name().to_string_lossy().to_string();
-            data.push(json!({
-                "id": name,
-                "name": name,
-                "kind": "lora",
-                "path": format!("loras/{name}"),
-            }));
+    let dir = app.models_dir.join(subdir);
+    let Ok(mut rd) = fs::read_dir(&dir).await else {
+        return data;
+    };
+    while let Ok(Some(ent)) = rd.next_entry().await {
+        let name = ent.file_name().to_string_lossy().to_string();
+        if name.ends_with(".meta.json") || name.starts_with('.') {
+            continue;
         }
+        let Ok(ft) = ent.file_type().await else {
+            continue;
+        };
+        if !ft.is_file() {
+            continue;
+        }
+        let path = format!("{subdir}/{name}");
+        let full = app.models_dir.join(&path);
+        let meta = read_meta_sidecar(&full).await.unwrap_or_default();
+        let size_bytes = ent.metadata().await.ok().map(|m| m.len());
+        let id = name.trim_end_matches(".safetensors").to_string();
+        data.push(json!({
+            "id": id,
+            "name": meta.name.unwrap_or_else(|| id.clone()),
+            "kind": kind,
+            "path": path,
+            "baseModel": meta.base_model,
+            "versionId": meta.version_id,
+            "modelId": meta.model_id,
+            "modelType": meta.model_type,
+            "sizeBytes": size_bytes,
+            "source": meta.source,
+            "thumbnailUrl": meta.thumbnail_url,
+        }));
     }
-    Json(json!({ "data": data }))
+    data.sort_by(|a, b| {
+        a.get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .cmp(b.get("id").and_then(|x| x.as_str()).unwrap_or(""))
+    });
+    data
+}
+
+async fn list_loras(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(json!({ "data": list_dir_assets(&app, "loras", "lora").await }))
+}
+
+async fn list_checkpoints(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(json!({ "data": list_dir_assets(&app, "checkpoints", "checkpoint").await }))
+}
+
+async fn list_embeddings(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(json!({ "data": list_dir_assets(&app, "embeddings", "embedding").await }))
+}
+
+async fn list_vaes(State(app): State<Arc<App>>) -> Json<Value> {
+    Json(json!({ "data": list_dir_assets(&app, "vae", "vae").await }))
+}
+
+async fn get_base_model(State(app): State<Arc<App>>) -> Json<Value> {
+    let active = app.active.read().await.clone();
+    Json(json!({
+        "ok": true,
+        "model": if active.model.is_empty() { Value::Null } else { json!(active.model) },
+        "baseModel": active.base_model,
+        "modelsDir": app.models_dir.display().to_string(),
+        "modelsDirHost": app.models_dir_host.clone(),
+        "note": "Active base for generate; Diffusers engine loads weights into VRAM on demand.",
+    }))
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetBaseReq {
+    /// HF id or relative path under models dir (e.g. checkpoints/foo.safetensors).
+    model: String,
+    #[serde(default)]
+    base_model: Option<String>,
+}
+
+async fn put_base_model(
+    State(app): State<Arc<App>>,
+    Json(req): Json<SetBaseReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let model = req.model.trim().to_string();
+    if model.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "model must be non-empty" })),
+        ));
+    }
+    // If it looks like a relative checkpoint path, ensure it stays under models dir.
+    if model.contains('/') || model.ends_with(".safetensors") {
+        if let Err(e) = resolve_dest(&app.models_dir, &model) {
+            return Err((StatusCode::BAD_REQUEST, Json(json!({ "error": e }))));
+        }
+    }
+    let next = ActiveBase {
+        model: model.clone(),
+        base_model: req.base_model.filter(|s| !s.trim().is_empty()),
+    };
+    persist_active_base(&app.models_dir, &next)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e })),
+            )
+        })?;
+    *app.active.write().await = next.clone();
+    // Drop any previously loaded weights so the next generate picks up the new base.
+    if !app.engine_url.is_empty() {
+        let url = format!("{}/v1/unload", app.engine_url);
+        let _ = app.http.post(&url).send().await;
+    }
+    info!(model = %next.model, base = ?next.base_model, "set active base model");
+    let engine = if app.engine_url.is_empty() {
+        "stub"
+    } else {
+        "diffusers"
+    };
+    Ok(Json(json!({
+        "ok": true,
+        "model": next.model,
+        "baseModel": next.base_model,
+        "loadedInVram": false,
+        "engine": engine,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct GenReq {
     prompt: String,
     #[serde(default)]
@@ -770,6 +1062,38 @@ struct InstallReq {
     /// Optional download credential (Civitai/HF). Never embed secrets in `url` — reqwest errors echo URLs.
     #[serde(default)]
     auth_token: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    base_model: Option<String>,
+    #[serde(default)]
+    version_id: Option<i64>,
+    #[serde(default)]
+    model_id: Option<i64>,
+    #[serde(default)]
+    model_type: Option<String>,
+    #[serde(default)]
+    thumbnail_url: Option<String>,
+    /// When true (default for `/v1/assets/jobs`), enqueue and return immediately.
+    /// `/v1/assets/install` defaults to false for operator/sync callers.
+    #[serde(default)]
+    r#async: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ClearJobsReq {
+    /// When true, also remove queued jobs that have not started. Active downloads are never cleared.
+    #[serde(default)]
+    include_queued: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteAssetReq {
+    path: String,
 }
 
 /// Resolve `dest_path` under `models_dir`, rejecting absolute paths and `..` escape.
@@ -805,6 +1129,32 @@ fn install_host_ok(host: &str) -> bool {
         || h.ends_with(".hf.co")
 }
 
+/// Civitai now serves some files from Cloudflare R2
+/// (`civitai-delivery-worker-prod.<hash>.r2.cloudflarestorage.com`). Allow only as a
+/// redirect target after an allowlisted civitai.com hop — never as a direct install URL.
+fn civitai_r2_delivery_host(host: &str) -> bool {
+    let h = host.to_ascii_lowercase();
+    h.contains("civitai") && h.ends_with(".r2.cloudflarestorage.com")
+}
+
+fn redirect_came_from_civitai(previous: &[reqwest::Url]) -> bool {
+    previous.iter().any(|u| {
+        u.host_str()
+            .map(|h| {
+                let h = h.to_ascii_lowercase();
+                h == "civitai.com" || h.ends_with(".civitai.com")
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn redirect_host_ok(host: &str, previous: &[reqwest::Url]) -> bool {
+    if install_host_ok(host) {
+        return true;
+    }
+    civitai_r2_delivery_host(host) && redirect_came_from_civitai(previous)
+}
+
 fn install_url_ok(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
@@ -822,7 +1172,7 @@ fn download_client() -> Result<reqwest::Client, String> {
                 return attempt.error("too many redirects");
             }
             match attempt.url().host_str() {
-                Some(h) if install_host_ok(h) => attempt.follow(),
+                Some(h) if redirect_host_ok(h, attempt.previous()) => attempt.follow(),
                 _ => attempt.error("redirect to disallowed host"),
             }
         }))
@@ -857,7 +1207,7 @@ fn validate_install(app: &App, req: &InstallReq) -> Result<PathBuf, (StatusCode,
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))))?;
     if !install_url_ok(&req.url) {
         return Err((
-            axum::http::StatusCode::BAD_REQUEST,
+            StatusCode::BAD_REQUEST,
             Json(json!({
                 "error": "url must be http(s) on civitai.com, huggingface.co, or hf.co"
             })),
@@ -1304,36 +1654,104 @@ async fn run_download(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .await
-            .map_err(|e| internal("create dest dir", e))?;
+            .map_err(|_| "create dest dir failed".to_string())?;
     }
-    let client = download_client().map_err(|e| internal("download client", e))?;
-    let mut req_builder = client.get(&req.url);
-    if let Some(token) = req
-        .auth_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
+    let client = download_client().map_err(|_| "download client failed".to_string())?;
+    let mut req_builder = client.get(url);
+    if let Some(token) = auth_token.map(str::trim).filter(|t| !t.is_empty()) {
         req_builder = req_builder.bearer_auth(token);
     }
     let mut resp = req_builder.send().await.map_err(download_request_err)?;
     if !resp.status().is_success() {
-        return Err((
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": format!("download failed with HTTP {}", resp.status())
-            })),
-        ));
+        return Err(format!("download failed with HTTP {}", resp.status()));
     }
-    let bytes = resp
-        .bytes()
+    let total = resp.content_length();
+    if let (Some(id), Some(t)) = (job_id.as_ref(), total) {
+        update_job_progress(app, id, 0, Some(t)).await;
+    }
+    let tmp = {
+        let mut s = dest.as_os_str().to_os_string();
+        s.push(".partial");
+        PathBuf::from(s)
+    };
+    let mut file = fs::File::create(&tmp)
         .await
-        .map_err(|e| internal("download body", e))?;
-    fs::write(&dest, &bytes)
+        .map_err(|_| "create temp file failed".to_string())?;
+    let mut done: u64 = 0;
+    let mut last_report = 0u64;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            let _ = fs::remove_file(&tmp).await;
+            return Err("cancelled".into());
+        }
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|_| "write asset failed".to_string())?;
+                done += chunk.len() as u64;
+                if let Some(id) = job_id.as_ref() {
+                    // Throttle progress updates (~256 KiB).
+                    if done - last_report >= 256 * 1024 || total == Some(done) {
+                        update_job_progress(app, id, done, total).await;
+                        last_report = done;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                let _ = fs::remove_file(&tmp).await;
+                return Err("download body failed".into());
+            }
+        }
+    }
+    file.flush()
         .await
-        .map_err(|e| internal("write asset", e))?;
-    info!(path = %dest.display(), bytes = bytes.len(), "installed asset");
-    Ok(Json(json!({ "ok": true, "path": req.dest_path })))
+        .map_err(|_| "flush asset failed".to_string())?;
+    drop(file);
+    if cancel.load(Ordering::SeqCst) {
+        let _ = fs::remove_file(&tmp).await;
+        return Err("cancelled".into());
+    }
+    fs::rename(&tmp, dest)
+        .await
+        .map_err(|_| "finalize asset failed".to_string())?;
+
+    if meta.name.is_some()
+        || meta.base_model.is_some()
+        || meta.version_id.is_some()
+        || meta.model_id.is_some()
+        || meta.model_type.is_some()
+        || meta.source.is_some()
+        || meta.thumbnail_url.is_some()
+    {
+        let meta_path = meta_path_for(dest);
+        if let Ok(blob) = serde_json::to_vec_pretty(meta) {
+            let _ = fs::write(&meta_path, blob).await;
+        }
+    }
+
+    let is_checkpoint = dest_path.starts_with("checkpoints/")
+        || meta
+            .model_type
+            .as_deref()
+            .map(|t| t.eq_ignore_ascii_case("checkpoint"))
+            .unwrap_or(false);
+    if is_checkpoint {
+        let mut active = app.active.write().await;
+        if active.model.is_empty() {
+            let next = ActiveBase {
+                model: dest_path.to_string(),
+                base_model: meta.base_model.clone(),
+            };
+            let _ = persist_active_base(&app.models_dir, &next).await;
+            *active = next;
+        }
+    }
+    if let Some(id) = job_id.as_ref() {
+        update_job_progress(app, id, done, total.or(Some(done))).await;
+    }
+    Ok(done)
 }
 
 /// Never return or log raw transport errors — reqwest Display includes the full URL.
@@ -1341,7 +1759,7 @@ async fn run_download(
 fn internal(context: &str, _detail: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
     warn!(%context, error = "asset install failed", "asset install failed");
     (
-        axum::http::StatusCode::BAD_REQUEST,
+        StatusCode::BAD_REQUEST,
         Json(json!({ "error": format!("{context} failed") })),
     )
 }
@@ -1432,6 +1850,9 @@ mod tests {
     fn tempfile_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("freya-worker-test-{}", std::process::id()));
         let _ = fs::create_dir_all(dir.join("loras"));
+        let _ = dir.canonicalize();
+        // canonicalize needs the dir to exist
+        let _ = fs::create_dir_all(&dir);
         dir
     }
 }

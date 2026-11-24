@@ -108,11 +108,7 @@ impl Gallery {
         meta: &mut ArtifactMeta,
     ) -> Result<ArtifactMeta> {
         let id = Uuid::new_v4().to_string();
-        let ext = if mime.contains("jpeg") || mime.contains("jpg") {
-            "jpg"
-        } else {
-            "png"
-        };
+        let ext = mime_to_ext(mime);
         let filename = format!("{id}.{ext}");
         meta.id = id.clone();
         meta.filename = filename.clone();
@@ -164,6 +160,27 @@ impl Gallery {
         }
         let raw = fs::read(path).await?;
         Ok(Some(serde_json::from_slice(&raw)?))
+    }
+
+    /// Remove artifact bytes + metadata. Returns `false` if id is invalid or missing.
+    pub async fn delete(&self, id: &str) -> Result<bool> {
+        let Some(id) = sanitize_gallery_id(id) else {
+            return Ok(false);
+        };
+        let Some(meta) = self.get(id).await? else {
+            return Ok(false);
+        };
+        let img = self.image_path(&meta);
+        let meta_path = self.root.join(format!("{id}.json"));
+        if img.exists() {
+            fs::remove_file(&img)
+                .await
+                .with_context(|| format!("remove gallery image {}", img.display()))?;
+        }
+        fs::remove_file(&meta_path)
+            .await
+            .with_context(|| format!("remove gallery meta {}", meta_path.display()))?;
+        Ok(true)
     }
 
     pub fn image_path(&self, meta: &ArtifactMeta) -> PathBuf {

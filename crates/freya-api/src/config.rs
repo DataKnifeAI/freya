@@ -1,6 +1,7 @@
 use crate::prefs::{AlignmentPrefs, AutoFallbacksPrefs, ChatProvidersPrefs, PrivacyPrefs};
 use crate::studio::StudioPrefs;
 use clap::Parser;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Parser)]
@@ -19,15 +20,17 @@ pub struct Config {
     )]
     pub openrouter_base_url: String,
 
-    #[arg(long, env = "FREYA_CHAT_MODEL", default_value = "openrouter/auto")]
+    /// Agent / plan chat model. `auto` = Freya internal Auto (not OpenRouter's upstream router).
+    #[arg(long, env = "FREYA_CHAT_MODEL", default_value = "auto")]
     pub chat_model: String,
 
-    #[arg(
-        long,
-        env = "FREYA_IMAGE_MODEL",
-        default_value = "black-forest-labs/flux.2-klein-4b"
-    )]
+    /// Still-image model. `auto` = Freya router / Flux NL default (legacy Flux alignment).
+    #[arg(long, env = "FREYA_IMAGE_MODEL", default_value = "auto")]
     pub image_model: String,
+
+    /// Light Freya-owned intent router model. `auto` = Llama 3.1 8B-class (dolphin3 spirit).
+    #[arg(long, env = "FREYA_ROUTER_MODEL", default_value = "auto")]
+    pub router_model: String,
 
     #[arg(long, env = "FREYA_CHAT_BACKEND", default_value = "openrouter")]
     pub chat_backend: String,
@@ -62,6 +65,22 @@ pub struct Config {
     /// Optional bearer token for `/v1/*` routes. Empty = open (local/dev only).
     #[arg(long, env = "FREYA_API_TOKEN", default_value = "")]
     pub api_token: String,
+
+    /// When set, `POST /v1/auth/token` also patches this Secret (in-cluster) so MCP/env stay aligned.
+    #[arg(long, env = "FREYA_API_TOKEN_SECRET_NAME", default_value = "")]
+    pub api_token_secret_name: String,
+
+    /// Key inside `FREYA_API_TOKEN_SECRET_NAME` (default `token`).
+    #[arg(long, env = "FREYA_API_TOKEN_SECRET_KEY", default_value = "token")]
+    pub api_token_secret_key: String,
+
+    /// Admin username for human UI login (game-operator style). Default `admin`.
+    #[arg(long, env = "FREYA_ADMIN_USER", default_value = "admin")]
+    pub admin_user: String,
+
+    /// Admin password from operator-generated Secret (`admin-password`). Empty = no admin login.
+    #[arg(long, env = "FREYA_ADMIN_PASSWORD", default_value = "")]
+    pub admin_password: String,
 
     /// Bearer token the API sends to the diffusion worker (`FREYA_WORKER_TOKEN`).
     #[arg(long, env = "FREYA_WORKER_TOKEN", default_value = "")]
@@ -150,12 +169,80 @@ pub struct Config {
 }
 
 impl Config {
+    pub fn privacy_prefs(&self) -> PrivacyPrefs {
+        let excluded: Vec<String> = self
+            .chat_providers_excluded
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        PrivacyPrefs {
+            zero_data_retention: self.openrouter_zdr,
+            data_collection: self.openrouter_data_collection.clone(),
+            chat_providers: ChatProvidersPrefs {
+                excluded,
+                legacy_only: None,
+            },
+            // Legacy env/secrets free-text — migrated inside normalize().
+            provider_only: self.openrouter_provider_only.clone(),
+            provider_ignore: self.openrouter_provider_ignore.clone(),
+        }
+        .normalize()
+    }
+
+    pub fn alignment_prefs(&self) -> AlignmentPrefs {
+        AlignmentPrefs {
+            model_alignment: self.model_alignment.clone(),
+            allow_nsfw_local: self.allow_nsfw_local,
+            instruction_tone: self.instruction_tone.clone(),
+        }
+        .normalize()
+    }
+
+    pub fn apply_privacy(&mut self, p: PrivacyPrefs) {
+        let p = p.normalize();
+        self.openrouter_zdr = p.zero_data_retention;
+        self.openrouter_data_collection = p.data_collection;
+        self.chat_providers_excluded = p.chat_providers.excluded.join(",");
+        // Persist legacy_only via provider_only until Settings clears it (checkbox save).
+        self.openrouter_provider_only = p
+            .chat_providers
+            .legacy_only
+            .as_ref()
+            .map(|v| v.join(","))
+            .unwrap_or_default();
+        self.openrouter_provider_ignore = String::new();
+    }
+
+    pub fn apply_alignment(&mut self, a: AlignmentPrefs) {
+        let a = a.normalize();
+        self.model_alignment = a.model_alignment;
+        self.allow_nsfw_local = a.allow_nsfw_local;
+        self.instruction_tone = a.instruction_tone;
+    }
+
+    pub fn auto_fallbacks_prefs(&self) -> AutoFallbacksPrefs {
+        self.auto_fallbacks.clone().normalize()
+    }
+
+    pub fn apply_auto_fallbacks(&mut self, f: AutoFallbacksPrefs) {
+        self.auto_fallbacks = f.normalize();
+    }
+
     pub fn openrouter_configured(&self) -> bool {
         !self.openrouter_api_key.trim().is_empty()
     }
 
     pub fn civitai_configured(&self) -> bool {
         !self.civitai_api_key.trim().is_empty()
+    }
+
+    pub fn admin_login_configured(&self) -> bool {
+        !self.admin_password.trim().is_empty()
+    }
+
+    pub fn auth_required(&self) -> bool {
+        !self.api_token.trim().is_empty() || self.admin_login_configured()
     }
 
     pub fn chat_url(&self) -> String {

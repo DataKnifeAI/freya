@@ -52,6 +52,7 @@ logs/
 .env
 .env.*
 !.env.example
+!deploy/compose/.env.example
 *.pem
 
 # .NET (legacy SwarmUI)

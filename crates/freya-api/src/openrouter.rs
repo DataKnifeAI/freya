@@ -1,4 +1,8 @@
 use crate::config::Config;
+use crate::prefs::{
+    chat_model_matches_alignment, inject_provider, AlignmentPrefs, AutoFallbacksPrefs,
+    ChatProvidersPrefs, PrivacyPrefs,
+};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,6 +14,10 @@ pub struct OpenRouterClient {
     api_key: String,
     chat_model: String,
     image_model: String,
+    router_model: String,
+    privacy: PrivacyPrefs,
+    alignment: AlignmentPrefs,
+    auto_fallbacks: AutoFallbacksPrefs,
 }
 
 impl OpenRouterClient {
@@ -20,6 +28,10 @@ impl OpenRouterClient {
             api_key: cfg.openrouter_api_key.clone(),
             chat_model: cfg.chat_model.clone(),
             image_model: cfg.image_model.clone(),
+            router_model: cfg.router_model.clone(),
+            privacy: cfg.privacy_prefs(),
+            alignment: cfg.alignment_prefs(),
+            auto_fallbacks: cfg.auto_fallbacks_prefs(),
         }
     }
 
@@ -68,6 +80,15 @@ impl OpenRouterClient {
 
     pub fn configured_image_model(&self) -> &str {
         &self.image_model
+    }
+
+    pub fn configured_router_model(&self) -> &str {
+        &self.router_model
+    }
+
+    #[allow(dead_code)]
+    pub fn configured_chat_model(&self) -> &str {
+        &self.chat_model
     }
 
     async fn auth_post(&self, path: &str, body: Value) -> Result<Value> {
@@ -178,13 +199,14 @@ impl OpenRouterClient {
 
     pub async fn chat(&self, system: &str, user: &str, model: Option<&str>) -> Result<String> {
         let model = model.unwrap_or(&self.chat_model);
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user}
             ]
         });
+        inject_provider(&mut body, &self.privacy);
         let v = self.auth_post("/chat/completions", body).await?;
         v.pointer("/choices/0/message/content")
             .and_then(|c| c.as_str())
@@ -194,8 +216,33 @@ impl OpenRouterClient {
 
     pub async fn list_image_models(&self) -> Result<Vec<ImageModel>> {
         if self.api_key.is_empty() {
-            return Ok(fallback_models());
+            return Ok(filter_fallback_image(
+                &fallback_models(),
+                self.privacy.zero_data_retention,
+            ));
         }
+        // When Freya ZDR is on, list only models with ZDR-capable endpoints
+        // (`GET /models?output_modalities=image&zdr=true`). Dedicated /images/models
+        // does not expose the zdr query filter.
+        if self.privacy.zero_data_retention {
+            let url = format!("{}/models?output_modalities=image&zdr=true", self.base);
+            let resp = self
+                .http
+                .get(&url)
+                .bearer_auth(&self.api_key)
+                .send()
+                .await
+                .context("list image models (zdr)")?;
+            if resp.status().is_success() {
+                let v: Value = resp.json().await.unwrap_or(Value::Null);
+                let out = parse_image_models_from_catalog(&v);
+                if !out.is_empty() {
+                    return Ok(out);
+                }
+            }
+            return Ok(filter_fallback_image(&fallback_models(), true));
+        }
+
         let url = format!("{}/images/models", self.base);
         let resp = self
             .http
@@ -208,9 +255,55 @@ impl OpenRouterClient {
             return Ok(fallback_models());
         }
         let v: Value = resp.json().await.unwrap_or(Value::Null);
-        let mut out = Vec::new();
+        let out = parse_image_models_from_catalog(&v);
+        if out.is_empty() {
+            return Ok(fallback_models());
+        }
+        Ok(out)
+    }
+
+    /// Discover chat/agent models via `GET /models`, filtered to text/chat
+    /// candidates (denylist: routing suffixes, non-text modalities, image/embed/…).
+    /// When ZDR is on, requests `?zdr=true` (OpenRouter catalog filter).
+    /// Alignment prefs further filter by `top_provider.is_moderated` / name heuristics.
+    /// User chat-provider checkboxes (Settings) filter vendor prefixes last.
+    #[allow(dead_code)]
+    pub async fn list_chat_models(&self) -> Result<Vec<ImageModel>> {
+        Ok(self.list_chat_catalog().await?.models)
+    }
+
+    /// Chat catalog plus the vendor prefixes present before checkbox filtering.
+    pub async fn list_chat_catalog(&self) -> Result<ChatCatalog> {
+        let chat_providers = self.privacy.chat_providers.clone();
+        if self.api_key.is_empty() {
+            return Ok(self.fallback_chat_catalog());
+        }
+        let url = if self.privacy.zero_data_retention {
+            format!("{}/models?zdr=true", self.base)
+        } else {
+            format!("{}/models", self.base)
+        };
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("list chat models")?;
+        if !resp.status().is_success() {
+            return Ok(self.fallback_chat_catalog());
+        }
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        let mut agent_scored: Vec<(i64, ImageModel)> = Vec::new();
+        let mut router_scored: Vec<(i64, ImageModel)> = Vec::new();
+        let mut available_set = std::collections::BTreeSet::new();
         if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
             for m in arr {
+                let agent_ok = is_agent_capable(m);
+                let router_ok = is_router_capable(m);
+                if !agent_ok && !router_ok {
+                    continue;
+                }
                 let id = m
                     .get("id")
                     .and_then(|x| x.as_str())
@@ -219,22 +312,105 @@ impl OpenRouterClient {
                 if id.is_empty() {
                     continue;
                 }
-                let name = m
-                    .get("name")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or(&id)
-                    .to_string();
-                out.push(ImageModel {
+                available_set.insert(openrouter_vendor(&id).to_ascii_lowercase());
+                if !chat_model_matches_alignment(m, &self.alignment) {
+                    continue;
+                }
+                if !chat_providers.includes_model_id(&id) {
+                    continue;
+                }
+                let name = display_name_for_catalog(m, &id);
+                let created = m.get("created").and_then(|c| c.as_i64()).unwrap_or(0);
+                let model = ImageModel {
                     id,
                     name,
                     backend: "openrouter".into(),
-                });
+                };
+                if agent_ok {
+                    agent_scored.push((created, model.clone()));
+                }
+                if router_ok {
+                    router_scored.push((created, model));
+                }
             }
         }
-        if out.is_empty() {
-            return Ok(fallback_models());
+        if agent_scored.is_empty() && router_scored.is_empty() && available_set.is_empty() {
+            return Ok(self.fallback_chat_catalog());
         }
-        Ok(out)
+        let mut models = order_pinned(agent_scored);
+        let mut router = order_pinned(router_scored);
+        if crate::router::privacy_requires_strict(&self.privacy) {
+            // Upstream router is not on the ZDR catalog.
+            models.retain(|m| !is_upstream_router_id(&m.id));
+            router.retain(|m| !is_upstream_router_id(&m.id));
+        } else if let Some(existing) = models.iter_mut().find(|m| is_upstream_router_id(&m.id)) {
+            existing.name = "OpenRouter router (upstream)".into();
+        } else {
+            // Catalog omitted it (or alignment hid it). Offer it only when privacy is not strict
+            // and alignment did not reject a row we already saw. Balanced always keeps it.
+            if self.alignment.model_alignment != "safety" {
+                ensure_upstream_agent(&mut models);
+            }
+        }
+        Ok(ChatCatalog {
+            models,
+            router,
+            available: available_set.into_iter().collect(),
+        })
+    }
+
+    /// Discover OpenRouter video models via `GET /videos/models`.
+    pub async fn list_video_models(&self) -> Result<Vec<VideoModel>> {
+        if self.api_key.is_empty() {
+            return Ok(Vec::new());
+        }
+        // When Freya ZDR is on, prefer the ZDR-filtered modality catalog.
+        if self.privacy.zero_data_retention {
+            let url = format!("{}/models?output_modalities=video&zdr=true", self.base);
+            let resp = self
+                .http
+                .get(&url)
+                .bearer_auth(&self.api_key)
+                .send()
+                .await
+                .context("list video models (zdr)")?;
+            if resp.status().is_success() {
+                let v: Value = resp.json().await.unwrap_or(Value::Null);
+                let out = parse_video_models(&v);
+                if !out.is_empty() {
+                    return Ok(out);
+                }
+            }
+        }
+        // Prefer dedicated video catalog; fall back to modality filter on /models.
+        let url = format!("{}/videos/models", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("list video models")?;
+        if resp.status().is_success() {
+            let v: Value = resp.json().await.unwrap_or(Value::Null);
+            let out = parse_video_models(&v);
+            if !out.is_empty() {
+                return Ok(out);
+            }
+        }
+        let url = format!("{}/models?output_modalities=video", self.base);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("list video models (modality)")?;
+        if !resp.status().is_success() {
+            return Ok(Vec::new());
+        }
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        Ok(parse_video_models(&v))
     }
 
     pub async fn generate_image(
@@ -303,6 +479,7 @@ impl OpenRouterClient {
                 body["size"] = Value::String(size.into());
             }
         }
+        inject_provider(&mut body, &self.privacy);
 
         let v = self.auth_post("/images", body).await?;
         extract_image(&self.http, &v).await
@@ -712,7 +889,83 @@ fn size_to_aspect(size: &str) -> Option<&'static str> {
     }
 }
 
-fn extract_image(v: &Value) -> Result<GeneratedImage> {
+/// Per-key usage from OpenRouter `GET /api/v1/key` (USD credits).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenRouterKeyUsage {
+    pub label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_daily: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_weekly: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage_monthly: Option<f64>,
+    /// Key spend cap (USD), or null when unlimited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
+    /// Remaining under the key cap (null when unlimited).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_remaining: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit_reset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_free_tier: Option<bool>,
+    pub is_management_key: bool,
+}
+
+/// Account-level purchased vs spent credits (`GET /api/v1/credits`, management key).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenRouterCredits {
+    pub total_credits: f64,
+    pub total_usage: f64,
+    pub remaining: f64,
+}
+
+/// True when OpenRouter refused routing because no ZDR/data-policy endpoint matched.
+pub fn is_zdr_routing_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("zdr")
+        || lower.contains("zero data retention")
+        || lower.contains("data-policy")
+        || lower.contains("data policy")
+        || lower.contains("no endpoints matching")
+        || (lower.contains("guardrail")
+            && (lower.contains("endpoint") || lower.contains("excluded")))
+}
+
+fn humanize_openrouter_error(status: u16, text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("zdr")
+        || lower.contains("zero data retention")
+        || lower.contains("no endpoints matching")
+        || (lower.contains("guardrail")
+            && (lower.contains("endpoint") || lower.contains("zdr") || lower.contains("data")))
+    {
+        return format!(
+            "OpenRouter blocked media routing (ZDR/data-policy, HTTP {status}). \
+             No Zero Data Retention endpoints matched this image/video model. \
+             Fix options: (1) Freya Settings → Privacy → turn off “Zero Data Retention on Freya requests”, \
+             or pick a ZDR-capable model (often Google image/video) from the Image picker; \
+             (2) OpenRouter account privacy / model-group ZDR at https://openrouter.ai/settings/privacy \
+             (Freya can only tighten ZDR, not loosen account guardrails). Details: {text}"
+        );
+    }
+    if status == 402
+        || lower.contains("insufficient credits")
+        || lower.contains("at least $1.00 in balance")
+    {
+        return format!(
+            "OpenRouter needs more credits for image output (HTTP {status}). \
+             Add credits at https://openrouter.ai/settings/credits. Details: {text}"
+        );
+    }
+    format!("openrouter {status}: {text}")
+}
+
+async fn extract_image(http: &reqwest::Client, v: &Value) -> Result<GeneratedImage> {
     if let Some(b64) = v.pointer("/data/0/b64_json").and_then(|x| x.as_str()) {
         return Ok(GeneratedImage {
             b64: b64.to_string(),
@@ -720,13 +973,41 @@ fn extract_image(v: &Value) -> Result<GeneratedImage> {
         });
     }
     if let Some(url) = v.pointer("/data/0/url").and_then(|x| x.as_str()) {
-        if let Some(rest) = url.strip_prefix("data:image/png;base64,") {
+        if let Some(rest) = url
+            .strip_prefix("data:image/png;base64,")
+            .or_else(|| url.strip_prefix("data:image/jpeg;base64,"))
+        {
+            let mime = if url.contains("jpeg") {
+                "image/jpeg"
+            } else {
+                "image/png"
+            };
             return Ok(GeneratedImage {
                 b64: rest.to_string(),
-                mime: "image/png".into(),
+                mime: mime.into(),
             });
         }
-        return Err(anyhow!("image url responses not downloaded yet: {url}"));
+        // Remote URL — download bytes.
+        let resp = http
+            .get(url)
+            .send()
+            .await
+            .context("download openrouter image url")?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("image url download failed: {}", resp.status()));
+        }
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/png")
+            .to_string();
+        let bytes = resp.bytes().await.context("read image bytes")?;
+        use base64::Engine;
+        return Ok(GeneratedImage {
+            b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            mime,
+        });
     }
     Err(anyhow!("no image in openrouter response"))
 }
@@ -768,8 +1049,13 @@ fn fallback_models() -> Vec<ImageModel> {
             backend: "openrouter".into(),
         },
         ImageModel {
-            id: "openai/gpt-image-2".into(),
-            name: "GPT Image 2".into(),
+            id: "google/gemini-2.5-flash-image".into(),
+            name: "Gemini 2.5 Flash Image".into(),
+            backend: "openrouter".into(),
+        },
+        ImageModel {
+            id: "openai/gpt-image-1-mini".into(),
+            name: "GPT Image 1 Mini".into(),
             backend: "openrouter".into(),
         },
     ]
@@ -1102,6 +1388,106 @@ pub struct ImageModel {
     pub id: String,
     pub name: String,
     pub backend: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoModel {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_durations: Vec<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_resolutions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_aspect_ratios: Vec<String>,
+}
+
+/// OpenRouter vendor slug: id prefix before `/` (`openai/gpt-5.2` → `openai`).
+pub fn openrouter_vendor(id: &str) -> &str {
+    id.split_once('/').map(|(v, _)| v).unwrap_or(id)
+}
+
+/// Sort catalogs by vendor, then display name, then id (case-insensitive).
+pub fn sort_models_by_vendor_name(models: &mut [ImageModel]) {
+    models.sort_by(|a, b| {
+        openrouter_vendor(&a.id)
+            .to_ascii_lowercase()
+            .cmp(&openrouter_vendor(&b.id).to_ascii_lowercase())
+            .then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
+            .then_with(|| a.id.to_ascii_lowercase().cmp(&b.id.to_ascii_lowercase()))
+    });
+}
+
+pub fn sort_video_models_by_vendor_name(models: &mut [VideoModel]) {
+    models.sort_by(|a, b| {
+        openrouter_vendor(&a.id)
+            .to_ascii_lowercase()
+            .cmp(&openrouter_vendor(&b.id).to_ascii_lowercase())
+            .then_with(|| {
+                a.name
+                    .to_ascii_lowercase()
+                    .cmp(&b.name.to_ascii_lowercase())
+            })
+            .then_with(|| a.id.to_ascii_lowercase().cmp(&b.id.to_ascii_lowercase()))
+    });
+}
+
+fn parse_video_models(v: &Value) -> Vec<VideoModel> {
+    let mut out = Vec::new();
+    let Some(arr) = v.get("data").and_then(|d| d.as_array()) else {
+        return out;
+    };
+    for m in arr {
+        let id = m
+            .get("id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() || is_upstream_router_id(&id) || !keeps_declared_output(m, "video") {
+            continue;
+        }
+        let name = m
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        let supported_durations = m
+            .get("supported_durations")
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_i64()).collect())
+            .unwrap_or_default();
+        let supported_resolutions = m
+            .get("supported_resolutions")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let supported_aspect_ratios = m
+            .get("supported_aspect_ratios")
+            .and_then(|a| a.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(VideoModel {
+            id,
+            name,
+            supported_durations,
+            supported_resolutions,
+            supported_aspect_ratios,
+        });
+    }
+    out
 }
 
 #[derive(Debug, Clone)]

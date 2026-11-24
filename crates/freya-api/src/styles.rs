@@ -66,7 +66,7 @@ pub async fn load_styles(packs_dir: &Path) -> Result<Vec<StylePack>> {
 }
 
 /// Assist `mode` must be a single path segment (no `/`, `..`, or absolute paths).
-fn is_safe_instruction_mode(mode: &str) -> bool {
+pub fn is_safe_instruction_mode(mode: &str) -> bool {
     !mode.is_empty()
         && mode.len() <= 64
         && mode
@@ -74,7 +74,38 @@ fn is_safe_instruction_mode(mode: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-pub async fn load_instruction(packs_dir: &Path, mode: &str) -> String {
+/// Modes exposed in Settings for view/edit (packs/instructions defaults + overrides).
+pub const EDITABLE_INSTRUCTION_MODES: &[&str] = &[
+    "converse",
+    "route",
+    "chat",
+    "plan",
+    "suggest",
+    "session",
+    "prompt-prose",
+    "prompt-sd",
+];
+
+pub fn is_editable_instruction_mode(mode: &str) -> bool {
+    is_safe_instruction_mode(mode) && EDITABLE_INSTRUCTION_MODES.contains(&mode)
+}
+
+pub fn instruction_mode_label(mode: &str) -> String {
+    match mode {
+        "converse" => "Converse (chat agent)".into(),
+        "route" => "Route (intent classifier)".into(),
+        "chat" => "Chat (assist)".into(),
+        "plan" => "Plan".into(),
+        "suggest" => "Suggest".into(),
+        "session" => "Session".into(),
+        "prompt-prose" => "Enhance — prose brief".into(),
+        "prompt-sd" => "Enhance — SD keywords".into(),
+        _ => mode.to_string(),
+    }
+}
+
+/// Pack / builtin default only (ignores Settings overrides).
+pub async fn load_instruction_default(packs_dir: &Path, mode: &str) -> String {
     if !is_safe_instruction_mode(mode) {
         return builtin_instruction("chat").to_string();
     }
@@ -147,7 +178,7 @@ pub fn builtin_instruction(mode: &str) -> &'static str {
             "You are Freya's planner for agentic image sessions. Reply with JSON only: {\"backend\":\"openrouter\"|\"local\",\"model\":null|\"provider/model\",\"styleId\":null|\"...\",\"enhanceMode\":\"prompt-prose\"|\"prompt-sd\",\"civitaiQuery\":null|\"short search\",\"rationale\":\"short\"}. Prefer openrouter + prompt-prose. model is a real provider/model image id (black-forest-labs/flux.2-klein-4b, google/gemini-2.5-flash-image, or google/gemini-3-pro-image) or null. Never prefix openrouter/ onto an id. Never use openrouter/auto, chat-only ids, or invented ids such as openrouter/google-gemini-pro-image-1. Use local + prompt-sd for pinned/Installed LoRAs; set civitaiQuery only when Installed has no match."
         }
         "suggest" => {
-            "You are Freya. Reply with JSON only: {\"ideas\":[\"nl alt 1\",\"nl alt 2\"],\"civitaiQuery\":\"short LoRA search\",\"sessionNote\":\"what to try next\"}. Ideas are everyday prose, never SD tags. civitaiQuery is 2–6 words for Civitai."
+            "You are Freya. Reply with JSON only: {\"ideas\":[\"nl alt 1\",\"nl alt 2\"],\"civitaiQuery\":\"short LoRA search or empty\",\"sessionNote\":\"what to try next\"}. Ideas are everyday prose, never SD tags. civitaiQuery is 2–6 words for Civitai when weights would help."
         }
         "session" => {
             "You are Freya running an agentic image session. Reply JSON only: {\"goal\":\"...\",\"steps\":[{\"kind\":\"search_loras\"|\"generate\"|\"iterate\",\"prompt\":\"nl\",\"note\":\"why\"}],\"civitaiQuery\":\"short or empty\",\"batchPrompts\":[\"nl 1\",\"nl 2\",\"nl 3\"],\"sessionNote\":\"next\"}. Prefer Installed weights; search Civitai only if needed. Clarify ambiguous character likeness before heavy search/generate. Never SD keyword soup."
@@ -177,7 +208,7 @@ mod tests {
     #[tokio::test]
     async fn load_instruction_ignores_unsafe_mode() {
         let packs = PathBuf::from("/nonexistent-packs-dir");
-        let text = load_instruction(&packs, "../../etc/passwd").await;
+        let text = load_instruction(&packs, "../../etc/passwd", None).await;
         assert_eq!(text, builtin_instruction("chat"));
     }
 

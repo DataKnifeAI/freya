@@ -26,8 +26,17 @@ spec:
         description: Auto-generated derived type for FreyaStudioSpec via `CustomResource`
         properties:
           spec:
-            description: 'Namespaced Freya studio: API + UI + gallery.'
+            description: 'Namespaced Freya studio: API + UI + gallery + optional MCP.'
             properties:
+              adminCredentialsSecretRef:
+                description: 'BYO admin credentials Secret (keys: `admin-password` required, `username` optional → `admin`). Used when `generateAdminSecrets` is false, or as the target name when generating.'
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
               apiImage:
                 description: Image reference for Freya components.
                 nullable: true
@@ -43,7 +52,7 @@ spec:
                     type: string
                 type: object
               apiTokenSecretRef:
-                description: Secret holding `FREYA_API_TOKEN` for the API. Set for non-dev / Ingress; UI sends the bearer from Settings.
+                description: Secret holding `FREYA_API_TOKEN` for the API (machine bearer for MCP/worker/UI after login). When unset and `generateAdminSecrets` is true, the operator creates `{name}-api-token`.
                 nullable: true
                 properties:
                   key:
@@ -90,6 +99,10 @@ spec:
                 description: Optional FreyaDiffusionWorker name in the same namespace.
                 nullable: true
                 type: string
+              generateAdminSecrets:
+                default: true
+                description: 'Game-operator style: ensure an admin login Secret (`username` + `admin-password`) and, when `apiTokenSecretRef` is unset, an API bearer Secret. Default true.'
+                type: boolean
               huggingFace:
                 default: {}
                 description: Optional Hugging Face token for gated checkpoints.
@@ -120,12 +133,35 @@ spec:
                   host:
                     nullable: true
                     type: string
+                  tlsSecretName:
+                    description: 'TLS Secret in the Studio namespace (e.g. `wildcard-dataknife-net-tls`). Fleet pattern: same Let''s Encrypt `*.dataknife.net` secret synced to `kube-system` as the ingress default cert; copy into this namespace when setting `tlsSecretName`. Omit to rely on the controller default cert only.'
+                    nullable: true
+                    type: string
+                type: object
+              mcpEnabled:
+                default: true
+                description: Deploy Freya MCP (`{name}-mcp`) and Ingress path `/mcp`. Default true.
+                type: boolean
+              mcpImage:
+                description: MCP Streamable HTTP server image (defaults to harbor freya-mcp).
+                nullable: true
+                properties:
+                  pullPolicy:
+                    nullable: true
+                    type: string
+                  repository:
+                    nullable: true
+                    type: string
+                  tag:
+                    nullable: true
+                    type: string
                 type: object
               openRouter:
                 default:
                   baseUrl: https://openrouter.ai/api/v1
-                  chatModel: openrouter/auto
-                  imageModel: black-forest-labs/flux.2-klein-4b
+                  chatModel: auto
+                  imageModel: auto
+                  routerModel: auto
                   secretRef:
                     key: apiKey
                     name: freya-openrouter
@@ -138,8 +174,12 @@ spec:
                     description: Default chat / plan model id. `auto` = Freya internal Auto (not `openrouter/auto`).
                     type: string
                   imageModel:
-                    default: black-forest-labs/flux.2-klein-4b
-                    description: Default cloud image model id (OpenRouter).
+                    default: auto
+                    description: Default cloud image model id. `auto` = Freya router / Flux NL default.
+                    type: string
+                  routerModel:
+                    default: auto
+                    description: Freya-owned light intent router model. `auto` = Llama 3.1 8B-class (dolphin3 spirit).
                     type: string
                   secretRef:
                     description: Reference to a Secret key holding credentials.
@@ -188,7 +228,23 @@ spec:
           status:
             nullable: true
             properties:
+              adminCredentialsGenerated:
+                description: True when the operator generated (or filled) the admin credentials Secret.
+                nullable: true
+                type: boolean
+              adminCredentialsSecretName:
+                description: Secret holding admin login (`username` + `admin-password`). Never includes the password.
+                nullable: true
+                type: string
               apiEndpoint:
+                nullable: true
+                type: string
+              apiTokenSecretName:
+                description: Secret holding the machine API bearer (`token` key).
+                nullable: true
+                type: string
+              mcpEndpoint:
+                description: In-cluster MCP Streamable HTTP base, e.g. `http://freya-mcp.freya.svc:8090/mcp`.
                 nullable: true
                 type: string
               observedGeneration:
@@ -447,7 +503,7 @@ spec:
             description: |-
               Optional GPU worker for local SD / LoRA (vLLM-Omni by default).
 
-              Placement: - `incluster` — operator deploys the engine on a GPU node when the cluster has GPUs. - `external` — point `externalEndpoint` at a remote physical system running vLLM-Omni (or compatible `/v1/images/generations` + LoRA install API). Freya UI/API use that endpoint; `FreyaModelAsset` installs LoRAs onto the remote worker for the UI catalog.
+              Placement: - `external` (**recommended**) — point `externalEndpoint` at the GPU host running `freya-local-worker` / vLLM-Omni (or compatible `/v1/images/generations` + LoRA install). Studio stays in-cluster; the worker stays out-of-cluster via URL. - `incluster` (optional) — operator deploys the engine only when the cluster has GPUs.
             properties:
               authSecretRef:
                 description: Optional admin/API token Secret for remote LoRA install + generate.

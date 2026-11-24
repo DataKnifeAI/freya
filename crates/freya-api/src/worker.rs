@@ -12,6 +12,7 @@ pub struct DiffusionWorkerClient {
 }
 
 impl DiffusionWorkerClient {
+    #[allow(dead_code)]
     pub fn new(base: impl Into<String>) -> Self {
         Self::new_with_tls(base, false)
     }
@@ -46,7 +47,13 @@ impl DiffusionWorkerClient {
     }
 
     pub async fn health(&self) -> bool {
-        self.http
+        self.health_detail().await.is_some()
+    }
+
+    /// Fetch worker `/health` JSON when reachable.
+    pub async fn health_detail(&self) -> Option<Value> {
+        let resp = self
+            .http
             .get(format!("{}/health", self.base))
             .send()
             .await
@@ -77,11 +84,27 @@ impl DiffusionWorkerClient {
     }
 
     pub async fn list_loras(&self) -> Result<Vec<LocalAsset>> {
+        self.list_assets("/v1/loras").await
+    }
+
+    pub async fn list_checkpoints(&self) -> Result<Vec<LocalAsset>> {
+        self.list_assets("/v1/checkpoints").await
+    }
+
+    pub async fn list_embeddings(&self) -> Result<Vec<LocalAsset>> {
+        self.list_assets("/v1/embeddings").await
+    }
+
+    pub async fn list_vaes(&self) -> Result<Vec<LocalAsset>> {
+        self.list_assets("/v1/vae").await
+    }
+
+    async fn list_assets(&self, path: &str) -> Result<Vec<LocalAsset>> {
         let resp = self
-            .apply_auth(self.http.get(format!("{}/v1/loras", self.base)))
+            .apply_auth(self.http.get(format!("{}{path}", self.base)))
             .send()
             .await
-            .context("list loras")?;
+            .with_context(|| format!("list assets {path}"))?;
         if !resp.status().is_success() {
             return Ok(Vec::new());
         }
@@ -286,15 +309,9 @@ impl DiffusionWorkerClient {
         url: &str,
         dest_path: &str,
         auth_token: Option<&str>,
+        meta: Option<&InstallMeta>,
     ) -> Result<()> {
-        let mut body = serde_json::json!({
-            "source": source,
-            "url": url,
-            "destPath": dest_path,
-        });
-        if let Some(t) = auth_token.map(str::trim).filter(|t| !t.is_empty()) {
-            body["authToken"] = Value::String(t.into());
-        }
+        let body = self.install_body(source, url, dest_path, auth_token, meta, false);
         let resp = self
             .apply_auth(
                 self.http
