@@ -6199,6 +6199,20 @@ export default function App() {
       previewResult.artifactId === gallery[0]?.id ||
       previewResult.artifactId === gallery[0]?.artifactId);
 
+  /** Items already shown in the feature / session-set preview — omit from the wall below. */
+  const galleryPreviewIds = new Set();
+  if (batchResults.length > 1) {
+    for (const r of batchResults) {
+      if (r?.artifactId) galleryPreviewIds.add(r.artifactId);
+    }
+  } else if (previewResult?.artifactId) {
+    galleryPreviewIds.add(previewResult.artifactId);
+  }
+  const galleryWallItems = gallery.filter((g) => {
+    const id = g.id || g.artifactId;
+    return id && !galleryPreviewIds.has(id);
+  });
+
   const selectGalleryPreview = (g) => {
     const next = galleryToResult(g);
     if (!next) return;
@@ -8029,7 +8043,7 @@ export default function App() {
         </section>
       )}
 
-      {tab === "gallery" && previewResult && (
+      {tab === "gallery" && previewResult && batchResults.length <= 1 && (
         <section className="salon salon-single">
           <div className="salon-head">
             <span className="t-kind">
@@ -8676,7 +8690,7 @@ export default function App() {
       {tab === "gallery" && (
         <section className="panel salon">
           <div className="salon-wall salon-wall-gallery">
-            {gallery.map((g) => (
+            {galleryWallItems.map((g) => (
               <article
                 key={g.id}
                 className={`salon-work${previewResult?.artifactId === g.id ? " selected" : ""}`}
