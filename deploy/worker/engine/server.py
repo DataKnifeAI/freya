@@ -210,6 +210,12 @@ def _load_pipeline(model: str, base_model: str | None) -> Any:
     return pipe
 
 
+def _seed_generator(seed: int) -> torch.Generator:
+    """Manual seed on CPU — matches Automatic1111 / webui reproducibility conventions."""
+    gen = torch.Generator(device="cpu")
+    return gen.manual_seed(int(seed) & 0xFFFFFFFF)
+
+
 def _apply_loras(pipe: Any, lora_request: list[dict[str, Any]] | None) -> list[str]:
     names: list[str] = []
     if not lora_request:
@@ -243,6 +249,16 @@ def _apply_loras(pipe: Any, lora_request: list[dict[str, Any]] | None) -> list[s
         names.append(path.stem)
     if adapters:
         pipe.set_adapters(adapters, adapter_weights=weights)
+        # A1111 merges LoRA into weights; fuse single-adapter loads for closer conditioning.
+        if len(adapters) == 1:
+            try:
+                pipe.fuse_lora(
+                    adapter_names=adapters,
+                    lora_scale=weights[0],
+                    components=["unet", "text_encoder", "text_encoder_2"],
+                )
+            except Exception as e:
+                LOG.warning("fuse_lora failed (%s); keeping PEFT adapters", e)
     return names
 
 
@@ -336,8 +352,9 @@ def _apply_scheduler(pipe: Any, sampler: str | None) -> tuple[str | None, str | 
             EulerDiscreteScheduler,
         )
 
-        config = pipe.scheduler.config
+        config = dict(pipe.scheduler.config)
         if kind == "euler_a":
+            config["timestep_spacing"] = "leading"
             pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(config)
             sched = "EulerAncestralDiscreteScheduler"
         elif kind == "euler":
@@ -414,22 +431,51 @@ def _encode_a1111_prompts(
     return out
 
 
+def _prompt_token_diag(pipe: Any, prompt: str, negative: str | None) -> dict[str, Any]:
+    """Rough token counts for SDXL dual encoders (SDXL reports the longer path)."""
+    out: dict[str, Any] = {"promptChars": len(prompt), "negativeChars": len(negative or "")}
+    try:
+        if _sdxl_pipeline(pipe):
+            t1 = pipe.tokenizer(prompt, truncation=False, return_tensors="pt")
+            t2 = pipe.tokenizer_2(prompt, truncation=False, return_tensors="pt")
+            n1 = int(t1["input_ids"].shape[-1])
+            n2 = int(t2["input_ids"].shape[-1])
+            out["promptTokens"] = max(n1, n2)
+            out["promptTokensClipL"] = n1
+            out["promptTokensClipG"] = n2
+            if negative:
+                u1 = pipe.tokenizer(negative, truncation=False, return_tensors="pt")
+                u2 = pipe.tokenizer_2(negative, truncation=False, return_tensors="pt")
+                out["negativeTokens"] = max(int(u1["input_ids"].shape[-1]), int(u2["input_ids"].shape[-1]))
+            # Compel path uses both encoders; flag when either encoder context is long.
+            out["promptMayTruncate"] = n1 > 77 or n2 > 77
+        else:
+            t = pipe.tokenizer(prompt, truncation=False, return_tensors="pt")
+            n = int(t["input_ids"].shape[-1])
+            out["promptTokens"] = n
+            out["promptMayTruncate"] = n > 77
+            if negative:
+                u = pipe.tokenizer(negative, truncation=False, return_tensors="pt")
+                out["negativeTokens"] = int(u["input_ids"].shape[-1])
+    except Exception as e:
+        out["promptTokenError"] = str(e)
+    return out
+
+
 def _generation_prompt_kwargs(
     pipe: Any, prompt: str, negative: str | None, clip_skip: int | None
 ) -> dict[str, Any]:
-    if not _needs_a1111_prompt_parse(prompt, negative):
-        kwargs: dict[str, Any] = {"prompt": prompt}
-        if negative:
-            kwargs["negative_prompt"] = negative
-        return kwargs
-    try:
-        return _encode_a1111_prompts(pipe, prompt, negative, clip_skip)
-    except Exception as e:
-        LOG.warning("compel encode failed (%s); using raw prompt strings", e)
-        kwargs = {"prompt": prompt}
-        if negative:
-            kwargs["negative_prompt"] = negative
-        return kwargs
+    skip = int(clip_skip) if clip_skip is not None else 1
+    use_compel = _sdxl_pipeline(pipe) or _needs_a1111_prompt_parse(prompt, negative) or skip > 1
+    if use_compel:
+        try:
+            return _encode_a1111_prompts(pipe, prompt, negative, clip_skip)
+        except Exception as e:
+            LOG.warning("compel encode failed (%s); using raw prompt strings", e)
+    kwargs: dict[str, Any] = {"prompt": prompt}
+    if negative:
+        kwargs["negative_prompt"] = negative
+    return kwargs
 
 
 def _call_pipe(pipe: Any, kwargs: dict[str, Any], clip_skip: int | None) -> tuple[Any, bool]:
@@ -526,7 +572,7 @@ def generate_gif(req: GenerateReq) -> JSONResponse:
             images = []
             clip_applied = False
             for i in range(frames):
-                gen = torch.Generator(device=device).manual_seed((base_seed + i * 17) & 0xFFFFFFFF)
+                gen = _seed_generator((base_seed + i * 17) & 0xFFFFFFFF)
                 kwargs: dict[str, Any] = {
                     "num_inference_steps": steps,
                     "guidance_scale": guidance,
@@ -619,7 +665,7 @@ def generate(req: GenerateReq) -> JSONResponse:
             clip_applied = False
             for i in range(quantity):
                 seed_i = (base_seed + i) & 0xFFFFFFFF
-                generator = torch.Generator(device=device).manual_seed(seed_i)
+                generator = _seed_generator(seed_i)
                 kwargs: dict[str, Any] = {
                     "num_inference_steps": steps,
                     "guidance_scale": guidance,
@@ -650,6 +696,7 @@ def generate(req: GenerateReq) -> JSONResponse:
                 image.save(buf, format="PNG")
                 b64 = base64.b64encode(buf.getvalue()).decode("ascii")
                 data.append({"b64_json": b64, "seed": seed_i})
+            prompt_diag = _prompt_token_diag(pipe, prompt, req.negative_prompt)
             if not KEEP_LOADED:
                 _unload_locked()
             return JSONResponse(
@@ -673,6 +720,8 @@ def generate(req: GenerateReq) -> JSONResponse:
                     "quantity": quantity,
                     "negative_prompt": req.negative_prompt,
                     "workerPrompt": prompt if prompt != req.prompt.strip() else None,
+                    "promptEncoding": "compel-sdxl" if _sdxl_pipeline(pipe) else "compel-sd15",
+                    **prompt_diag,
                 }
             )
         except HTTPException:
