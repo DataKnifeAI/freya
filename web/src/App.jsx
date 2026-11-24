@@ -331,6 +331,12 @@ function buildWindowsWorkerSetupCmd({ origin, token, apiUrl }) {
   return `iex "& { \$(irm '${base}/scripts/setup-local-worker.ps1') } -Token '${tok}' -ApiUrl '${api}'"`;
 }
 
+/** Run on the GPU host after patching FreyaDiffusionWorker.spec.image (external workers). */
+function buildLinuxWorkerUpdateCmd({ origin }) {
+  const base = (origin || "").replace(/\/$/, "") || "<studio-origin>";
+  return `curl -fsSL ${base}/scripts/update-local-worker.sh | bash -s -- --from-cr freya-gpu`;
+}
+
 function readFavorites() {
   try {
     const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
@@ -3850,11 +3856,23 @@ export default function App() {
       apiUrl: studioOrigin(),
     });
 
+  const linuxWorkerUpdateCmd = () =>
+    buildLinuxWorkerUpdateCmd({ origin: studioOrigin() });
+
   const copyWorkerSetupCmd = async (which) => {
     const text = which === "windows" ? windowsWorkerSetupCmd() : linuxWorkerSetupCmd();
     try {
       await navigator.clipboard.writeText(text);
       setSetupCmdCopyMsg(which === "windows" ? "Windows copied" : "Linux copied");
+    } catch {
+      setSetupCmdCopyMsg("Select and copy manually");
+    }
+  };
+
+  const copyWorkerUpdateCmd = async () => {
+    try {
+      await navigator.clipboard.writeText(linuxWorkerUpdateCmd());
+      setSetupCmdCopyMsg("Update command copied");
     } catch {
       setSetupCmdCopyMsg("Select and copy manually");
     }
@@ -8466,6 +8484,36 @@ export default function App() {
                 </div>
               </div>
 
+              <div className="worker-setup" aria-label="Worker image update">
+                <strong className="worker-connect-title">Update worker image</strong>
+                <p className="hint">
+                  External GPU hosts: patch <code>FreyaDiffusionWorker</code>{" "}
+                  <code>spec.image</code>, then run on that host (pulls tag from the CR). Studio
+                  cannot restart a remote URL.
+                </p>
+                <label>
+                  Linux / macOS
+                  <textarea
+                    className="worker-setup-cmd"
+                    readOnly
+                    rows={2}
+                    value={linuxWorkerUpdateCmd()}
+                    spellCheck={false}
+                  />
+                </label>
+                <div className="row settings-token-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || mock}
+                    onClick={() => copyWorkerUpdateCmd()}
+                    title="Copy worker update one-liner"
+                  >
+                    Copy update
+                  </button>
+                </div>
+              </div>
+
               <div className="worker-connect" aria-label="Connect options">
                 <strong className="worker-connect-title">Connect</strong>
                 <p className="hint">
@@ -9440,6 +9488,8 @@ export default function App() {
               process is <code>freya-local-worker</code> (default port {DEFAULT_WORKER_PORT}); Studio
               is usually in-cluster and reaches it by URL (
               <code>FreyaDiffusionWorker</code> <code>externalEndpoint</code>).
+              New engine images: patch <code>spec.image</code>, then{" "}
+              <code>update-local-worker.sh --from-cr</code> on the GPU host.
             </p>
           </HelpSection>
 

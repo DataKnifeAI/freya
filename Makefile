@@ -52,6 +52,14 @@ run-api: ## Run Freya API locally
 run-worker: ## Run diffusion worker stub locally
 	$(CARGO) run -p freya-worker -- --port 8091
 
+.PHONY: run-local-worker
+run-local-worker: ## Build/run Docker freya-local-worker with GPU + Diffusers
+	./scripts/run-local-worker.sh
+
+.PHONY: update-local-worker
+update-local-worker: ## Pull CR/image tag and recreate freya-local-worker (GPU host)
+	./scripts/update-local-worker.sh
+
 run-operator: ## Run operator (needs kubeconfig)
 	$(CARGO) run -p freya-operator --bin freya-operator
 

@@ -109,14 +109,16 @@ async fn ensure_deployment(
     worker: &FreyaDiffusionWorker,
     owner: &OwnerReference,
 ) -> Result<(), Error> {
-    let (repo, tag) = match &worker.spec.image {
+    let (def_repo, def_tag) = default_worker_image();
+    let (repo, tag, pull) = match &worker.spec.image {
         Some(i) => (
-            i.repository
+            i.repository.clone().unwrap_or(def_repo),
+            i.tag.clone().unwrap_or(def_tag),
+            i.pull_policy
                 .clone()
-                .unwrap_or_else(|| default_worker_image().0),
-            i.tag.clone().unwrap_or_else(|| default_worker_image().1),
+                .unwrap_or_else(|| "IfNotPresent".into()),
         ),
-        None => default_worker_image(),
+        None => (def_repo, def_tag, "IfNotPresent".into()),
     };
     let image = format!("{repo}:{tag}");
     let port = worker.spec.port;
@@ -156,6 +158,7 @@ async fn ensure_deployment(
                     containers: vec![Container {
                         name: "diffusion".into(),
                         image: Some(image),
+                        image_pull_policy: Some(pull),
                         ports: Some(vec![ContainerPort {
                             container_port: port,
                             name: Some("http".into()),

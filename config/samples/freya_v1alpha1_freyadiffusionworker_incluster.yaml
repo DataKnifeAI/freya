@@ -7,6 +7,10 @@ metadata:
 spec:
   placement: incluster
   engine: vllm-omni
+  image:
+    repository: harbor.dataknife.net/library/freya-diffusion-worker
+    tag: "4a17ec9"
+    pullPolicy: IfNotPresent
   model: stabilityai/stable-diffusion-xl-base-1.0
   gpuCount: 1
   modelsPvcSize: 100Gi
