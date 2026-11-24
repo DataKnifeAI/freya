@@ -1193,6 +1193,27 @@ html.chat-busy, html.chat-busy * { cursor: none !important; }
 .community-image-modal .civitai-modal-head .agent-gallery-actions {
   margin-left: auto; justify-content: flex-end;
 }
+.civitai-asset-modal .civitai-modal-head {
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.civitai-asset-modal .civitai-modal-head .agent-gallery-actions {
+  margin-left: auto; justify-content: flex-end;
+}
+.salon-wall-gallery {
+  list-style: none;
+  margin: 0.6rem 0 0;
+  padding: 0;
+}
+.salon-gallery-tile.selected .agent-gallery-shot {
+  outline: 2px solid var(--ember);
+  outline-offset: 2px;
+}
+.salon-feature-actions {
+  justify-content: flex-start;
+  margin-top: 0.5rem;
+  padding-top: 0.35rem;
+}
 a.civitai-open-link.civitai-link-nsfw,
 a.civitai-open-link.civitai-link-nsfw:hover {
   color: var(--ember) !important;
