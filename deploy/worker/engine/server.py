@@ -435,13 +435,14 @@ def _encode_a1111_prompts(
             truncate_long_prompts=False,
             device=device,
         )
-        pos = compel(prompt)
-        neg = compel(negative or "")
+        neg_text = negative or ""
+        # Batch both prompts so Compel pads to the same sequence length (long prompt + short negative).
+        cond, pooled = compel([prompt, neg_text])
         return {
-            "prompt_embeds": pos[0],
-            "pooled_prompt_embeds": pos[1],
-            "negative_prompt_embeds": neg[0],
-            "negative_pooled_prompt_embeds": neg[1],
+            "prompt_embeds": cond[0:1],
+            "pooled_prompt_embeds": pooled[0:1],
+            "negative_prompt_embeds": cond[1:2],
+            "negative_pooled_prompt_embeds": pooled[1:2],
         }
     compel = Compel(
         tokenizer=pipe.tokenizer,

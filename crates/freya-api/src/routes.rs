@@ -3954,8 +3954,86 @@ fn suggestion_names(cards: &[Value], limit: usize) -> Vec<String> {
     names
 }
 
+fn asset_path_stem(value: &str) -> String {
+    let s = value.trim();
+    let base = s.rsplit('/').next().unwrap_or(s);
+    base.strip_suffix(".safetensors")
+        .unwrap_or(base)
+        .to_lowercase()
+}
+
+fn pinned_lora_matches_card(card: &Value, pinned: &[LoraIn]) -> bool {
+    let name = card
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    pinned.iter().any(|p| {
+        let pn = p.name.to_lowercase();
+        if name.contains(&pn) || pn.contains(&name) {
+            return true;
+        }
+        if let Some(ref path) = p.path {
+            let stem = asset_path_stem(path);
+            !stem.is_empty() && (name.contains(&stem) || stem.contains(&name))
+        } else {
+            false
+        }
+    })
+}
+
+fn active_base_matches_card(card: &Value, active_base: &str) -> bool {
+    let base_key = asset_path_stem(active_base);
+    if base_key.is_empty() || base_key == "none" {
+        return false;
+    }
+    for key in ["path", "model", "name"] {
+        if let Some(raw) = card.get(key).and_then(|v| v.as_str()) {
+            let stem = asset_path_stem(raw);
+            if !stem.is_empty() && (stem.contains(&base_key) || base_key.contains(&stem)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Skip the Agent-tab hint when the user already pinned the suggested LoRA and selected the matching base.
+fn lookup_hint_redundant(cards: &[Value], pinned: &[LoraIn], active_base: &str) -> bool {
+    if pinned.is_empty() {
+        return false;
+    }
+    if !cards.iter().any(|c| pinned_lora_matches_card(c, pinned)) {
+        return false;
+    }
+    let ckpt_cards: Vec<&Value> = cards
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.get("type").and_then(|t| t.as_str()),
+                Some("Checkpoint" | "checkpoint")
+            )
+        })
+        .collect();
+    if ckpt_cards.is_empty() {
+        return !active_base.is_empty() && active_base != "none";
+    }
+    ckpt_cards
+        .iter()
+        .any(|c| active_base_matches_card(c, active_base))
+}
+
 /// Vague first turn: name a couple of matches and explain pin. A clear render only notes the Agent tab.
-fn note_subject_lookup(reply: &str, modality: &str, cards: &[Value]) -> String {
+fn note_subject_lookup(
+    reply: &str,
+    modality: &str,
+    cards: &[Value],
+    pinned: &[LoraIn],
+    active_base: &str,
+) -> String {
     let names = suggestion_names(cards, 2);
     let reply = reply.trim();
     if modality == "chat" {
@@ -3978,7 +4056,10 @@ fn note_subject_lookup(reply: &str, modality: &str, cards: &[Value]) -> String {
         } else {
             format!("{reply}\n\n{lead}{pin}")
         }
-    } else if names.is_empty() || reply.to_lowercase().contains("agent tab") {
+    } else if names.is_empty()
+        || reply.to_lowercase().contains("agent tab")
+        || lookup_hint_redundant(cards, pinned, active_base)
+    {
         reply.to_string()
     } else {
         format!(
@@ -4554,17 +4635,23 @@ async fn chat_run(
     // Tool results arrive after the LLM reply — fold worker summaries into reply.
     let reply = enrich_reply_with_worker_results(&reply, &action_results);
     let reply = scrub_tool_noise(&reply);
-    let reply = if initial_turn {
-        note_subject_lookup(&reply, route.modality.as_str(), &loras)
-    } else {
-        reply
-    };
     let effective_backend = env.backend.as_deref().or(req.backend.as_deref());
     let local_backend = effective_backend.is_some_and(|b| b.eq_ignore_ascii_case("local"));
     let base_name = if local_backend {
         local_base_display(&state).await
     } else {
         String::new()
+    };
+    let reply = if initial_turn {
+        note_subject_lookup(
+            &reply,
+            route.modality.as_str(),
+            &loras,
+            &env.loras,
+            &base_name,
+        )
+    } else {
+        reply
     };
     let lora_line = if local_backend {
         pinned_lora_footer(&env.loras)
@@ -7832,7 +7919,7 @@ mod route_footer_tests {
             json!({ "name": "Foster LoRA", "path": "loras/foster.safetensors", "installed": true }),
             json!({ "name": "Other Foster", "installed": false }),
         ];
-        let note = note_subject_lookup("Happy to help you choose.", "chat", &cards);
+        let note = note_subject_lookup("Happy to help you choose.", "chat", &cards, &[], "");
         let lower = note.to_lowercase();
         assert!(lower.contains("foster lora"));
         assert!(lower.contains("pin"));
@@ -7844,9 +7931,44 @@ mod route_footer_tests {
     #[test]
     fn detailed_lookup_note_does_not_ask_a_question() {
         let cards = vec![json!({ "name": "Neon Diner", "installed": false })];
-        let note = note_subject_lookup("On it — I’ll make that image for you.", "picture", &cards);
+        let note = note_subject_lookup(
+            "On it — I’ll make that image for you.",
+            "picture",
+            &cards,
+            &[],
+            "",
+        );
         assert!(note.contains("Agent tab"));
         assert!(note.contains("Neon Diner"));
         assert!(!note.contains('?'));
+    }
+
+    #[test]
+    fn lookup_hint_skipped_when_lora_pinned_and_base_set() {
+        let cards = vec![
+            json!({ "name": "Frankie Foster - Foster's Home", "type": "LORA", "installed": true }),
+            json!({
+                "name": "waiNSFWIllustrious_v100",
+                "type": "Checkpoint",
+                "model": "checkpoints/waiNSFWIllustrious_v100.safetensors",
+                "installed": true
+            }),
+        ];
+        let pinned = vec![LoraIn {
+            name: "Frankie".into(),
+            scale: 1.0,
+            path: Some("loras/Frankie_Foster.safetensors".into()),
+            base_model: None,
+            version_id: None,
+            model_id: None,
+        }];
+        let note = note_subject_lookup(
+            "On it — I'll make that image for you.\n\nI couldn't finish that generation.",
+            "picture",
+            &cards,
+            &pinned,
+            "waiNSFWIllustrious_v100",
+        );
+        assert!(!note.to_lowercase().contains("agent tab"));
     }
 }

@@ -1253,6 +1253,12 @@ export function generateOfferForTurn(messages, index) {
       a.status === "executed",
   );
   if (done) return null;
+  const failed = actions.some(
+    (a) =>
+      (a.type === "generate_image" || a.type === "generate_video" || a.type === "run_session") &&
+      a.status === "error",
+  );
+  if (failed) return null;
   const proposed = actions.find(
     (a) =>
       (a.type === "generate_image" || a.type === "generate_video" || a.type === "run_session") &&
@@ -1455,7 +1461,46 @@ function initialLookupActions(message) {
   }));
 }
 
-function noteSubjectLookup(reply, modality, loras) {
+function assetPathStem(value) {
+  const s = String(value || "").trim();
+  const base = s.includes("/") ? s.split("/").pop() : s;
+  return base.replace(/\.safetensors$/i, "").toLowerCase();
+}
+
+function pinnedLoraMatchesCard(card, pinned) {
+  const name = String(card?.name || "").trim().toLowerCase();
+  if (!name) return false;
+  return (pinned || []).some((p) => {
+    const pn = String(p?.name || "").trim().toLowerCase();
+    if (pn && (name.includes(pn) || pn.includes(name))) return true;
+    const stem = assetPathStem(p?.path);
+    return stem && (name.includes(stem) || stem.includes(name));
+  });
+}
+
+function activeBaseMatchesCard(card, activeBase) {
+  const baseKey = assetPathStem(activeBase);
+  if (!baseKey || baseKey === "none") return false;
+  for (const key of ["path", "model", "name"]) {
+    const stem = assetPathStem(card?.[key]);
+    if (stem && (stem.includes(baseKey) || baseKey.includes(stem))) return true;
+  }
+  return false;
+}
+
+function lookupHintRedundant(cards, pinned, activeBase) {
+  if (!Array.isArray(pinned) || !pinned.length) return false;
+  if (!(cards || []).some((c) => pinnedLoraMatchesCard(c, pinned))) return false;
+  const ckptCards = (cards || []).filter(
+    (c) => String(c?.type || "").toLowerCase() === "checkpoint",
+  );
+  if (!ckptCards.length) {
+    return Boolean(activeBase) && activeBase !== "none";
+  }
+  return ckptCards.some((c) => activeBaseMatchesCard(c, activeBase));
+}
+
+function noteSubjectLookup(reply, modality, loras, pinned = [], activeBase = "") {
   const names = [];
   for (const card of loras || []) {
     const name = String(card?.name || "").trim();
@@ -1477,7 +1522,13 @@ function noteSubjectLookup(reply, modality, loras) {
       " Pin one on the Agent tab to use it. That installs the LoRA if it is not on the worker, then pins it, and installs or selects the matching base checkpoint.";
     return `${text}\n\n${lead}${pin}`.trim();
   }
-  if (!names.length || text.toLowerCase().includes("agent tab")) return text;
+  if (
+    !names.length ||
+    text.toLowerCase().includes("agent tab") ||
+    lookupHintRedundant(loras, pinned, activeBase)
+  ) {
+    return text;
+  }
   return `${text}\n\nMatching assets are on the Agent tab (${names.join(", ")}) if you want to pin a LoRA or switch the base.`;
 }
 
@@ -2620,7 +2671,12 @@ export async function mockApi(path, opts = {}) {
     const loras = sawSearch ? searchLoras : listed;
 
     reply = enrichMockReplyWithWorker(reply, actionResults);
-    if (initial) reply = noteSubjectLookup(reply, route.modality, loras);
+    const activeBase =
+      state.activeBaseModel && state.activeBaseModel !== "auto"
+        ? String(state.activeBaseModel).split("/").pop()
+        : "";
+    const pins = Array.isArray(body.loras) ? body.loras : [];
+    if (initial) reply = noteSubjectLookup(reply, route.modality, loras, pins, activeBase);
 
     return {
       reply,
