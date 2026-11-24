@@ -342,7 +342,10 @@ function readFavorites() {
     const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((x) => x && (x.id != null || x.name)) : [];
+    const list = Array.isArray(parsed)
+      ? parsed.filter((x) => x && (x.id != null || x.name) && x.kind !== "community-image")
+      : [];
+    return dedupeFavoriteAssets(list);
   } catch {
     return [];
   }
@@ -1315,6 +1318,59 @@ function resolveCivitaiModelId(item) {
   return null;
 }
 
+function normalizeCivitaiFavoriteUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  try {
+    const u = new URL(s.startsWith("http") ? s : `https://${s}`);
+    const host = u.hostname.toLowerCase().replace(/^www\./, "");
+    const modelMatch = u.pathname.match(/\/models\/(\d+)/i);
+    if (modelMatch) return `${host}/models/${modelMatch[1]}`;
+    return `${host}${u.pathname.replace(/\/$/, "")}`.toLowerCase();
+  } catch {
+    return s.toLowerCase().split(/[?#]/)[0];
+  }
+}
+
+/** Stable keys for Civitai model-card favorites (not community images). */
+function favoriteAssetKeys(item) {
+  if (!item || item.kind === "community-image") return [];
+  const keys = [];
+  const modelId = resolveCivitaiModelId(item);
+  if (modelId != null && String(modelId).trim() !== "") keys.push(`model:${modelId}`);
+  const vid = item.versionId ?? item.modelVersionId;
+  const vn = Number(vid);
+  if (Number.isFinite(vn) && vn > 0) keys.push(`ver:${vn}`);
+  if (item.path) keys.push(`path:${item.path}`);
+  const pageUrl = normalizeCivitaiFavoriteUrl(
+    item.civitaiUrl ||
+      (modelId != null ? `https://civitai.com/models/${modelId}` : ""),
+  );
+  if (pageUrl) keys.push(`url:${pageUrl}`);
+  keys.push(`card:${loraKey(item)}`);
+  return keys;
+}
+
+function favoriteAssetsMatch(a, b) {
+  if (!a || !b) return false;
+  const setB = new Set(favoriteAssetKeys(b));
+  return favoriteAssetKeys(a).some((k) => setB.has(k));
+}
+
+function dedupeFavoriteAssets(list) {
+  const seen = new Set();
+  const out = [];
+  for (const item of list || []) {
+    if (!item || item.kind === "community-image") continue;
+    const keys = favoriteAssetKeys(item);
+    if (!keys.length) continue;
+    if (keys.some((k) => seen.has(k))) continue;
+    keys.forEach((k) => seen.add(k));
+    out.push(item);
+  }
+  return out;
+}
+
 /** NSFW model pages open on civitai.red. SFW pages stay on civitai.com. */
 function modelPageIsNsfw(item, version) {
   if (!item && !version) return false;
@@ -1680,6 +1736,12 @@ const IconGallery = () => (
 const IconClear = () => (
   <Svg>
     <path d="M5 7h14M9 7V5h6v2M8 7l1 12h6l1-12" />
+  </Svg>
+);
+const IconRemix = () => (
+  <Svg>
+    <path d="M6 18H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2" />
+    <path d="M14 4l4 4-8 8H6v-4l8-8z" />
   </Svg>
 );
 
@@ -2755,6 +2817,17 @@ export default function App() {
     persistCivitaiSubview(next);
   };
   const [favorites, setFavorites] = useState(readFavorites);
+
+  useEffect(() => {
+    setFavorites((prev) => {
+      const next = dedupeFavoriteAssets(prev);
+      if (next.length !== prev.length) {
+        writeFavorites(next);
+        return next;
+      }
+      return prev;
+    });
+  }, []);
   const [civitaiDetail, setCivitaiDetail] = useState(null);
   /** Last model the Agent Gallery should list community images for. */
   const [agentAsset, setAgentAsset] = useState(null);
@@ -2765,6 +2838,7 @@ export default function App() {
   const [communityInstallId, setCommunityInstallId] = useState(null);
   const [communityMore, setCommunityMore] = useState(false);
   const [communityDetail, setCommunityDetail] = useState(null);
+  const [galleryDetail, setGalleryDetail] = useState(null);
   const [imageFavorites, setImageFavorites] = useState(bootstrapImageFavorites);
   const [favoriteType, setFavoriteType] = useState("LORA");
   const communitySentinelRef = useRef(null);
@@ -3273,11 +3347,11 @@ export default function App() {
     }
   };
 
-  /** Wipe composer prompt, Agent Meta, enhance, seed, and pinned LoRAs before a gallery Copy. */
-  const clearReproductionInputs = async () => {
+  /** Wipe composer prompt, Agent Meta, enhance, seed, and pinned LoRAs (same as gallery Clear). */
+  const resetReproductionInputs = async ({ quiet = false } = {}) => {
     setPrompt("");
     setCommunityErr("");
-    setSavedMsg("");
+    if (!quiet) setSavedMsg("");
     const next = { ...BLANK_GEN_META };
     genMetaDirtyRef.current = true;
     genMetaRef.current = next;
@@ -3291,10 +3365,16 @@ export default function App() {
     } catch {
       /* form and session state are already cleared */
     }
-    setCommunityNote(
-      "Cleared the prompt, negative prompt, generation meta (enhance, seed, sampler fields), and pinned LoRAs.",
-    );
+    if (quiet) {
+      setCommunityNote("");
+    } else {
+      setCommunityNote(
+        "Cleared the prompt, negative prompt, generation meta (enhance, seed, sampler fields), and pinned LoRAs.",
+      );
+    }
   };
+
+  const clearReproductionInputs = () => resetReproductionInputs({ quiet: false });
 
   const submitLogin = async (e) => {
     e?.preventDefault?.();
@@ -3339,17 +3419,15 @@ export default function App() {
     setSavedMsg("Signed out.");
   };
 
-  const isFavorite = (item) =>
-    favorites.some((f) => loraKey(f) === loraKey(item));
+  const isFavorite = (item) => favorites.some((f) => favoriteAssetsMatch(f, item));
 
   const toggleFavorite = (item) => {
     setFavorites((prev) => {
-      const key = loraKey(item);
-      const exists = prev.some((f) => loraKey(f) === key);
+      const exists = prev.some((f) => favoriteAssetsMatch(f, item));
       const civitaiId = resolveCivitaiModelId(item);
       const next = exists
-        ? prev.filter((f) => loraKey(f) !== key)
-        : [
+        ? prev.filter((f) => !favoriteAssetsMatch(f, item))
+        : dedupeFavoriteAssets([
             {
               id: civitaiId ?? item.id,
               modelId: civitaiId ?? item.modelId ?? null,
@@ -3366,7 +3444,7 @@ export default function App() {
               trainedWords: item.trainedWords,
             },
             ...prev,
-          ].slice(0, 200);
+          ]).slice(0, 200);
       writeFavorites(next);
       void persistStudio({ favorites: next });
       return next;
@@ -5734,6 +5812,9 @@ export default function App() {
       );
       setBatchResults((prev) => prev.filter((r) => r.artifactId !== id));
       setResult((prev) => (prev?.artifactId === id ? null : prev));
+      setGalleryDetail((prev) =>
+        prev && (prev.artifactId === id || prev.id === id) ? null : prev,
+      );
       setSession((prev) => ({
         ...prev,
         turns: (prev.turns || []).map((t) => ({
@@ -6046,8 +6127,9 @@ export default function App() {
     return "";
   };
 
-  /** Copy fills the composer, negative prompt, and Agent Meta, then the clipboard. */
+  /** Copy clears the composer first, then fills prompt, negative, meta, base, and installed LoRA pins. */
   const copyImageInput = async (item) => {
+    await resetReproductionInputs({ quiet: true });
     const prompt = String(item?.prompt || "").trim();
     const negative = String(item?.negativePrompt || item?.negative || "").trim();
     const sampler = metaField(item, "sampler");
@@ -6194,7 +6276,7 @@ export default function App() {
       const data = await api(`/v1/gallery/${id}/apply`, { method: "POST", body: "{}" });
       const applied = data.applied || {};
       if (applied.prompt) setPrompt(applied.prompt);
-      if (applied.settings) applyGenMeta({ settings: applied.settings });
+      if (applied.settings) applyGenMeta(applied.settings);
       if (Array.isArray(applied.pinnedLoras)) {
         setSession((prev) => ({ ...prev, pinnedLoras: applied.pinnedLoras }));
         void persistStudio({ pinnedLoras: applied.pinnedLoras });
@@ -6204,6 +6286,166 @@ export default function App() {
     } catch (e) {
       setError(e.message);
     }
+  };
+
+  /** Load this image's settings into the composer, then open it for another pass (apply + remix). */
+  const remixGalleryArtifact = async (item) => {
+    const id = item?.artifactId || item?.id;
+    if (!id) return;
+    const asResult = galleryToResult(item) || item;
+    setResult(asResult);
+    setModelBrief(asResult.enhancedPrompt || "");
+    setGalleryDetail(null);
+    setTab("gallery");
+    await applyGalleryArtifact(item);
+    try {
+      const remix = await api(`/v1/gallery/${id}/remix`, { method: "POST", body: "{}" });
+      if (remix.prompt) setPrompt(remix.prompt);
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  const renderFreyaGalleryActions = (item) => {
+    const id = item?.artifactId || item?.id;
+    return (
+      <>
+        {id ? (
+          <button
+            type="button"
+            className="ghost icon-btn"
+            title="Load settings and remix this image"
+            aria-label="Remix"
+            onClick={(e) => {
+              e.stopPropagation();
+              void remixGalleryArtifact(item);
+            }}
+          >
+            <IconRemix />
+          </button>
+        ) : null}
+        <MediaDownload
+          src={gallerySrc(item)}
+          item={galleryToResult(item) || item}
+          className="ghost icon-btn"
+          onError={setError}
+        />
+        {id ? (
+          <button
+            type="button"
+            className="ghost icon-btn"
+            title="Delete from gallery"
+            aria-label="Delete from gallery"
+            onClick={(e) => {
+              e.stopPropagation();
+              deleteGalleryItem(id);
+            }}
+          >
+            <IconTrash />
+          </button>
+        ) : null}
+      </>
+    );
+  };
+
+  const renderCivitaiDetailActions = () => {
+    if (!detailModel) return null;
+    const installed =
+      findInstalledForItem(detailModel) ||
+      (detailModel.path
+        ? installedAssets.find((a) => a.path === detailModel.path)
+        : null);
+    const isCkpt =
+      installed &&
+      (installed.kind === "checkpoint" || (installed.path || "").startsWith("checkpoints/"));
+    const isActive = installed && activeBasePath && activeBasePath === installed.path;
+    const href = civitaiModelPageUrl(
+      detailModel,
+      detailSelectedVersion?.id ?? detailModel.versionId,
+    );
+    const nsfwLink = modelPageIsNsfw(detailModel, detailSelectedVersion);
+    const linkHost = nsfwLink ? "civitai.red" : "civitai.com";
+    return (
+      <>
+        <button
+          type="button"
+          className={`${isFavorite(detailModel) ? "primary" : "ghost"} icon-btn`}
+          title={
+            isFavorite(detailModel) ? "Remove from favorites" : "Save to favorites library"
+          }
+          aria-label={isFavorite(detailModel) ? "Unfavorite" : "Favorite"}
+          onClick={() => toggleFavorite(detailModel)}
+        >
+          <IconStar filled={isFavorite(detailModel)} />
+        </button>
+        {resolveCivitaiModelId(detailModel) != null ||
+        Number(detailSelectedVersion?.id ?? detailModel.versionId) > 0 ? (
+          <button
+            type="button"
+            className="ghost icon-btn"
+            title="Community images for this model"
+            aria-label="Open community gallery"
+            onClick={() =>
+              openAssetGallery(detailModel, detailSelectedVersion?.id ?? detailModel.versionId)
+            }
+          >
+            <IconGallery />
+          </button>
+        ) : null}
+        {isPinnableAsset(detailModel) || isCheckpointAsset(detailModel) ? (
+          <button
+            type="button"
+            className={`${isPinned(detailModel) ? "primary" : "ghost"} icon-btn`}
+            title={
+              isPinned(detailModel)
+                ? "Unpin from this session"
+                : isCheckpointAsset(detailModel)
+                  ? "Install if needed and set as base"
+                  : "Pin to use — installs the LoRA and matching base if needed"
+            }
+            aria-label={
+              isPinned(detailModel)
+                ? "Unpin from session"
+                : isCheckpointAsset(detailModel)
+                  ? "Set as base"
+                  : "Pin to use"
+            }
+            onClick={() =>
+              isPinned(detailModel) ? unpinLora(detailModel) : void pinToUse(detailModel)
+            }
+          >
+            <IconPin />
+          </button>
+        ) : null}
+        {renderInstallAction(detailModel)}
+        {isCkpt ? (
+          <button
+            type="button"
+            className={`${isActive ? "primary" : "ghost"} icon-btn`}
+            disabled={isActive}
+            title={isActive ? "Active base" : "Set as base"}
+            aria-label={isActive ? "Active base" : "Set as base"}
+            onClick={() => setInstalledAsBase(installed)}
+          >
+            <IconPin />
+          </button>
+        ) : null}
+        {href ? (
+          <a
+            className={`ghost icon-btn civitai-open-link ${
+              nsfwLink ? "civitai-link-nsfw" : "civitai-link-sfw"
+            }`}
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            title={`Open on ${linkHost}`}
+            aria-label={`Open on ${linkHost}`}
+          >
+            <IconExternal />
+          </a>
+        ) : null}
+      </>
+    );
   };
 
   const renderCommunityActions = (item) => {
@@ -6279,7 +6521,7 @@ export default function App() {
         <button
           type="button"
           className="ghost icon-btn"
-          title="Fill the prompt, negative prompt, and generation meta"
+          title="Clear the composer, then fill prompt, negative prompt, and generation meta"
           aria-label="Copy input"
           onClick={(e) => {
             e.stopPropagation();
@@ -7259,6 +7501,16 @@ export default function App() {
               <div className="compose-actions">
                 <button
                   type="button"
+                  className="ghost icon-btn"
+                  title="Clear prompt, meta, and pinned LoRAs"
+                  aria-label="Clear inputs"
+                  onClick={() => void clearReproductionInputs()}
+                >
+                  <IconClear />
+                  <span className="sr-only">Clear inputs</span>
+                </button>
+                <button
+                  type="button"
                   className={`ghost icon-btn sidebar-toggle${sidebarOpen ? " open" : ""}`}
                   aria-pressed={sidebarOpen}
                   aria-controls="freya-sessions"
@@ -7588,58 +7840,32 @@ export default function App() {
         <section className="salon">
           <div className="salon-head">
             <span className="t-kind">Session set</span>
-            <p className="salon-sub">Select a work to inspect it above / remix its prompt.</p>
+            <p className="salon-sub">Select a work to inspect it. Remix loads its settings for another pass.</p>
           </div>
-          <div className="salon-wall">
-            {batchResults.map((r, i) => (
-              <article
+          <ul className="agent-gallery-list salon-wall-gallery">
+            {batchResults.map((r) => (
+              <li
                 key={r.artifactId || r.url}
-                className={`salon-work${result?.artifactId === r.artifactId ? " selected" : ""} salon-work-${(i % 3) + 1}`}
-                onClick={() => {
-                  setResult(r);
-                  setModelBrief(r.enhancedPrompt || "");
-                  if (r.prompt) setPrompt(r.prompt);
-                }}
+                className={`agent-gallery-tile salon-gallery-tile${
+                  previewResult?.artifactId === r.artifactId ? " selected" : ""
+                }`}
               >
-                {r.url ? (
-                  <MediaDownload
-                    src={r.url}
-                    item={r}
-                    className="ghost icon-btn salon-work-dl"
-                    onError={setError}
-                  />
-                ) : null}
-                {r.artifactId ? (
-                  <button
-                    type="button"
-                    className="ghost salon-work-del"
-                    title="Delete from gallery"
-                    aria-label="Delete variation"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      deleteGalleryItem(r.artifactId);
-                    }}
-                  >
-                    <IconTrash />
-                  </button>
-                ) : null}
-                <figure>
-                  <img src={r.url} alt={r.prompt || "variation"} />
-                  <figcaption>
-                    <span className="salon-caption">
-                      {(r.prompt || "").slice(0, 100)}
-                      {(r.prompt || "").length > 100 ? "…" : ""}
-                    </span>
-                    <span className="salon-meta">
-                      {r.backend}
-                      {r.model ? ` · ${r.model}` : ""}
-                      {mock ? " · mock" : ""}
-                    </span>
-                  </figcaption>
-                </figure>
-              </article>
+                <button
+                  type="button"
+                  className="agent-gallery-shot"
+                  onClick={() => {
+                    setResult(r);
+                    setModelBrief(r.enhancedPrompt || "");
+                    setGalleryDetail(r);
+                    setTab("gallery");
+                  }}
+                >
+                  <MediaFigure item={r} src={r.url} alt="" />
+                </button>
+                <div className="agent-gallery-tile-actions">{renderFreyaGalleryActions(r)}</div>
+              </li>
             ))}
-          </div>
+          </ul>
         </section>
       )}
 
@@ -7649,126 +7875,17 @@ export default function App() {
             <span className="t-kind">{batchResults.length > 1 ? "Selected variation" : "Latest image"}</span>
           </div>
           <figure className="salon-feature">
-            <img src={result.url} alt={result.enhancedPrompt || prompt} />
-            <figcaption>
-              <span className="salon-meta">
-                {result.backend}
-                {result.model ? ` · ${result.model}` : ""}
-                {mock ? " · mock" : ""}
-              </span>
-              {previewResult.artifactId && (
-                <div className="salon-actions">
-                  <MediaDownload
-                    src={previewResult.url}
-                    item={previewResult}
-                    className="ghost icon-btn salon-dl"
-                    onError={setError}
-                  />
-                  <button
-                    type="button"
-                    className="ghost remix-btn"
-                    onClick={() => void applyGalleryArtifact(previewResult)}
-                    title="Load sampler, weights, and prompt as-is into the composer"
-                  >
-                    Load settings
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost remix-btn"
-                    onClick={async () => {
-                      const remix = await api(
-                        `/v1/gallery/${previewResult.artifactId}/remix`,
-                        { method: "POST" },
-                      );
-                      setPrompt(remix.prompt || "");
-                    }}
-                  >
-                    Remix this prompt
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost remix-btn salon-del-btn"
-                    title="Delete from gallery"
-                    onClick={() => deleteGalleryItem(previewResult.artifactId)}
-                  >
-                    <IconTrash />
-                    Delete
-                  </button>
-                </div>
-              )}
-            </figcaption>
+            <MediaFigure
+              item={previewResult}
+              src={previewResult.url}
+              alt={previewResult.enhancedPrompt || previewResult.prompt || prompt}
+            />
+            {previewResult.artifactId ? (
+              <figcaption className="agent-gallery-tile-actions salon-feature-actions">
+                {renderFreyaGalleryActions(previewResult)}
+              </figcaption>
+            ) : null}
           </figure>
-          {modelBrief && (
-            <details className="model-brief">
-              <summary>What Freya sent to the model</summary>
-              <p>{modelBrief}</p>
-            </details>
-          )}
-          {previewResult?.meta || previewResult?.sampler ? (
-            <details className="gallery-sidecar" open>
-              <summary>Generation settings</summary>
-              <dl className="sidecar-dl">
-                {previewResult.meta?.sampler || previewResult.sampler ? (
-                  <>
-                    <dt>Sampler</dt>
-                    <dd>{previewResult.meta?.sampler || previewResult.sampler}</dd>
-                  </>
-                ) : null}
-                {previewResult.meta?.steps != null ? (
-                  <>
-                    <dt>Steps</dt>
-                    <dd>{previewResult.meta.steps}</dd>
-                  </>
-                ) : null}
-                {previewResult.meta?.cfg != null ? (
-                  <>
-                    <dt>CFG</dt>
-                    <dd>{previewResult.meta.cfg}</dd>
-                  </>
-                ) : null}
-                {previewResult.meta?.clipSkip != null ? (
-                  <>
-                    <dt>Clip skip</dt>
-                    <dd>{previewResult.meta.clipSkip}</dd>
-                  </>
-                ) : null}
-                {previewResult.meta?.seed != null ? (
-                  <>
-                    <dt>Seed</dt>
-                    <dd>{previewResult.meta.seed}</dd>
-                  </>
-                ) : null}
-                {previewResult.meta?.size ? (
-                  <>
-                    <dt>Size</dt>
-                    <dd>{previewResult.meta.size}</dd>
-                  </>
-                ) : null}
-                {previewResult.meta?.checkpoint ? (
-                  <>
-                    <dt>Checkpoint</dt>
-                    <dd>
-                      {previewResult.meta.checkpoint.name}
-                      {previewResult.meta.checkpoint.versionId
-                        ? ` · v${previewResult.meta.checkpoint.versionId}`
-                        : ""}
-                    </dd>
-                  </>
-                ) : null}
-              </dl>
-              {(previewResult.meta?.loraPins || []).length > 0 && (
-                <p className="hint">
-                  LoRAs:{" "}
-                  {previewResult.meta.loraPins
-                    .map((l) => `${l.name}@${l.scale ?? 1}`)
-                    .join(", ")}
-                </p>
-              )}
-              {previewResult.meta?.enhanceOn === false ? (
-                <p className="hint">Prompt was sent unchanged (enhance off).</p>
-              ) : null}
-            </details>
-          ) : null}
         </section>
       )}
 
@@ -7793,7 +7910,7 @@ export default function App() {
                   galleryContext.modelVersionId
                     ? ` · version ${galleryContext.modelVersionId}`
                     : ""
-                }. Click an image to open it. Clear wipes prompt and meta; Copy fills them from that image. Favorite, copy, download, install, and the Civitai link sit under the image.`
+                }. Click an image for details. Copy clears the composer first, then fills prompt and meta from that image. Clear resets without copying.`
               : "Open a model, or use a suggested or installed row, to list community images for that version."}
           </p>
           {communityBusy && <p className="hint">Loading community images…</p>}
@@ -8364,48 +8481,62 @@ export default function App() {
         </section>
       )}
 
-      {tab === "gallery" && (
+      {tab === "gallery" && galleryWallItems.length > 0 && (
         <section className="panel salon">
-          <div className="salon-wall salon-wall-gallery">
+          <ul className="agent-gallery-list salon-wall-gallery">
             {galleryWallItems.map((g) => (
-              <article
+              <li
                 key={g.id}
-                className="salon-work"
-                onClick={async () => {
-                  const remix = await api(`/v1/gallery/${g.id}/remix`, { method: "POST" });
-                  setPrompt(remix.prompt || "");
-                  setTab("gallery");
-                }}
+                className={`agent-gallery-tile salon-gallery-tile${
+                  previewResult?.artifactId === g.id ? " selected" : ""
+                }`}
               >
-                <MediaDownload
-                  src={gallerySrc(g)}
-                  item={g}
-                  className="ghost icon-btn salon-work-dl"
-                  onError={setError}
-                />
                 <button
                   type="button"
-                  className="ghost salon-work-del"
-                  title="Delete from gallery"
-                  aria-label={`Delete ${(g.prompt || "generation").slice(0, 40)}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    deleteGalleryItem(g.id);
+                  className="agent-gallery-shot"
+                  onClick={() => {
+                    selectGalleryPreview(g);
+                    setGalleryDetail(galleryToResult(g));
                   }}
                 >
-                  <IconTrash />
+                  <MediaFigure item={g} src={gallerySrc(g)} alt="" />
                 </button>
-                <figure>
-                  <img src={gallerySrc(g)} alt={g.prompt} />
-                  <figcaption>
-                    <span className="salon-caption">{(g.prompt || "").slice(0, 90)}…</span>
-                    <span className="salon-meta">{g.backend}</span>
-                  </figcaption>
-                </figure>
-              </article>
+                <div className="agent-gallery-tile-actions">
+                  {renderFreyaGalleryActions(galleryToResult(g) || g)}
+                </div>
+              </li>
             ))}
-          </div>
+          </ul>
         </section>
+      )}
+
+      {tab === "gallery" && galleryDetail && (
+        <div
+          className="civitai-modal-backdrop"
+          role="presentation"
+          onClick={() => setGalleryDetail(null)}
+        >
+          <div
+            className="civitai-modal community-image-modal freya-gallery-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Gallery image"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="civitai-modal-head">
+              <h3>Your generation</h3>
+              <div className="row lora-card-actions agent-gallery-actions">
+                {renderFreyaGalleryActions(galleryDetail)}
+                <button type="button" className="ghost" onClick={() => setGalleryDetail(null)}>
+                  Close
+                </button>
+              </div>
+            </div>
+            <div className="civitai-modal-gallery">
+              <MediaFigure item={galleryDetail} src={galleryDetail.url} alt="" />
+            </div>
+          </div>
+        </div>
       )}
 
       {tab === "worker" && (
@@ -9663,7 +9794,7 @@ export default function App() {
           onClick={closeCivitaiDetail}
         >
           <div
-            className="civitai-modal"
+            className="civitai-modal community-image-modal civitai-asset-modal"
             role="dialog"
             aria-modal="true"
             aria-label={detailModel.name || "Civitai asset"}
@@ -9679,9 +9810,12 @@ export default function App() {
                     .join(" · ")}
                 </p>
               </div>
-              <button type="button" className="ghost" onClick={closeCivitaiDetail}>
-                Close
-              </button>
+              <div className="row lora-card-actions agent-gallery-actions">
+                {renderCivitaiDetailActions()}
+                <button type="button" className="ghost" onClick={closeCivitaiDetail}>
+                  Close
+                </button>
+              </div>
             </div>
             <div className="civitai-modal-gallery">
               {detailImages.length > 0 ? (
@@ -9811,107 +9945,6 @@ export default function App() {
                     .join(" · ")}
                 </p>
               )}
-              <div className="row lora-card-actions">
-                <button
-                  type="button"
-                  className={`${isFavorite(detailModel) ? "primary" : "ghost"} icon-btn`}
-                  title={
-                    isFavorite(detailModel)
-                      ? "Remove from favorites"
-                      : "Save to favorites library"
-                  }
-                  aria-label={isFavorite(detailModel) ? "Unfavorite" : "Favorite"}
-                  onClick={() => toggleFavorite(detailModel)}
-                >
-                  <IconStar filled={isFavorite(detailModel)} />
-                </button>
-                {resolveCivitaiModelId(detailModel) != null ||
-                Number(detailSelectedVersion?.id ?? detailModel.versionId) > 0 ? (
-                  <button
-                    type="button"
-                    className="ghost icon-btn"
-                    title="Community images for this model"
-                    aria-label="Open community gallery"
-                    onClick={() =>
-                      openAssetGallery(
-                        detailModel,
-                        detailSelectedVersion?.id ?? detailModel.versionId,
-                      )
-                    }
-                  >
-                    <IconGallery />
-                  </button>
-                ) : null}
-                {isPinnableAsset(detailModel) || isCheckpointAsset(detailModel) ? (
-                  <button
-                    type="button"
-                    className={`${isPinned(detailModel) ? "primary" : "ghost"} icon-btn`}
-                    title={
-                      isPinned(detailModel)
-                        ? "Unpin from this session"
-                        : isCheckpointAsset(detailModel)
-                          ? "Install if needed and set as base"
-                          : "Pin to use — installs the LoRA and matching base if needed"
-                    }
-                    aria-label={
-                      isPinned(detailModel)
-                        ? "Unpin from session"
-                        : isCheckpointAsset(detailModel)
-                          ? "Set as base"
-                          : "Pin to use"
-                    }
-                    onClick={() =>
-                      isPinned(detailModel)
-                        ? unpinLora(detailModel)
-                        : void pinToUse(detailModel)
-                    }
-                  >
-                    <IconPin />
-                  </button>
-                ) : null}
-                {renderInstallAction(detailModel)}
-                {(() => {
-                  const installed =
-                    findInstalledForItem(detailModel) ||
-                    (detailModel.path
-                      ? installedAssets.find((a) => a.path === detailModel.path)
-                      : null);
-                  const isCkpt =
-                    installed &&
-                    (installed.kind === "checkpoint" ||
-                      (installed.path || "").startsWith("checkpoints/"));
-                  const isActive = installed && activeBasePath && activeBasePath === installed.path;
-                  if (!isCkpt) return null;
-                  return (
-                    <button
-                      type="button"
-                      className={isActive ? "primary" : "ghost"}
-                      disabled={isActive}
-                      onClick={() => setInstalledAsBase(installed)}
-                    >
-                      {isActive ? "Active base" : "Set as base"}
-                    </button>
-                  );
-                })()}
-                {(() => {
-                  const href = civitaiModelPageUrl(
-                    detailModel,
-                    detailSelectedVersion?.id ?? detailModel.versionId,
-                  );
-                  if (!href) return null;
-                  const nsfwLink = modelPageIsNsfw(detailModel, detailSelectedVersion);
-                  return (
-                    <a
-                      className={`ghost civitai-open-link ${nsfwLink ? "civitai-link-nsfw" : "civitai-link-sfw"}`}
-                      href={href}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      Open on Civitai
-                    </a>
-                  );
-                })()}
-              </div>
               {(detailModel.needsBase || detailModel.baseModel) && (
                 <p className="hint">
                   {detailModel.needsBase ||
