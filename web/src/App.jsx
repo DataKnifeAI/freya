@@ -2521,6 +2521,38 @@ function installedLorasFromPostResources(item, installed) {
   return out;
 }
 
+/** Every installed LoRA on the post, plus gallery-context LoRA when it is not already listed. */
+function installedLorasToPinFromCommunity(item, installed, galleryContext) {
+  const fromPost = installedLorasFromPostResources(item, installed);
+  const ctx = installedGalleryContextLora(galleryContext, installed);
+  if (!ctx) return fromPost;
+  const seen = new Set(fromPost.map((l) => loraKey(l)));
+  if (seen.has(loraKey(ctx))) return fromPost;
+  return [...fromPost, ctx];
+}
+
+function postResourceForLora(lora, postResources) {
+  return (
+    (postResources || []).find(
+      (r) => resourceLooksLikeLora(r) && findInstalledResource(r, [lora]),
+    ) || null
+  );
+}
+
+/** Append trigger tokens for pinned LoRAs when they are not already in the prompt. */
+function appendMissingLoraTriggers(prompt, loras) {
+  let next = String(prompt || "").trim();
+  const lower = next.toLowerCase();
+  const add = [];
+  for (const lora of loras || []) {
+    const tw = String(lora?.triggerWord || "").trim();
+    if (!tw || lower.includes(tw.toLowerCase())) continue;
+    add.push(tw);
+  }
+  if (!add.length) return next;
+  return `${next}, ${add.join(", ")}`;
+}
+
 /** Gallery opened for a model — pin that LoRA when it is already on the worker. */
 function installedGalleryContextLora(ctx, installed) {
   if (!ctx) return null;
@@ -4895,9 +4927,9 @@ export default function App() {
         lower.includes("mp4") ||
         lower.includes("animate "));
     const wantLocal = generateBackend === "local";
+    const enhanceMode = genMetaRef.current?.enhance;
     const body = {
       prompt: nlPrompt,
-      enhance: genMetaRef.current?.enhance === "off" ? "off" : "auto",
       backend: wantLocal
         ? "local"
         : loras.length && hasWorker() && !looksGif && !looksVideo
@@ -4906,6 +4938,8 @@ export default function App() {
       loras,
       automationMode,
     };
+    if (enhanceMode === "off") body.enhance = "off";
+    else if (enhanceMode && enhanceMode !== "auto") body.enhance = enhanceMode;
     if (looksGif) body.modality = "gif";
     if (looksVideo) body.modality = "video";
     if (looksGif || looksVideo) {
@@ -6585,7 +6619,14 @@ export default function App() {
       setCommunityErr("This image has no prompt or generation data to copy.");
       return;
     }
-    if (prompt) setPrompt(prompt);
+    const postResourcesEarly = Array.isArray(item?.resources) ? item.resources : [];
+    const lorasToPinEarly = installedLorasToPinFromCommunity(
+      item,
+      installedAssets,
+      galleryContext,
+    );
+    const promptWithTriggers = appendMissingLoraTriggers(prompt, lorasToPinEarly);
+    if (promptWithTriggers) setPrompt(promptWithTriggers);
     const next = {
       ...genMetaRef.current,
       sampler: sampler === "" ? "" : String(sampler),
@@ -6660,20 +6701,19 @@ export default function App() {
       baseNote = ` Checkpoint “${item.checkpoint}” is not installed.`;
     }
 
-    const postResources = Array.isArray(item?.resources) ? item.resources : [];
-    const contextLora = installedGalleryContextLora(galleryContext, installedAssets);
-    const lorasToPin = contextLora
-      ? [contextLora]
-      : installedLorasFromPostResources(item, installedAssets);
+    const postResources = postResourcesEarly;
+    const lorasToPin = lorasToPinEarly;
     const pinNames = [];
     for (const lora of lorasToPin) {
-      const resource =
-        postResources.find(
-          (r) => resourceLooksLikeLora(r) && findInstalledResource(r, [lora]),
-        ) || null;
+      const resource = postResourceForLora(lora, postResources);
       const scale = loraScaleDefault(lora, {}, resource?.weight);
+      const pinExtra = {
+        scale,
+        versionId: positiveId(resource?.modelVersionId ?? lora.versionId) ?? undefined,
+        modelId: positiveId(resource?.modelId ?? lora.modelId) ?? undefined,
+      };
       if (!isPinned(lora)) {
-        pinLora(lora, { scale });
+        pinLora(lora, pinExtra);
       } else {
         setPinScale(lora, scale);
       }
