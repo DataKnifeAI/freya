@@ -1,15 +1,20 @@
+use crate::civitai::CommunityImage;
 use crate::gallery::ArtifactMeta;
 use crate::prefs::{looks_nsfw_label, AlignmentPrefs, AutoFallbacksPrefs, PrivacyPrefs};
 use crate::state::{AppState, RuntimeSecrets};
 use crate::styles::{self, StylePack};
 use crate::worker::LoraWeight;
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
+use futures::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::convert::Infallible;
+use tokio::sync::mpsc;
 
 type ApiResult<T> = Result<T, ApiError>;
 
@@ -127,8 +132,339 @@ fn local_asset_json(a: crate::worker::LocalAsset) -> Value {
         "sizeBytes": a.size_bytes,
         "source": a.source,
         "thumbnailUrl": a.thumbnail_url,
+        "hash": a.hash,
         "backend": "local",
+        "installed": true,
     })
+}
+
+fn asset_label_key(raw: &str) -> String {
+    let file = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
+    let stem = file
+        .trim_end_matches(".safetensors")
+        .trim_end_matches(".ckpt")
+        .trim_end_matches(".pt")
+        .trim_end_matches(".gguf")
+        .trim_end_matches(".bin");
+    stem.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn card_label(v: &Value) -> String {
+    v.get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn card_version(v: &Value) -> Option<i64> {
+    v.get("versionId")
+        .and_then(|x| x.as_i64())
+        .filter(|n| *n > 0)
+}
+
+fn json_field_missing(v: Option<&Value>) -> bool {
+    match v {
+        None | Some(Value::Null) => true,
+        Some(Value::String(s)) if s.trim().is_empty() => true,
+        Some(Value::Array(a)) if a.is_empty() => true,
+        _ => false,
+    }
+}
+
+/// Name or file-stem equality. Different version ids are not the same asset.
+fn lookup_same_asset(local: &Value, search: &Value) -> bool {
+    match (card_version(local), card_version(search)) {
+        (Some(a), Some(b)) if a == b => return true,
+        (Some(_), Some(_)) => return false,
+        _ => {}
+    }
+    let local_path = local.get("path").and_then(|p| p.as_str()).unwrap_or("");
+    let search_file = search
+        .get("fileName")
+        .and_then(|n| n.as_str())
+        .unwrap_or("");
+    let local_keys = [
+        asset_label_key(&card_label(local)),
+        asset_label_key(local_path),
+    ];
+    let search_keys = [
+        asset_label_key(&card_label(search)),
+        asset_label_key(search_file),
+    ];
+    local_keys
+        .iter()
+        .any(|lk| !lk.is_empty() && search_keys.iter().any(|sk| !sk.is_empty() && sk == lk))
+}
+
+fn query_hits_label(query: &str, label: &str) -> bool {
+    let q = asset_label_key(query);
+    let n = asset_label_key(label);
+    if q.len() < 3 || n.is_empty() {
+        return false;
+    }
+    if q == n {
+        return true;
+    }
+    (q.len() >= 4 && n.contains(&q)) || (n.len() >= 4 && q.contains(&n))
+}
+
+fn merge_installed_lookup(local: &Value, search: Option<&Value>) -> Value {
+    let mut out = local.clone();
+    let Some(obj) = out.as_object_mut() else {
+        return local.clone();
+    };
+    obj.insert("installed".into(), json!(true));
+    let Some(search) = search else {
+        return out;
+    };
+    for key in [
+        "modelId",
+        "versionId",
+        "versionName",
+        "thumbnailUrl",
+        "imageUrls",
+        "baseModel",
+        "modelType",
+        "triggerWord",
+        "downloadUrl",
+        "civitaiUrl",
+        "fileId",
+        "fileName",
+        "fileFormat",
+        "stats",
+    ] {
+        if json_field_missing(obj.get(key)) {
+            if let Some(v) = search.get(key) {
+                if !json_field_missing(Some(v)) {
+                    obj.insert(key.to_string(), v.clone());
+                }
+            }
+        }
+    }
+    // Search `id` is the Civitai model id. Installed `id` is a file stem — do not copy it over.
+    if json_field_missing(obj.get("modelId")) {
+        if let Some(id) = search.get("id").and_then(|x| x.as_i64()).filter(|n| *n > 0) {
+            obj.insert("modelId".into(), json!(id));
+        }
+    }
+    out
+}
+
+/// Installed name/version matches first, then Civitai hits that are not that asset.
+/// Does not pin or download.
+fn order_lookup_assets(installed: &[Value], search: &[Value], query: &str) -> Vec<Value> {
+    let mut used_paths = std::collections::HashSet::new();
+    let mut consumed = std::collections::HashSet::new();
+    let mut existing = Vec::new();
+
+    let push_existing = |existing: &mut Vec<Value>,
+                         used_paths: &mut std::collections::HashSet<String>,
+                         local: &Value,
+                         hit: Option<&Value>| {
+        let path = local
+            .get("path")
+            .and_then(|p| p.as_str())
+            .unwrap_or("")
+            .to_string();
+        if path.is_empty() || !used_paths.insert(path) {
+            return;
+        }
+        existing.push(merge_installed_lookup(local, hit));
+    };
+
+    if asset_label_key(query).len() >= 3 {
+        for local in installed {
+            let name = card_label(local);
+            let stem = local.get("path").and_then(|p| p.as_str()).unwrap_or("");
+            if query_hits_label(query, &name) || query_hits_label(query, stem) {
+                let hit_idx = search.iter().position(|s| lookup_same_asset(local, s));
+                push_existing(
+                    &mut existing,
+                    &mut used_paths,
+                    local,
+                    hit_idx.and_then(|i| search.get(i)),
+                );
+                if let Some(i) = hit_idx {
+                    consumed.insert(i);
+                }
+            }
+        }
+    }
+
+    for (i, hit) in search.iter().enumerate() {
+        if consumed.contains(&i) {
+            continue;
+        }
+        if let Some(local) = installed.iter().find(|l| lookup_same_asset(l, hit)) {
+            push_existing(&mut existing, &mut used_paths, local, Some(hit));
+            consumed.insert(i);
+        }
+    }
+
+    let mut ordered = existing;
+    for (i, hit) in search.iter().enumerate() {
+        if consumed.contains(&i) {
+            continue;
+        }
+        let mut card = hit.clone();
+        if let Some(obj) = card.as_object_mut() {
+            obj.insert("installed".into(), json!(false));
+        }
+        ordered.push(card);
+    }
+    ordered
+}
+
+/// Installed row belongs to this agent search type.
+/// A set `modelType` must match. Untyped adapter files in `loras/` match LoRA / LoCon / DoRA / LyCORIS.
+fn installed_matches_search_type(asset: &Value, canon: &str) -> bool {
+    let mt = asset
+        .get("modelType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if !mt.is_empty() {
+        return crate::civitai::same_search_type(mt, canon);
+    }
+    let kind = asset
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if !kind.is_empty() {
+        if let Ok(got) = crate::civitai::canonical_search_type(kind) {
+            if matches!(canon, "LORA" | "LoCon" | "DoRA" | "LyCORIS")
+                && matches!(got, "LORA" | "LoCon" | "DoRA" | "LyCORIS")
+            {
+                return true;
+            }
+            return got == canon;
+        }
+    }
+    let path = asset.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    match canon {
+        "LORA" | "LoCon" | "DoRA" | "LyCORIS" => path.starts_with("loras/"),
+        "Checkpoint" => path.starts_with("checkpoints/"),
+        "TextualInversion" => path.starts_with("embeddings/"),
+        "VAE" => path.starts_with("vae/"),
+        _ => false,
+    }
+}
+
+fn search_type_arg(args: &Value) -> &str {
+    for key in ["type", "modelType", "types"] {
+        if let Some(t) = args.get(key).and_then(|v| v.as_str()) {
+            let t = t.trim();
+            if !t.is_empty() {
+                return t;
+            }
+        }
+    }
+    ""
+}
+
+/// Search one Civitai type. Installed name/version matches first, then other hits.
+/// Does not pin or download.
+async fn typed_civitai_lookup(
+    state: &AppState,
+    query: &str,
+    type_raw: &str,
+    limit: u32,
+) -> Result<Value, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("missing query".into());
+    }
+    let canon = crate::civitai::canonical_search_type(type_raw)?;
+    let cap = limit.clamp(1, 20) as usize;
+    let fetch = (cap as u32).max(12).min(20);
+    let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
+    let searched = {
+        let civ = state.civitai.read().await;
+        if !civ.configured() {
+            return Err("Civitai API key not configured".into());
+        }
+        civ.search_types(query, fetch, &[canon], allow_nsfw).await
+    };
+    let items = searched.map_err(|e| e.to_string())?;
+    let mut assets: Vec<_> = items
+        .into_iter()
+        .filter(|c| crate::civitai::same_search_type(&c.model_type, canon))
+        .collect();
+    assets.sort_by_key(|c| crate::civitai::asset_type_rank(&c.model_type));
+    let search_vals: Vec<Value> = assets
+        .iter()
+        .map(|c| serde_json::to_value(c).unwrap_or_else(|_| json!({})))
+        .collect();
+    let installed: Vec<Value> = installed_asset_values(state)
+        .await
+        .into_iter()
+        .filter(|a| installed_matches_search_type(a, canon))
+        .collect();
+    let mut loras = order_lookup_assets(&installed, &search_vals, query);
+    loras.truncate(cap);
+    Ok(json!({
+        "query": query,
+        "type": canon,
+        "loras": loras,
+    }))
+}
+
+async fn installed_asset_values(state: &AppState) -> Vec<Value> {
+    let Ok(v) = installed_payload(state).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for key in ["loras", "checkpoints", "embeddings", "vaes"] {
+        if let Some(arr) = v.get(key).and_then(|x| x.as_array()) {
+            out.extend(arr.iter().cloned());
+        }
+    }
+    out
+}
+
+/// Search results already put installed matches first. A bare list is the library.
+fn collect_chat_lookup_cards(action_results: &[Value]) -> Vec<Value> {
+    let mut search_cards = Vec::new();
+    let mut listed = Vec::new();
+    let mut saw_search = false;
+    for ar in action_results {
+        if ar.get("status").and_then(|s| s.as_str()) != Some("executed") {
+            continue;
+        }
+        let ty = ar.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let Some(res) = ar.get("result") else {
+            continue;
+        };
+        let push_arr = |dest: &mut Vec<Value>, v: Option<&Value>| {
+            if let Some(arr) = v.and_then(|x| x.as_array()) {
+                dest.extend(arr.iter().cloned());
+            }
+        };
+        if ty == "search_civitai" {
+            saw_search = true;
+            push_arr(&mut search_cards, res.get("loras"));
+            continue;
+        }
+        match ty {
+            "list_loras" => push_arr(&mut listed, res.get("loras")),
+            "list_checkpoints" => push_arr(&mut listed, res.get("checkpoints")),
+            "list_installed" => {
+                for key in ["loras", "checkpoints", "embeddings", "vaes"] {
+                    push_arr(&mut listed, res.get(key));
+                }
+            }
+            _ => {}
+        }
+    }
+    if saw_search {
+        search_cards
+    } else {
+        listed
+    }
 }
 
 pub async fn worker_checkpoints(State(state): State<AppState>) -> ApiResult<Json<Value>> {
@@ -397,9 +733,10 @@ pub async fn assist(
                 .filter(|q| !q.is_empty());
             if let Some(q) = query {
                 out["civitaiQuery"] = json!(q);
+                let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
                 let civ = state.civitai.read().await;
                 if civ.configured() {
-                    match civ.search(q, 12).await {
+                    match civ.search(q, 12, allow_nsfw).await {
                         Ok(items) => {
                             let mut assets: Vec<_> = items
                                 .into_iter()
@@ -459,9 +796,15 @@ pub struct ChatRequest {
     /// Composer video model pin (`auto` or a provider/model id). Not an API key.
     #[serde(default)]
     pub video_model: Option<String>,
+    /// Compact prior-tool memory (installed, pinned, active base). Not shown in the transcript.
+    #[serde(default)]
+    pub tool_context: Option<String>,
     /// When true, skip LLM planning and execute `actions` (Plan confirmation).
     #[serde(default)]
     pub confirm: bool,
+    /// NDJSON status lines (`Thinking`, `Searching`, `Generating`, `Downloading`) then one result.
+    #[serde(default)]
+    pub stream: bool,
     #[serde(default)]
     pub actions: Vec<ChatActionIn>,
     #[serde(default)]
@@ -472,6 +815,62 @@ pub struct ChatRequest {
 struct PlannedAction {
     action_type: String,
     args: serde_json::Value,
+}
+
+/// Keyword fallback only. The converse prompt requires the model to set `type`.
+fn infer_civitai_search_type(message: &str) -> &'static str {
+    let m = message.to_ascii_lowercase();
+    let words: Vec<&str> = m
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let has = |w: &str| words.iter().any(|x| *x == w);
+    if has("embedding") || has("embeddings") || m.contains("textual inversion") {
+        "TextualInversion"
+    } else if has("lycoris") || has("lyco") {
+        "LyCORIS"
+    } else if has("locon") {
+        "LoCon"
+    } else if has("dora") {
+        "DoRA"
+    } else if has("vae") || has("vaes") {
+        "VAE"
+    } else if has("checkpoint") || has("checkpoints") {
+        "Checkpoint"
+    } else {
+        "LORA"
+    }
+}
+
+fn stamp_gen_args(args: &mut Value, message: &str) {
+    let patch = crate::genmeta::patch_from_message(message);
+    let Some(obj) = args.as_object_mut() else {
+        return;
+    };
+    if let Some(s) = patch.sampler.as_deref() {
+        obj.insert("sampler".into(), json!(s));
+    }
+    if let Some(n) = patch.cfg {
+        obj.insert("cfg".into(), json!(n));
+    }
+    if let Some(n) = patch.steps {
+        obj.insert("steps".into(), json!(n));
+    }
+    if let Some(n) = patch.clip_skip {
+        obj.insert("clipSkip".into(), json!(n));
+    }
+    if let Some(n) = patch.seed {
+        obj.insert("seed".into(), json!(n));
+    }
+    if let Some(n) = patch.quantity {
+        obj.insert("quantity".into(), json!(n));
+    }
+    if crate::genmeta::wants_reuse(message) {
+        obj.insert("reuse".into(), json!(true));
+    }
+    if patch.any() {
+        obj.insert("persistMeta".into(), json!(true));
+    }
 }
 
 fn wants_image_intent(message: &str) -> bool {
@@ -496,14 +895,19 @@ fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
         || m.contains("find loras")
         || m.contains("search civitai")
     {
-        let query = message
-            .split_once("for ")
-            .map(|(_, rest)| rest.trim())
-            .filter(|s| !s.is_empty())
-            .unwrap_or(message);
+        let query = subject_query(message);
+        let query = if query.chars().count() >= 2 {
+            query
+        } else {
+            message.chars().take(80).collect()
+        };
+        let search_type = infer_civitai_search_type(message);
         actions.push(PlannedAction {
             action_type: "search_civitai".into(),
-            args: json!({ "query": query.chars().take(80).collect::<String>() }),
+            args: json!({
+                "query": query,
+                "type": search_type,
+            }),
         });
     }
 
@@ -580,18 +984,30 @@ fn infer_chat_plan(message: &str) -> (String, Vec<PlannedAction>) {
         });
     }
 
-    if wants_image_intent(message) {
+    if wants_image_intent(message) || crate::genmeta::wants_reuse(message) {
         if m.contains("run session") || m.contains("variations") || m.contains("batch") {
+            let mut args = json!({ "goal": message });
+            stamp_gen_args(&mut args, message);
             actions.push(PlannedAction {
                 action_type: "run_session".into(),
-                args: json!({ "goal": message }),
+                args,
             });
         } else {
+            let mut args = json!({ "prompt": message, "batch": false });
+            stamp_gen_args(&mut args, message);
             actions.push(PlannedAction {
                 action_type: "generate_image".into(),
-                args: json!({ "prompt": message, "batch": false }),
+                args,
             });
         }
+    } else if crate::genmeta::settings_command_only(message) {
+        // "set steps to 30" with no scene — write the shared store, do not render.
+        let mut args = json!({});
+        stamp_gen_args(&mut args, message);
+        actions.push(PlannedAction {
+            action_type: "set_generation_meta".into(),
+            args,
+        });
     }
 
     let reply = if actions.is_empty() {
@@ -801,6 +1217,10 @@ fn is_side_effect_action(ty: &str) -> bool {
             | "set_privacy"
             | "set_generate_backend"
             | "set_automation_mode"
+            | "set_generation_meta"
+            | "recommend_generation_meta"
+            | "apply_gallery_artifact"
+            | "apply_community_generation"
             | "favorite_asset"
             | "unfavorite_asset"
             | "pin_lora"
@@ -942,11 +1362,14 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
     let ty = ar.get("type").and_then(|t| t.as_str()).unwrap_or("");
     let status = ar.get("status").and_then(|s| s.as_str()).unwrap_or("");
     if status == "error" {
-        let err = ar.get("error").and_then(|e| e.as_str()).unwrap_or("error");
-        return Some(format!("{ty} failed: {err}"));
+        // Lookup failures stay in the tool disclosure. Do not paste tool names into the reply.
+        if matches!(ty, "generate_image" | "generate_video" | "run_session") {
+            return Some("I couldn't finish that generation.".into());
+        }
+        return None;
     }
     if status == "proposed" {
-        return Some(format!("Proposed: {ty}"));
+        return None;
     }
     let res = ar.get("result")?;
     match ty {
@@ -1243,6 +1666,14 @@ fn format_worker_action_summary(ar: &Value) -> Option<String> {
         "set_privacy" | "set_alignment" | "set_generate_backend" | "set_automation_mode" => {
             Some(format!("{ty} saved."))
         }
+        "set_generation_meta" | "recommend_generation_meta" => {
+            let label = res
+                .get("settings")
+                .and_then(|s| s.get("sourceLabel"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("Generation settings saved.");
+            Some(label.to_string())
+        }
         "generate_image" | "generate_video" => {
             let backend = res.get("backend").and_then(|b| b.as_str()).unwrap_or("?");
             let model = res
@@ -1478,44 +1909,82 @@ async fn execute_chat_action(
             }
         }
         "search_civitai" => {
-            let q = action
+            let raw = action
                 .args
                 .get("query")
                 .and_then(|q| q.as_str())
                 .unwrap_or("")
                 .trim();
-            if q.is_empty() {
+            let short = subject_query(raw);
+            let q = if short.chars().count() >= 2 {
+                short
+            } else {
+                raw.to_string()
+            };
+            let mut args = action.args.clone();
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert("query".to_string(), json!(q));
+            }
+            let type_raw = search_type_arg(&args);
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(6) as u32;
+            match typed_civitai_lookup(state, &q, type_raw, limit).await {
+                Ok(result) => json!({
+                    "type": ty,
+                    "status": "executed",
+                    "args": args,
+                    "result": result
+                }),
+                Err(e) => json!({
+                    "type": ty,
+                    "status": "error",
+                    "args": args,
+                    "error": e
+                }),
+            }
+        }
+        "civitai_images" => {
+            let model_id = json_i64(action.args.get("modelId"));
+            let version_id = json_i64(action.args.get("modelVersionId"));
+            if model_id.filter(|n| *n > 0).is_none() {
                 return json!({
                     "type": ty,
                     "status": "error",
                     "args": action.args,
-                    "error": "missing query"
+                    "error": "modelId is required"
                 });
             }
-            let civ = state.civitai.read().await;
-            if !civ.configured() {
-                return json!({
+            let limit = action
+                .args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(20) as u32;
+            let cursor = action.args.get("cursor").and_then(|v| v.as_str());
+            let page_no = action
+                .args
+                .get("page")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32);
+            let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
+            match load_community_images(
+                state, model_id, version_id, allow_nsfw, limit, cursor, page_no,
+            )
+            .await
+            {
+                Ok(page) => json!({
                     "type": ty,
-                    "status": "error",
+                    "status": "executed",
                     "args": action.args,
-                    "error": "Civitai API key not configured"
-                });
-            }
-            match civ.search(q, 12).await {
-                Ok(items) => {
-                    let mut assets: Vec<_> = items
-                        .into_iter()
-                        .filter(|c| crate::civitai::is_freya_asset_type(&c.model_type))
-                        .collect();
-                    assets.sort_by_key(|c| crate::civitai::asset_type_rank(&c.model_type));
-                    assets.truncate(6);
-                    json!({
-                        "type": ty,
-                        "status": "executed",
-                        "args": action.args,
-                        "result": { "query": q, "loras": assets }
-                    })
-                }
+                    "result": {
+                        "modelId": model_id,
+                        "modelVersionId": version_id,
+                        "nsfw": allow_nsfw,
+                        "count": page.items.len(),
+                        "items": page.items,
+                        "nextCursor": page.next_cursor,
+                        "nextPage": page.next_page,
+                        "note": "Community image posts. Pass nextCursor or nextPage for another page. Does not download or generate."
+                    }
+                }),
                 Err(e) => json!({
                     "type": ty,
                     "status": "error",
@@ -1540,19 +2009,14 @@ async fn execute_chat_action(
                 });
             }
             let backend_choice = chat_generate_backend(state, pinned, backend).await;
-            let req = GenerateRequest {
-                prompt: prompt.to_string(),
-                negative_prompt: None,
-                enhance: Some("auto".into()),
-                backend: Some(backend_choice.clone()),
-                model: resolve_action_image_model(image_model, &backend_choice),
-                style_ref: style_ref_from_args(&action.args),
-                loras: pinned.to_vec(),
-                size: None,
-                seed: None,
-                modality: Some("picture".into()),
-                duration: None,
-            };
+            let req = image_generate_request(
+                prompt.to_string(),
+                &action.args,
+                backend_choice.clone(),
+                resolve_action_image_model(image_model, &backend_choice),
+                style_ref_from_args(&action.args),
+                pinned.to_vec(),
+            );
             match run_generate(state, req).await {
                 Ok(result) => json!({
                     "type": ty,
@@ -1598,19 +2062,16 @@ async fn execute_chat_action(
                 .unwrap_or("video")
                 .to_string();
             let backend_choice = chat_generate_backend(state, pinned, backend).await;
-            let mut req = GenerateRequest {
-                prompt: prompt.to_string(),
-                negative_prompt: None,
-                enhance: Some("auto".into()),
-                backend: Some(backend_choice),
-                model: video_model.map(str::to_string),
-                style_ref: style_ref_from_args(&action.args),
-                loras: vec![],
-                size: None,
-                seed: None,
-                modality: Some(modality),
-                duration: action.args.get("duration").and_then(|d| d.as_i64()),
-            };
+            let mut req = image_generate_request(
+                prompt.to_string(),
+                &action.args,
+                backend_choice,
+                video_model.map(str::to_string),
+                style_ref_from_args(&action.args),
+                vec![],
+            );
+            req.modality = Some(modality);
+            req.duration = action.args.get("duration").and_then(|d| d.as_i64());
             if req.model.as_deref() == Some("auto") {
                 req.model = None;
             }
@@ -1690,19 +2151,14 @@ async fn execute_chat_action(
             let session_style = style_ref_from_args(&action.args);
             let mut results = Vec::new();
             for p in &prompts {
-                let req = GenerateRequest {
-                    prompt: p.clone(),
-                    negative_prompt: None,
-                    enhance: Some("auto".into()),
-                    backend: Some(backend_choice.clone()),
-                    model: resolve_action_image_model(image_model, &backend_choice),
-                    style_ref: session_style.clone(),
-                    loras: pinned.to_vec(),
-                    size: None,
-                    seed: None,
-                    modality: Some("picture".into()),
-                    duration: None,
-                };
+                let req = image_generate_request(
+                    p.clone(),
+                    &action.args,
+                    backend_choice.clone(),
+                    resolve_action_image_model(image_model, &backend_choice),
+                    session_style.clone(),
+                    pinned.to_vec(),
+                );
                 match run_generate(state, req).await {
                     Ok(r) => results.push(r),
                     Err(e) => {
@@ -1744,6 +2200,11 @@ async fn execute_chat_action(
                 .and_then(|u| u.as_str())
                 .unwrap_or("");
             let version_id = action.args.get("versionId").and_then(|x| x.as_i64());
+            let model_id = action
+                .args
+                .get("modelId")
+                .and_then(|x| x.as_i64())
+                .or_else(|| action.args.get("id").and_then(|x| x.as_i64()));
             let dest_path = action
                 .args
                 .get("destPath")
@@ -1754,12 +2215,12 @@ async fn execute_chat_action(
                 .get("name")
                 .and_then(|n| n.as_str())
                 .map(str::to_string);
-            if download_url.is_empty() && version_id.is_none() {
+            if download_url.is_empty() && version_id.is_none() && model_id.is_none() {
                 return json!({
                     "type": ty,
                     "status": "error",
                     "args": action.args,
-                    "error": "missing downloadUrl or versionId"
+                    "error": "missing downloadUrl, versionId, or modelId"
                 });
             }
             let install_req = InstallCivitaiRequest {
@@ -1772,12 +2233,13 @@ async fn execute_chat_action(
                     .and_then(|x| x.as_str())
                     .map(str::to_string),
                 version_id,
-                model_id: action
-                    .args
-                    .get("modelId")
-                    .and_then(|x| x.as_i64())
-                    .or_else(|| action.args.get("id").and_then(|x| x.as_i64())),
+                model_id,
                 file_id: action.args.get("fileId").and_then(|x| x.as_i64()),
+                file_hash: action
+                    .args
+                    .get("fileHash")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string),
                 model_type: action
                     .args
                     .get("modelType")
@@ -1854,19 +2316,7 @@ async fn execute_chat_action(
             };
             match client.list_checkpoints().await {
                 Ok(items) => {
-                    let checkpoints: Vec<Value> = items
-                        .into_iter()
-                        .map(|a| {
-                            json!({
-                                "id": a.id,
-                                "name": a.name.unwrap_or_else(|| a.id.clone()),
-                                "kind": a.kind,
-                                "path": a.path,
-                                "baseModel": a.base_model,
-                                "backend": "local",
-                            })
-                        })
-                        .collect();
+                    let checkpoints: Vec<Value> = items.into_iter().map(local_asset_json).collect();
                     json!({
                         "type": ty,
                         "status": "executed",
@@ -1894,19 +2344,7 @@ async fn execute_chat_action(
             };
             match client.list_loras().await {
                 Ok(items) => {
-                    let loras: Vec<Value> = items
-                        .into_iter()
-                        .map(|a| {
-                            json!({
-                                "id": a.id,
-                                "name": a.name.unwrap_or_else(|| a.id.clone()),
-                                "kind": a.kind,
-                                "path": a.path,
-                                "baseModel": a.base_model,
-                                "backend": "local",
-                            })
-                        })
-                        .collect();
+                    let loras: Vec<Value> = items.into_iter().map(local_asset_json).collect();
                     json!({
                         "type": ty,
                         "status": "executed",
@@ -2158,83 +2596,11 @@ async fn execute_chat_action(
             })
         }
         "get_route_defaults" => {
-            let (cfg_snap, privacy, alignment, auto_fallbacks) = {
-                let cfg = state.config.read().await;
-                let or = state.openrouter.read().await;
-                (
-                    (
-                        cfg.chat_model.clone(),
-                        cfg.image_model.clone(),
-                        cfg.router_model.clone(),
-                        or.configured_chat_model().to_string(),
-                        or.configured_image_model().to_string(),
-                        or.configured_router_model().to_string(),
-                    ),
-                    or.privacy().clone(),
-                    or.alignment().clone(),
-                    or.auto_fallbacks().clone(),
-                )
-            };
-            let (chat_model, image_model, router_model, _or_chat, or_image, or_router) = cfg_snap;
-            let resolved_router = crate::router::resolve_router_model_prefs(
-                &or_router,
-                &privacy,
-                &alignment,
-                &auto_fallbacks,
-            );
-            let auto_image = crate::router::resolve_auto_fallback(
-                crate::router::AutoFallbackKind::Image,
-                &privacy,
-                &alignment,
-                &auto_fallbacks,
-            );
-            let auto_video = crate::router::resolve_auto_fallback(
-                crate::router::AutoFallbackKind::Video,
-                &privacy,
-                &alignment,
-                &auto_fallbacks,
-            );
-            let auto_agent = crate::router::resolve_auto_fallback(
-                crate::router::AutoFallbackKind::Agent,
-                &privacy,
-                &alignment,
-                &auto_fallbacks,
-            );
             json!({
                 "type": ty,
                 "status": "executed",
                 "args": action.args,
-                "result": {
-                    "sentinels": {
-                        "agent": crate::router::AUTO_AGENT,
-                        "image": crate::router::AUTO_IMAGE,
-                        "router": crate::router::AUTO_ROUTER,
-                    },
-                    "configured": {
-                        "chatModel": chat_model,
-                        "imageModel": image_model,
-                        "routerModel": router_model,
-                    },
-                    "auto": {
-                        "router": resolved_router.clone(),
-                        "image": auto_image,
-                        "video": auto_video,
-                        "agent": auto_agent,
-                    },
-                    "autoFallbacks": auto_fallbacks,
-                    "resolved": {
-                        "router": resolved_router,
-                        "imageConfigured": or_image,
-                        "zdr": privacy.zero_data_retention,
-                        "alignment": alignment.model_alignment,
-                    },
-                    "notes": [
-                        "Pin agent/image/router with set_chat_models (persists to Settings).",
-                        "Cloud vs Local is the Studio composer switch (backend), not a chat model pref.",
-                        "Pin video with set_chat_models videoModel (id only). Cloud vs Local is set_generate_backend.",
-                        "Configure Auto fallbacks on the Models tab when the router does not pin a model.",
-                    ],
-                }
+                "result": route_defaults_payload(state).await
             })
         }
         "set_chat_models" => {
@@ -2461,7 +2827,7 @@ async fn execute_chat_action(
             let mut err = None;
             {
                 let mut cfg = state.config.write().await;
-                if let Err(e) = crate::studio::pin_add(&mut cfg.studio, &card) {
+                if let Err(e) = crate::studio::pin_upsert(&mut cfg.studio, &card) {
                     err = Some(e);
                 }
             }
@@ -2724,6 +3090,129 @@ async fn execute_chat_action(
                 Err(e) => action_error(ty, &action.args, e),
             }
         }
+        "get_generation_meta" => {
+            action_ok(ty, &action.args, generation_meta_value(state, false).await)
+        }
+        "recommend_generation_meta" => {
+            action_ok(ty, &action.args, generation_meta_value(state, true).await)
+        }
+        "set_generation_meta" => {
+            if let Some(msg) = reject_secret_fields(&action.args) {
+                return action_error(ty, &action.args, msg);
+            }
+            let patch = crate::genmeta::patch_from_value(&action.args);
+            let pin_weights = action
+                .args
+                .get("loraWeights")
+                .or_else(|| action.args.get("lora_weights"))
+                .and_then(|v| v.as_array());
+            if !patch.any() && pin_weights.is_none() {
+                return action_error(
+                    ty,
+                    &action.args,
+                    "provide sampler, cfg, steps, clipSkip, negativePrompt, seed, size, quantity, enhance, or loraWeights",
+                );
+            }
+            let mut settings = state.config.read().await.studio.generation.clone();
+            if patch.any() {
+                settings.apply_patch(&patch, "agent", true);
+                write_generation(state, &settings).await;
+            }
+            if let Some(weights) = pin_weights {
+                let mut cfg = state.config.write().await;
+                for w in weights {
+                    let name = w.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+                    let path = w.get("path").and_then(|p| p.as_str()).unwrap_or("").trim();
+                    let scale = w.get("scale").and_then(|s| s.as_f64());
+                    if name.is_empty() && path.is_empty() {
+                        continue;
+                    }
+                    let mut card = json!({ "name": name, "path": path });
+                    if let Some(s) = scale {
+                        card["scale"] = json!(s);
+                    }
+                    let _ = crate::studio::pin_upsert(&mut cfg.studio, &card);
+                }
+                let _ = state.persist_secrets().await;
+            }
+            let pins = state.config.read().await.studio.pinned_loras.clone();
+            action_ok(
+                ty,
+                &action.args,
+                json!({ "settings": settings, "pinnedLoras": pins, "persisted": true }),
+            )
+        }
+        "apply_gallery_artifact" => {
+            let id = action
+                .args
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let Some(id) = id else {
+                return action_error(ty, &action.args, "missing id");
+            };
+            let meta = match state.gallery.get(id).await {
+                Ok(Some(m)) => m,
+                Ok(None) => return action_error(ty, &action.args, "gallery artifact not found"),
+                Err(e) => return action_error(ty, &action.args, e.to_string()),
+            };
+            let inventory = studio_inventory(state).await;
+            let mut settings = state.config.read().await.studio.generation.clone();
+            let mut studio = state.config.read().await.studio.clone();
+            let out = crate::reproduce::apply_gallery_meta(&meta, &inventory, &mut settings, &mut studio);
+            {
+                let mut cfg = state.config.write().await;
+                cfg.studio.generation = settings.clone();
+                cfg.studio.pinned_loras = studio.pinned_loras.clone();
+            }
+            let _ = state.persist_secrets().await;
+            if let Some(ck) = meta.checkpoint.as_ref().and_then(|c| c.path.as_deref()) {
+                if inventory
+                    .installed
+                    .iter()
+                    .any(|a| a.path == ck)
+                {
+                    if let Some(w) = state.worker.read().await.as_ref() {
+                        let family = meta
+                            .base_model
+                            .as_deref()
+                            .or_else(|| meta.checkpoint.as_ref().map(|c| c.name.as_str()));
+                        let _ = w.set_active_base(ck, family).await;
+                    }
+                }
+            }
+            write_generation(state, &settings).await;
+            action_ok(ty, &action.args, serde_json::to_value(&out).unwrap_or(json!({})))
+        }
+        "apply_community_generation" => {
+            let image: CommunityImage = match serde_json::from_value(action.args.clone()) {
+                Ok(i) => i,
+                Err(e) => {
+                    return action_error(ty, &action.args, format!("invalid community image: {e}"));
+                }
+            };
+            let inventory = studio_inventory(state).await;
+            let mut settings = state.config.read().await.studio.generation.clone();
+            let mut studio = state.config.read().await.studio.clone();
+            let out =
+                crate::reproduce::apply_community_image(&image, &inventory, &mut settings, &mut studio);
+            {
+                let mut cfg = state.config.write().await;
+                cfg.studio.generation = settings.clone();
+                cfg.studio.pinned_loras = studio.pinned_loras.clone();
+            }
+            let _ = state.persist_secrets().await;
+            if let Some(base) = crate::reproduce::installed_checkpoint_for_image(&image, &inventory) {
+                if let Some(w) = state.worker.read().await.as_ref() {
+                    let _ = w
+                        .set_active_base(&base.path, image.checkpoint.as_deref())
+                        .await;
+                }
+            }
+            write_generation(state, &settings).await;
+            action_ok(ty, &action.args, serde_json::to_value(&out).unwrap_or(json!({})))
+        }
         other => json!({
             "type": other,
             "status": "error",
@@ -2745,14 +3234,39 @@ async fn civitai_install_inner(
     }
     drop(cfg);
 
-    // Prefer client URL; otherwise resolve from versionId (+ optional fileId).
+    // Prefer client URL; otherwise resolve from versionId, or modelId's latest version.
+    if req.download_url.trim().is_empty() && req.version_id.filter(|n| *n > 0).is_none() {
+        let model_id = req.model_id.filter(|n| *n > 0).ok_or_else(|| {
+            ApiError::Msg("downloadUrl, versionId, or modelId required to install".into())
+        })?;
+        let civ = state.civitai.read().await;
+        let resolved = civ
+            .resolve_model_download(model_id)
+            .await
+            .map_err(ApiError::from)?;
+        req.version_id = Some(resolved.version_id);
+        req.download_url = resolved.download_url;
+        if req.file_id.is_none() {
+            req.file_id = resolved.file_id;
+        }
+        if req.base_model.is_none() {
+            req.base_model = resolved.base_model;
+        }
+        if req.thumbnail_url.is_none() {
+            req.thumbnail_url = resolved.thumbnail_url;
+        }
+    }
     if req.download_url.trim().is_empty() {
         let version_id = req
             .version_id
             .ok_or_else(|| ApiError::Msg("downloadUrl or versionId required to install".into()))?;
         let civ = state.civitai.read().await;
         let resolved = civ
-            .resolve_version_download(version_id, req.file_id)
+            .resolve_version_download(
+                version_id,
+                req.file_id,
+                req.file_hash.as_deref(),
+            )
             .await
             .map_err(ApiError::from)?;
         req.download_url = resolved.download_url;
@@ -2776,7 +3290,10 @@ async fn civitai_install_inner(
     if req.model_id.is_none() || req.thumbnail_url.is_none() {
         if let Some(version_id) = req.version_id {
             let civ = state.civitai.read().await;
-            if let Ok(resolved) = civ.resolve_version_download(version_id, req.file_id).await {
+            if let Ok(resolved) = civ
+                .resolve_version_download(version_id, req.file_id, req.file_hash.as_deref())
+                .await
+            {
                 if req.model_id.is_none() {
                     req.model_id = resolved.model_id;
                 }
@@ -2868,15 +3385,62 @@ async fn civitai_install_inner(
     }))
 }
 
+#[derive(Clone, Default)]
+struct Phase {
+    tx: Option<mpsc::Sender<String>>,
+}
+
+impl Phase {
+    fn emit(&self, status: &str) {
+        let Some(tx) = &self.tx else {
+            return;
+        };
+        let line = json!({ "type": "status", "status": status }).to_string();
+        let _ = tx.try_send(line);
+    }
+}
+
+fn phase_for_action(ty: &str) -> Option<&'static str> {
+    match ty {
+        "generate_image" | "generate_video" | "run_session" => Some("Generating"),
+        "install_asset" => Some("Downloading"),
+        "search_civitai"
+        | "civitai_images"
+        | "suggest_ideas"
+        | "list_loras"
+        | "list_checkpoints"
+        | "list_installed"
+        | "list_styles"
+        | "list_models"
+        | "list_favorites"
+        | "list_pins"
+        | "list_install_jobs"
+        | "gallery_list"
+        | "gallery_get"
+        | "get_settings"
+        | "get_route_defaults"
+        | "worker_status"
+        | "get_base_model"
+        | "apply_style"
+        | "get_generation_meta"
+        | "recommend_generation_meta" => Some("Searching"),
+        _ => None,
+    }
+}
+
 struct ActionRun {
     loras: Vec<LoraIn>,
     image_model: Option<String>,
     video_model: Option<String>,
     backend: Option<String>,
+    phase: Phase,
 }
 
 impl ActionRun {
     async fn exec(&mut self, state: &AppState, action: &PlannedAction) -> Value {
+        if let Some(label) = phase_for_action(&action.action_type) {
+            self.phase.emit(label);
+        }
         let v = execute_chat_action(
             state,
             action,
@@ -2958,19 +3522,647 @@ fn lora_from_pin_value(v: &Value) -> Option<LoraIn> {
     }
     Some(LoraIn {
         name: name.to_string(),
-        scale: v.get("scale").and_then(|s| s.as_f64()).unwrap_or(0.8) as f32,
+        scale: v.get("scale").and_then(|s| s.as_f64()).unwrap_or(1.0) as f32,
         path: v.get("path").and_then(|p| p.as_str()).map(str::to_string),
         base_model: v
             .get("baseModel")
             .and_then(|b| b.as_str())
             .map(str::to_string),
+        version_id: v.get("versionId").and_then(|x| json_i64(Some(x))),
+        model_id: v
+            .get("modelId")
+            .and_then(|x| json_i64(Some(x)))
+            .or_else(|| v.get("id").and_then(|x| json_i64(Some(x)))),
     })
 }
 
-pub async fn chat(
-    State(state): State<AppState>,
-    Json(mut req): Json<ChatRequest>,
-) -> ApiResult<Json<serde_json::Value>> {
+const QUERY_INSTRUCTION: &[&str] = &[
+    "a",
+    "an",
+    "the",
+    "please",
+    "me",
+    "my",
+    "of",
+    "to",
+    "and",
+    "or",
+    "with",
+    "for",
+    "on",
+    "in",
+    "at",
+    "it",
+    "this",
+    "that",
+    "image",
+    "images",
+    "picture",
+    "pictures",
+    "photo",
+    "photos",
+    "pic",
+    "are",
+    "you",
+    "your",
+    "able",
+    "can",
+    "could",
+    "would",
+    "should",
+    "make",
+    "makes",
+    "making",
+    "create",
+    "creating",
+    "generate",
+    "generating",
+    "draw",
+    "drawing",
+    "paint",
+    "render",
+    "want",
+    "need",
+    "help",
+    "do",
+    "does",
+    "did",
+    "is",
+    "am",
+    "be",
+    "was",
+    "were",
+    "i",
+    "im",
+    "we",
+    "our",
+    "us",
+    "just",
+    "like",
+    "some",
+    "any",
+    "what",
+    "how",
+    "which",
+    "who",
+    "when",
+    "where",
+    "why",
+    "will",
+    "let",
+    "show",
+    "give",
+    "get",
+    "got",
+    "using",
+    "use",
+    "used",
+    "via",
+    "from",
+    "into",
+    "about",
+    "character",
+    "characters",
+    "style",
+    "reference",
+    "lora",
+    "loras",
+    "checkpoint",
+    "checkpoints",
+    "model",
+    "models",
+    "asset",
+    "assets",
+    "base",
+    "please",
+    "look",
+    "looking",
+    "see",
+    "standing",
+    "sitting",
+    "walking",
+    "holding",
+    "wearing",
+    "wear",
+    "wears",
+    "worn",
+    "dressed",
+    "an",
+    "by",
+    "as",
+    "if",
+    "but",
+    "so",
+    "not",
+    "no",
+    "yes",
+    "now",
+    "then",
+    "here",
+    "there",
+    "also",
+    "really",
+    "very",
+    "prompt",
+    "art",
+    "artwork",
+    "illustration",
+];
+
+/// Clothing, lighting, and scene filler. Dropped unless they are the only name.
+const QUERY_SCENE: &[&str] = &[
+    "dress",
+    "dresses",
+    "shirt",
+    "skirt",
+    "pants",
+    "jeans",
+    "jacket",
+    "coat",
+    "hat",
+    "shoes",
+    "boots",
+    "outfit",
+    "outfits",
+    "clothing",
+    "clothes",
+    "hoodie",
+    "gown",
+    "armor",
+    "armour",
+    "cape",
+    "cloak",
+    "lingerie",
+    "bikini",
+    "stockings",
+    "gloves",
+    "uniform",
+    "costume",
+    "heels",
+    "socks",
+    "shorts",
+    "sweater",
+    "blouse",
+    "suit",
+    "scarf",
+    "helmet",
+    "crown",
+    "necklace",
+    "lighting",
+    "light",
+    "lights",
+    "neon",
+    "cinematic",
+    "shadow",
+    "shadows",
+    "moonlight",
+    "sunlight",
+    "lamp",
+    "lamps",
+    "glow",
+    "glowing",
+    "dark",
+    "night",
+    "bright",
+    "dim",
+    "bokeh",
+    "sunset",
+    "sunrise",
+    "dawn",
+    "dusk",
+    "spotlight",
+    "emerald",
+    "crimson",
+    "scarlet",
+    "pink",
+    "red",
+    "blue",
+    "black",
+    "white",
+    "gold",
+    "golden",
+    "silver",
+    "purple",
+    "violet",
+    "green",
+    "yellow",
+    "orange",
+    "teal",
+    "cyan",
+    "ivory",
+    "nude",
+    "background",
+    "foreground",
+];
+
+fn query_key(word: &str) -> String {
+    word.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn query_display(word: &str) -> &str {
+    word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '\'')
+}
+
+fn query_listed(key: &str, list: &[&str]) -> bool {
+    list.iter().any(|w| *w == key)
+}
+
+struct QueryTok {
+    display: String,
+    key: String,
+    cap: bool,
+}
+
+fn query_tokens(message: &str) -> Vec<QueryTok> {
+    message
+        .split_whitespace()
+        .filter_map(|raw| {
+            let key = query_key(raw);
+            if key.is_empty() {
+                return None;
+            }
+            let cap = raw
+                .chars()
+                .find(|c| c.is_alphabetic())
+                .is_some_and(|c| c.is_uppercase());
+            let display = query_display(raw);
+            if display.is_empty() {
+                return None;
+            }
+            Some(QueryTok {
+                display: display.to_string(),
+                key,
+                cap,
+            })
+        })
+        .collect()
+}
+
+fn finish_query(words: &[String]) -> String {
+    words.join(" ").chars().take(80).collect()
+}
+
+/// Civitai query is the subject (character or asset name, 2–6 words), not the prompt.
+/// Proper nouns win. Question words, scene prose, clothing, and lighting do not.
+fn subject_query(message: &str) -> String {
+    let raw = message.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    let tokens = query_tokens(raw);
+    let mut spans: Vec<(Vec<String>, bool)> = Vec::new();
+    let mut cur: Vec<String> = Vec::new();
+    let mut scene_only = true;
+    let flush =
+        |spans: &mut Vec<(Vec<String>, bool)>, cur: &mut Vec<String>, scene_only: &mut bool| {
+            if !cur.is_empty() {
+                spans.push((std::mem::take(cur), *scene_only));
+                *scene_only = true;
+            }
+        };
+    for tok in &tokens {
+        let instruction = query_listed(&tok.key, QUERY_INSTRUCTION);
+        let scene = query_listed(&tok.key, QUERY_SCENE);
+        if tok.cap && !instruction && cur.len() < 6 {
+            if !scene {
+                scene_only = false;
+            }
+            cur.push(tok.display.clone());
+        } else if !cur.is_empty() && !tok.cap && !instruction && !scene && cur.len() < 6 {
+            scene_only = false;
+            cur.push(tok.display.clone());
+        } else {
+            flush(&mut spans, &mut cur, &mut scene_only);
+        }
+    }
+    flush(&mut spans, &mut cur, &mut scene_only);
+    let named: Vec<&(Vec<String>, bool)> = spans.iter().filter(|(_, scene)| !scene).collect();
+    let pool: Vec<&(Vec<String>, bool)> = if named.is_empty() {
+        spans.iter().collect()
+    } else {
+        named
+    };
+    if let Some((words, _)) = pool.iter().max_by_key(|(words, _)| words.len()) {
+        if !words.is_empty() {
+            return finish_query(words);
+        }
+    }
+    let strict: Vec<String> = tokens
+        .iter()
+        .filter(|t| !query_listed(&t.key, QUERY_INSTRUCTION) && !query_listed(&t.key, QUERY_SCENE))
+        .take(6)
+        .map(|t| t.display.clone())
+        .collect();
+    if !strict.is_empty() {
+        return finish_query(&strict);
+    }
+    let loose: Vec<String> = tokens
+        .iter()
+        .filter(|t| !query_listed(&t.key, QUERY_INSTRUCTION))
+        .take(4)
+        .map(|t| t.display.clone())
+        .collect();
+    finish_query(&loose)
+}
+
+fn sentence_is_tool_noise(sentence: &str) -> bool {
+    let lower = sentence.to_ascii_lowercase();
+    lower.contains("freya route")
+        || lower.contains("search_civitai")
+        || lower.contains("civitai_images")
+        || lower.contains("generate_image")
+        || lower.contains("generate_video")
+        || lower.contains("run_session")
+        || lower.contains("install_asset")
+}
+
+fn tool_noise_line(line: &str) -> bool {
+    let lower = line.trim().to_ascii_lowercase();
+    if lower.starts_with("proposed:") {
+        return true;
+    }
+    if let Some((head, _)) = lower.split_once(" failed:") {
+        return head.contains('_') && head.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+    }
+    false
+}
+
+fn scrub_sentences(line: &str) -> String {
+    let mut out = String::new();
+    let mut start = 0usize;
+    for (i, ch) in line.char_indices() {
+        if ch == '.' || ch == '!' || ch == '?' {
+            let sentence = line[start..=i].trim();
+            if !sentence.is_empty() && !sentence_is_tool_noise(sentence) {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(sentence);
+            }
+            start = i + ch.len_utf8();
+        }
+    }
+    let tail = line[start..].trim();
+    if !tail.is_empty() && !sentence_is_tool_noise(tail) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(tail);
+    }
+    out
+}
+
+/// Drop tool-call lines and route-machinery sentences from the visible reply.
+fn scrub_tool_noise(reply: &str) -> String {
+    reply
+        .split('\n')
+        .filter(|line| !tool_noise_line(line))
+        .map(scrub_sentences)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn suggestion_names(cards: &[Value], limit: usize) -> Vec<String> {
+    let mut names = Vec::new();
+    let push = |names: &mut Vec<String>, card: &Value| {
+        if names.len() >= limit {
+            return;
+        }
+        let Some(name) = card.get("name").and_then(|n| n.as_str()).map(str::trim) else {
+            return;
+        };
+        if name.is_empty() || names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            return;
+        }
+        names.push(name.to_string());
+    };
+    for card in cards.iter().filter(|c| {
+        c.get("installed").and_then(|v| v.as_bool()) == Some(true)
+            || c.get("path")
+                .and_then(|p| p.as_str())
+                .is_some_and(|p| !p.is_empty())
+    }) {
+        push(&mut names, card);
+    }
+    for card in cards {
+        push(&mut names, card);
+    }
+    names
+}
+
+fn asset_path_stem(value: &str) -> String {
+    let s = value.trim();
+    let base = s.rsplit('/').next().unwrap_or(s);
+    base.strip_suffix(".safetensors")
+        .unwrap_or(base)
+        .to_lowercase()
+}
+
+fn pinned_lora_matches_card(card: &Value, pinned: &[LoraIn]) -> bool {
+    let name = card
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if name.is_empty() {
+        return false;
+    }
+    pinned.iter().any(|p| {
+        let pn = p.name.to_lowercase();
+        if name.contains(&pn) || pn.contains(&name) {
+            return true;
+        }
+        if let Some(ref path) = p.path {
+            let stem = asset_path_stem(path);
+            !stem.is_empty() && (name.contains(&stem) || stem.contains(&name))
+        } else {
+            false
+        }
+    })
+}
+
+fn active_base_matches_card(card: &Value, active_base: &str) -> bool {
+    let base_key = asset_path_stem(active_base);
+    if base_key.is_empty() || base_key == "none" {
+        return false;
+    }
+    for key in ["path", "model", "name"] {
+        if let Some(raw) = card.get(key).and_then(|v| v.as_str()) {
+            let stem = asset_path_stem(raw);
+            if !stem.is_empty() && (stem.contains(&base_key) || base_key.contains(&stem)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Skip the Agent-tab hint when the user already pinned the suggested LoRA and selected the matching base.
+fn lookup_hint_redundant(cards: &[Value], pinned: &[LoraIn], active_base: &str) -> bool {
+    if pinned.is_empty() {
+        return false;
+    }
+    if !cards.iter().any(|c| pinned_lora_matches_card(c, pinned)) {
+        return false;
+    }
+    let ckpt_cards: Vec<&Value> = cards
+        .iter()
+        .filter(|c| {
+            matches!(
+                c.get("type").and_then(|t| t.as_str()),
+                Some("Checkpoint" | "checkpoint")
+            )
+        })
+        .collect();
+    if ckpt_cards.is_empty() {
+        return !active_base.is_empty() && active_base != "none";
+    }
+    ckpt_cards
+        .iter()
+        .any(|c| active_base_matches_card(c, active_base))
+}
+
+/// Vague first turn: name a couple of matches and explain pin. A clear render only notes the Agent tab.
+fn note_subject_lookup(
+    reply: &str,
+    modality: &str,
+    cards: &[Value],
+    pinned: &[LoraIn],
+    active_base: &str,
+) -> String {
+    let names = suggestion_names(cards, 2);
+    let reply = reply.trim();
+    if modality == "chat" {
+        if reply.to_lowercase().contains("pin")
+            && reply.to_lowercase().contains("base")
+            && reply.to_lowercase().contains("lora")
+        {
+            return reply.to_string();
+        }
+        let lead = if names.is_empty() {
+            "I looked for a matching LoRA and base.".to_string()
+        } else if names.len() == 1 {
+            format!("A match: {}.", names[0])
+        } else {
+            format!("A couple of matches: {} and {}.", names[0], names[1])
+        };
+        let pin = " Pin one on the Agent tab to use it. That installs the LoRA if it is not on the worker, then pins it, and installs or selects the matching base checkpoint.";
+        if reply.is_empty() {
+            format!("{lead}{pin}")
+        } else {
+            format!("{reply}\n\n{lead}{pin}")
+        }
+    } else if names.is_empty()
+        || reply.to_lowercase().contains("agent tab")
+        || lookup_hint_redundant(cards, pinned, active_base)
+    {
+        reply.to_string()
+    } else {
+        format!(
+            "{reply}\n\nMatching assets are on the Agent tab ({}) if you want to pin a LoRA or switch the base.",
+            names.join(", ")
+        )
+    }
+}
+
+/// First prompt: installed-first Civitai lookup, one call per agent search type. Does not pin or install.
+async fn run_initial_subject_lookup(state: &AppState, message: &str) -> Vec<Value> {
+    let query = subject_query(message);
+    if query.chars().count() < 2 {
+        return Vec::new();
+    }
+    let configured = state.civitai.read().await.configured();
+    if !configured {
+        return vec![json!({
+            "type": "search_civitai",
+            "status": "error",
+            "args": { "query": query, "type": "LORA" },
+            "error": "Civitai API key not configured"
+        })];
+    }
+    let mut joins = Vec::new();
+    for ty in crate::civitai::AGENT_SEARCH_TYPES {
+        let state = state.clone();
+        let query = query.clone();
+        let limit: u32 = if *ty == "LORA" || *ty == "Checkpoint" {
+            4
+        } else {
+            2
+        };
+        joins.push(tokio::spawn(async move {
+            let args = json!({ "query": query, "type": ty, "limit": limit });
+            match typed_civitai_lookup(&state, &query, ty, limit).await {
+                Ok(result) => json!({
+                    "type": "search_civitai",
+                    "status": "executed",
+                    "args": args,
+                    "result": result
+                }),
+                Err(e) => json!({
+                    "type": "search_civitai",
+                    "status": "error",
+                    "args": args,
+                    "error": e
+                }),
+            }
+        }));
+    }
+    let mut out = Vec::new();
+    for join in joins {
+        match join.await {
+            Ok(v) => out.push(v),
+            Err(e) => out.push(json!({
+                "type": "search_civitai",
+                "status": "error",
+                "error": e.to_string()
+            })),
+        }
+    }
+    out
+}
+
+pub async fn chat(State(state): State<AppState>, Json(req): Json<ChatRequest>) -> Response {
+    if !req.stream {
+        return match chat_run(state, req, Phase::default()).await {
+            Ok(v) => Json(v).into_response(),
+            Err(e) => e.into_response(),
+        };
+    }
+    let (tx, rx) = mpsc::channel(32);
+    let phase = Phase {
+        tx: Some(tx.clone()),
+    };
+    phase.emit("Thinking");
+    tokio::spawn(async move {
+        let line = match chat_run(state, req, phase).await {
+            Ok(v) => json!({ "type": "result", "data": v }).to_string(),
+            Err(e) => json!({ "type": "error", "error": api_err_msg(e) }).to_string(),
+        };
+        let _ = tx.send(line).await;
+    });
+    let body = Body::from_stream(stream::unfold(rx, |mut rx| async move {
+        let line = rx.recv().await?;
+        Some((Ok::<String, Infallible>(format!("{line}\n")), rx))
+    }));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-accel-buffering", "no")
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+async fn chat_run(
+    state: AppState,
+    mut req: ChatRequest,
+    phase: Phase,
+) -> ApiResult<serde_json::Value> {
+    phase.emit("Thinking");
     req.loras = session_lora_pins(std::mem::take(&mut req.loras));
     let mode = req
         .automation_mode
@@ -2982,7 +4174,7 @@ pub async fn chat(
         _ => "auto".into(),
     };
 
-    let hist_blob = if req.messages.is_empty() {
+    let mut hist_blob = if req.messages.is_empty() {
         String::new()
     } else {
         req.messages
@@ -2994,6 +4186,20 @@ pub async fn chat(
             .collect::<Vec<_>>()
             .join("\n")
     };
+    if let Some(ctx) = req
+        .tool_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let ctx: String = ctx.chars().take(2000).collect();
+        hist_blob = if hist_blob.is_empty() {
+            format!("--- prior tools ---\n{ctx}")
+        } else {
+            format!("{hist_blob}\n\n--- prior tools ---\n{ctx}")
+        };
+    }
+    let initial_turn = !req.confirm && req.messages.is_empty();
 
     let media_ask = crate::router::direct_media_ask(&req.message);
 
@@ -3121,14 +4327,16 @@ pub async fn chat(
                 })
             )
         };
+        let mut args = json!({
+            "prompt": req.message,
+            "modality": modality,
+        });
+        stamp_gen_args(&mut args, &req.message);
         (
             reply,
             vec![PlannedAction {
                 action_type: "generate_video".into(),
-                args: json!({
-                    "prompt": req.message,
-                    "modality": modality,
-                }),
+                args,
             }],
         )
     } else if !req.confirm
@@ -3144,11 +4352,13 @@ pub async fn chat(
             } else {
                 "On it — I’ll make a short series of images.".to_string()
             };
+            let mut args = json!({ "goal": req.message });
+            stamp_gen_args(&mut args, &req.message);
             (
                 reply,
                 vec![PlannedAction {
                     action_type: "run_session".into(),
-                    args: json!({ "goal": req.message }),
+                    args,
                 }],
             )
         } else {
@@ -3157,14 +4367,41 @@ pub async fn chat(
             } else {
                 "On it — I’ll make that image for you.".to_string()
             };
+            let mut args = json!({ "prompt": req.message, "batch": false });
+            stamp_gen_args(&mut args, &req.message);
             (
                 reply,
                 vec![PlannedAction {
                     action_type: "generate_image".into(),
-                    args: json!({ "prompt": req.message, "batch": false }),
+                    args,
                 }],
             )
         }
+    } else if !req.confirm && crate::genmeta::wants_reuse(&req.message) {
+        let reply = if mode == "plan" {
+            "Ready to generate again with the same settings — press Generate to run it.".to_string()
+        } else {
+            "Using the same settings as the last image.".to_string()
+        };
+        let mut args = json!({ "prompt": req.message, "batch": false });
+        stamp_gen_args(&mut args, &req.message);
+        (
+            reply,
+            vec![PlannedAction {
+                action_type: "generate_image".into(),
+                args,
+            }],
+        )
+    } else if !req.confirm && crate::genmeta::settings_command_only(&req.message) {
+        let mut args = json!({});
+        stamp_gen_args(&mut args, &req.message);
+        (
+            "Updated the generation settings.".to_string(),
+            vec![PlannedAction {
+                action_type: "set_generation_meta".into(),
+                args,
+            }],
+        )
     } else {
         let mut system = load_instruction_toned(&state, "converse").await;
         if alignment.local_adult_passthrough() {
@@ -3264,12 +4501,23 @@ pub async fn chat(
         }
     }
 
+    // First prompt looks up the subject (installed first, then each Civitai type).
+    // The fan-out replaces any single search the planner already chose so types are not dropped.
+    let lookup_results = if initial_turn {
+        planned.retain(|a| a.action_type != "search_civitai");
+        phase.emit("Searching");
+        run_initial_subject_lookup(&state, &req.message).await
+    } else {
+        Vec::new()
+    };
+
     // Prefer router-resolved image model when executing generates under Auto.
     let mut env = ActionRun {
         loras: req.loras.clone(),
         image_model: Some(resolved_image.clone()),
         video_model: Some(resolved_video.clone()),
         backend: req.backend.clone(),
+        phase: phase.clone(),
     };
 
     let side_effects: Vec<_> = planned
@@ -3348,9 +4596,14 @@ pub async fn chat(
         }
     }
 
+    if !lookup_results.is_empty() {
+        let mut merged = lookup_results;
+        merged.append(&mut action_results);
+        action_results = merged;
+    }
+
     // Aggregate convenience fields for the UI
     let mut ideas = Vec::new();
-    let mut loras = Vec::new();
     let mut artifacts = Vec::new();
     let mut civitai_query = String::new();
     for ar in &action_results {
@@ -3361,9 +4614,6 @@ pub async fn chat(
                         ideas.push(json!(s));
                     }
                 }
-            }
-            if let Some(arr) = res.get("loras").and_then(|i| i.as_array()) {
-                loras.extend(arr.iter().cloned());
             }
             if let Some(q) = res.get("query").and_then(|q| q.as_str()) {
                 civitai_query = q.to_string();
@@ -3379,15 +4629,29 @@ pub async fn chat(
             }
         }
     }
+    // Search payload is already installed-first. Do not prepend the full library.
+    let loras = collect_chat_lookup_cards(&action_results);
 
     // Tool results arrive after the LLM reply — fold worker summaries into reply.
     let reply = enrich_reply_with_worker_results(&reply, &action_results);
+    let reply = scrub_tool_noise(&reply);
     let effective_backend = env.backend.as_deref().or(req.backend.as_deref());
     let local_backend = effective_backend.is_some_and(|b| b.eq_ignore_ascii_case("local"));
     let base_name = if local_backend {
         local_base_display(&state).await
     } else {
         String::new()
+    };
+    let reply = if initial_turn {
+        note_subject_lookup(
+            &reply,
+            route.modality.as_str(),
+            &loras,
+            &env.loras,
+            &base_name,
+        )
+    } else {
+        reply
     };
     let lora_line = if local_backend {
         pinned_lora_footer(&env.loras)
@@ -3409,7 +4673,7 @@ pub async fn chat(
     );
     let footer_backend = if local_backend { "local" } else { "cloud" };
 
-    Ok(Json(json!({
+    Ok(json!({
         "reply": reply,
         "actions": action_results,
         "pendingConfirmation": pending_confirmation,
@@ -3432,7 +4696,7 @@ pub async fn chat(
             "image": resolved_image,
             "video": resolved_video,
         },
-    })))
+    }))
 }
 
 fn pinned_lora_footer(loras: &[LoraIn]) -> String {
@@ -3525,6 +4789,22 @@ pub struct GenerateRequest {
     /// Video duration seconds (OpenRouter), when supported.
     #[serde(default)]
     pub duration: Option<i64>,
+    #[serde(default)]
+    pub steps: Option<u32>,
+    #[serde(default, alias = "guidance", alias = "guidanceScale")]
+    pub cfg: Option<f64>,
+    #[serde(default)]
+    pub sampler: Option<String>,
+    #[serde(default)]
+    pub clip_skip: Option<u32>,
+    #[serde(default, alias = "n")]
+    pub quantity: Option<u32>,
+    /// Repeat the last gallery sidecar (sampler, cfg, steps, clip skip, seed, …).
+    #[serde(default)]
+    pub reuse_meta: Option<bool>,
+    /// Write request sampling fields into the shared generation store.
+    #[serde(default)]
+    pub persist_meta: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -3539,6 +4819,11 @@ pub struct LoraIn {
     /// Civitai base family (SDXL 1.0, Pony, …) — used to pick a checkpoint.
     #[serde(default)]
     pub base_model: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub version_id: Option<i64>,
+    /// Civitai model id when known; non-numeric strings in JSON are dropped (legacy clients sent filenames).
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
+    pub model_id: Option<i64>,
 }
 
 fn one() -> f32 {
@@ -3708,7 +4993,419 @@ pub async fn run(
     run_generate(&state, req).await.map(Json)
 }
 
+fn image_generate_request(
+    prompt: String,
+    args: &Value,
+    backend: String,
+    model: Option<String>,
+    style_ref: Option<String>,
+    loras: Vec<LoraIn>,
+) -> GenerateRequest {
+    let from_args = crate::genmeta::patch_from_value(args);
+    let from_text = crate::genmeta::patch_from_message(&prompt);
+    let pick_s = |a: &Option<String>, b: &Option<String>| a.clone().or_else(|| b.clone());
+    let reuse = args.get("reuse").and_then(|v| v.as_bool()).unwrap_or(false)
+        || args
+            .get("reuseMeta")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        || crate::genmeta::wants_reuse(&prompt);
+    let persist = args
+        .get("persistMeta")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || from_args.any()
+        || from_text.any();
+    GenerateRequest {
+        prompt,
+        negative_prompt: pick_s(&from_args.negative_prompt, &from_text.negative_prompt),
+        enhance: pick_s(&from_args.enhance, &from_text.enhance),
+        backend: Some(backend),
+        model,
+        style_ref,
+        loras,
+        size: pick_s(&from_args.size, &from_text.size).and_then(|s| crate::genmeta::clean_size(&s)),
+        seed: if from_args.clear_seed {
+            None
+        } else {
+            from_args.seed.or(from_text.seed)
+        },
+        modality: Some("picture".into()),
+        duration: None,
+        steps: from_args.steps.or(from_text.steps),
+        cfg: from_args.cfg.or(from_text.cfg),
+        sampler: pick_s(&from_args.sampler, &from_text.sampler),
+        clip_skip: from_args.clip_skip.or(from_text.clip_skip),
+        quantity: from_args.quantity.or(from_text.quantity),
+        reuse_meta: Some(reuse),
+        persist_meta: Some(persist),
+    }
+}
+
+struct PreparedGen {
+    sampler: String,
+    cfg: f64,
+    steps: u32,
+    clip_skip: u32,
+    negative: Option<String>,
+    seed: i64,
+    size: Option<String>,
+    quantity: u32,
+    source: String,
+    source_label: String,
+}
+
+struct SelAsset {
+    kind: &'static str,
+    name: String,
+    version_id: Option<i64>,
+    base: Option<String>,
+}
+
+fn pin_version(pin: &Value) -> Option<i64> {
+    pin.get("versionId")
+        .and_then(|v| v.as_i64())
+        .or_else(|| pin.get("version_id").and_then(|v| v.as_i64()))
+}
+
+fn sel_from_pin(pin: &Value) -> Option<SelAsset> {
+    if !crate::studio::is_pinnable(pin) {
+        return None;
+    }
+    let name = pin
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(SelAsset {
+        kind: "lora",
+        name,
+        version_id: pin_version(pin),
+        base: pin
+            .get("baseModel")
+            .and_then(|b| b.as_str())
+            .map(str::to_string),
+    })
+}
+
+async fn selection_assets(state: &AppState, req: &GenerateRequest) -> (Vec<SelAsset>, String) {
+    let pins = state.config.read().await.studio.pinned_loras.clone();
+    let mut assets = Vec::new();
+    if req.loras.is_empty() {
+        for pin in &pins {
+            if let Some(sel) = sel_from_pin(pin) {
+                assets.push(sel);
+            }
+        }
+    } else {
+        for lora in &req.loras {
+            let matched = pins.iter().find(|pin| {
+                let name = pin.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                let path = pin.get("path").and_then(|p| p.as_str()).unwrap_or("");
+                name.eq_ignore_ascii_case(&lora.name)
+                    || path == lora.path.as_deref().unwrap_or("")
+                    || path.ends_with(&format!("/{}.safetensors", lora.name))
+            });
+            assets.push(SelAsset {
+                kind: "lora",
+                name: lora.name.clone(),
+                version_id: lora.version_id.or_else(|| matched.and_then(pin_version)),
+                base: lora.base_model.clone().or_else(|| {
+                    matched
+                        .and_then(|p| p.get("baseModel"))
+                        .and_then(|b| b.as_str())
+                        .map(str::to_string)
+                }),
+            });
+        }
+    }
+    let mut family = assets
+        .iter()
+        .find_map(|a| a.base.clone())
+        .unwrap_or_default();
+    if let Some(client) = state.worker.read().await.as_ref() {
+        if let Ok(active) = client.get_active_base().await {
+            let model_path = active
+                .get("model")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            let base = active
+                .get("baseModel")
+                .and_then(|b| b.as_str())
+                .map(str::to_string);
+            if family.is_empty() {
+                family = base.clone().unwrap_or_default();
+            }
+            let mut version_id = None;
+            if let Ok(cps) = client.list_checkpoints().await {
+                if let Some(hit) = cps.iter().find(|c| c.path == model_path) {
+                    version_id = hit.version_id;
+                    if family.is_empty() {
+                        family = hit.base_model.clone().unwrap_or_default();
+                    }
+                }
+            }
+            if !model_path.is_empty() || version_id.is_some() {
+                assets.push(SelAsset {
+                    kind: "checkpoint",
+                    name: checkpoint_display_name(&model_path),
+                    version_id,
+                    base,
+                });
+            }
+        }
+    }
+    (assets, family)
+}
+
+fn selection_key(assets: &[SelAsset], family: &str) -> String {
+    if assets.is_empty() {
+        return format!("family:{family}");
+    }
+    assets
+        .iter()
+        .map(|a| {
+            format!(
+                "{}:{}:{}:{}",
+                a.kind,
+                a.version_id.unwrap_or(0),
+                a.name,
+                a.base.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+async fn recommend_current(
+    state: &AppState,
+    req: &GenerateRequest,
+) -> crate::genmeta::RecommendedGen {
+    let (assets, family) = selection_assets(state, req).await;
+    let civ_ok = state.civitai.read().await.configured();
+    if civ_ok {
+        for kind in ["lora", "checkpoint"] {
+            for asset in assets.iter().filter(|a| a.kind == kind) {
+                let Some(vid) = asset.version_id else {
+                    continue;
+                };
+                let fetched = {
+                    let civ = state.civitai.read().await;
+                    civ.version_example(vid).await
+                };
+                let Ok(ver) = fetched else {
+                    continue;
+                };
+                let base = ver
+                    .base_model
+                    .clone()
+                    .or_else(|| asset.base.clone())
+                    .unwrap_or_else(|| family.clone());
+                if ver
+                    .example
+                    .as_ref()
+                    .map(|e| e.has_sampling())
+                    .unwrap_or(false)
+                {
+                    let label = match &ver.model_name {
+                        Some(n) if !n.is_empty() => format!("{n} {}", ver.version_name),
+                        _ => format!("{} {}", asset.name, ver.version_name),
+                    };
+                    return crate::genmeta::recommend_from_example(
+                        ver.example.as_ref(),
+                        &base,
+                        &label,
+                    );
+                }
+            }
+        }
+    }
+    let base = if family.is_empty() {
+        assets
+            .iter()
+            .find_map(|a| a.base.clone())
+            .unwrap_or_default()
+    } else {
+        family
+    };
+    crate::genmeta::recommend_from_example(None, &base, "")
+}
+
+async fn write_generation(state: &AppState, settings: &crate::genmeta::GenerationSettings) {
+    {
+        let mut cfg = state.config.write().await;
+        cfg.studio.generation = settings.clone();
+    }
+    let _ = state.persist_secrets().await;
+}
+
+async fn prepare_generation(
+    state: &AppState,
+    req: &mut GenerateRequest,
+    client_size: Option<String>,
+    style_size: Option<String>,
+) -> PreparedGen {
+    if req.reuse_meta.unwrap_or(false) && crate::genmeta::reuse_command_only(&req.prompt) {
+        if let Ok(Some(last)) = state.gallery.latest_generation().await {
+            if !last.prompt.trim().is_empty() {
+                req.prompt = last.prompt.clone();
+            }
+        }
+    }
+
+    let mut stored = state.config.read().await.studio.generation.clone();
+    if req.reuse_meta.unwrap_or(false) {
+        if let Ok(Some(last)) = state.gallery.latest_generation().await {
+            if let Some(s) = last.sampler.clone().filter(|s| !s.trim().is_empty()) {
+                stored.sampler = Some(s);
+            }
+            if let Some(c) = last.cfg {
+                stored.cfg = Some(c);
+            }
+            if let Some(s) = last.steps {
+                stored.steps = Some(s);
+            }
+            if let Some(c) = last.clip_skip {
+                stored.clip_skip = Some(c);
+            }
+            stored.negative_prompt = last.negative_prompt.clone();
+            stored.seed = last.seed.or(stored.seed);
+            if let Some(sz) = last.size.clone() {
+                stored.size = Some(sz);
+            }
+            if let Some(q) = last.quantity {
+                stored.quantity = Some(q);
+            }
+            stored.locked = true;
+            stored.source = Some("last".into());
+            stored.source_label = Some(format!(
+                "Reused from the last image{}",
+                last.seed
+                    .map(|s| format!(" (seed {s})"))
+                    .unwrap_or_default()
+            ));
+            write_generation(state, &stored).await;
+        }
+    }
+
+    let (assets, family) = selection_assets(state, req).await;
+    let key = selection_key(&assets, &family);
+    let refresh = !req.reuse_meta.unwrap_or(false)
+        && !stored.locked
+        && (!stored.sampling_complete() || stored.recommend_key.as_deref() != Some(key.as_str()));
+    let fill_gaps =
+        !req.reuse_meta.unwrap_or(false) && stored.locked && !stored.sampling_complete();
+    if refresh || fill_gaps {
+        let rec = recommend_current(state, req).await;
+        if refresh {
+            stored.apply_recommendation(&rec, &key);
+            write_generation(state, &stored).await;
+        } else {
+            if stored
+                .sampler
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .is_none()
+            {
+                stored.sampler = Some(rec.sampler);
+            }
+            if stored.cfg.is_none() {
+                stored.cfg = Some(rec.cfg);
+            }
+            if stored.steps.is_none() {
+                stored.steps = Some(rec.steps);
+            }
+            if stored.clip_skip.is_none() {
+                stored.clip_skip = Some(rec.clip_skip);
+            }
+            write_generation(state, &stored).await;
+        }
+    }
+
+    let mut working = stored.clone();
+    if let Some(s) = req.sampler.clone().filter(|s| !s.trim().is_empty()) {
+        working.sampler = Some(s);
+    }
+    if let Some(c) = req.cfg {
+        working.cfg = Some(crate::genmeta::clamp_cfg(c));
+    }
+    if let Some(s) = req.steps {
+        working.steps = Some(crate::genmeta::clamp_steps(s));
+    }
+    if let Some(c) = req.clip_skip {
+        working.clip_skip = Some(crate::genmeta::clamp_clip(c));
+    }
+    if let Some(n) = req.negative_prompt.clone() {
+        working.negative_prompt = {
+            let t = n.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+    }
+    if let Some(seed) = req.seed {
+        working.seed = Some(seed);
+    }
+    if let Some(q) = req.quantity {
+        working.quantity = Some(crate::genmeta::clamp_quantity(q));
+    }
+    if let Some(sz) = client_size.as_deref().and_then(crate::genmeta::clean_size) {
+        working.size = Some(sz);
+    }
+
+    if req.persist_meta.unwrap_or(false) && !req.reuse_meta.unwrap_or(false) {
+        working.locked = true;
+        working.source = Some("agent".into());
+        working.source_label = Some("Set from chat".into());
+        write_generation(state, &working).await;
+    }
+
+    let fam = crate::genmeta::family_default(&family);
+    let sampler = working
+        .sampler
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| fam.sampler.into());
+    let cfg = crate::genmeta::clamp_cfg(working.cfg.unwrap_or(fam.cfg));
+    let steps = crate::genmeta::clamp_steps(working.steps.unwrap_or(fam.steps));
+    let clip_skip = crate::genmeta::clamp_clip(working.clip_skip.unwrap_or(fam.clip_skip));
+    let seed = working.seed.unwrap_or_else(crate::genmeta::random_seed);
+    let quantity = crate::genmeta::clamp_quantity(working.quantity.unwrap_or(1));
+    let size = working
+        .size
+        .clone()
+        .or_else(|| style_size.as_deref().and_then(crate::genmeta::clean_size));
+    PreparedGen {
+        sampler,
+        cfg,
+        steps,
+        clip_skip,
+        negative: working.negative_prompt.clone(),
+        seed,
+        size,
+        quantity,
+        source: working.source.clone().unwrap_or_else(|| "family".into()),
+        source_label: working
+            .source_label
+            .clone()
+            .unwrap_or_else(|| fam_label_fallback(&fam)),
+    }
+}
+
+fn fam_label_fallback(fam: &crate::genmeta::FamilyDefault) -> String {
+    format!("Family default ({})", fam.label)
+}
+
 async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<serde_json::Value> {
+    let client_size = req.size.clone();
     req.loras = session_lora_pins(std::mem::take(&mut req.loras));
     let styles = styles::load_styles(&state.packs_dir)
         .await
@@ -3737,6 +5434,8 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
                     scale: l.scale,
                     path: None,
                     base_model: None,
+                    version_id: None,
+                    model_id: None,
                 })
                 .collect();
         }
@@ -3756,8 +5455,35 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
         req.backend = Some("local".into());
     }
 
+    let style_size = if client_size.is_none() {
+        req.size.clone()
+    } else {
+        None
+    };
+    let prepared = prepare_generation(state, &mut req, client_size, style_size).await;
+    req.negative_prompt = prepared.negative.clone();
+    req.seed = Some(prepared.seed);
+    req.size = prepared.size.clone();
+    req.sampler = Some(prepared.sampler.clone());
+    req.cfg = Some(prepared.cfg);
+    req.steps = Some(prepared.steps);
+    req.clip_skip = Some(prepared.clip_skip);
+    req.quantity = Some(prepared.quantity);
+
     let backend = req.backend.clone().unwrap_or_else(|| "openrouter".into());
-    let enhance = req.enhance.clone().unwrap_or_else(|| "auto".into());
+    let (stored_locked, stored_enhance) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.studio.generation.locked,
+            cfg.studio.generation.enhance.clone(),
+        )
+    };
+    let enhance = crate::prefs::resolve_generate_enhance(
+        req.enhance.as_deref(),
+        stored_enhance.as_deref(),
+        stored_locked,
+    );
+    let enhance_on = crate::prefs::enhance_enabled(&enhance);
     let (alignment, privacy, auto_fallbacks, chat_pin) = {
         let cfg = state.config.read().await;
         (
@@ -3864,8 +5590,64 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     }
 
     let modality = resolve_generate_modality(&req);
-    let (bytes, mime, model_used, backend_used) = if modality.is_motion() {
-        run_motion_generate(state, &req, &final_prompt, modality).await?
+    struct Batch {
+        images: Vec<(Vec<u8>, i64)>,
+        mime: String,
+        model: String,
+        backend: String,
+        base_model: Option<String>,
+        checkpoint_path: Option<String>,
+        sampler_applied: Option<String>,
+        sampler_note: Option<String>,
+        clip_skip_applied: bool,
+        steps: u32,
+        cfg: f64,
+    }
+    let batch = if modality.is_motion() {
+        let motion = run_motion_generate(state, &req, &final_prompt, modality).await?;
+        let seed = motion
+            .applied
+            .as_ref()
+            .and_then(|a| a.images.first())
+            .and_then(|i| i.seed)
+            .unwrap_or(prepared.seed);
+        let (steps, cfg, applied, note, clip_ok) = motion
+            .applied
+            .as_ref()
+            .map(|a| {
+                (
+                    a.steps.unwrap_or(prepared.steps),
+                    a.guidance.unwrap_or(prepared.cfg),
+                    a.scheduler.clone().or(a.sampler.clone()),
+                    a.sampler_note.clone(),
+                    a.clip_skip_applied.unwrap_or(false),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    prepared.steps,
+                    prepared.cfg,
+                    None,
+                    Some(
+                        "recorded only; this path does not apply sampler, steps, or clip skip"
+                            .into(),
+                    ),
+                    false,
+                )
+            });
+        Batch {
+            images: vec![(motion.bytes, seed)],
+            mime: motion.mime,
+            model: motion.model,
+            backend: motion.backend,
+            base_model: None,
+            checkpoint_path: None,
+            sampler_applied: applied,
+            sampler_note: note,
+            clip_skip_applied: clip_ok,
+            steps,
+            cfg,
+        }
     } else if backend == "local" {
         let worker = state.worker.read().await;
         let client = worker.as_ref().ok_or(ApiError::NoWorker)?;
@@ -3940,23 +5722,50 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
                 );
             }
         }
-        let bytes = client
-            .generate(
-                &final_prompt,
-                model.as_deref(),
-                &loras,
-                req.size.as_deref(),
-                req.seed,
-                req.negative_prompt.as_deref(),
-            )
-            .await
-            .map_err(ApiError::from)?;
-        (
-            bytes,
-            "image/png".to_string(),
-            model.unwrap_or_else(|| "local".into()),
-            "local".to_string(),
-        )
+        let worker_prompt = if loras.is_empty() {
+            final_prompt.clone()
+        } else {
+            crate::genmeta::strip_a1111_resource_tags(&final_prompt)
+        };
+        let call = crate::worker::GenCall {
+            prompt: worker_prompt.clone(),
+            model: model.clone(),
+            loras,
+            size: req.size.clone(),
+            seed: req.seed,
+            negative: req.negative_prompt.clone(),
+            steps: req.steps,
+            guidance: req.cfg,
+            sampler: req.sampler.clone(),
+            clip_skip: req.clip_skip,
+            quantity: req.quantity,
+        };
+        let result = client.generate(&call).await.map_err(ApiError::from)?;
+        let images = result
+            .images
+            .iter()
+            .enumerate()
+            .map(|(i, img)| {
+                (
+                    img.bytes.clone(),
+                    img.seed
+                        .unwrap_or_else(|| prepared.seed.wrapping_add(i as i64)),
+                )
+            })
+            .collect();
+        Batch {
+            images,
+            mime: "image/png".into(),
+            model: model.clone().unwrap_or_else(|| "local".into()),
+            backend: "local".into(),
+            base_model: active_base_label,
+            checkpoint_path: model.clone(),
+            sampler_applied: result.scheduler.clone().or(result.sampler.clone()),
+            sampler_note: result.sampler_note.clone(),
+            clip_skip_applied: result.clip_skip_applied.unwrap_or(false),
+            steps: result.steps.unwrap_or(prepared.steps),
+            cfg: result.guidance.unwrap_or(prepared.cfg),
+        }
     } else {
         let or = state.openrouter.read().await;
         let default_image = or.default_image_model();
@@ -3974,41 +5783,142 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&img.b64)
             .map_err(|e| ApiError::Msg(e.to_string()))?;
-        (
-            bytes,
-            img.mime,
-            model.unwrap_or(default_image),
-            "openrouter".to_string(),
-        )
+        let note = if prepared.quantity > 1 {
+            "OpenRouter image API generates one image; sampler, steps, clip skip, and quantity are stored only"
+        } else {
+            "recorded only; OpenRouter image API does not apply sampler, steps, or clip skip"
+        };
+        Batch {
+            images: vec![(bytes, prepared.seed)],
+            mime: img.mime,
+            model: model.unwrap_or(default_image),
+            backend: "openrouter".into(),
+            base_model: None,
+            checkpoint_path: None,
+            sampler_applied: None,
+            sampler_note: Some(note.into()),
+            clip_skip_applied: false,
+            steps: prepared.steps,
+            cfg: prepared.cfg,
+        }
     };
 
-    let mut meta = ArtifactMeta {
-        id: String::new(),
-        prompt: req.prompt.clone(),
-        enhanced_prompt: enhanced.clone(),
-        backend: backend_used.clone(),
-        model: model_used.clone(),
-        style_ref: req.style_ref.clone(),
-        loras: req.loras.iter().map(|l| l.name.clone()).collect(),
-        created_at: String::new(),
-        mime: mime.clone(),
-        filename: String::new(),
+    let lora_names: Vec<String> = req.loras.iter().map(|l| l.name.clone()).collect();
+    let lora_pins: Vec<crate::gallery::ArtifactLoraMeta> = req
+        .loras
+        .iter()
+        .map(|l| crate::gallery::ArtifactLoraMeta {
+            name: l.name.clone(),
+            path: l.path.clone(),
+            scale: l.scale,
+            model_id: l.model_id,
+            version_id: l.version_id,
+        })
+        .collect();
+    let checkpoint = batch
+        .checkpoint_path
+        .as_deref()
+        .and_then(|p| crate::reproduce::checkpoint_meta_from_path(p, batch.base_model.as_deref()));
+    let worker_prompt_stored = if backend == "local" && !req.loras.is_empty() {
+        let stripped = crate::genmeta::strip_a1111_resource_tags(&final_prompt);
+        if stripped != final_prompt {
+            Some(stripped)
+        } else {
+            None
+        }
+    } else {
+        None
     };
-    let saved = state
-        .gallery
-        .save(&bytes, &mime, &mut meta)
-        .await
-        .map_err(ApiError::from)?;
+    let mut saved_all = Vec::new();
+    for (bytes, seed) in &batch.images {
+        let mut meta = ArtifactMeta {
+            id: String::new(),
+            prompt: req.prompt.clone(),
+            worker_prompt: worker_prompt_stored.clone(),
+            enhanced_prompt: enhanced.clone(),
+            backend: batch.backend.clone(),
+            model: batch.model.clone(),
+            style_ref: req.style_ref.clone(),
+            loras: lora_names.clone(),
+            lora_pins: lora_pins.clone(),
+            checkpoint: checkpoint.clone(),
+            enhance_on: Some(enhance_on),
+            created_at: String::new(),
+            mime: batch.mime.clone(),
+            filename: String::new(),
+            negative_prompt: prepared.negative.clone(),
+            sampler: Some(prepared.sampler.clone()),
+            sampler_applied: batch.sampler_applied.clone(),
+            sampler_note: batch.sampler_note.clone(),
+            cfg: Some(batch.cfg),
+            steps: Some(batch.steps),
+            clip_skip: Some(prepared.clip_skip),
+            clip_skip_applied: Some(batch.clip_skip_applied),
+            seed: Some(*seed),
+            size: prepared.size.clone(),
+            base_model: batch.base_model.clone(),
+            quantity: Some(prepared.quantity),
+            gen_source: Some(prepared.source.clone()),
+        };
+        let saved = state
+            .gallery
+            .save(bytes, &batch.mime, &mut meta)
+            .await
+            .map_err(ApiError::from)?;
+        saved_all.push(saved);
+    }
+    let saved = saved_all
+        .first()
+        .cloned()
+        .ok_or_else(|| ApiError::Msg("worker returned no images".into()))?;
+    {
+        let mut cfgw = state.config.write().await;
+        let g = &mut cfgw.studio.generation;
+        g.last_seed = saved.seed;
+        g.sampler_applied = batch.sampler_applied.clone();
+        g.sampler_note = batch.sampler_note.clone();
+        g.clip_skip_applied = Some(batch.clip_skip_applied);
+        if g.sampler.is_none() {
+            g.sampler = Some(prepared.sampler.clone());
+        }
+        if g.cfg.is_none() {
+            g.cfg = Some(batch.cfg);
+        }
+        if g.steps.is_none() {
+            g.steps = Some(batch.steps);
+        }
+        if g.clip_skip.is_none() {
+            g.clip_skip = Some(prepared.clip_skip);
+        }
+    }
+    let _ = state.persist_secrets().await;
 
+    let extras: Vec<Value> = saved_all.iter().skip(1).map(with_gallery_url).collect();
     Ok(json!({
         "artifactId": saved.id,
-        "backend": backend_used,
-        "model": model_used,
+        "backend": batch.backend,
+        "model": batch.model,
         "enhancedPrompt": enhanced,
         "modality": modality.as_str(),
-        "mime": mime,
+        "mime": batch.mime,
         "url": format!("/v1/gallery/{}/image", saved.id),
         "meta": saved,
+        "seed": prepared.seed,
+        "seeds": saved_all.iter().filter_map(|m| m.seed).collect::<Vec<_>>(),
+        "sampler": prepared.sampler,
+        "samplerApplied": batch.sampler_applied,
+        "samplerNote": batch.sampler_note,
+        "cfg": batch.cfg,
+        "steps": batch.steps,
+        "clipSkip": prepared.clip_skip,
+        "clipSkipApplied": batch.clip_skip_applied,
+        "negativePrompt": prepared.negative,
+        "size": prepared.size,
+        "quantity": prepared.quantity,
+        "baseModel": batch.base_model,
+        "genSource": prepared.source,
+        "sourceLabel": prepared.source_label,
+        "results": extras,
     }))
 }
 
@@ -4046,12 +5956,20 @@ fn resolve_generate_modality(req: &GenerateRequest) -> crate::router::Modality {
     crate::router::infer_modality(&req.prompt).modality
 }
 
+struct MotionOut {
+    bytes: Vec<u8>,
+    mime: String,
+    model: String,
+    backend: String,
+    applied: Option<crate::worker::WorkerGenResult>,
+}
+
 async fn run_motion_generate(
     state: &AppState,
     req: &GenerateRequest,
     final_prompt: &str,
     modality: crate::router::Modality,
-) -> ApiResult<(Vec<u8>, String, String, String)> {
+) -> ApiResult<MotionOut> {
     let want_gif = matches!(modality, crate::router::Modality::Gif);
     let backend = req.backend.as_deref().unwrap_or("auto");
     let pinned_local = backend == "local";
@@ -4062,23 +5980,33 @@ async fn run_motion_generate(
         let worker = state.worker.read().await;
         if let Some(client) = worker.as_ref() {
             let gif_model = crate::base_models::filter_local_model(req.model.as_deref());
-            match client
-                .generate_gif(
-                    final_prompt,
-                    gif_model.as_deref(),
-                    req.size.as_deref(),
-                    req.seed,
-                    req.negative_prompt.as_deref(),
-                )
-                .await
-            {
-                Ok(bytes) => {
-                    return Ok((
+            let call = crate::worker::GenCall {
+                prompt: final_prompt.to_string(),
+                model: gif_model.clone(),
+                loras: vec![],
+                size: req.size.clone(),
+                seed: req.seed,
+                negative: req.negative_prompt.clone(),
+                steps: req.steps,
+                guidance: req.cfg,
+                sampler: req.sampler.clone(),
+                clip_skip: req.clip_skip,
+                quantity: Some(1),
+            };
+            match client.generate_gif(&call).await {
+                Ok(result) => {
+                    let bytes = result
+                        .images
+                        .first()
+                        .map(|i| i.bytes.clone())
+                        .unwrap_or_default();
+                    return Ok(MotionOut {
                         bytes,
-                        "image/gif".into(),
-                        gif_model.unwrap_or_else(|| "local-gif".into()),
-                        "local".into(),
-                    ));
+                        mime: "image/gif".into(),
+                        model: gif_model.unwrap_or_else(|| "local-gif".into()),
+                        backend: "local".into(),
+                        applied: Some(result),
+                    });
                 }
                 Err(e) => {
                     if pinned_local {
@@ -4135,7 +6063,13 @@ async fn run_motion_generate(
     } else {
         (vid.bytes, vid.mime)
     };
-    Ok((bytes, mime, vid.model, "openrouter".into()))
+    Ok(MotionOut {
+        bytes,
+        mime,
+        model: vid.model,
+        backend: "openrouter".into(),
+        applied: None,
+    })
 }
 
 fn size_to_video_aspect(size: &str) -> Option<&'static str> {
@@ -4234,8 +6168,16 @@ pub async fn gallery_image(
     let bytes = tokio::fs::read(state.gallery.image_path(&meta))
         .await
         .map_err(ApiError::from)?;
-    let ct = crate::gallery::content_type_for_mime(&meta.mime);
-    Ok(([(axum::http::header::CONTENT_TYPE, ct)], bytes).into_response())
+    // Original file bytes. GIF stays image/gif (no PNG/WebP poster).
+    let ct = crate::gallery::content_type_for_bytes(&bytes, &meta.mime);
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, ct),
+            (axum::http::header::CONTENT_DISPOSITION, "inline"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 pub async fn gallery_remix(
@@ -4256,7 +6198,70 @@ pub async fn gallery_remix(
         "model": meta.model,
         "styleRef": meta.style_ref,
         "loras": meta.loras,
+        "loraPins": meta.lora_pins,
+        "checkpoint": meta.checkpoint,
     })))
+}
+
+/// Load sidecar meta into generation settings, pins, and enhance-off (does not download).
+pub async fn gallery_apply(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let meta = state
+        .gallery
+        .get(&id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or(ApiError::NotFound)?;
+    let inventory = studio_inventory(&state).await;
+    let mut settings = state.config.read().await.studio.generation.clone();
+    let mut studio = state.config.read().await.studio.clone();
+    let out = crate::reproduce::apply_gallery_meta(&meta, &inventory, &mut settings, &mut studio);
+    {
+        let mut cfg = state.config.write().await;
+        cfg.studio.generation = settings.clone();
+        cfg.studio.pinned_loras = studio.pinned_loras.clone();
+    }
+    let persisted = state.persist_secrets().await.is_ok();
+    if let Some(ck) = meta.checkpoint.as_ref().and_then(|c| c.path.as_deref()) {
+        if inventory.installed.iter().any(|a| a.path == ck) {
+            if let Some(w) = state.worker.read().await.as_ref() {
+                let family = meta
+                    .base_model
+                    .as_deref()
+                    .or_else(|| meta.checkpoint.as_ref().map(|c| c.name.as_str()));
+                let _ = w.set_active_base(ck, family).await;
+            }
+        }
+    }
+    write_generation(&state, &settings).await;
+    Ok(Json(json!({ "applied": out, "meta": meta, "persisted": persisted })))
+}
+
+pub async fn reproduction_community_apply(
+    State(state): State<AppState>,
+    Json(image): Json<CommunityImage>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let inventory = studio_inventory(&state).await;
+    let mut settings = state.config.read().await.studio.generation.clone();
+    let mut studio = state.config.read().await.studio.clone();
+    let out = crate::reproduce::apply_community_image(&image, &inventory, &mut settings, &mut studio);
+    {
+        let mut cfg = state.config.write().await;
+        cfg.studio.generation = settings.clone();
+        cfg.studio.pinned_loras = studio.pinned_loras.clone();
+    }
+    let persisted = state.persist_secrets().await.is_ok();
+    if let Some(base) = crate::reproduce::installed_checkpoint_for_image(&image, &inventory) {
+        if let Some(w) = state.worker.read().await.as_ref() {
+            let _ = w
+                .set_active_base(&base.path, image.checkpoint.as_deref())
+                .await;
+        }
+    }
+    write_generation(&state, &settings).await;
+    Ok(Json(json!({ "applied": out, "persisted": persisted })))
 }
 
 async fn models_payload(state: &AppState) -> ApiResult<serde_json::Value> {
@@ -4369,6 +6374,86 @@ pub async fn models(State(state): State<AppState>) -> ApiResult<Json<serde_json:
     models_payload(&state).await.map(Json)
 }
 
+pub async fn route_defaults(State(state): State<AppState>) -> Json<serde_json::Value> {
+    Json(route_defaults_payload(&state).await)
+}
+
+async fn route_defaults_payload(state: &AppState) -> Value {
+    let (cfg_snap, privacy, alignment, auto_fallbacks) = {
+        let cfg = state.config.read().await;
+        let or = state.openrouter.read().await;
+        (
+            (
+                cfg.chat_model.clone(),
+                cfg.image_model.clone(),
+                cfg.router_model.clone(),
+                or.configured_chat_model().to_string(),
+                or.configured_image_model().to_string(),
+                or.configured_router_model().to_string(),
+            ),
+            or.privacy().clone(),
+            or.alignment().clone(),
+            or.auto_fallbacks().clone(),
+        )
+    };
+    let (chat_model, image_model, router_model, _or_chat, or_image, or_router) = cfg_snap;
+    let resolved_router = crate::router::resolve_router_model_prefs(
+        &or_router,
+        &privacy,
+        &alignment,
+        &auto_fallbacks,
+    );
+    let auto_image = crate::router::resolve_auto_fallback(
+        crate::router::AutoFallbackKind::Image,
+        &privacy,
+        &alignment,
+        &auto_fallbacks,
+    );
+    let auto_video = crate::router::resolve_auto_fallback(
+        crate::router::AutoFallbackKind::Video,
+        &privacy,
+        &alignment,
+        &auto_fallbacks,
+    );
+    let auto_agent = crate::router::resolve_auto_fallback(
+        crate::router::AutoFallbackKind::Agent,
+        &privacy,
+        &alignment,
+        &auto_fallbacks,
+    );
+    json!({
+        "sentinels": {
+            "agent": crate::router::AUTO_AGENT,
+            "image": crate::router::AUTO_IMAGE,
+            "router": crate::router::AUTO_ROUTER,
+        },
+        "configured": {
+            "chatModel": chat_model,
+            "imageModel": image_model,
+            "routerModel": router_model,
+        },
+        "auto": {
+            "router": resolved_router.clone(),
+            "image": auto_image,
+            "video": auto_video,
+            "agent": auto_agent,
+        },
+        "autoFallbacks": auto_fallbacks,
+        "resolved": {
+            "router": resolved_router,
+            "imageConfigured": or_image,
+            "zdr": privacy.zero_data_retention,
+            "alignment": alignment.model_alignment,
+        },
+        "notes": [
+            "Pin agent/image/router with set_chat_models (persists to Settings).",
+            "Cloud vs Local is the Studio composer switch (backend), not a chat model pref.",
+            "Pin video with set_chat_models videoModel (id only). Cloud vs Local is set_generate_backend.",
+            "Configure Auto fallbacks on the Models tab when the router does not pin a model.",
+        ],
+    })
+}
+
 pub async fn styles_list(State(state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     let items = styles::load_styles(&state.packs_dir)
         .await
@@ -4385,6 +6470,16 @@ pub struct CivitaiSearchQuery {
     /// Empty / omitted → Freya defaults (adapters, checkpoints, embeddings, VAE).
     #[serde(default)]
     pub types: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CivitaiLookupQuery {
+    pub q: String,
+    /// One agent search type: LORA, LoCon, DoRA, LyCORIS, Checkpoint, TextualInversion, VAE.
+    #[serde(rename = "type")]
+    pub asset_type: String,
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 fn default_limit() -> u32 {
@@ -4421,7 +6516,7 @@ pub async fn civitai_search(
     let types = parse_civitai_types(q.types.as_deref());
     let type_refs: Vec<&str> = types.iter().map(String::as_str).collect();
     let mut items = civ
-        .search_types(&q.q, q.limit, &type_refs)
+        .search_types(&q.q, q.limit, &type_refs, allow_nsfw)
         .await
         .map_err(ApiError::from)?;
     if !allow_nsfw {
@@ -4430,19 +6525,268 @@ pub async fn civitai_search(
     Ok(Json(json!({ "items": items })))
 }
 
+/// One Civitai type. Installed matches first, then other hits. Does not pin or download.
+pub async fn civitai_lookup(
+    State(state): State<AppState>,
+    Query(q): Query<CivitaiLookupQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let limit = q.limit.unwrap_or(12).clamp(1, 20);
+    let value = typed_civitai_lookup(&state, &q.q, &q.asset_type, limit)
+        .await
+        .map_err(ApiError::Msg)?;
+    Ok(Json(value))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CivitaiImagesQuery {
+    /// Civitai model id. Optional when `modelVersionId` is set.
+    #[serde(default)]
+    pub model_id: Option<i64>,
+    #[serde(default)]
+    pub model_version_id: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Opaque `nextCursor` from the previous images response.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Page number when metadata has `nextPage` and no cursor.
+    #[serde(default)]
+    pub page: Option<u32>,
+}
+
+fn json_i64(v: Option<&serde_json::Value>) -> Option<i64> {
+    let v = v?;
+    v.as_i64()
+        .or_else(|| v.as_u64().and_then(|n| i64::try_from(n).ok()))
+        .or_else(|| {
+            v.as_str()
+                .and_then(|s| s.trim().parse().ok())
+                .filter(|n: &i64| *n > 0)
+        })
+}
+
+fn deserialize_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(opt.and_then(|v| json_i64(Some(&v))))
+}
+
+fn installed_match(asset: crate::worker::LocalAsset) -> crate::civitai::InstalledAssetMatch {
+    let kind = if asset.path.starts_with("checkpoints/") {
+        "checkpoint"
+    } else if asset.path.starts_with("embeddings/") {
+        "embedding"
+    } else if asset.path.starts_with("loras/") {
+        "lora"
+    } else {
+        asset.model_type.as_deref().unwrap_or(asset.kind.as_str())
+    };
+    crate::civitai::InstalledAssetMatch {
+        name: asset.name.unwrap_or_else(|| {
+            asset
+                .path
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(asset.id.as_str())
+                .to_string()
+        }),
+        path: asset.path,
+        kind: kind.to_string(),
+        version_id: asset.version_id,
+        model_id: asset.model_id,
+        hash: asset.hash,
+    }
+}
+
+async fn studio_inventory(state: &AppState) -> crate::civitai::StudioInventory {
+    let worker = state.worker.read().await;
+    let Some(client) = worker.as_ref() else {
+        return crate::civitai::StudioInventory {
+            installed: Vec::new(),
+            current_base: None,
+            base_known: true,
+        };
+    };
+    let mut installed = Vec::new();
+    if let Ok(items) = client.list_checkpoints().await {
+        installed.extend(items.into_iter().map(installed_match));
+    }
+    if let Ok(items) = client.list_loras().await {
+        installed.extend(items.into_iter().map(installed_match));
+    }
+    if let Ok(items) = client.list_embeddings().await {
+        installed.extend(items.into_iter().map(installed_match));
+    }
+    let base = client.get_active_base().await.ok();
+    let Some(base) = base else {
+        return crate::civitai::StudioInventory {
+            installed,
+            current_base: None,
+            base_known: false,
+        };
+    };
+    let path = base
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let current_base = path.map(|path| {
+        installed
+            .iter()
+            .find(|asset| asset.path == path)
+            .cloned()
+            .unwrap_or_else(|| crate::civitai::InstalledAssetMatch {
+                name: path
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(path.as_str())
+                    .to_string(),
+                path,
+                kind: "checkpoint".into(),
+                version_id: None,
+                model_id: None,
+                hash: None,
+            })
+    });
+    crate::civitai::StudioInventory {
+        installed,
+        current_base,
+        base_known: true,
+    }
+}
+
+async fn load_community_images(
+    state: &AppState,
+    model_id: Option<i64>,
+    version_id: Option<i64>,
+    allow_nsfw: bool,
+    limit: u32,
+    cursor: Option<&str>,
+    page: Option<u32>,
+) -> Result<crate::civitai::CommunityImagePage, anyhow::Error> {
+    let mut page = {
+        let civ = state.civitai.read().await;
+        civ.community_images(model_id, version_id, allow_nsfw, limit, cursor, page)
+            .await?
+    };
+    let inventory = studio_inventory(state).await;
+    crate::civitai::annotate_community_images(&mut page.items, &inventory);
+    Ok(page)
+}
+
+/// Community images for the model or version in context. Pages follow Civitai's cursor.
+pub async fn civitai_images(
+    State(state): State<AppState>,
+    Query(q): Query<CivitaiImagesQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let model_id = q.model_id.filter(|n| *n > 0);
+    let version_id = q.model_version_id.filter(|n| *n > 0);
+    if model_id.is_none() && version_id.is_none() {
+        return Err(ApiError::Msg(
+            "modelId or modelVersionId is required".into(),
+        ));
+    }
+    let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
+    let limit = q.limit.unwrap_or(20);
+    let page = load_community_images(
+        &state,
+        model_id,
+        version_id,
+        allow_nsfw,
+        limit,
+        q.cursor.as_deref(),
+        q.page,
+    )
+    .await
+    .map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "modelId": model_id,
+        "modelVersionId": version_id,
+        "nsfw": allow_nsfw,
+        "count": page.items.len(),
+        "items": page.items,
+        "nextCursor": page.next_cursor,
+        "nextPage": page.next_page,
+        "upstream": "https://civitai.com/api/v1/images",
+        "note": "Community image posts. Pass nextCursor or nextPage for another page. Does not download or generate."
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CivitaiMediaQuery {
+    pub url: String,
+}
+
+/// Proxy Civitai community image/video bytes for same-origin `<video>` playback.
+pub async fn civitai_media(
+    State(state): State<AppState>,
+    Query(q): Query<CivitaiMediaQuery>,
+) -> ApiResult<Response> {
+    let url = q.url.trim();
+    if url.is_empty() || !crate::civitai::civitai_media_url_ok(url) {
+        return Err(ApiError::Msg("url must be https on image.civitai.com".into()));
+    }
+    let civ = state.civitai.read().await;
+    let (bytes, ct) = civ
+        .fetch_media(url)
+        .await
+        .map_err(|e| ApiError::Msg(e.to_string()))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, ct),
+            (header::CONTENT_DISPOSITION, "inline".into()),
+            (
+                header::CACHE_CONTROL,
+                "public, max-age=86400, stale-while-revalidate=604800".into(),
+            ),
+            (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*".into()),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 fn civitai_detail_response(detail: crate::civitai::CivitaiModelDetail) -> Json<serde_json::Value> {
-    // Nested shape for the UI modal: { model, related: [{ model, note }] }.
-    let related: Vec<_> = detail
-        .related
+    // Recommended checkpoints are the base suggestion rows. Popular-family hits stay the fallback.
+    let recommended: Vec<_> = detail
+        .recommended_resources
         .iter()
+        .filter(|r| r.resource_type.eq_ignore_ascii_case("Checkpoint"))
         .map(|r| {
             json!({
-                "relation": "compatible_checkpoint",
-                "note": detail.base_model.as_ref().map(|b| format!("Popular checkpoint for {b}")),
-                "model": r,
+                "relation": "recommended_checkpoint",
+                "note": "Recommended base checkpoint",
+                "model": {
+                    "id": r.id,
+                    "modelId": r.id,
+                    "name": r.name,
+                    "modelType": r.resource_type,
+                    "versionId": r.model_version_id,
+                    "baseModel": r.base_model,
+                    "nsfw": r.nsfw,
+                }
             })
         })
         .collect();
+    let related: Vec<_> = if !recommended.is_empty() {
+        recommended
+    } else {
+        detail
+            .related
+            .iter()
+            .map(|r| {
+                json!({
+                    "relation": "compatible_checkpoint",
+                    "note": detail.base_model.as_ref().map(|b| format!("Popular checkpoint for {b}")),
+                    "model": r,
+                })
+            })
+            .collect()
+    };
     let mut model = serde_json::to_value(&detail).unwrap_or(json!({}));
     if let Some(obj) = model.as_object_mut() {
         // Keep related nested under the response envelope, not duplicated on model.
@@ -4456,8 +6800,12 @@ pub async fn civitai_model(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
     let civ = state.civitai.read().await;
-    let detail = civ.get_model(id).await.map_err(ApiError::from)?;
+    let detail = civ
+        .get_model(id, allow_nsfw)
+        .await
+        .map_err(ApiError::from)?;
     Ok(civitai_detail_response(detail))
 }
 
@@ -4466,9 +6814,10 @@ pub async fn civitai_model_version(
     State(state): State<AppState>,
     axum::extract::Path(version_id): axum::extract::Path<i64>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let allow_nsfw = state.config.read().await.alignment_prefs().allow_nsfw_local;
     let civ = state.civitai.read().await;
     let detail = civ
-        .get_model_by_version(version_id)
+        .get_model_by_version(version_id, allow_nsfw)
         .await
         .map_err(ApiError::from)?;
     Ok(civitai_detail_response(detail))
@@ -4493,6 +6842,9 @@ pub struct InstallCivitaiRequest {
     pub model_id: Option<i64>,
     #[serde(default)]
     pub file_id: Option<i64>,
+    /// Civitai AutoV2/AutoV3/SHA256 prefix — selects a file when the version has several.
+    #[serde(default)]
+    pub file_hash: Option<String>,
     #[serde(default)]
     pub model_type: Option<String>,
     /// Preview URL persisted in sidecar for Installed card thumbs.
@@ -4756,6 +7108,118 @@ fn const_eq_str(a: &str, b: &str) -> bool {
 
 pub async fn settings_get(State(state): State<AppState>) -> Json<SettingsPublic> {
     Json(settings_public_from_state(&state).await)
+}
+
+fn blank_generate_request() -> GenerateRequest {
+    GenerateRequest {
+        prompt: String::new(),
+        negative_prompt: None,
+        enhance: None,
+        backend: None,
+        model: None,
+        style_ref: None,
+        loras: vec![],
+        size: None,
+        seed: None,
+        modality: None,
+        duration: None,
+        steps: None,
+        cfg: None,
+        sampler: None,
+        clip_skip: None,
+        quantity: None,
+        reuse_meta: None,
+        persist_meta: None,
+    }
+}
+
+async fn generation_meta_value(state: &AppState, force: bool) -> Value {
+    let blank = blank_generate_request();
+    let (assets, family) = selection_assets(state, &blank).await;
+    let key = selection_key(&assets, &family);
+    let mut settings = state.config.read().await.studio.generation.clone();
+    let refresh = force
+        || (!settings.locked
+            && (!settings.sampling_complete()
+                || settings.recommend_key.as_deref() != Some(key.as_str())));
+    if refresh {
+        let rec = recommend_current(state, &blank).await;
+        let seed = settings.seed;
+        let quantity = settings.quantity;
+        let size = settings.size.clone();
+        let last_seed = settings.last_seed;
+        settings.apply_recommendation(&rec, &key);
+        settings.seed = seed;
+        settings.quantity = quantity;
+        if size.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+            settings.size = size;
+        }
+        settings.last_seed = last_seed;
+        write_generation(state, &settings).await;
+    }
+    json!({ "settings": settings, "persisted": true })
+}
+
+pub async fn generation_meta_get(State(state): State<AppState>) -> Json<Value> {
+    Json(generation_meta_value(&state, false).await)
+}
+
+pub async fn generation_meta_recommend(State(state): State<AppState>) -> Json<Value> {
+    Json(generation_meta_value(&state, true).await)
+}
+
+pub async fn generation_meta_put(
+    State(state): State<AppState>,
+    Json(body): Json<Value>,
+) -> ApiResult<Json<Value>> {
+    if let Some(msg) = reject_secret_fields(&body) {
+        return Err(ApiError::Msg(msg));
+    }
+    let patch = crate::genmeta::patch_from_value(&body);
+    let source = match body.get("source").and_then(|s| s.as_str()) {
+        Some("gallery") => "gallery",
+        _ => "user",
+    };
+    let mut settings = state.config.read().await.studio.generation.clone();
+    if patch.any() {
+        settings.apply_patch(&patch, source, true);
+    }
+    if source == "gallery" {
+        if let Some(label) = body
+            .get("sourceLabel")
+            .and_then(|s| s.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            settings.source_label = Some(label.chars().take(160).collect());
+        }
+    }
+    let pin_weights = body
+        .get("loraWeights")
+        .or_else(|| body.get("lora_weights"))
+        .and_then(|v| v.as_array());
+    if pin_weights.is_some() || patch.any() {
+        write_generation(&state, &settings).await;
+    }
+    if let Some(weights) = pin_weights {
+        let mut cfg = state.config.write().await;
+        for w in weights {
+            let name = w.get("name").and_then(|n| n.as_str()).unwrap_or("").trim();
+            let path = w.get("path").and_then(|p| p.as_str()).unwrap_or("").trim();
+            let scale = w.get("scale").and_then(|s| s.as_f64());
+            if name.is_empty() && path.is_empty() {
+                continue;
+            }
+            let mut card = json!({ "name": name, "path": path });
+            if let Some(s) = scale {
+                card["scale"] = json!(s);
+            }
+            let _ = crate::studio::pin_upsert(&mut cfg.studio, &card);
+        }
+        let _ = state.persist_secrets().await;
+    }
+    let pins = state.config.read().await.studio.pinned_loras.clone();
+    Ok(Json(json!({ "settings": settings, "pinnedLoras": pins, "persisted": true })))
 }
 
 pub async fn studio_get(State(state): State<AppState>) -> Json<crate::studio::StudioPrefs> {
@@ -5126,6 +7590,7 @@ mod route_footer_tests {
             image_model: Some("google/gemini-2.5-flash-image".into()),
             video_model: Some("google/veo-3.1".into()),
             backend: None,
+            phase: Phase::default(),
         };
         let chat_only = PlannedAction {
             action_type: "set_chat_models".into(),
@@ -5230,5 +7695,280 @@ mod route_footer_tests {
         );
         assert!(!line.contains("base="));
         assert!(!line.contains("lora="));
+    }
+
+    #[test]
+    fn lookup_prefers_installed_version_and_keeps_other_hits() {
+        let installed = vec![json!({
+            "id": "eagle_wing",
+            "name": "Eagle Wing Warrior",
+            "path": "loras/eagle_wing.safetensors",
+            "versionId": 100,
+            "modelId": null,
+            "thumbnailUrl": null,
+            "kind": "lora"
+        })];
+        let search = vec![
+            json!({
+                "id": 901,
+                "name": "Eagle Wing Warrior",
+                "versionId": 100,
+                "thumbnailUrl": "https://img/eagle.png",
+                "modelType": "LORA"
+            }),
+            json!({
+                "id": 902,
+                "name": "Valkyrie Feather Armor",
+                "versionId": 200,
+                "thumbnailUrl": "https://img/val.png",
+                "modelType": "LORA"
+            }),
+        ];
+        let ordered = order_lookup_assets(&installed, &search, "eagle wing");
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0]["installed"], json!(true));
+        assert_eq!(ordered[0]["path"], "loras/eagle_wing.safetensors");
+        assert_eq!(ordered[0]["versionId"], 100);
+        assert_eq!(ordered[0]["modelId"], 901);
+        assert_eq!(ordered[0]["thumbnailUrl"], "https://img/eagle.png");
+        assert_eq!(ordered[1]["installed"], json!(false));
+        assert_eq!(ordered[1]["name"], "Valkyrie Feather Armor");
+        assert_eq!(ordered[1].get("path"), None);
+    }
+
+    #[test]
+    fn installed_filter_keeps_only_the_requested_type() {
+        let lora = json!({
+            "name": "Eagle Wing",
+            "path": "loras/eagle.safetensors",
+            "kind": "lora"
+        });
+        let typed_lora = json!({
+            "name": "Eagle LoRA",
+            "path": "loras/eagle_lora.safetensors",
+            "kind": "lora",
+            "modelType": "LORA"
+        });
+        let locon = json!({
+            "name": "Eagle LoCon",
+            "path": "loras/eagle_locon.safetensors",
+            "kind": "lora",
+            "modelType": "LoCon"
+        });
+        let ckpt = json!({
+            "name": "Eagle Wing",
+            "path": "checkpoints/eagle.safetensors",
+            "kind": "checkpoint",
+            "modelType": "Checkpoint"
+        });
+        let emb = json!({
+            "name": "Eagle Token",
+            "path": "embeddings/eagle.pt",
+            "kind": "embedding"
+        });
+        let vae = json!({
+            "name": "Eagle VAE",
+            "path": "vae/eagle.safetensors",
+            "kind": "vae"
+        });
+        assert!(installed_matches_search_type(&lora, "LORA"));
+        assert!(installed_matches_search_type(&lora, "LoCon"));
+        assert!(installed_matches_search_type(&typed_lora, "LORA"));
+        assert!(!installed_matches_search_type(&typed_lora, "LoCon"));
+        assert!(installed_matches_search_type(&locon, "LoCon"));
+        assert!(!installed_matches_search_type(&locon, "LORA"));
+        assert!(!installed_matches_search_type(&ckpt, "LORA"));
+        assert!(installed_matches_search_type(&ckpt, "Checkpoint"));
+        assert!(installed_matches_search_type(&emb, "TextualInversion"));
+        assert!(!installed_matches_search_type(&emb, "VAE"));
+        assert!(installed_matches_search_type(&vae, "VAE"));
+
+        let installed = vec![lora, ckpt];
+        let kept: Vec<_> = installed
+            .iter()
+            .filter(|a| installed_matches_search_type(a, "LORA"))
+            .cloned()
+            .collect();
+        let search = vec![json!({
+            "id": 901,
+            "name": "Eagle Wing XL",
+            "versionId": 200,
+            "modelType": "LORA"
+        })];
+        let ordered = order_lookup_assets(&kept, &search, "eagle wing");
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0]["installed"], json!(true));
+        assert_eq!(ordered[0]["path"], "loras/eagle.safetensors");
+        assert_eq!(ordered[1]["installed"], json!(false));
+        assert_eq!(ordered[1]["name"], "Eagle Wing XL");
+    }
+
+    #[test]
+    fn lookup_keeps_a_different_version_in_the_new_list() {
+        let installed = vec![json!({
+            "name": "Eagle Wing Warrior",
+            "path": "loras/eagle.safetensors",
+            "versionId": 100,
+            "modelId": 901,
+            "thumbnailUrl": "https://img/installed.png"
+        })];
+        let search = vec![json!({
+            "id": 901,
+            "name": "Eagle Wing Warrior XL",
+            "versionId": 101,
+            "thumbnailUrl": "https://img/xl.png"
+        })];
+        let ordered = order_lookup_assets(&installed, &search, "eagle wing warrior");
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0]["installed"], json!(true));
+        assert_eq!(ordered[0]["path"], "loras/eagle.safetensors");
+        assert_eq!(ordered[0]["versionId"], 100);
+        assert_eq!(ordered[0]["thumbnailUrl"], "https://img/installed.png");
+        assert_eq!(ordered[1]["installed"], json!(false));
+        assert_eq!(ordered[1]["versionId"], 101);
+    }
+
+    #[test]
+    fn lookup_without_installed_assets_lists_search_hits() {
+        let search = vec![json!({ "id": 1, "name": "A", "versionId": 2 })];
+        let ordered = order_lookup_assets(&[], &search, "a");
+        assert_eq!(ordered.len(), 1);
+        assert_eq!(ordered[0]["installed"], json!(false));
+    }
+
+    #[test]
+    fn chat_cards_use_search_order_not_the_full_library() {
+        let actions = vec![
+            json!({
+                "type": "list_loras",
+                "status": "executed",
+                "result": { "loras": [ { "name": "Unrelated", "path": "loras/unrelated.safetensors" } ] }
+            }),
+            json!({
+                "type": "search_civitai",
+                "status": "executed",
+                "result": { "query": "eagle", "loras": [
+                    { "name": "Eagle Wing Warrior", "path": "loras/eagle.safetensors", "installed": true, "versionId": 100 },
+                    { "name": "Valkyrie", "installed": false, "versionId": 200 }
+                ] }
+            }),
+        ];
+        let cards = collect_chat_lookup_cards(&actions);
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0]["name"], "Eagle Wing Warrior");
+        assert_eq!(cards[1]["name"], "Valkyrie");
+    }
+
+    #[test]
+    fn subject_query_keeps_the_named_subject() {
+        assert_eq!(
+            subject_query("what should I do for Frankie Foster?"),
+            "Frankie Foster"
+        );
+        assert_eq!(
+            subject_query("are you able to make an image of Frankie Foster?"),
+            "Frankie Foster"
+        );
+        assert_eq!(
+            subject_query("are you able make Frankie Foster"),
+            "Frankie Foster"
+        );
+        assert_eq!(
+            subject_query("Frankie Foster in an emerald dress under neon lighting"),
+            "Frankie Foster"
+        );
+        assert_eq!(subject_query("Emerald Dress"), "Emerald Dress");
+        let scene = subject_query("a woman in an emerald dress in a neon diner at night");
+        assert_eq!(scene, "woman diner");
+        assert!(!scene.to_lowercase().contains("emerald"));
+        assert!(!scene.to_lowercase().contains("dress"));
+        assert!(!scene.to_lowercase().contains("neon"));
+    }
+
+    #[test]
+    fn scrub_drops_tool_names_and_keeps_the_reply() {
+        let raw = "I can help with Frankie Foster. I see you're on Freya Route mode.\n\nsearch_civitai failed: civitai search";
+        let cleaned = scrub_tool_noise(raw);
+        assert!(cleaned.contains("Frankie Foster"));
+        assert!(!cleaned.to_lowercase().contains("freya route"));
+        assert!(!cleaned.contains("search_civitai"));
+    }
+
+    #[test]
+    fn lora_in_ignores_filename_model_id() {
+        let raw = json!({
+            "name": "Frankie",
+            "modelId": "Frankie_Foster_-_Foster_s_Home_for_Imaginary_Friends_-_Illustrious_XL_-_by_YeiyeiArt",
+            "path": "loras/Frankie_Foster_-_Foster_s_Home_for_Imaginary_Friends_-_Illustrious_XL_-_by_YeiyeiArt.safetensors"
+        });
+        let l: LoraIn = serde_json::from_value(raw).expect("deserialize lora");
+        assert!(l.model_id.is_none());
+        assert_eq!(l.name, "Frankie");
+    }
+
+    #[test]
+    fn lora_in_parses_numeric_model_id_string() {
+        let raw = json!({ "name": "x", "modelId": "1319790" });
+        let l: LoraIn = serde_json::from_value(raw).expect("deserialize lora");
+        assert_eq!(l.model_id, Some(1319790));
+    }
+
+    #[test]
+    fn vague_lookup_note_mentions_pin_lora_and_base() {
+        let cards = vec![
+            json!({ "name": "Foster LoRA", "path": "loras/foster.safetensors", "installed": true }),
+            json!({ "name": "Other Foster", "installed": false }),
+        ];
+        let note = note_subject_lookup("Happy to help you choose.", "chat", &cards, &[], "");
+        let lower = note.to_lowercase();
+        assert!(lower.contains("foster lora"));
+        assert!(lower.contains("pin"));
+        assert!(lower.contains("lora"));
+        assert!(lower.contains("base"));
+        assert!(!lower.contains("```"));
+    }
+
+    #[test]
+    fn detailed_lookup_note_does_not_ask_a_question() {
+        let cards = vec![json!({ "name": "Neon Diner", "installed": false })];
+        let note = note_subject_lookup(
+            "On it — I’ll make that image for you.",
+            "picture",
+            &cards,
+            &[],
+            "",
+        );
+        assert!(note.contains("Agent tab"));
+        assert!(note.contains("Neon Diner"));
+        assert!(!note.contains('?'));
+    }
+
+    #[test]
+    fn lookup_hint_skipped_when_lora_pinned_and_base_set() {
+        let cards = vec![
+            json!({ "name": "Frankie Foster - Foster's Home", "type": "LORA", "installed": true }),
+            json!({
+                "name": "waiNSFWIllustrious_v100",
+                "type": "Checkpoint",
+                "model": "checkpoints/waiNSFWIllustrious_v100.safetensors",
+                "installed": true
+            }),
+        ];
+        let pinned = vec![LoraIn {
+            name: "Frankie".into(),
+            scale: 1.0,
+            path: Some("loras/Frankie_Foster.safetensors".into()),
+            base_model: None,
+            version_id: None,
+            model_id: None,
+        }];
+        let note = note_subject_lookup(
+            "On it — I'll make that image for you.\n\nI couldn't finish that generation.",
+            "picture",
+            &cards,
+            &pinned,
+            "waiNSFWIllustrious_v100",
+        );
+        assert!(!note.to_lowercase().contains("agent tab"));
     }
 }

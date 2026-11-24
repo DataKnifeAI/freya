@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { api, AUTH_REQUIRED_EVENT, hasBrowserBearer, isMockMode } from "./api.js";
-import { BEGINNER_EXAMPLE, demoCivitaiQuery, generateOfferForTurn } from "./mockApi.js";
+import { api, AUTH_REQUIRED_EVENT, hasBrowserBearer, isMockMode, postChat } from "./api.js";
+import {
+  BEGINNER_EXAMPLE,
+  demoCivitaiQuery,
+  generateOfferForTurn,
+  partitionAssistantReply,
+  routeLineForMessage,
+} from "./mockApi.js";
 
 const AUTOMATION_MODES = ["plan", "auto", "yolo"];
 const AUTOMATION_LABELS = { plan: "Plan", auto: "Auto", yolo: "YOLO" };
@@ -19,15 +25,14 @@ const THEME_STORAGE_KEY = "freya.theme";
 const TAB_STORAGE_KEY = "freya.tab";
 /** Top-level Studio tabs (nav + restore must stay in sync). */
 const STUDIO_TABS = [
+  "agent",
   "gallery",
-  "styles",
-  "civitai",
-  "worker",
   "metrics",
-  "models",
-  "settings",
   "help",
   "guidelines",
+  "models",
+  "worker",
+  "settings",
 ];
 
 /** Empty Auto fallbacks → API uses Privacy/Alignment built-in matrix. */
@@ -76,6 +81,9 @@ function costTierCurrent(value) {
 const GUIDELINES_ACK_STORAGE_KEY = "freya.guidelinesAck";
 /** Persistent Civitai library (survives sessions). Distinct from session Pin. */
 const FAVORITES_STORAGE_KEY = "freya.civitaiFavorites";
+/** Community image favorites. Not Civitai model cards. */
+const IMAGE_FAVORITES_STORAGE_KEY = "freya.communityImageFavorites";
+const COMMUNITY_PAGE_SIZE = 20;
 
 /** Third-party policy links (README + Settings + Guidelines tab stay in sync). */
 const POLICY_LINKS = {
@@ -330,12 +338,21 @@ function buildWindowsWorkerSetupCmd({ origin, token, apiUrl }) {
   return `iex "& { \$(irm '${base}/scripts/setup-local-worker.ps1') } -Token '${tok}' -ApiUrl '${api}'"`;
 }
 
+/** Run on the GPU host after patching FreyaDiffusionWorker.spec.image (external workers). */
+function buildLinuxWorkerUpdateCmd({ origin }) {
+  const base = (origin || "").replace(/\/$/, "") || "<studio-origin>";
+  return `curl -fsSL ${base}/scripts/update-local-worker.sh | bash -s -- --from-cr freya-gpu`;
+}
+
 function readFavorites() {
   try {
     const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.filter((x) => x && (x.id != null || x.name)) : [];
+    const list = Array.isArray(parsed)
+      ? parsed.filter((x) => x && (x.id != null || x.name) && x.kind !== "community-image")
+      : [];
+    return dedupeFavoriteAssets(list);
   } catch {
     return [];
   }
@@ -347,6 +364,185 @@ function writeFavorites(list) {
   } catch {
     /* ignore quota */
   }
+}
+
+function readImageFavorites() {
+  try {
+    const raw = localStorage.getItem(IMAGE_FAVORITES_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return dedupeCommunityItems(
+      Array.isArray(parsed) ? parsed.map(normalizeImageFavorite).filter(Boolean) : [],
+    );
+  } catch {
+    return [];
+  }
+}
+
+function writeImageFavorites(list) {
+  try {
+    localStorage.setItem(IMAGE_FAVORITES_STORAGE_KEY, JSON.stringify(list.slice(0, 200)));
+  } catch {
+    /* ignore quota */
+  }
+}
+
+/** Civitai thumbnail vs original paths for the same file become one key. */
+function canonicalCommunityMediaUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s.startsWith("https://")) return "";
+  try {
+    const u = new URL(s);
+    const host = u.hostname.toLowerCase();
+    const path = u.pathname
+      .replace(/\/width=\d+\//gi, "/original=true/")
+      .replace(/\/original=true\//gi, "/original=true/");
+    const file = path.split("/").filter(Boolean).pop() || "";
+    if (!file) return "";
+    return `${host}/${file}`.toLowerCase();
+  } catch {
+    return s
+      .toLowerCase()
+      .split("#")[0]
+      .split("?")[0]
+      .replace(/\/width=\d+\//gi, "/original=true/");
+  }
+}
+
+function communityMediaKeys(item) {
+  const keys = [];
+  if (item?.id != null && String(item.id).trim() !== "") {
+    keys.push(`id:${item.id}`);
+  }
+  const urlKey = canonicalCommunityMediaUrl(item?.url || item?.thumbnailUrl);
+  if (urlKey) keys.push(`url:${urlKey}`);
+  return keys;
+}
+
+function communityItemsMatch(a, b) {
+  if (!a || !b) return false;
+  const setB = new Set(communityMediaKeys(b));
+  return communityMediaKeys(a).some((k) => setB.has(k));
+}
+
+function dedupeCommunityItems(items) {
+  const seen = new Set();
+  const out = [];
+  for (const item of items || []) {
+    const keys = communityMediaKeys(item);
+    if (!keys.length) continue;
+    if (keys.some((k) => seen.has(k))) continue;
+    keys.forEach((k) => seen.add(k));
+    out.push(item);
+  }
+  return out;
+}
+
+function civitaiStudioMediaSrc(raw) {
+  const s = String(raw || "").trim();
+  if (!s || isMockMode()) return s;
+  if (!/^https:\/\/(image\.civitai\.(com|red)|blobs-b2\.civitai\.com)/i.test(s)) {
+    return s;
+  }
+  return `/v1/civitai/media?url=${encodeURIComponent(s)}`;
+}
+
+/** Load image favorites and migrate legacy community-image rows out of model favorites. */
+function bootstrapImageFavorites() {
+  let images = dedupeCommunityItems(readImageFavorites());
+  try {
+    const raw = localStorage.getItem(FAVORITES_STORAGE_KEY);
+    if (!raw) {
+      if (images.length) writeImageFavorites(images);
+      return images;
+    }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      if (images.length) writeImageFavorites(images);
+      return images;
+    }
+    const legacy = parsed
+      .filter((f) => f && f.kind === "community-image")
+      .map(normalizeImageFavorite)
+      .filter(Boolean);
+    const modelOnly = parsed.filter((f) => !f || f.kind !== "community-image");
+    if (legacy.length) {
+      images = dedupeCommunityItems([...legacy, ...images]);
+      writeImageFavorites(images);
+    }
+    if (legacy.length || modelOnly.length !== parsed.length) {
+      writeFavorites(modelOnly.slice(0, 200));
+    }
+  } catch {
+    /* quota / private mode */
+  }
+  return images;
+}
+
+function communityImageFilename(item) {
+  const src = String(item?.url || item?.thumbnailUrl || "");
+  const match = src.toLowerCase().match(/\.([a-z0-9]{2,5})(?:\?|#|$)/);
+  const raw = match ? match[1] : "jpg";
+  const ext = raw === "jpeg" ? "jpg" : raw;
+  const id = String(item?.id || "image").replace(/[^a-z0-9-]/gi, "").slice(0, 16) || "image";
+  return `civitai-${id}.${ext}`;
+}
+
+function communityImageFavorite(item, ctx, origin) {
+  const resources = (item?.resources || [])
+    .map(slimCommunityResource)
+    .filter(Boolean)
+    .slice(0, 32);
+  const missingResources = (item?.missingResources || [])
+    .map(slimCommunityResource)
+    .filter(Boolean)
+    .slice(0, 32);
+  const prompt = String(item?.prompt || "").slice(0, 4000);
+  const negative = String(item?.negativePrompt || item?.negative || "").slice(0, 4000);
+  const sampler = item?.sampler ?? item?.meta?.sampler ?? null;
+  const steps = item?.steps ?? item?.meta?.steps ?? null;
+  const cfg = item?.cfg ?? item?.meta?.cfg ?? null;
+  const seed = item?.seed ?? item?.meta?.seed ?? null;
+  const clipSkip = item?.clipSkip ?? item?.meta?.clipSkip ?? null;
+  const size = item?.size || item?.meta?.size || null;
+  return {
+    kind: "community-image",
+    id: item.id,
+    url: item.url || item.thumbnailUrl || "",
+    thumbnailUrl: item.thumbnailUrl || item.url || "",
+    mediaType: item.mediaType || item.type || null,
+    prompt,
+    negativePrompt: negative,
+    negative,
+    sampler,
+    steps,
+    cfg,
+    seed,
+    clipSkip,
+    size,
+    meta: { sampler, steps, cfg, seed, clipSkip, size },
+    nsfw: Boolean(item.nsfw),
+    civitaiUrl: item.civitaiUrl || null,
+    checkpoint: item.checkpoint || null,
+    resources,
+    missingResources,
+    modelId: ctx?.modelId ?? item.modelId ?? null,
+    modelVersionId:
+      ctx?.modelVersionId ?? item.modelVersionId ?? item.modelVersionIds?.[0] ?? null,
+    modelName: ctx?.name || item.modelName || null,
+    fallbackCheckpoint: origin || item.fallbackCheckpoint || null,
+  };
+}
+
+/** Clipboard copy of prompt + negative. Returns false when there is nothing to copy. */
+async function copyCommunityInput(item) {
+  const prompt = String(item?.prompt || "").trim();
+  const negative = String(item?.negativePrompt || item?.negative || "").trim();
+  const text = [prompt, negative ? `Negative: ${negative}` : ""].filter(Boolean).join("\n\n");
+  if (!text) return false;
+  if (!navigator.clipboard?.writeText) throw new Error("Clipboard is not available.");
+  await navigator.clipboard.writeText(text);
+  return true;
 }
 
 /** Human-readable byte size for storage meters (Worker tab). */
@@ -442,6 +638,7 @@ function readStoredTab() {
   try {
     if (readHelpHash()) return "help";
     const v = localStorage.getItem(TAB_STORAGE_KEY);
+    if (v === "styles" || v === "civitai") return "agent";
     if (STUDIO_TABS.includes(v)) return v;
   } catch {
     /* ignore */
@@ -513,25 +710,101 @@ function artifactMime(item) {
       ? "video/mp4"
       : typeof item?.filename === "string" && item.filename.endsWith(".webm")
         ? "video/webm"
-        : typeof item?.filename === "string" && item.filename.endsWith(".gif")
-          ? "image/gif"
-          : "")
+        : typeof item?.filename === "string" && item.filename.endsWith(".mov")
+          ? "video/quicktime"
+          : typeof item?.filename === "string" && item.filename.endsWith(".gif")
+            ? "image/gif"
+            : item?.mediaType === "video"
+              ? "video/mp4"
+              : "")
   );
 }
 
-function isVideoArtifact(item) {
-  const m = String(artifactMime(item) || "").toLowerCase();
-  return m.includes("mp4") || m.includes("webm") || m.startsWith("video/");
+function mediaSrc(item, src) {
+  return String(src || item?.url || "").toLowerCase().split("#")[0];
 }
 
-function isGifArtifact(item) {
+function isGifArtifact(item, src) {
   const m = String(artifactMime(item) || "").toLowerCase();
-  return m.includes("gif");
+  if (m.includes("gif")) return true;
+  const s = mediaSrc(item, src);
+  if (s.startsWith("data:image/gif")) return true;
+  return /\.gif(\?|$)/.test(s);
 }
 
-/** Gallery / chat media: video player, animated gif, or still image. */
+function isVideoArtifact(item, src) {
+  if (isGifArtifact(item, src)) return false;
+  const kind = String(item?.mediaType || item?.type || "").toLowerCase();
+  if (kind === "video") return true;
+  const m = String(artifactMime(item) || "").toLowerCase();
+  if (m.includes("mp4") || m.includes("webm") || m.includes("quicktime") || m.startsWith("video/"))
+    return true;
+  const s = mediaSrc(item, src);
+  return (
+    /\.mp4(\?|$)/.test(s) ||
+    /\.webm(\?|$)/.test(s) ||
+    /\.mov(\?|$)/.test(s)
+  );
+}
+
+function communityPreviewSrc(item) {
+  const url = String(item?.url || "");
+  const thumb = String(item?.thumbnailUrl || "");
+  if (isVideoArtifact(item, url) || isVideoArtifact(item, thumb)) {
+    return civitaiStudioMediaSrc(url || thumb);
+  }
+  return thumb || url;
+}
+
+/** Still poster for community video when Civitai sends a separate image preview. */
+function communityVideoPoster(item) {
+  const candidates = [item?.thumbnailUrl, item?.url].filter(Boolean);
+  const hasVideo = candidates.some((s) => isVideoArtifact(item, s));
+  if (!hasVideo) return undefined;
+  const still = candidates.find((s) => !isVideoArtifact(item, s));
+  return still || undefined;
+}
+
+/** Civitai community gallery: gif/stills in img; MP4/WebM/MOV in video. */
+function CommunityMedia({ item, variant = "tile", className, alt = "" }) {
+  const src = communityPreviewSrc(item);
+  if (!src) {
+    return variant === "tile" ? (
+      <span className="agent-gallery-thumb-empty" />
+    ) : (
+      <div className="lora-card-thumb-fallback">No preview</div>
+    );
+  }
+  if (isGifArtifact(item, src)) {
+    return <img className={className} src={src} alt={alt} />;
+  }
+  if (isVideoArtifact(item, src)) {
+    const poster = communityVideoPoster(item);
+    return (
+      <video
+        className={className}
+        src={src}
+        crossOrigin="anonymous"
+        poster={poster ? civitaiStudioMediaSrc(poster) : undefined}
+        muted
+        loop
+        playsInline
+        autoPlay
+        preload="auto"
+        controls={variant === "modal"}
+        aria-label={variant === "modal" ? alt || "Community video" : undefined}
+      />
+    );
+  }
+  return <img className={className} src={src} alt={alt} />;
+}
+
+/** Gallery / chat media: animated gif and stills use img; MP4/WebM use video. */
 function MediaFigure({ item, src, alt, className }) {
-  if (isVideoArtifact(item)) {
+  if (isGifArtifact(item, src)) {
+    return <img className={className} src={src} alt={alt || ""} />;
+  }
+  if (isVideoArtifact(item, src)) {
     return (
       <video
         className={className}
@@ -540,7 +813,8 @@ function MediaFigure({ item, src, alt, className }) {
         playsInline
         loop
         muted
-        preload="metadata"
+        autoPlay
+        preload="auto"
         aria-label={alt || "Generated video"}
       />
     );
@@ -744,6 +1018,25 @@ const emptySession = () => ({
   messages: [],
   sessionNote: "",
 });
+
+const BLANK_GEN_META = {
+  sampler: "",
+  cfg: "",
+  steps: "",
+  clipSkip: "",
+  negativePrompt: "",
+  seed: "",
+  size: "",
+  quantity: 1,
+  source: "",
+  sourceLabel: "",
+  locked: false,
+  lastSeed: null,
+  samplerApplied: "",
+  samplerNote: "",
+  clipSkipApplied: null,
+  enhance: "",
+};
 
 /** Normalize persisted session: promote legacy turns into chat messages. */
 function normalizeSession(raw) {
@@ -1052,6 +1345,128 @@ function resolveCivitaiModelId(item) {
   return null;
 }
 
+function normalizeCivitaiFavoriteUrl(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+  try {
+    const u = new URL(s.startsWith("http") ? s : `https://${s}`);
+    const host = u.hostname.toLowerCase().replace(/^www\./, "");
+    const modelMatch = u.pathname.match(/\/models\/(\d+)/i);
+    if (modelMatch) return `${host}/models/${modelMatch[1]}`;
+    return `${host}${u.pathname.replace(/\/$/, "")}`.toLowerCase();
+  } catch {
+    return s.toLowerCase().split(/[?#]/)[0];
+  }
+}
+
+/** Stable keys for Civitai model-card favorites (not community images). */
+function favoriteAssetKeys(item) {
+  if (!item || item.kind === "community-image") return [];
+  const keys = [];
+  const modelId = resolveCivitaiModelId(item);
+  if (modelId != null && String(modelId).trim() !== "") keys.push(`model:${modelId}`);
+  const vid = item.versionId ?? item.modelVersionId;
+  const vn = Number(vid);
+  if (Number.isFinite(vn) && vn > 0) keys.push(`ver:${vn}`);
+  if (item.path) keys.push(`path:${item.path}`);
+  const pageUrl = normalizeCivitaiFavoriteUrl(
+    item.civitaiUrl ||
+      (modelId != null ? `https://civitai.com/models/${modelId}` : ""),
+  );
+  if (pageUrl) keys.push(`url:${pageUrl}`);
+  keys.push(`card:${loraKey(item)}`);
+  return keys;
+}
+
+function favoriteAssetsMatch(a, b) {
+  if (!a || !b) return false;
+  const setB = new Set(favoriteAssetKeys(b));
+  return favoriteAssetKeys(a).some((k) => setB.has(k));
+}
+
+function dedupeFavoriteAssets(list) {
+  const seen = new Set();
+  const out = [];
+  for (const item of list || []) {
+    if (!item || item.kind === "community-image") continue;
+    const keys = favoriteAssetKeys(item);
+    if (!keys.length) continue;
+    if (keys.some((k) => seen.has(k))) continue;
+    keys.forEach((k) => seen.add(k));
+    out.push(item);
+  }
+  return out;
+}
+
+/** NSFW model pages open on civitai.red. SFW pages stay on civitai.com. */
+function modelPageIsNsfw(item, version) {
+  if (!item && !version) return false;
+  if (item?.nsfw === true || version?.nsfw === true) return true;
+  return [item?.nsfwLevel, version?.nsfwLevel].some((level) => {
+    const n = Number(level);
+    return Number.isFinite(n) && n > 1;
+  });
+}
+
+/** Model page URL, including modelVersionId when we have a version id. */
+function civitaiModelPageUrl(item, versionId) {
+  if (!item) return null;
+  const id = resolveCivitaiModelId(item);
+  const vid = versionId ?? item.versionId ?? item.modelVersionId;
+  const hasVid = vid != null && vid !== "" && Number(vid) > 0;
+  const nsfw = modelPageIsNsfw(item);
+  const host = nsfw ? "https://civitai.red" : "https://civitai.com";
+  if (id == null) {
+    const raw = item.civitaiUrl;
+    if (!raw) return null;
+    try {
+      const u = new URL(raw);
+      const hostName = u.hostname.toLowerCase();
+      const civitaiHost =
+        hostName === "civitai.com" ||
+        hostName === "civitai.red" ||
+        hostName.endsWith(".civitai.com") ||
+        hostName.endsWith(".civitai.red");
+      if (!civitaiHost) return raw;
+      u.protocol = "https:";
+      u.hostname = nsfw ? "civitai.red" : "civitai.com";
+      if (hasVid) u.searchParams.set("modelVersionId", String(vid));
+      return u.toString();
+    } catch {
+      return raw;
+    }
+  }
+  let url = `${host}/models/${id}`;
+  if (hasVid) url += `?modelVersionId=${encodeURIComponent(vid)}`;
+  return url;
+}
+
+/** `nsfw` paints the link ember (civitai.red). `sfw` paints it blue (civitai.com). */
+function civitaiLinkTone(url, item) {
+  try {
+    const host = new URL(String(url)).hostname.toLowerCase();
+    if (host === "civitai.red" || host.endsWith(".civitai.red")) return "nsfw";
+    if (host === "civitai.com" || host.endsWith(".civitai.com")) return "sfw";
+  } catch {
+    /* fall through to the image flag */
+  }
+  return item?.nsfw ? "nsfw" : "sfw";
+}
+
+function recommendedResourceCard(rec) {
+  if (!rec || rec.id == null || rec.id === "") return null;
+  return {
+    id: rec.id,
+    modelId: rec.modelId ?? rec.id,
+    name: rec.name,
+    modelType: rec.type || rec.modelType || "Checkpoint",
+    versionId: rec.modelVersionId ?? rec.versionId ?? null,
+    baseModel: rec.baseModel || null,
+    nsfw: rec.nsfw === true,
+    nsfwLevel: rec.nsfwLevel,
+  };
+}
+
 function readStoredMode() {
   try {
     const v = localStorage.getItem(AUTOMATION_STORAGE_KEY);
@@ -1319,6 +1734,26 @@ const IconSpinner = () => (
     </Svg>
   </span>
 );
+/** Follows the pointer while a chat turn is in flight. Does not capture clicks. */
+function ChatPointer() {
+  const [pos, setPos] = useState({ x: -40, y: -40 });
+  useEffect(() => {
+    const onMove = (e) => setPos({ x: e.clientX, y: e.clientY });
+    window.addEventListener("pointermove", onMove, { passive: true });
+    document.documentElement.classList.add("chat-busy");
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      document.documentElement.classList.remove("chat-busy");
+    };
+  }, []);
+  return (
+    <span
+      className="chat-pointer"
+      style={{ left: pos.x, top: pos.y }}
+      aria-hidden="true"
+    />
+  );
+}
 const IconBulb = () => (
   <Svg>
     <path d="M9 18h6M10 21h4" />
@@ -1451,9 +1886,45 @@ const IconDownload = () => (
     <path d="M5 19h14" />
   </Svg>
 );
+const IconCopy = () => (
+  <Svg>
+    <rect x="8" y="8" width="12" height="12" />
+    <path d="M4 16V4h12" />
+  </Svg>
+);
+/** Install missing files — arrow into a tray, distinct from the file download. */
+const IconInstall = () => (
+  <Svg>
+    <path d="M12 3v8" />
+    <path d="m8 8 4 4 4-4" />
+    <path d="M4 14.5h16V20H4z" />
+  </Svg>
+);
+/** Open the image on Civitai. Color comes from the host, not this glyph. */
+const IconExternal = () => (
+  <Svg>
+    <path d="M14 5h5v5" />
+    <path d="M10 14 19 5" />
+    <path d="M18 13v6H5V6h6" />
+  </Svg>
+);
+const IconGallery = () => (
+  <Svg>
+    <rect x="3" y="3" width="7.5" height="7.5" />
+    <rect x="13.5" y="3" width="7.5" height="7.5" />
+    <rect x="3" y="13.5" width="7.5" height="7.5" />
+    <rect x="13.5" y="13.5" width="7.5" height="7.5" />
+  </Svg>
+);
 const IconClear = () => (
   <Svg>
     <path d="M5 7h14M9 7V5h6v2M8 7l1 12h6l1-12" />
+  </Svg>
+);
+const IconRemix = () => (
+  <Svg>
+    <path d="M6 18H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v2" />
+    <path d="M14 4l4 4-8 8H6v-4l8-8z" />
   </Svg>
 );
 
@@ -1463,6 +1934,19 @@ const CIVITAI_SUBNAV = [
   { id: "favorites", label: "Favorites" },
   { id: "installed", label: "Installed" },
   { id: "downloads", label: "Downloads", end: true },
+];
+const CIVITAI_AGENT_FOCUS = new Set(CIVITAI_SUBNAV.map((s) => s.id));
+
+/** Favorites sub-tabs. Empty types stay hidden. Images are community gallery favorites. */
+const FAVORITE_TYPE_TABS = [
+  { id: "LORA", label: "LORA" },
+  { id: "LoCon", label: "LoCon" },
+  { id: "DoRA", label: "DoRA" },
+  { id: "LyCORIS", label: "LyCORIS" },
+  { id: "Checkpoint", label: "Checkpoint" },
+  { id: "TextualInversion", label: "TextualInversion" },
+  { id: "VAE", label: "VAE" },
+  { id: "Images", label: "Images" },
 ];
 
 /** Installed section order / labels by kind or modelType. */
@@ -1585,6 +2069,731 @@ function pickCivitaiThumb(item, favoritesList = []) {
       (vid != null && String(f.versionId) === String(vid)),
   );
   return fromFav?.thumbnailUrl || fromFav?.imageUrls?.[0] || null;
+}
+
+/** Keep in sync with order_lookup_assets in crates/freya-api/src/routes.rs. */
+function assetLabelKey(raw) {
+  const file = String(raw || "").split(/[/\\]/).pop() || "";
+  const stem = file.replace(/\.(safetensors|ckpt|pt|gguf|bin)$/i, "");
+  return stem.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function queryHitsLabel(query, label) {
+  const q = assetLabelKey(query);
+  const n = assetLabelKey(label);
+  if (q.length < 3 || !n) return false;
+  if (q === n) return true;
+  return (q.length >= 4 && n.includes(q)) || (n.length >= 4 && q.includes(n));
+}
+
+function cardVersionId(item) {
+  const n = Number(item?.versionId);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+/** Same installed file: equal version ids, or equal name/stem when a version is missing.
+ * Different version ids stay distinct so the other version remains a new hit.
+ */
+function lookupSameAsset(local, search) {
+  if (!local || !search) return false;
+  const lv = cardVersionId(local);
+  const sv = cardVersionId(search);
+  if (lv && sv) return lv === sv;
+  const localKeys = [
+    assetLabelKey(local.name),
+    assetLabelKey(local.path),
+    assetLabelKey(local.fileName),
+  ].filter(Boolean);
+  const searchKeys = [assetLabelKey(search.name), assetLabelKey(search.fileName)].filter(Boolean);
+  return localKeys.some((lk) => searchKeys.includes(lk));
+}
+
+/** Query text that is a Civitai version id (the whole query, or a 4+ digit token). */
+function queryHitsVersion(query, item) {
+  const vid = cardVersionId(item);
+  if (!vid || !query) return false;
+  const q = String(query).trim();
+  if (q === String(vid)) return true;
+  return q.split(/[^0-9]+/).some((tok) => tok.length >= 4 && Number(tok) === vid);
+}
+
+/** Search hit from this chat lookup. A worker-library row is not a search hit unless stamped. */
+function isLookupSearchCard(card) {
+  if (!card) return false;
+  if (card.fromChatSearch) return true;
+  if (card.path) return false;
+  return (
+    resolveCivitaiModelId(card) != null ||
+    cardVersionId(card) != null ||
+    Boolean(card.downloadUrl || card.civitaiUrl || card.thumbnailUrl || card.imageUrls?.length)
+  );
+}
+
+/** Installed file matches the chat lookup by name, filename, version id, or a search hit. */
+function installedMatchesLookup(local, query, searchHits) {
+  if (!local) return false;
+  const q = String(query || "").trim();
+  if (q) {
+    if (queryHitsLabel(q, local.name)) return true;
+    if (queryHitsLabel(q, local.path)) return true;
+    if (queryHitsLabel(q, local.fileName)) return true;
+    if (queryHitsVersion(q, local)) return true;
+  }
+  return (searchHits || []).some(
+    (c) =>
+      lookupSameAsset(local, c) ||
+      Boolean(local.path && c?.path && local.path === c.path),
+  );
+}
+
+function findInstalledMatch(item, installed) {
+  if (!item || !installed?.length) return null;
+  if (item.path) {
+    const byPath = installed.find((a) => a?.path && a.path === item.path);
+    if (byPath) return byPath;
+  }
+  return installed.find((a) => lookupSameAsset(a, item)) || null;
+}
+
+function mergeInstalledCard(card, live) {
+  const searchModel = !card?.path ? resolveCivitaiModelId(card) : null;
+  const modelId = live?.modelId ?? card?.modelId ?? searchModel ?? null;
+  return {
+    ...(card || {}),
+    ...(live || {}),
+    modelId: modelId || null,
+    versionId: live?.versionId ?? card?.versionId ?? null,
+    thumbnailUrl: live?.thumbnailUrl || card?.thumbnailUrl || null,
+    imageUrls: live?.imageUrls?.length ? live.imageUrls : card?.imageUrls,
+    path: live?.path || card?.path || null,
+    name: live?.name || card?.name,
+    modelType: live?.modelType || live?.kind || card?.modelType,
+    baseModel: live?.baseModel || card?.baseModel,
+    triggerWord: live?.triggerWord || card?.triggerWord,
+    civitaiUrl: live?.civitaiUrl || card?.civitaiUrl,
+    downloadUrl: live?.downloadUrl || card?.downloadUrl,
+    fromChatSearch: Boolean(card?.fromChatSearch || live?.fromChatSearch),
+    installed: true,
+  };
+}
+
+function lookupCardKey(item) {
+  if (item?.path) return `p:${item.path}`;
+  const ver = cardVersionId(item);
+  if (ver) return `v:${ver}`;
+  return `n:${assetLabelKey(item?.name)}:${item?.id ?? ""}`;
+}
+
+/**
+ * Installed rows: only worker files that match this chat lookup
+ * (name, filename, or version id — or the same asset as a search hit).
+ * Other search hits stay in `fresh`. A full library dump is not listed.
+ */
+function presentLookup(cards, installed, query) {
+  const existing = [];
+  const fresh = [];
+  const seen = new Set();
+  const pushExisting = (item) => {
+    const key = lookupCardKey(item);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    existing.push(item);
+  };
+  const list = Array.isArray(cards) ? cards.filter(Boolean) : [];
+  const searchHits = list.filter(isLookupSearchCard);
+  const q = String(query || "").trim();
+  const candidates = [];
+  const seenPath = new Set();
+  const pushCandidate = (asset) => {
+    if (!asset) return;
+    if (asset.path) {
+      if (seenPath.has(asset.path)) return;
+      seenPath.add(asset.path);
+    }
+    candidates.push(asset);
+  };
+  for (const local of installed || []) pushCandidate(local);
+  for (const card of list) {
+    if (card.path) pushCandidate(card);
+  }
+  for (const local of candidates) {
+    const searchedFile = Boolean(local.fromChatSearch && local.path);
+    if (!searchedFile && !installedMatchesLookup(local, q, searchHits)) continue;
+    if (
+      existing.some(
+        (e) => lookupSameAsset(e, local) || (local.path && e.path === local.path),
+      )
+    ) {
+      continue;
+    }
+    const hit = searchHits.find((c) => c !== local && lookupSameAsset(local, c));
+    pushExisting(mergeInstalledCard(hit || local, local));
+  }
+  for (const card of searchHits) {
+    if (card.path && existing.some((e) => e.path === card.path)) continue;
+    if (existing.some((e) => lookupSameAsset(e, card))) continue;
+    const key = lookupCardKey(card);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    fresh.push({ ...card, installed: false });
+  }
+  return { existing, fresh };
+}
+
+function isCheckpointAsset(item) {
+  if (!item) return false;
+  const path = String(item.path || "");
+  if (path.startsWith("checkpoints/")) return true;
+  const t = String(item.modelType || item.kind || item.type || "")
+    .toLowerCase()
+    .replace(/[\s_-]/g, "");
+  return t === "checkpoint" || t === "model" || t === "ckpt";
+}
+
+function communityInstallableMissing(item) {
+  return (item?.missingResources || []).filter(
+    (r) => r && r.installable !== false && (r.modelVersionId || r.modelId),
+  );
+}
+
+function communityInstallType(raw) {
+  const t = String(raw || "")
+    .toLowerCase()
+    .replace(/[\s_-]/g, "");
+  if (t === "checkpoint" || t === "model" || t === "ckpt") return "Checkpoint";
+  if (t === "textualinversion" || t === "embedding" || t === "embed") return "TextualInversion";
+  if (t === "locon") return "LoCon";
+  if (t === "dora") return "DoRA";
+  if (t === "lycoris" || t === "lyco") return "LyCORIS";
+  return "LORA";
+}
+
+function familyKey(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+function checkpointMatchesFamily(asset, family) {
+  const want = familyKey(family);
+  if (!want || want.length < 3) return false;
+  const base = familyKey(asset?.baseModel);
+  const name = familyKey(`${asset?.name || ""} ${asset?.path || ""}`);
+  if (base && (base === want || base.includes(want) || want.includes(base))) return true;
+  return name.includes(want);
+}
+
+/** Model-card favorite bucket. Community images are a separate list, never folded into LORA. */
+function favoriteTypeId(item) {
+  if (item?.kind === "community-image") return "";
+  const path = String(item?.path || "");
+  const t = String(item?.modelType || item?.kind || item?.type || "")
+    .toLowerCase()
+    .replace(/[\s_-]/g, "");
+  if (t === "locon") return "LoCon";
+  if (t === "dora") return "DoRA";
+  if (t === "lycoris" || t === "lyco") return "LyCORIS";
+  if (
+    t === "textualinversion" ||
+    t === "embedding" ||
+    t === "embed" ||
+    path.startsWith("embeddings/")
+  ) {
+    return "TextualInversion";
+  }
+  if (t === "vae" || path.startsWith("vae/")) return "VAE";
+  if (t === "checkpoint" || t === "ckpt" || t === "model" || path.startsWith("checkpoints/")) {
+    return "Checkpoint";
+  }
+  return "LORA";
+}
+
+function positiveId(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function hashToken(raw) {
+  const trimmed = String(raw || "")
+    .trim()
+    .replace(/^['"]|['"]$/g, "");
+  const hex = (trimmed.split(/[:/]/).pop() || "").trim();
+  if (hex.length < 10 || hex.length > 128 || !/^[0-9a-f]+$/i.test(hex)) return "";
+  return hex.toLowerCase();
+}
+
+function hashesMatch(a, b) {
+  const left = hashToken(a);
+  const right = hashToken(b);
+  if (!left || !right) return false;
+  return left === right || left.startsWith(right) || right.startsWith(left);
+}
+
+function kindBucket(raw) {
+  const t = String(raw || "")
+    .toLowerCase()
+    .replace(/[\s_-]/g, "");
+  if (["checkpoint", "model", "ckpt", "base"].includes(t)) return "checkpoint";
+  if (["textualinversion", "embedding", "embed", "textinversion"].includes(t)) return "embedding";
+  if (
+    t === "lora" ||
+    t === "locon" ||
+    t === "dora" ||
+    t === "lycoris" ||
+    t === "lyco" ||
+    t.includes("lora")
+  ) {
+    return "lora";
+  }
+  return "other";
+}
+
+function kindsCompatible(resourceType, assetKind) {
+  const resource = kindBucket(resourceType);
+  const asset = kindBucket(assetKind);
+  return resource === asset || asset === "other" || resource === "other";
+}
+
+/** Filename, stem, or display name against an installed row (same spirit as chat lookup). */
+function labelMatchesAsset(label, asset) {
+  const want = String(label || "").trim();
+  if (!want || !asset) return false;
+  for (const field of [asset.name, asset.path, asset.fileName, asset.id]) {
+    if (field && queryHitsLabel(want, field)) return true;
+  }
+  return false;
+}
+
+function sameCheckpointPath(a, b) {
+  const left = String(a || "").trim();
+  const right = String(b || "").trim();
+  if (!left || !right) return false;
+  if (left === right) return true;
+  const lk = assetLabelKey(left);
+  const rk = assetLabelKey(right);
+  return Boolean(lk && rk && lk === rk);
+}
+
+/** Same rules as the API resource match: version id wins, then model id, hash, then file stem. */
+function resourceMatchesAsset(resource, asset) {
+  if (!resource || !asset) return false;
+  const rv = positiveId(resource.modelVersionId ?? resource.versionId);
+  const av = positiveId(asset.versionId);
+  if (rv && av) return rv === av;
+  const rm = positiveId(resource.modelId);
+  const am = positiveId(asset.modelId);
+  if (rm && am && rm !== am) return false;
+  if (rm && am && !rv) {
+    return kindsCompatible(resource.type || resource.modelType, asset.modelType || asset.kind);
+  }
+  if (resource.hash && asset.hash && hashesMatch(resource.hash, asset.hash)) return true;
+  const resourceType = resource.type || resource.modelType || "Checkpoint";
+  if (!kindsCompatible(resourceType, asset.modelType || asset.kind)) return false;
+  const name = String(resource.name || "").trim();
+  if (!name) return false;
+  return labelMatchesAsset(name, asset);
+}
+
+function slimCommunityResource(resource) {
+  if (!resource) return null;
+  const name = String(resource.name || "").trim();
+  const type = resource.type || resource.modelType || "";
+  const modelVersionId = positiveId(resource.modelVersionId ?? resource.versionId);
+  const modelId = positiveId(resource.modelId);
+  if (!name && !modelVersionId && !modelId && !resource.hash) return null;
+  return {
+    name,
+    type,
+    modelVersionId,
+    modelId,
+    hash: resource.hash || null,
+    weight: resource.weight ?? null,
+    installable: resource.installable !== false,
+    destPath: resource.destPath || null,
+  };
+}
+
+function checkpointResourceOf(item) {
+  const resources = Array.isArray(item?.resources) ? item.resources : [];
+  const found = resources.filter((r) =>
+    isCheckpointAsset({
+      modelType: r?.type || r?.modelType,
+      type: r?.type || r?.modelType,
+    }),
+  );
+  const named = found.find((r) => String(r?.name || "").trim()) || found[0];
+  if (named) return named;
+  const name = String(item?.checkpoint || "").trim();
+  if (!name) return null;
+  return { name, type: "Checkpoint" };
+}
+
+function findInstalledResource(resource, assets) {
+  if (!resource) return null;
+  return (assets || []).find((asset) => resourceMatchesAsset(resource, asset)) || null;
+}
+
+function recommendedCheckpointsFromCard(card, versionId) {
+  if (!card) return [];
+  const versions = card.modelVersions || [];
+  const ver =
+    versions.find((v) => versionId != null && String(v.id) === String(versionId)) ||
+    versions[0] ||
+    null;
+  const raw =
+    (ver?.recommendedResources?.length ? ver.recommendedResources : card.recommendedResources) ||
+    [];
+  return raw
+    .map(recommendedResourceCard)
+    .filter((rec) => rec && isCheckpointAsset(rec))
+    .map((rec) => ({
+      id: rec.id,
+      modelId: rec.modelId ?? rec.id,
+      name: rec.name,
+      modelType: "Checkpoint",
+      versionId: rec.versionId ?? null,
+      baseModel: rec.baseModel || null,
+    }));
+}
+
+function findContextCard(ctx, pools) {
+  if (!ctx) return null;
+  const list = (pools || []).filter(Boolean);
+  const id = ctx.modelId != null && ctx.modelId !== "" ? String(ctx.modelId) : "";
+  const ver =
+    ctx.modelVersionId != null && ctx.modelVersionId !== "" ? String(ctx.modelVersionId) : "";
+  if (id) {
+    const hit = list.find((card) => {
+      const cid = resolveCivitaiModelId(card);
+      return cid != null && String(cid) === id;
+    });
+    if (hit) return hit;
+  }
+  if (ver) {
+    const hit = list.find((card) => card.versionId != null && String(card.versionId) === ver);
+    if (hit) return hit;
+  }
+  const name = assetLabelKey(ctx.name || "");
+  if (name.length >= 4) return list.find((card) => assetLabelKey(card.name) === name) || null;
+  return null;
+}
+
+function originFromCard(card, ctx) {
+  if (!card && !ctx) return null;
+  const versionId = ctx?.modelVersionId || card?.versionId || null;
+  const versions = card?.modelVersions || [];
+  const ver =
+    versions.find((v) => versionId != null && String(v.id) === String(versionId)) ||
+    versions[0] ||
+    null;
+  return {
+    modelId: (card ? resolveCivitaiModelId(card) : null) ?? ctx?.modelId ?? null,
+    modelVersionId: versionId,
+    name: card?.name || ctx?.name || null,
+    modelType: card?.modelType || card?.kind || null,
+    baseModel: ver?.baseModel || card?.baseModel || null,
+    path: card?.path || null,
+    versionId: card?.versionId ?? versionId,
+    hash: card?.hash || null,
+    recommended: recommendedCheckpointsFromCard(card, versionId),
+  };
+}
+
+function mergeOrigin(primary, extra) {
+  if (!primary) return extra || null;
+  if (!extra) return primary;
+  return {
+    modelId: primary.modelId || extra.modelId || null,
+    modelVersionId: primary.modelVersionId || extra.modelVersionId || null,
+    name: primary.name || extra.name || null,
+    modelType: primary.modelType || extra.modelType || null,
+    baseModel: primary.baseModel || extra.baseModel || null,
+    path: primary.path || extra.path || null,
+    versionId: primary.versionId || extra.versionId || null,
+    hash: primary.hash || extra.hash || null,
+    recommended: primary.recommended?.length ? primary.recommended : extra.recommended || [],
+  };
+}
+
+/**
+ * Installed checkpoint for a community image.
+ * The post's own checkpoint wins when that file is on the worker.
+ * Otherwise the original asset's recommended checkpoint, when that file is installed.
+ * Does not pick a same-family substitute and does not download.
+ */
+function installedBaseForCommunityImage(item, installed, origin) {
+  const checkpoints = (installed || []).filter(isCheckpointAsset);
+  const fromPost = findInstalledResource(checkpointResourceOf(item), checkpoints);
+  if (fromPost) return fromPost;
+  const ckLabel = String(item?.checkpoint || "").trim();
+  if (ckLabel) {
+    const byLabel = checkpoints.find((asset) => labelMatchesAsset(ckLabel, asset));
+    if (byLabel) return byLabel;
+  }
+  const fb = origin || item?.fallbackCheckpoint || null;
+  if (!fb) return null;
+  if (isCheckpointAsset({ modelType: fb.modelType, kind: fb.modelType, path: fb.path })) {
+    const self = findInstalledResource(
+      {
+        name: fb.name,
+        type: "Checkpoint",
+        modelVersionId: fb.modelVersionId || fb.versionId,
+        modelId: fb.modelId,
+        hash: fb.hash,
+      },
+      checkpoints,
+    );
+    if (self) return self;
+    if (fb.name) {
+      const byName = checkpoints.find((asset) => labelMatchesAsset(fb.name, asset));
+      if (byName) return byName;
+    }
+    if (fb.path) {
+      const byPath = checkpoints.find((asset) => sameCheckpointPath(asset.path, fb.path));
+      if (byPath) return byPath;
+    }
+  }
+  for (const rec of fb.recommended || []) {
+    if (!isCheckpointAsset({ modelType: rec.modelType || rec.type, type: rec.type })) continue;
+    const hit =
+      findInstalledResource(
+        {
+          name: rec.name,
+          type: "Checkpoint",
+          modelVersionId: rec.versionId || rec.modelVersionId,
+          modelId: rec.modelId || rec.id,
+          hash: rec.hash,
+        },
+        checkpoints,
+      ) ||
+      (rec.name ? checkpoints.find((asset) => labelMatchesAsset(rec.name, asset)) : null);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function resourceLooksLikeLora(resource) {
+  return kindBucket(resource?.type || resource?.modelType) === "lora";
+}
+
+function loraScaleDefault(item, extra = {}, resourceWeight) {
+  const candidates = [
+    extra.scale,
+    item?.scale,
+    item?.weight,
+    item?.strength,
+    resourceWeight,
+  ];
+  for (const c of candidates) {
+    if (c != null && c !== "" && !Number.isNaN(Number(c))) return Number(c);
+  }
+  return 1.0;
+}
+
+/** Installed LoRAs named on a community post — does not download missing files. */
+function installedLorasFromPostResources(item, installed) {
+  const pinnable = (installed || []).filter(isPinnableAsset);
+  const resources = Array.isArray(item?.resources) ? item.resources : [];
+  const out = [];
+  const seen = new Set();
+  for (const resource of resources) {
+    if (!resourceLooksLikeLora(resource)) continue;
+    const hit = findInstalledResource(resource, pinnable);
+    if (!hit) continue;
+    const key = loraKey(hit);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(hit);
+  }
+  return out;
+}
+
+/** Every installed LoRA on the post, plus gallery-context LoRA when it is not already listed. */
+function installedLorasToPinFromCommunity(item, installed, galleryContext) {
+  const fromPost = installedLorasFromPostResources(item, installed);
+  const ctx = installedGalleryContextLora(galleryContext, installed);
+  if (!ctx) return fromPost;
+  const seen = new Set(fromPost.map((l) => loraKey(l)));
+  if (seen.has(loraKey(ctx))) return fromPost;
+  return [...fromPost, ctx];
+}
+
+function postResourceForLora(lora, postResources) {
+  return (
+    (postResources || []).find(
+      (r) => resourceLooksLikeLora(r) && findInstalledResource(r, [lora]),
+    ) || null
+  );
+}
+
+/** Append trigger tokens for pinned LoRAs when they are not already in the prompt. */
+function appendMissingLoraTriggers(prompt, loras) {
+  let next = String(prompt || "").trim();
+  const lower = next.toLowerCase();
+  const add = [];
+  for (const lora of loras || []) {
+    const tw = String(lora?.triggerWord || "").trim();
+    if (!tw || lower.includes(tw.toLowerCase())) continue;
+    add.push(tw);
+  }
+  if (!add.length) return next;
+  return `${next}, ${add.join(", ")}`;
+}
+
+/** Gallery opened for a model — pin that LoRA when it is already on the worker. */
+function installedGalleryContextLora(ctx, installed) {
+  if (!ctx) return null;
+  const pinnable = (installed || []).filter(isPinnableAsset);
+  const hit = findInstalledResource(
+    {
+      name: ctx.name || "",
+      type: "LORA",
+      modelVersionId: ctx.modelVersionId ?? null,
+      modelId: ctx.modelId ?? null,
+    },
+    pinnable,
+  );
+  return hit && isPinnableAsset(hit) ? hit : null;
+}
+
+function communityCheckpointLine(item) {
+  if (!item?.checkpoint) return "";
+  if (item.kind === "community-image") return String(item.checkpoint);
+  return [
+    item.checkpoint,
+    item.checkpointDifferent ? "different" : "",
+    item.checkpointInstalled ? "installed" : "not installed",
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function normalizeImageFavorite(item) {
+  if (!item || item.id == null) return null;
+  const meta = item.meta && typeof item.meta === "object" ? item.meta : {};
+  const negative = String(item.negativePrompt || item.negative || "");
+  return {
+    kind: "community-image",
+    id: item.id,
+    url: item.url || item.thumbnailUrl || "",
+    thumbnailUrl: item.thumbnailUrl || item.url || "",
+    mediaType: item.mediaType || item.type || null,
+    prompt: String(item.prompt || ""),
+    negativePrompt: negative,
+    negative,
+    sampler: item.sampler ?? meta.sampler ?? null,
+    steps: item.steps ?? meta.steps ?? null,
+    cfg: item.cfg ?? meta.cfg ?? null,
+    seed: item.seed ?? meta.seed ?? null,
+    clipSkip: item.clipSkip ?? meta.clipSkip ?? null,
+    size: item.size || meta.size || null,
+    meta,
+    nsfw: Boolean(item.nsfw),
+    civitaiUrl: item.civitaiUrl || null,
+    checkpoint: item.checkpoint || null,
+    resources: Array.isArray(item.resources) ? item.resources : [],
+    missingResources: Array.isArray(item.missingResources) ? item.missingResources : [],
+    modelId: item.modelId ?? null,
+    modelVersionId: item.modelVersionId ?? null,
+    modelName: item.modelName || null,
+    fallbackCheckpoint: item.fallbackCheckpoint || null,
+  };
+}
+
+function priorToolContext(session) {
+  const lines = [];
+  const pins = (session?.pinnedLoras || []).map((l) => l?.name).filter(Boolean);
+  if (pins.length) lines.push(`pinned: ${pins.join(", ")}`);
+  for (const message of session?.messages || []) {
+    for (const action of message.actions || []) {
+      if (action?.status !== "executed") continue;
+      if (action.type === "install_asset") {
+        const name = action.args?.name || action.result?.destPath;
+        if (name) lines.push(`installed: ${name}`);
+      }
+      if (action.type === "set_base_model") {
+        const model = action.result?.model || action.args?.model;
+        if (model) lines.push(`base: ${model}`);
+      }
+      if (action.type === "pin_lora" && Array.isArray(action.result?.pinnedLoras)) {
+        const names = action.result.pinnedLoras.map((l) => l?.name).filter(Boolean);
+        if (names.length) lines.push(`pinned: ${names.join(", ")}`);
+      }
+      if (action.type === "search_civitai") {
+        const type = action.result?.type || action.args?.type || "";
+        const query = action.result?.query || action.args?.query || "";
+        if (query) lines.push(`searched ${type}: ${query}`.trim());
+      }
+    }
+  }
+  return [...new Set(lines)].slice(-16).join("\n");
+}
+
+function replyMentionsName(content, name) {
+  const label = String(name || "").trim();
+  if (label.length < 2) return false;
+  return String(content || "").toLowerCase().includes(label.toLowerCase());
+}
+
+function referencedAssets(message) {
+  const out = [];
+  const seen = new Set();
+  const push = (item) => {
+    const name = String(item?.name || "").trim();
+    if (!name) return;
+    const key = name.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ ...item, name });
+  };
+  for (const item of message?.loras || []) {
+    if (replyMentionsName(message?.content, item?.name)) push(item);
+  }
+  for (const action of message?.actions || []) {
+    if (action?.status !== "executed" && action?.status !== "proposed") continue;
+    if (action.type !== "install_asset" && action.type !== "pin_lora" && action.type !== "set_base_model") {
+      continue;
+    }
+    const raw = action.args?.name || action.result?.name || action.result?.model || action.args?.model;
+    if (!raw) continue;
+    const name = String(raw).split("/").pop().replace(/\.safetensors$/i, "");
+    if (replyMentionsName(message?.content, name) || action.type !== "search_civitai") push({ name, path: action.result?.model || action.args?.model || action.args?.path || action.args?.destPath });
+  }
+  return out.slice(0, 4);
+}
+
+function imageLinkLabel(art, index) {
+  const prompt = String(art?.prompt || "").trim();
+  if (!prompt) return index === 0 ? "Image" : `Image ${index + 1}`;
+  return prompt.length > 42 ? `${prompt.slice(0, 42)}…` : prompt;
+}
+
+/** Prefer the search payload (already installed-first). Otherwise list installed/local. */
+function cardsFromChatPayload(data) {
+  const actions = Array.isArray(data?.actions) ? data.actions : [];
+  const searches = actions.filter(
+    (a) => a?.type === "search_civitai" && a.status === "executed" && Array.isArray(a.result?.loras),
+  );
+  if (searches.length) {
+    return searches.flatMap((a) =>
+      a.result.loras.filter(Boolean).map((c) => ({ ...c, fromChatSearch: true })),
+    );
+  }
+  const listed = [];
+  for (const a of actions) {
+    if (a?.status !== "executed" || !a.result) continue;
+    if (a.type === "list_loras" && Array.isArray(a.result.loras)) listed.push(...a.result.loras);
+    if (a.type === "list_checkpoints" && Array.isArray(a.result.checkpoints)) {
+      listed.push(...a.result.checkpoints);
+    }
+    if (a.type === "list_installed") {
+      for (const key of ["loras", "checkpoints", "embeddings", "vaes"]) {
+        if (Array.isArray(a.result[key])) listed.push(...a.result[key]);
+      }
+    }
+  }
+  if (listed.length) return listed;
+  return Array.isArray(data?.loras) ? data.loras : [];
 }
 
 /** Dismiss helpers shared by compact + grouped chrome menus. */
@@ -1892,6 +3101,8 @@ export default function App() {
   };
   const [prompt, setPrompt] = useState(() => bootSession.prompt || "");
   const [busy, setBusy] = useState(false);
+  /** Live transcript line while a chat turn is in flight. */
+  const [chatStatus, setChatStatus] = useState("");
   const [error, setError] = useState("");
   const [result, setResult] = useState(() => bootSession.result ?? null);
   const [batchResults, setBatchResults] = useState(() =>
@@ -1984,12 +3195,61 @@ export default function App() {
   const lastSucceededJobIdsRef = useRef(new Set());
   const [civitaiItems, setCivitaiItems] = useState([]);
   const [civitaiSubview, setCivitaiSubviewState] = useState(readStoredCivitaiSubview);
+  /** Agent tab: suggestions table, Meta, or a Civitai library subview (search stays typed). */
+  const [agentFocus, setAgentFocus] = useState("suggestions");
+  const [genMeta, setGenMeta] = useState({
+    sampler: "",
+    cfg: "",
+    steps: "",
+    clipSkip: "",
+    negativePrompt: "",
+    seed: "",
+    size: "",
+    quantity: 1,
+    source: "",
+    sourceLabel: "",
+    locked: false,
+    lastSeed: null,
+    samplerApplied: "",
+    samplerNote: "",
+    clipSkipApplied: null,
+    enhance: "",
+  });
+  const genMetaRef = useRef(genMeta);
+  genMetaRef.current = genMeta;
+  const genMetaDirtyRef = useRef(false);
   const setCivitaiSubview = (next) => {
     setCivitaiSubviewState(next);
     persistCivitaiSubview(next);
   };
   const [favorites, setFavorites] = useState(readFavorites);
+
+  useEffect(() => {
+    setFavorites((prev) => {
+      const next = dedupeFavoriteAssets(prev);
+      if (next.length !== prev.length) {
+        writeFavorites(next);
+        return next;
+      }
+      return prev;
+    });
+  }, []);
   const [civitaiDetail, setCivitaiDetail] = useState(null);
+  /** Last model the Agent Gallery should list community images for. */
+  const [agentAsset, setAgentAsset] = useState(null);
+  const [communityImages, setCommunityImages] = useState([]);
+  const [communityBusy, setCommunityBusy] = useState(false);
+  const [communityErr, setCommunityErr] = useState("");
+  const [communityNote, setCommunityNote] = useState("");
+  const [communityInstallId, setCommunityInstallId] = useState(null);
+  const [communityMore, setCommunityMore] = useState(false);
+  const [communityDetail, setCommunityDetail] = useState(null);
+  const [galleryDetail, setGalleryDetail] = useState(null);
+  const [imageFavorites, setImageFavorites] = useState(bootstrapImageFavorites);
+  const [favoriteType, setFavoriteType] = useState("LORA");
+  const communitySentinelRef = useRef(null);
+  const communityPagerRef = useRef({ key: "", cursor: null, page: null, done: true });
+  const communityFlightRef = useRef(false);
   const [civitaiDetailBusy, setCivitaiDetailBusy] = useState(false);
   const [detailImageIdx, setDetailImageIdx] = useState(0);
   const [downloadJobs, setDownloadJobs] = useState([]);
@@ -2069,6 +3329,7 @@ export default function App() {
   const workspaceRef = useRef(null);
   const workspaceSplitRef = useRef(workspaceSplit);
   const civitaiAbortRef = useRef(null);
+  const pinUseLockRef = useRef(new Set());
   const lastCivitaiSearchQRef = useRef("");
 
   const flashSave = (kind, msg) => {
@@ -2142,7 +3403,7 @@ export default function App() {
     }
   };
 
-  /** Featured style example from /v1/styles (styles[0]) — same text Styles tab shows. */
+  /** Featured style example from /v1/styles (styles[0]) — same text the Agent tab shows. */
   const examplePrompt = styles[0]?.examplePrompt || BEGINNER_EXAMPLE;
   const exampleCivitaiQuery = demoCivitaiQuery(examplePrompt);
 
@@ -2553,11 +3814,128 @@ export default function App() {
       setGallery(g.items || []);
       setError("");
       setAuthCta("");
+      void refreshGenMeta();
     } catch (e) {
       setError(e.message);
     }
     await refreshModels();
   };
+
+  const applyGenMeta = (data) => {
+    const s = data?.settings || data || {};
+    const next = {
+      sampler: s.sampler || "",
+      cfg: s.cfg ?? "",
+      steps: s.steps ?? "",
+      clipSkip: s.clipSkip ?? "",
+      negativePrompt: s.negativePrompt || "",
+      seed: s.seed ?? "",
+      size: s.size || "",
+      quantity: s.quantity || 1,
+      source: s.source || "",
+      sourceLabel: s.sourceLabel || "",
+      locked: Boolean(s.locked),
+      lastSeed: s.lastSeed ?? null,
+      samplerApplied: s.samplerApplied || "",
+      samplerNote: s.samplerNote || "",
+      clipSkipApplied: s.clipSkipApplied ?? null,
+      enhance: s.enhance || "",
+    };
+    genMetaDirtyRef.current = false;
+    genMetaRef.current = next;
+    setGenMeta(next);
+  };
+
+  const refreshGenMeta = async () => {
+    try {
+      applyGenMeta(await api("/v1/generation-meta"));
+    } catch {
+      /* panel keeps the last values */
+    }
+  };
+
+  const genMetaBody = (form, extra = {}) => {
+    const num = (v) => (v === "" || v == null || Number.isNaN(Number(v)) ? null : Number(v));
+    const body = {
+      sampler: form.sampler || null,
+      cfg: num(form.cfg),
+      steps: num(form.steps),
+      clipSkip: num(form.clipSkip),
+      negativePrompt: form.negativePrompt || "",
+      seed: form.seed === "" || form.seed == null ? null : num(form.seed),
+      clearSeed: form.seed === "" || form.seed == null,
+      size: form.size || null,
+      quantity: num(form.quantity) || 1,
+      enhance: form.enhance === "off" ? "off" : null,
+    };
+    if (extra.source) body.source = extra.source;
+    if (extra.sourceLabel) body.sourceLabel = extra.sourceLabel;
+    return body;
+  };
+
+  const saveGenMeta = async (form, extra) => {
+    const data = await api("/v1/generation-meta", {
+      method: "PUT",
+      body: JSON.stringify(genMetaBody(form, extra)),
+    });
+    applyGenMeta(data);
+    return data;
+  };
+
+  const flushGenMeta = async () => {
+    if (!genMetaDirtyRef.current) return;
+    try {
+      await saveGenMeta(genMetaRef.current);
+    } catch {
+      /* the next generate still sends the form fields */
+    }
+  };
+
+  const patchGenMeta = (partial) => {
+    genMetaDirtyRef.current = true;
+    setGenMeta((prev) => {
+      const next = { ...prev, ...partial, source: "user", sourceLabel: "Hand edit", locked: true };
+      genMetaRef.current = next;
+      return next;
+    });
+  };
+
+  const useExampleMeta = async () => {
+    try {
+      applyGenMeta(await api("/v1/generation-meta/recommend", { method: "POST", body: "{}" }));
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  /** Wipe composer prompt, Agent Meta, enhance, seed, and pinned LoRAs (same as gallery Clear). */
+  const resetReproductionInputs = async ({ quiet = false } = {}) => {
+    setPrompt("");
+    setCommunityErr("");
+    if (!quiet) setSavedMsg("");
+    const next = { ...BLANK_GEN_META };
+    genMetaDirtyRef.current = true;
+    genMetaRef.current = next;
+    setGenMeta(next);
+    setSession((prev) => {
+      void persistStudio({ pinnedLoras: [] });
+      return { ...prev, pinnedLoras: [], sessionNote: "" };
+    });
+    try {
+      await saveGenMeta(next);
+    } catch {
+      /* form and session state are already cleared */
+    }
+    if (quiet) {
+      setCommunityNote("");
+    } else {
+      setCommunityNote(
+        "Cleared the prompt, negative prompt, generation meta (enhance, seed, sampler fields), and pinned LoRAs.",
+      );
+    }
+  };
+
+  const clearReproductionInputs = () => resetReproductionInputs({ quiet: false });
 
   const submitLogin = async (e) => {
     e?.preventDefault?.();
@@ -2602,17 +3980,15 @@ export default function App() {
     setSavedMsg("Signed out.");
   };
 
-  const isFavorite = (item) =>
-    favorites.some((f) => loraKey(f) === loraKey(item));
+  const isFavorite = (item) => favorites.some((f) => favoriteAssetsMatch(f, item));
 
   const toggleFavorite = (item) => {
     setFavorites((prev) => {
-      const key = loraKey(item);
-      const exists = prev.some((f) => loraKey(f) === key);
+      const exists = prev.some((f) => favoriteAssetsMatch(f, item));
       const civitaiId = resolveCivitaiModelId(item);
       const next = exists
-        ? prev.filter((f) => loraKey(f) !== key)
-        : [
+        ? prev.filter((f) => !favoriteAssetsMatch(f, item))
+        : dedupeFavoriteAssets([
             {
               id: civitaiId ?? item.id,
               modelId: civitaiId ?? item.modelId ?? null,
@@ -2629,7 +4005,7 @@ export default function App() {
               trainedWords: item.trainedWords,
             },
             ...prev,
-          ].slice(0, 200);
+          ]).slice(0, 200);
       writeFavorites(next);
       void persistStudio({ favorites: next });
       return next;
@@ -2641,12 +4017,36 @@ export default function App() {
     setDetailImageIdx(0);
   };
 
+  const rememberAgentAsset = (item, versionId) => {
+    if (!item) return;
+    const modelId = resolveCivitaiModelId(item);
+    const raw = versionId ?? item.versionId ?? item.modelVersionId;
+    const modelVersionId = raw != null && Number(raw) > 0 ? Number(raw) : null;
+    if (modelId == null && modelVersionId == null) return;
+    setAgentAsset({
+      modelId: modelId ?? null,
+      modelVersionId,
+      name: item.name || "This model",
+    });
+  };
+
+  const openAssetGallery = (item, versionId) => {
+    rememberAgentAsset(item, versionId);
+    setCivitaiDetail(null);
+    setDetailImageIdx(0);
+    setCommunityDetail(null);
+    setTab("agent");
+    setAgentFocus("gallery");
+  };
+
   const selectCivitaiVariant = (versionId, fileId) => {
+    let nextModel = null;
     setCivitaiDetail((prev) => {
       if (!prev?.model) return prev;
-      const next = applyCivitaiVariant(prev.model, versionId, fileId);
-      return { ...prev, model: next };
+      nextModel = applyCivitaiVariant(prev.model, versionId, fileId);
+      return { ...prev, model: nextModel };
     });
+    if (nextModel) rememberAgentAsset(nextModel, versionId);
     setDetailImageIdx(0);
   };
 
@@ -2672,6 +4072,7 @@ export default function App() {
       item.versionId,
       item.fileId,
     );
+    rememberAgentAsset(initial, versionId);
     setCivitaiDetail({
       model: initial,
       related: [],
@@ -2682,7 +4083,13 @@ export default function App() {
       if (willFetch) {
         let data;
         if (civitaiId != null) {
-          data = await api(`/v1/civitai/models/${civitaiId}`);
+          try {
+            data = await api(`/v1/civitai/models/${civitaiId}`);
+          } catch (err) {
+            // Chat cards sometimes carry a version id where a model id belongs.
+            if (versionId == null) throw err;
+            data = await api(`/v1/civitai/model-versions/${versionId}`);
+          }
         } else {
           // Installed sidecars often have versionId but null modelId — resolve via version.
           data = await api(`/v1/civitai/model-versions/${versionId}`);
@@ -2731,6 +4138,7 @@ export default function App() {
             ),
           );
         }
+        rememberAgentAsset(merged, merged.versionId ?? versionId);
         setCivitaiDetail({
           model: merged,
           related,
@@ -3095,11 +4503,23 @@ export default function App() {
       apiUrl: studioOrigin(),
     });
 
+  const linuxWorkerUpdateCmd = () =>
+    buildLinuxWorkerUpdateCmd({ origin: studioOrigin() });
+
   const copyWorkerSetupCmd = async (which) => {
     const text = which === "windows" ? windowsWorkerSetupCmd() : linuxWorkerSetupCmd();
     try {
       await navigator.clipboard.writeText(text);
       setSetupCmdCopyMsg(which === "windows" ? "Windows copied" : "Linux copied");
+    } catch {
+      setSetupCmdCopyMsg("Select and copy manually");
+    }
+  };
+
+  const copyWorkerUpdateCmd = async () => {
+    try {
+      await navigator.clipboard.writeText(linuxWorkerUpdateCmd());
+      setSetupCmdCopyMsg("Update command copied");
     } catch {
       setSetupCmdCopyMsg("Select and copy manually");
     }
@@ -3168,6 +4588,13 @@ export default function App() {
   };
   const canCloudGenerate = () => Boolean(settings?.openRouterConfigured);
 
+  const pinnedCivitaiModelId = (l) => {
+    const fromField = positiveId(l.modelId ?? l.civitaiModelId);
+    if (fromField != null) return fromField;
+    if (l.id != null && /^\d+$/.test(String(l.id))) return Number(l.id);
+    return undefined;
+  };
+
   const pinnedPayload = () =>
     (session.pinnedLoras || [])
       .filter((l) => isPinnableAsset(l))
@@ -3175,9 +4602,11 @@ export default function App() {
         name: l.path
           ? String(l.path).split("/").pop().replace(/\.safetensors$/i, "")
           : l.name,
-        scale: l.scale ?? 0.8,
+        scale: l.scale ?? 1.0,
         path: l.path || undefined,
         baseModel: l.baseModel || undefined,
+        versionId: positiveId(l.versionId) ?? undefined,
+        modelId: pinnedCivitaiModelId(l),
       }));
 
   const isPinned = (item) =>
@@ -3203,7 +4632,7 @@ export default function App() {
         baseModel: item.baseModel || null,
         path: extra.path || item.path || null,
         versionId: item.versionId || null,
-        scale: 0.8,
+        scale: loraScaleDefault(item, extra),
       };
       const baseHint = item.baseModel
         ? ` Needs base family “${item.baseModel}” on the local worker (Worker → active base / install checkpoint).`
@@ -3217,6 +4646,18 @@ export default function App() {
           ? `Pinned “${item.name}”. Trigger word “${item.triggerWord}” is optional — Freya keeps your prompt as you wrote it.${baseHint}`
           : `Pinned “${item.name}” for this session. Your prompt stays as you wrote it.${baseHint}`,
       };
+    });
+  };
+
+  const setPinScale = (item, scale) => {
+    const n = Number(scale);
+    if (Number.isNaN(n) || n < 0 || n > 2) return;
+    setSession((prev) => {
+      const pinnedLoras = (prev.pinnedLoras || []).map((p) =>
+        loraKey(p) === loraKey(item) ? { ...p, scale: n } : p,
+      );
+      void persistStudio({ pinnedLoras });
+      return { ...prev, pinnedLoras };
     });
   };
 
@@ -3265,11 +4706,29 @@ export default function App() {
       : [];
     const artifactIds = artifacts.map((a) => a.artifactId).filter(Boolean);
     const ideasNext = Array.isArray(data.ideas) ? data.ideas : [];
-    const lorasNext = Array.isArray(data.loras) ? data.loras : [];
     const query = data.civitaiQuery || "";
+    const sourceCards = cardsFromChatPayload(data);
+    const presented = presentLookup(sourceCards, installedAssets, query || "");
+    const lorasNext = [...presented.existing, ...presented.fresh];
 
     if (ideasNext.length) setIdeas(ideasNext);
-    if (lorasNext.length) setSuggestedLoras(lorasNext);
+    if (lorasNext.length) {
+      const fromSearch = sourceCards.some((c) => c.fromChatSearch);
+      // Search payload keeps version ids so installed rows can match them.
+      // A worker listing is stored only after that lookup filter.
+      setSuggestedLoras(fromSearch ? sourceCards : lorasNext);
+      // Lookups render on Agent. A turn that also made images stays put.
+      if (!artifacts.length) {
+        setAgentFocus("suggestions");
+        setTab("agent");
+      }
+    }
+    if (settings?.civitaiConfigured) {
+      const bare = presented.existing.filter(
+        (a) => a?.path && !a.thumbnailUrl && (a.versionId != null || a.modelId != null),
+      );
+      if (bare.length) scheduleEnrichInstalledThumbs(bare);
+    }
     if (query) {
       setCivitaiQuery(query);
       setCivitaiQ(query);
@@ -3330,8 +4789,11 @@ export default function App() {
         if (a.type === "generate_image") return `Generated image`;
         if (a.type === "run_session")
           return `Generated ${(a.result?.results || []).length || "a"} variation(s)`;
-        if (a.type === "search_civitai")
-          return `Searched Civitai for “${a.result?.query || a.args?.query || "…"}”`;
+        if (a.type === "search_civitai") {
+          const searchedType = a.result?.type || a.args?.type;
+          const typeLabel = searchedType ? `${searchedType} ` : "";
+          return `Searched Civitai ${typeLabel}for “${a.result?.query || a.args?.query || "…"}”`;
+        }
         if (a.type === "suggest_ideas")
           return `Suggested ${(a.result?.ideas || []).length || "some"} ideas`;
         if (a.type === "install_asset") {
@@ -3356,6 +4818,8 @@ export default function App() {
         if (a.type === "set_base_model")
           return `Set active base to ${a.result?.model || a.args?.model || "—"}`;
         if (a.type === "generate_video") return `Generated ${a.result?.modality || "video"}`;
+        if (a.type === "civitai_images")
+          return `Community images: ${a.result?.count ?? (a.result?.items || []).length ?? 0}`;
         if (a.type === "gallery_list")
           return `Gallery: ${(a.result?.items || []).length || 0} item(s)`;
         if (a.type === "gallery_get") return `Gallery item ${a.result?.id || a.args?.id || "—"}`;
@@ -3476,6 +4940,7 @@ export default function App() {
       artifactIds,
       ideas: ideasNext,
       loras: lorasNext,
+      civitaiQuery: query || null,
       route,
       routeContext,
       resolvedModels,
@@ -3491,6 +4956,16 @@ export default function App() {
           ...(prev.turns || []),
         ].slice(0, 12),
       }));
+    }
+
+    if (
+      actions.some((a) =>
+        ["set_generation_meta", "recommend_generation_meta", "get_generation_meta", "generate_image", "generate_video", "run_session"].includes(
+          a.type,
+        ),
+      )
+    ) {
+      void refreshGenMeta();
     }
 
     return artifacts;
@@ -3511,6 +4986,7 @@ export default function App() {
         recentPrompts: (session.turns || []).slice(0, 5).map((t) => t.prompt),
       },
       loras: pinnedPayload(),
+      toolContext: priorToolContext(session),
       ...extra,
     };
     body.videoModel = videoModel || AUTO_VIDEO.id;
@@ -3527,6 +5003,7 @@ export default function App() {
 
   /** Primary composer action — send a chat message; tools run per Plan/Auto/YOLO. */
   const submitChat = async (overrideText, extra = {}) => {
+    await flushGenMeta();
     const text = (overrideText ?? prompt).trim();
     if (!text && !extra.confirm) return;
     if (generateBackend === "local" && !localBackendOk) {
@@ -3536,6 +5013,7 @@ export default function App() {
     const sessionId = activeIdRef.current;
     const userText = text || session.goal || examplePrompt;
     setBusy(true);
+    setChatStatus("Thinking");
     setError("");
     setSavedMsg("");
     try {
@@ -3545,9 +5023,8 @@ export default function App() {
         setSession((prev) => ({ ...prev, goal: prev.goal || userText }));
         setPrompt("");
       }
-      const data = await api("/v1/chat", {
-        method: "POST",
-        body: JSON.stringify(chatBody(userText, extra)),
+      const data = await postChat(chatBody(userText, extra), (status) => {
+        if (activeIdRef.current === sessionId) setChatStatus(status);
       });
       if (activeIdRef.current !== sessionId) return;
       applyChatResponse(data, userText);
@@ -3557,6 +5034,7 @@ export default function App() {
     } catch (e) {
       if (activeIdRef.current === sessionId) setError(e.message);
     } finally {
+      setChatStatus("");
       if (activeIdRef.current === sessionId) setBusy(false);
     }
   };
@@ -3587,9 +5065,9 @@ export default function App() {
         lower.includes("mp4") ||
         lower.includes("animate "));
     const wantLocal = generateBackend === "local";
+    const enhanceMode = genMetaRef.current?.enhance;
     const body = {
       prompt: nlPrompt,
-      enhance: "auto",
       backend: wantLocal
         ? "local"
         : loras.length && hasWorker() && !looksGif && !looksVideo
@@ -3598,6 +5076,8 @@ export default function App() {
       loras,
       automationMode,
     };
+    if (enhanceMode === "off") body.enhance = "off";
+    else if (enhanceMode && enhanceMode !== "auto") body.enhance = enhanceMode;
     if (looksGif) body.modality = "gif";
     if (looksVideo) body.modality = "video";
     if (looksGif || looksVideo) {
@@ -3605,6 +5085,15 @@ export default function App() {
     } else if (!wantLocal && imageModel && imageModel !== AUTO_IMAGE.id) {
       body.model = imageModel;
     }
+    const form = genMetaRef.current;
+    if (form?.sampler) body.sampler = form.sampler;
+    if (form?.cfg !== "" && form?.cfg != null) body.cfg = Number(form.cfg);
+    if (form?.steps !== "" && form?.steps != null) body.steps = Number(form.steps);
+    if (form?.clipSkip !== "" && form?.clipSkip != null) body.clipSkip = Number(form.clipSkip);
+    if (form?.negativePrompt) body.negativePrompt = form.negativePrompt;
+    if (form?.seed !== "" && form?.seed != null) body.seed = Number(form.seed);
+    if (form?.size) body.size = form.size;
+    if (form?.quantity) body.quantity = Number(form.quantity) || 1;
     return body;
   };
 
@@ -3624,6 +5113,7 @@ export default function App() {
   };
 
   const runOne = async (nlPrompt) => {
+    await flushGenMeta();
     const data = await api("/v1/run", {
       method: "POST",
       body: JSON.stringify(runBody(nlPrompt)),
@@ -3632,6 +5122,10 @@ export default function App() {
   };
 
   const destPathForAsset = (item) => {
+    const given = String(item?.destPath || "");
+    if (given && !given.includes("..") && !given.startsWith("/") && !given.includes("\\")) {
+      return given;
+    }
     const safe = (item.name || "model").replace(/[^a-zA-Z0-9._-]+/g, "_");
     const ext = fileExtFromVariant(item);
     const t = (item.modelType || "").toLowerCase();
@@ -3810,20 +5304,27 @@ export default function App() {
             },
             thumb,
           );
+          const applyThumb = (a) =>
+            a?.path === asset.path
+              ? {
+                  ...a,
+                  thumbnailUrl: a.thumbnailUrl || thumb,
+                  modelId: a.modelId ?? resolvedModelId,
+                  imageUrls: a.imageUrls?.length ? a.imageUrls : model?.imageUrls,
+                }
+              : a;
           setInstalledAssets((prev) => {
-            const next = prev.map((a) =>
-              a.path === asset.path
-                ? {
-                    ...a,
-                    thumbnailUrl: a.thumbnailUrl || thumb,
-                    modelId: a.modelId ?? resolvedModelId,
-                    imageUrls: a.imageUrls?.length ? a.imageUrls : model?.imageUrls,
-                  }
-                : a,
-            );
+            const next = prev.map(applyThumb);
             installedFingerprintRef.current = installedListFingerprint(next);
             return next;
           });
+          setSuggestedLoras((prev) => prev.map(applyThumb));
+          setSession((prev) => ({
+            ...prev,
+            messages: (prev.messages || []).map((m) =>
+              Array.isArray(m.loras) ? { ...m, loras: m.loras.map(applyThumb) } : m,
+            ),
+          }));
         } catch {
           /* ignore per-asset resolve failures */
         }
@@ -3886,21 +5387,38 @@ export default function App() {
   };
 
   const setInstalledAsBase = async (asset) => {
-    if (!asset?.path) return;
+    if (!asset?.path) return false;
     try {
-      await api("/v1/worker/base-model", {
+      const res = await api("/v1/worker/base-model", {
         method: "PUT",
         body: JSON.stringify({
           model: asset.path,
           baseModel: asset.baseModel || undefined,
         }),
       });
-      setActiveBasePath(asset.path);
-      setLocalBaseModel(asset.path);
-      if (typeof asset.baseModel === "string") setLocalBaseFamily(asset.baseModel);
-      setSavedMsg(`Active base → ${asset.name || asset.path}`);
+      const nextPath = res?.model || asset.path;
+      const nextFamily =
+        typeof res?.baseModel === "string" ? res.baseModel : asset.baseModel || "";
+      setActiveBasePath(nextPath);
+      setLocalBaseModel(nextPath);
+      if (nextFamily) setLocalBaseFamily(nextFamily);
+      setWorkerStats((prev) =>
+        prev
+          ? {
+              ...prev,
+              modelLoaded: {
+                ...(prev.modelLoaded || {}),
+                model: nextPath,
+                baseModel: nextFamily || prev.modelLoaded?.baseModel || null,
+              },
+            }
+          : prev,
+      );
+      setSavedMsg(`Active base → ${asset.name || nextPath}`);
+      return true;
     } catch (e) {
       setError(e.message);
+      return false;
     }
   };
 
@@ -3923,9 +5441,152 @@ export default function App() {
         thumbnailUrl: thumb || undefined,
       }),
     });
-    // Install/enqueue must not auto-pin — user pins LoRAs explicitly when wanted.
+    // A plain download never pins. Pin-to-use calls this, then pins or selects the base.
     await refreshDownloadJobs();
     return { dest, jobId: res?.jobId, status: res?.status || "queued" };
+  };
+
+  const waitForInstallJob = async (jobId) => {
+    if (!jobId) return null;
+    const deadline = Date.now() + 10 * 60 * 1000;
+    while (Date.now() < deadline) {
+      const data = await api("/v1/civitai/jobs");
+      const jobs = Array.isArray(data?.data) ? data.data : [];
+      const job = jobs.find((j) => j.id === jobId);
+      if (!job) return null;
+      const status = String(job.status || "").toLowerCase();
+      if (status === "succeeded" || status === "failed" || status === "cancelled") return job;
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+    return null;
+  };
+
+  /** Queue a download and resolve the worker path once the job succeeds. Does not pin. */
+  const installAssetAndWait = async (item) => {
+    const existing = findInstalledForItem(item);
+    if (existing?.path) return existing.path;
+    if (!hasWorker()) {
+      setError(`“${item?.name || "Asset"}” needs a worker before it can be installed.`);
+      return null;
+    }
+    if (!settings?.civitaiConfigured) {
+      setError("Add a Civitai key in Settings before installing.");
+      return null;
+    }
+    const active = activeJobForItem(item);
+    let jobId = active?.id;
+    let dest = active?.destPath || destPathForAsset(item);
+    if (!jobId) {
+      const queued = await installOne(item);
+      jobId = queued.jobId;
+      dest = queued.dest || dest;
+    }
+    setSavedMsg(`Installing “${item?.name || dest}”…`);
+    const job = await waitForInstallJob(jobId);
+    const status = String(job?.status || "").toLowerCase();
+    if (status !== "succeeded") {
+      setError(job?.error || `Install of “${item?.name || "asset"}” did not finish.`);
+      return null;
+    }
+    await refreshInstalledAssets({ quiet: true });
+    await refreshDownloadJobs();
+    return job?.destPath || dest;
+  };
+
+  const selectInstalledBase = async (asset) => {
+    if (!asset?.path) return;
+    if (activeBasePath && activeBasePath === asset.path) return;
+    await setInstalledAsBase(asset);
+  };
+
+  /** Explicit pin: install a missing LoRA then pin it, and install or select the matching base. */
+  const pinToUse = async (item) => {
+    if (!item) return;
+    const lock = lookupCardKey(item);
+    if (pinUseLockRef.current.has(lock)) return;
+    pinUseLockRef.current.add(lock);
+    setError("");
+    try {
+      if (isCheckpointAsset(item)) {
+        const path = (await findInstalledForItem(item)?.path) || (await installAssetAndWait(item));
+        if (!path) return;
+        await selectInstalledBase({
+          ...item,
+          path,
+          name: item.name,
+          baseModel: item.baseModel,
+        });
+        setSavedMsg(`Base set to ${item.name || path}.`);
+        return;
+      }
+      if (!isPinnableAsset(item)) {
+        setError(`“${item.name || "Asset"}” is not a LoRA or a checkpoint.`);
+        return;
+      }
+      const installed = findInstalledForItem(item);
+      const path = installed?.path || (await installAssetAndWait(item));
+      if (!path && !installed) return;
+      pinLora(
+        { ...item, ...(installed || {}), path: path || installed?.path || item.path || null },
+        path ? { path } : undefined,
+      );
+      const family = String(item.baseModel || installed?.baseModel || "").trim();
+      if (!family) {
+        setSavedMsg(`Pinned “${item.name}”.`);
+        return;
+      }
+      if (
+        activeBasePath &&
+        checkpointMatchesFamily(
+          { baseModel: localBaseFamily, name: localBaseModel, path: activeBasePath },
+          family,
+        )
+      ) {
+        setSavedMsg(`Pinned “${item.name}”. Base “${family}” is already selected.`);
+        return;
+      }
+      const onDisk = installedAssets.find(
+        (asset) => isCheckpointAsset(asset) && checkpointMatchesFamily(asset, family),
+      );
+      if (onDisk?.path) {
+        await selectInstalledBase(onDisk);
+        setSavedMsg(`Pinned “${item.name}”. Base set to ${onDisk.name || onDisk.path}.`);
+        return;
+      }
+      if (!settings?.civitaiConfigured || !hasWorker()) {
+        setSavedMsg(
+          `Pinned “${item.name}”. No installed checkpoint matches base “${family}”.`,
+        );
+        return;
+      }
+      const data = await api(
+        `/v1/civitai/search?q=${encodeURIComponent(family)}&limit=4&types=Checkpoint`,
+      );
+      const candidate = (data.items || []).find((row) => row) || null;
+      if (!candidate) {
+        setSavedMsg(`Pinned “${item.name}”. No checkpoint matched base “${family}”.`);
+        return;
+      }
+      const basePath = await installAssetAndWait({
+        ...candidate,
+        modelType: candidate.modelType || "Checkpoint",
+      });
+      if (!basePath) return;
+      await selectInstalledBase({
+        ...candidate,
+        path: basePath,
+        modelType: "Checkpoint",
+        baseModel: candidate.baseModel || family,
+      });
+      setSavedMsg(
+        `Pinned “${item.name}”. Installed and selected base ${candidate.name || family}.`,
+      );
+    } catch (e) {
+      const msg = e.message || "Could not pin that asset";
+      if (!/already downloading/i.test(msg)) setError(msg);
+    } finally {
+      pinUseLockRef.current.delete(lock);
+    }
   };
 
   const executeBatch = async (batch, goal) => {
@@ -4543,9 +6204,9 @@ export default function App() {
     }
   };
 
-  // Search-as-you-type on the Civitai tab (debounced; AbortController cancels in-flight).
+  // Search-as-you-type on Agent → Search (debounced; AbortController cancels in-flight).
   useEffect(() => {
-    if (tab !== "civitai" || civitaiSubview !== "search") return;
+    if (tab !== "agent" || agentFocus !== "search") return;
     const q = civitaiQ.trim();
     if (!q) {
       const pending = civitaiAbortRef.current;
@@ -4562,15 +6223,15 @@ export default function App() {
     }, CIVITAI_SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: debounce on query/tab only
-  }, [civitaiQ, tab, civitaiSubview]);
+  }, [civitaiQ, tab, agentFocus]);
 
   useEffect(() => {
-    if (tab !== "civitai") return;
+    if (tab !== "agent") return;
     // Keep installed + jobs warm so search/favorites/detail can flip Install → Delete / Downloading…
     refreshInstalledAssets();
     refreshDownloadJobs();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tab, civitaiSubview]);
+  }, [tab, agentFocus]);
 
   useEffect(() => {
     if (tab !== "worker") return undefined;
@@ -4590,7 +6251,7 @@ export default function App() {
     const active = downloadJobs.some((j) =>
       ["queued", "downloading"].includes(j.status),
     );
-    const onCivitai = tab === "civitai";
+    const onCivitai = tab === "agent" && agentFocus !== "suggestions";
     // Follow in-flight installs from any tab. Success must refresh worker lists
     // even when this effect restarts because the job just left "downloading".
     if (!active && !(onCivitai && downloadJobs.length > 0)) return undefined;
@@ -4609,7 +6270,7 @@ export default function App() {
         await refreshInstalledAssets({ quiet: true });
       }
     };
-    const ms = active || (onCivitai && civitaiSubview === "downloads") ? 1500 : 5000;
+    const ms = active || (onCivitai && agentFocus === "downloads") ? 1500 : 5000;
     const t = setInterval(tick, ms);
     const soon = setTimeout(tick, 250);
     return () => {
@@ -4620,7 +6281,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     tab,
-    civitaiSubview,
+    agentFocus,
     downloadJobs.some((j) => ["queued", "downloading"].includes(j.status)),
     downloadJobs.length > 0,
   ]);
@@ -4739,6 +6400,20 @@ export default function App() {
       previewResult.artifactId === gallery[0]?.id ||
       previewResult.artifactId === gallery[0]?.artifactId);
 
+  /** Items already shown in the feature / session-set preview — omit from the wall below. */
+  const galleryPreviewIds = new Set();
+  if (batchResults.length > 1) {
+    for (const r of batchResults) {
+      if (r?.artifactId) galleryPreviewIds.add(r.artifactId);
+    }
+  } else if (previewResult?.artifactId) {
+    galleryPreviewIds.add(previewResult.artifactId);
+  }
+  const galleryWallItems = gallery.filter((g) => {
+    const id = g.id || g.artifactId;
+    return id && !galleryPreviewIds.has(id);
+  });
+
   const selectGalleryPreview = (g) => {
     const next = galleryToResult(g);
     if (!next) return;
@@ -4763,6 +6438,9 @@ export default function App() {
       );
       setBatchResults((prev) => prev.filter((r) => r.artifactId !== id));
       setResult((prev) => (prev?.artifactId === id ? null : prev));
+      setGalleryDetail((prev) =>
+        prev && (prev.artifactId === id || prev.id === id) ? null : prev,
+      );
       setSession((prev) => ({
         ...prev,
         turns: (prev.turns || []).map((t) => ({
@@ -4815,6 +6493,7 @@ export default function App() {
     ideas.length,
     pendingPlan,
     pendingQuestion,
+    chatStatus,
   ]);
 
   const hasTimeline =
@@ -4823,16 +6502,24 @@ export default function App() {
     (session.pinnedLoras || []).length > 0 ||
     Boolean(session.sessionNote);
 
-  const renderLoraCard = (item, { compact = false, onAfterPin } = {}) => {
+  const renderLoraCard = (item, { compact = false, layout = "card" } = {}) => {
     const pinned = isPinned(item);
     const favorited = isFavorite(item);
     const pinnable = isPinnableAsset(item);
+    const checkpoint = isCheckpointAsset(item);
     const typeLabel = item.modelType || item.kind || "LORA";
     const downloads = formatStat(item.stats?.downloadCount);
     const thumbUrl = pickCivitaiThumb(item, favorites);
     const cardKey = item.path ? `path:${item.path}` : loraKey(item);
+    const row = layout === "row";
+    const canOpenGallery =
+      resolveCivitaiModelId(item) != null || Number(item.versionId || item.modelVersionId) > 0;
     return (
-      <article key={cardKey} className={`lora-card${compact ? " compact" : ""}`}>
+      <article
+        key={cardKey}
+        role={row ? "row" : undefined}
+        className={row ? "lora-card asset-match-row" : `lora-card${compact ? " compact" : ""}`}
+      >
         <button
           type="button"
           className="lora-card-thumb lora-card-thumb-btn"
@@ -4872,18 +6559,38 @@ export default function App() {
           >
             <IconStar filled={favorited} />
           </button>
-          {pinnable ? (
+          {canOpenGallery ? (
             <button
               type="button"
-              className={`${pinned ? "primary" : "ghost"} icon-btn`}
-              title={pinned ? "Unpin from this session" : "Pin to session"}
-              aria-label={pinned ? "Unpin from session" : "Pin to session"}
+              className="ghost icon-btn"
+              title="Community images for this model"
+              aria-label="Open community gallery"
+              onClick={() => openAssetGallery(item)}
+            >
+              <IconGallery />
+            </button>
+          ) : null}
+          {pinnable || checkpoint ? (
+            <button
+              type="button"
+              className={`${pinned && pinnable ? "primary" : "ghost"} icon-btn`}
+              title={
+                pinned && pinnable
+                  ? "Unpin from this session"
+                  : checkpoint
+                    ? "Install if needed and set as base"
+                    : "Pin to use — installs the LoRA and matching base if needed"
+              }
+              aria-label={
+                pinned && pinnable
+                  ? "Unpin from session"
+                  : checkpoint
+                    ? "Set as base"
+                    : "Pin to use"
+              }
               onClick={() => {
-                if (pinned) unpinLora(item);
-                else {
-                  pinLora(item, item.path ? { path: item.path } : undefined);
-                  onAfterPin?.(item);
-                }
+                if (pinned && pinnable) unpinLora(item);
+                else void pinToUse(item);
               }}
             >
               <IconPin />
@@ -4892,6 +6599,29 @@ export default function App() {
           {renderInstallAction(item)}
         </div>
       </article>
+    );
+  };
+
+  const renderAssetLookup = ({ existing, fresh }) => {
+    if (!existing.length && !fresh.length) return null;
+    const rows = (items) => items.map((item) => renderLoraCard(item, { layout: "row" }));
+    return (
+      <div className="asset-match-table" role="table" aria-label="Civitai matches">
+        {existing.length > 0 && (
+          <div className="asset-match-group" role="rowgroup" aria-label="Installed">
+            <div className="asset-match-label">Installed</div>
+            {rows(existing)}
+          </div>
+        )}
+        {fresh.length > 0 && (
+          <div className="asset-match-group" role="rowgroup" aria-label="Other Civitai matches">
+            <div className="asset-match-label">Other Civitai matches</div>
+            <div className="asset-match-scroll">
+              <div className="asset-match-group">{rows(fresh)}</div>
+            </div>
+          </div>
+        )}
+      </div>
     );
   };
 
@@ -4914,9 +6644,780 @@ export default function App() {
           ? [detailModel.thumbnailUrl]
           : []) || [];
   const detailRelated = civitaiDetail?.related || [];
+  const detailRecommendedRaw =
+    (detailSelectedVersion?.recommendedResources?.length
+      ? detailSelectedVersion.recommendedResources
+      : detailModel?.recommendedResources) || [];
+  const detailRecommendedCards = detailRecommendedRaw
+    .map(recommendedResourceCard)
+    .filter(Boolean);
+  const detailCheckpointRecs = detailRecommendedCards.filter(
+    (card) =>
+      String(card.modelType || "")
+        .toLowerCase()
+        .replace(/[\s_-]/g, "") === "checkpoint",
+  );
+  const detailSuggestionSource = detailCheckpointRecs.length
+    ? detailCheckpointRecs
+    : detailRecommendedCards;
+  const detailSuggestions = detailSuggestionSource.length
+    ? detailSuggestionSource.map((model) => ({
+        model,
+        note: "Recommended base checkpoint",
+        relation: "recommended_checkpoint",
+      }))
+    : detailRelated;
+  const detailSuggestionsAreRecommended = detailSuggestionSource.length > 0;
 
-  const showAssistPanel =
-    ideas.length > 0 || suggestedLoras.length > 0 || suggestNote || civitaiQuery;
+  const assetContext = (item, versionId) => {
+    if (!item) return null;
+    const modelId = resolveCivitaiModelId(item);
+    const raw = versionId ?? item.versionId ?? item.modelVersionId;
+    const modelVersionId = raw != null && Number(raw) > 0 ? Number(raw) : null;
+    if (modelId == null && modelVersionId == null) return null;
+    return {
+      modelId: modelId ?? null,
+      modelVersionId,
+      name: item.name || "This model",
+    };
+  };
+  const chatLookup = presentLookup(suggestedLoras, installedAssets, civitaiQuery || "");
+  const chatLookupCount = chatLookup.existing.length + chatLookup.fresh.length;
+  const suggestionAsset =
+    [...chatLookup.existing, ...chatLookup.fresh, ...installedAssets]
+      .map((item) => assetContext(item))
+      .find(Boolean) || null;
+  const galleryContext =
+    (detailModel && assetContext(detailModel, detailSelectedVersion?.id ?? detailModel.versionId)) ||
+    agentAsset ||
+    suggestionAsset;
+  const galleryKey = galleryContext
+    ? `${galleryContext.modelId || ""}:${galleryContext.modelVersionId || ""}:${
+        settings?.alignment?.allowNsfwLocal ? "nsfw" : "sfw"
+      }`
+    : "";
+
+  const imageFavorited = (item) => imageFavorites.some((f) => communityItemsMatch(f, item));
+
+  const originForContext = (ctx) => {
+    if (!ctx) return null;
+    const card = findContextCard(ctx, [
+      detailModel,
+      ...favorites,
+      ...civitaiItems,
+      ...suggestedLoras,
+      ...installedAssets,
+      ...(session?.pinnedLoras || []),
+    ]);
+    return originFromCard(card, ctx);
+  };
+
+  const toggleImageFavorite = (item) => {
+    if (!item) return;
+    const keys = communityMediaKeys(item);
+    if (!keys.length) return;
+    setImageFavorites((prev) => {
+      const exists = prev.some((f) => communityItemsMatch(f, item));
+      const ctx = galleryContext || {
+        modelId: item.modelId ?? null,
+        modelVersionId: item.modelVersionId ?? item.modelVersionIds?.[0] ?? null,
+        name: item.modelName || "",
+      };
+      const next = exists
+        ? prev.filter((f) => !communityItemsMatch(f, item))
+        : dedupeCommunityItems([
+            communityImageFavorite(item, ctx, originForContext(ctx)),
+            ...prev,
+          ]).slice(0, 200);
+      writeImageFavorites(next);
+      return next;
+    });
+  };
+
+  const metaField = (item, key) => {
+    const direct = item?.[key];
+    if (direct != null && direct !== "") return direct;
+    const nested = item?.meta?.[key];
+    if (nested != null && nested !== "") return nested;
+    return "";
+  };
+
+  /** Copy clears the composer first, then fills prompt, negative, meta, base, and installed LoRA pins. */
+  const copyImageInput = async (item) => {
+    await resetReproductionInputs({ quiet: true });
+    const prompt = String(item?.prompt || "").trim();
+    const negative = String(item?.negativePrompt || item?.negative || "").trim();
+    const sampler = metaField(item, "sampler");
+    const steps = metaField(item, "steps");
+    const cfg = metaField(item, "cfg");
+    const clipSkip = metaField(item, "clipSkip");
+    const seed = metaField(item, "seed");
+    const size = metaField(item, "size");
+    const hasAnything = [prompt, negative, sampler, steps, cfg, clipSkip, seed, size].some(
+      (value) => value !== "" && value != null,
+    );
+    if (!hasAnything && !item?.checkpoint) {
+      setCommunityNote("");
+      setCommunityErr("This image has no prompt or generation data to copy.");
+      return;
+    }
+    const postResourcesEarly = Array.isArray(item?.resources) ? item.resources : [];
+    const lorasToPinEarly = installedLorasToPinFromCommunity(
+      item,
+      installedAssets,
+      galleryContext,
+    );
+    const promptWithTriggers = appendMissingLoraTriggers(prompt, lorasToPinEarly);
+    if (promptWithTriggers) setPrompt(promptWithTriggers);
+    const next = {
+      ...BLANK_GEN_META,
+      sampler: sampler === "" ? "" : String(sampler),
+      cfg,
+      steps,
+      clipSkip,
+      seed,
+      size: size ? String(size) : "",
+      negativePrompt: negative,
+      enhance: "off",
+      source: "gallery",
+      sourceLabel: "Community image",
+      locked: true,
+    };
+    genMetaDirtyRef.current = true;
+    genMetaRef.current = next;
+    setGenMeta(next);
+    try {
+      await saveGenMeta(next, { source: "gallery", sourceLabel: "Community image" });
+    } catch {
+      /* the form already holds the image's values */
+    }
+
+    const ctx = {
+      modelId: item?.modelId ?? galleryContext?.modelId ?? null,
+      modelVersionId: item?.modelVersionId ?? galleryContext?.modelVersionId ?? null,
+      name: item?.modelName || galleryContext?.name || "",
+    };
+    let origin = mergeOrigin(originForContext(ctx), item?.fallbackCheckpoint || null);
+    let base = installedBaseForCommunityImage(item, installedAssets, origin);
+    const modelId = ctx.modelId || origin?.modelId;
+    if (!base && modelId && settings?.civitaiConfigured) {
+      try {
+        const data = await api(`/v1/civitai/models/${modelId}`);
+        const model = data?.model || data;
+        origin = mergeOrigin(
+          originFromCard(model, {
+            ...ctx,
+            modelVersionId: ctx.modelVersionId || model?.versionId || null,
+            name: ctx.name || model?.name || "",
+          }),
+          origin,
+        );
+        base = installedBaseForCommunityImage(item, installedAssets, origin);
+      } catch {
+        /* metadata lookup only — this button does not download */
+      }
+    }
+    const imageCheckpoint = findInstalledResource(
+      checkpointResourceOf(item),
+      (installedAssets || []).filter(isCheckpointAsset),
+    );
+    const baseName = base?.name || base?.path || "";
+    const recommendedInstead = Boolean(base?.path && !imageCheckpoint && item?.checkpoint);
+    let baseNote = "";
+    if (base?.path) {
+      if (activeBasePath && sameCheckpointPath(activeBasePath, base.path)) {
+        baseNote = recommendedInstead
+          ? ` Checkpoint “${item.checkpoint}” is not installed. Base already ${baseName}.`
+          : ` Base already ${baseName}.`;
+      } else {
+        const ok = await setInstalledAsBase(base);
+        if (!ok) {
+          baseNote = " The checkpoint is installed, but the base was not changed.";
+        } else if (recommendedInstead) {
+          baseNote = ` Checkpoint “${item.checkpoint}” is not installed. Base set to recommended ${baseName}.`;
+        } else {
+          baseNote = ` Base set to ${baseName}.`;
+        }
+      }
+    } else if (item?.checkpoint) {
+      baseNote = ` Checkpoint “${item.checkpoint}” is not installed.`;
+    }
+
+    const postResources = postResourcesEarly;
+    const lorasToPin = lorasToPinEarly;
+    const pinNames = [];
+    const freshPins = [];
+    for (const lora of lorasToPin) {
+      const resource = postResourceForLora(lora, postResources);
+      const scale = loraScaleDefault(lora, {}, resource?.weight);
+      freshPins.push({
+        id: lora.id,
+        name: lora.name,
+        modelType: lora.modelType || lora.kind || "LORA",
+        downloadUrl: lora.downloadUrl,
+        triggerWord: lora.triggerWord || null,
+        baseModel: lora.baseModel || null,
+        path: lora.path || null,
+        versionId:
+          positiveId(resource?.modelVersionId ?? lora.versionId) ?? lora.versionId ?? null,
+        modelId: positiveId(resource?.modelId ?? lora.modelId) ?? lora.modelId ?? null,
+        scale,
+      });
+      pinNames.push(`${lora.name || lora.path || "LoRA"}@${scale}`);
+    }
+    setSession((prev) => {
+      void persistStudio({ pinnedLoras: freshPins });
+      return { ...prev, pinnedLoras: freshPins };
+    });
+    const pinNote = pinNames.length ? ` Pinned ${pinNames.join(", ")}.` : "";
+
+    let copied = false;
+    try {
+      copied = await copyCommunityInput({ prompt, negativePrompt: negative });
+    } catch {
+      copied = false;
+    }
+    setCommunityErr("");
+    const clip = copied ? " Copied the prompt and negative prompt." : "";
+    setCommunityNote(
+      `Filled the prompt, negative prompt, and generation meta. Enhance off — prompt as-is.${pinNote}${baseNote}${clip}`,
+    );
+  };
+
+  const applyGalleryArtifact = async (item) => {
+    const id = item?.artifactId || item?.id;
+    if (!id) return;
+    try {
+      const data = await api(`/v1/gallery/${id}/apply`, { method: "POST", body: "{}" });
+      const applied = data.applied || {};
+      if (applied.prompt) setPrompt(applied.prompt);
+      if (applied.settings) applyGenMeta(applied.settings);
+      if (Array.isArray(applied.pinnedLoras)) {
+        setSession((prev) => ({ ...prev, pinnedLoras: applied.pinnedLoras }));
+        void persistStudio({ pinnedLoras: applied.pinnedLoras });
+      }
+      if (applied.baseNote) setSavedMsg(applied.baseNote);
+      await refreshInstalledAssets({ quiet: true });
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  /** Load this image's settings into the composer, then open it for another pass (apply + remix). */
+  const remixGalleryArtifact = async (item) => {
+    const id = item?.artifactId || item?.id;
+    if (!id) return;
+    const asResult = galleryToResult(item) || item;
+    setResult(asResult);
+    setModelBrief(asResult.enhancedPrompt || "");
+    setGalleryDetail(null);
+    setTab("gallery");
+    await applyGalleryArtifact(item);
+    try {
+      const remix = await api(`/v1/gallery/${id}/remix`, { method: "POST", body: "{}" });
+      if (remix.prompt) setPrompt(remix.prompt);
+    } catch (e) {
+      setError(e.message);
+    }
+  };
+
+  const renderFreyaGalleryActions = (item) => {
+    const id = item?.artifactId || item?.id;
+    return (
+      <>
+        {id ? (
+          <button
+            type="button"
+            className="ghost icon-btn"
+            title="Load settings and remix this image"
+            aria-label="Remix"
+            onClick={(e) => {
+              e.stopPropagation();
+              void remixGalleryArtifact(item);
+            }}
+          >
+            <IconRemix />
+          </button>
+        ) : null}
+        <MediaDownload
+          src={gallerySrc(item)}
+          item={galleryToResult(item) || item}
+          className="ghost icon-btn"
+          onError={setError}
+        />
+        {id ? (
+          <button
+            type="button"
+            className="ghost icon-btn"
+            title="Delete from gallery"
+            aria-label="Delete from gallery"
+            onClick={(e) => {
+              e.stopPropagation();
+              deleteGalleryItem(id);
+            }}
+          >
+            <IconTrash />
+          </button>
+        ) : null}
+      </>
+    );
+  };
+
+  const renderCivitaiDetailActions = () => {
+    if (!detailModel) return null;
+    const installed =
+      findInstalledForItem(detailModel) ||
+      (detailModel.path
+        ? installedAssets.find((a) => a.path === detailModel.path)
+        : null);
+    const isCkpt =
+      installed &&
+      (installed.kind === "checkpoint" || (installed.path || "").startsWith("checkpoints/"));
+    const isActive = installed && activeBasePath && activeBasePath === installed.path;
+    const href = civitaiModelPageUrl(
+      detailModel,
+      detailSelectedVersion?.id ?? detailModel.versionId,
+    );
+    const nsfwLink = modelPageIsNsfw(detailModel, detailSelectedVersion);
+    const linkHost = nsfwLink ? "civitai.red" : "civitai.com";
+    return (
+      <>
+        <button
+          type="button"
+          className={`${isFavorite(detailModel) ? "primary" : "ghost"} icon-btn`}
+          title={
+            isFavorite(detailModel) ? "Remove from favorites" : "Save to favorites library"
+          }
+          aria-label={isFavorite(detailModel) ? "Unfavorite" : "Favorite"}
+          onClick={() => toggleFavorite(detailModel)}
+        >
+          <IconStar filled={isFavorite(detailModel)} />
+        </button>
+        {resolveCivitaiModelId(detailModel) != null ||
+        Number(detailSelectedVersion?.id ?? detailModel.versionId) > 0 ? (
+          <button
+            type="button"
+            className="ghost icon-btn"
+            title="Community images for this model"
+            aria-label="Open community gallery"
+            onClick={() =>
+              openAssetGallery(detailModel, detailSelectedVersion?.id ?? detailModel.versionId)
+            }
+          >
+            <IconGallery />
+          </button>
+        ) : null}
+        {isPinnableAsset(detailModel) || isCheckpointAsset(detailModel) ? (
+          <button
+            type="button"
+            className={`${isPinned(detailModel) ? "primary" : "ghost"} icon-btn`}
+            title={
+              isPinned(detailModel)
+                ? "Unpin from this session"
+                : isCheckpointAsset(detailModel)
+                  ? "Install if needed and set as base"
+                  : "Pin to use — installs the LoRA and matching base if needed"
+            }
+            aria-label={
+              isPinned(detailModel)
+                ? "Unpin from session"
+                : isCheckpointAsset(detailModel)
+                  ? "Set as base"
+                  : "Pin to use"
+            }
+            onClick={() =>
+              isPinned(detailModel) ? unpinLora(detailModel) : void pinToUse(detailModel)
+            }
+          >
+            <IconPin />
+          </button>
+        ) : null}
+        {renderInstallAction(detailModel)}
+        {isCkpt ? (
+          <button
+            type="button"
+            className={`${isActive ? "primary" : "ghost"} icon-btn`}
+            disabled={isActive}
+            title={isActive ? "Active base" : "Set as base"}
+            aria-label={isActive ? "Active base" : "Set as base"}
+            onClick={() => setInstalledAsBase(installed)}
+          >
+            <IconPin />
+          </button>
+        ) : null}
+        {href ? (
+          <a
+            className={`ghost icon-btn civitai-open-link ${
+              nsfwLink ? "civitai-link-nsfw" : "civitai-link-sfw"
+            }`}
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            title={`Open on ${linkHost}`}
+            aria-label={`Open on ${linkHost}`}
+          >
+            <IconExternal />
+          </a>
+        ) : null}
+      </>
+    );
+  };
+
+  const renderCommunityActions = (item) => {
+    const saved = imageFavorited(item);
+    const installableMissing = communityInstallableMissing(item);
+    const queuing = communityInstallId === item.id;
+    const missingNames = installableMissing
+      .map((r) => r.name)
+      .filter(Boolean)
+      .join(", ");
+    const linkTone = item.civitaiUrl ? civitaiLinkTone(item.civitaiUrl, item) : "sfw";
+    const linkHost = linkTone === "nsfw" ? "civitai.red" : "civitai.com";
+    return (
+      <>
+        {installableMissing.length > 0 ? (
+          <button
+            type="button"
+            className="ghost icon-btn"
+            disabled={queuing}
+            title={
+              queuing
+                ? "Queuing…"
+                : `Install missing${missingNames ? `: ${missingNames}` : ""}. Does not change the base.`
+            }
+            aria-label={queuing ? "Queuing install" : "Install missing"}
+            onClick={(e) => {
+              e.stopPropagation();
+              void installCommunityMissing(item);
+            }}
+          >
+            {queuing ? <IconSpinner /> : <IconInstall />}
+          </button>
+        ) : null}
+        {item.civitaiUrl ? (
+          <a
+            className={`ghost icon-btn civitai-open-link ${
+              linkTone === "nsfw" ? "civitai-link-nsfw" : "civitai-link-sfw"
+            }`}
+            href={item.civitaiUrl}
+            target="_blank"
+            rel="noreferrer"
+            title={`Open on ${linkHost}`}
+            aria-label={`Open on ${linkHost}`}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <IconExternal />
+          </a>
+        ) : null}
+        <button
+          type="button"
+          className={`${saved ? "primary" : "ghost"} icon-btn`}
+          title={saved ? "Remove from image favorites" : "Favorite this image"}
+          aria-label={saved ? "Unfavorite image" : "Favorite image"}
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleImageFavorite(item);
+          }}
+        >
+          <IconStar filled={saved} />
+        </button>
+        <button
+          type="button"
+          className="ghost icon-btn"
+          title="Clear prompt, meta, and pinned LoRAs"
+          aria-label="Clear inputs"
+          onClick={(e) => {
+            e.stopPropagation();
+            void clearReproductionInputs();
+          }}
+        >
+          <IconClear />
+        </button>
+        <button
+          type="button"
+          className="ghost icon-btn"
+          title="Clear the composer, then fill prompt, negative prompt, and generation meta"
+          aria-label="Copy input"
+          onClick={(e) => {
+            e.stopPropagation();
+            void copyImageInput(item);
+          }}
+        >
+          <IconCopy />
+        </button>
+        <MediaDownload
+          src={item.url || item.thumbnailUrl}
+          item={{ ...item, filename: communityImageFilename(item) }}
+          className="ghost icon-btn"
+          onError={(msg) => {
+            setCommunityNote("");
+            setCommunityErr(msg || "Download failed");
+          }}
+        />
+      </>
+    );
+  };
+
+  const renderCommunityTile = (item) => {
+    const checkpointLine = communityCheckpointLine(item);
+    return (
+      <li key={communityMediaKeys(item).join("|") || item.id} className="agent-gallery-tile">
+        <button
+          type="button"
+          className="agent-gallery-shot"
+          onClick={() => setCommunityDetail(item)}
+        >
+          <CommunityMedia item={item} variant="tile" alt="" />
+        </button>
+        <div className="agent-gallery-tile-actions">{renderCommunityActions(item)}</div>
+        {checkpointLine ? (
+          <div className="agent-gallery-tile-foot">
+            <span className="agent-gallery-checkpoint">{checkpointLine}</span>
+          </div>
+        ) : null}
+      </li>
+    );
+  };
+
+  /** Queue missing generation resources. Does not pin or change the current base. */
+  const installCommunityMissing = async (item) => {
+    const missing = communityInstallableMissing(item);
+    if (!missing.length) {
+      setCommunityNote("");
+      setCommunityErr("Those files only have a name or hash, so there is no Civitai download.");
+      return;
+    }
+    if (!hasWorker()) {
+      setCommunityErr("A worker is needed before those files can be installed.");
+      return;
+    }
+    if (!settings?.civitaiConfigured) {
+      setCommunityErr("Add a Civitai key in Settings before installing.");
+      return;
+    }
+    setCommunityInstallId(item.id);
+    setCommunityErr("");
+    let queued = 0;
+    const problems = [];
+    try {
+      for (const resource of missing) {
+        const card = {
+          name: resource.name || `version ${resource.modelVersionId || resource.modelId}`,
+          modelType: communityInstallType(resource.type),
+          versionId: resource.modelVersionId || undefined,
+          modelId: resource.modelId || undefined,
+          destPath: resource.destPath || undefined,
+        };
+        if (findInstalledForItem(card)) continue;
+        try {
+          await installOne(card);
+          queued += 1;
+        } catch (e) {
+          const msg = e.message || "Install failed";
+          if (/already (installed|downloading)/i.test(msg)) continue;
+          problems.push(resource.name ? `${resource.name}: ${msg}` : msg);
+        }
+      }
+      if (queued) {
+        setCommunityNote(
+          `Queued ${queued} download${queued === 1 ? "" : "s"}. The current base is unchanged.`,
+        );
+      } else if (!problems.length) {
+        setCommunityNote("Those files are already installed or downloading. The current base is unchanged.");
+      }
+      if (problems.length) setCommunityErr(problems.join("; "));
+    } finally {
+      setCommunityInstallId(null);
+    }
+  };
+
+  const rememberCommunityPage = (data, { key, requested, append, added }) => {
+    const nextCursor = data?.nextCursor ? String(data.nextCursor) : "";
+    const nextPage = Number(data?.nextPage);
+    const hasPage = Number.isFinite(nextPage) && nextPage > 0;
+    const sameCursor = Boolean(requested && nextCursor && requested === nextCursor);
+    communityPagerRef.current = {
+      key,
+      cursor: nextCursor || null,
+      page: nextCursor ? null : hasPage ? nextPage : null,
+      done: (!nextCursor && !hasPage) || sameCursor || (append && added === 0),
+    };
+  };
+
+  const fetchCommunityPage = async (ctx, { cursor, page, append, key }) => {
+    const q = new URLSearchParams();
+    if (ctx.modelId) q.set("modelId", String(ctx.modelId));
+    if (ctx.modelVersionId) q.set("modelVersionId", String(ctx.modelVersionId));
+    q.set("limit", String(COMMUNITY_PAGE_SIZE));
+    if (cursor) q.set("cursor", cursor);
+    else if (page) q.set("page", String(page));
+    const data = await api(`/v1/civitai/images?${q}`);
+    if (communityPagerRef.current.key !== key) return;
+    const incoming = data.items || [];
+    let added = incoming.length;
+    setCommunityImages((prev) => {
+      const merged = append ? [...prev, ...incoming] : incoming;
+      const next = dedupeCommunityItems(merged);
+      if (append) {
+        added = Math.max(0, next.length - prev.length);
+      }
+      return next;
+    });
+    rememberCommunityPage(data, { key, requested: cursor || "", append, added });
+    if (!append) setCommunityNote("");
+  };
+
+  useEffect(() => {
+    if (tab !== "agent" || agentFocus !== "gallery" || !galleryKey) {
+      return undefined;
+    }
+    const ctx = galleryContext;
+    let cancel = false;
+    communityPagerRef.current = { key: galleryKey, cursor: null, page: null, done: true };
+    communityFlightRef.current = true;
+    setCommunityBusy(true);
+    setCommunityMore(false);
+    setCommunityErr("");
+    setCommunityImages([]);
+    setCommunityDetail(null);
+    fetchCommunityPage(ctx, { append: false, key: galleryKey })
+      .catch((e) => {
+        if (cancel) return;
+        setCommunityImages([]);
+        communityPagerRef.current = { key: galleryKey, cursor: null, page: null, done: true };
+        setCommunityErr(e.message || "Could not load community images");
+      })
+      .finally(() => {
+        if (cancel) return;
+        communityFlightRef.current = false;
+        setCommunityBusy(false);
+      });
+    return () => {
+      cancel = true;
+      communityFlightRef.current = false;
+    };
+  }, [tab, agentFocus, galleryKey]);
+
+  useEffect(() => {
+    if (tab !== "agent" || agentFocus !== "gallery" || !galleryKey) return undefined;
+    const sentinel = communitySentinelRef.current;
+    if (!sentinel) return undefined;
+    const root = sentinel.closest(".pane");
+    const io = new IntersectionObserver(
+      (entries) => {
+        if (!entries.some((entry) => entry.isIntersecting)) return;
+        const pager = communityPagerRef.current;
+        if (pager.key !== galleryKey || pager.done || communityFlightRef.current) return;
+        if (!pager.cursor && !pager.page) return;
+        const ctx = galleryContext;
+        communityFlightRef.current = true;
+        setCommunityMore(true);
+        fetchCommunityPage(ctx, {
+          cursor: pager.cursor,
+          page: pager.page,
+          append: true,
+          key: galleryKey,
+        })
+          .catch((e) => {
+            setCommunityErr(e.message || "Could not load more community images");
+            communityPagerRef.current = { ...communityPagerRef.current, done: true };
+          })
+          .finally(() => {
+            communityFlightRef.current = false;
+            setCommunityMore(false);
+          });
+      },
+      { root: root || null, rootMargin: "320px" },
+    );
+    io.observe(sentinel);
+    return () => io.disconnect();
+  }, [tab, agentFocus, galleryKey, communityImages.length, communityBusy]);
+
+  useEffect(() => {
+    if (!communityDetail) return undefined;
+    const onKey = (e) => {
+      if (e.key === "Escape") setCommunityDetail(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [communityDetail]);
+
+  const openAgentLibrary = (id) => {
+    setAgentFocus(id);
+    setCivitaiSubview(id);
+  };
+
+  const renderAgentSubnav = () => (
+    <div className="row civitai-subnav" style={{ marginBottom: "0.75rem" }}>
+      <button
+        type="button"
+        className={agentFocus === "suggestions" ? "primary" : "ghost"}
+        aria-pressed={agentFocus === "suggestions"}
+        onClick={() => setAgentFocus("suggestions")}
+      >
+        Suggestions
+      </button>
+      <button
+        type="button"
+        className={agentFocus === "gallery" ? "primary" : "ghost"}
+        aria-pressed={agentFocus === "gallery"}
+        onClick={() => setAgentFocus("gallery")}
+      >
+        Gallery
+      </button>
+      <button
+        type="button"
+        className={agentFocus === "meta" ? "primary" : "ghost"}
+        aria-pressed={agentFocus === "meta"}
+        onClick={() => {
+          setAgentFocus("meta");
+          if (!genMetaDirtyRef.current) void refreshGenMeta();
+        }}
+      >
+        Meta
+      </button>
+      {CIVITAI_SUBNAV.filter((s) => !s.end).map(({ id, label }) => {
+        const count =
+          id === "favorites"
+            ? favorites.length + imageFavorites.length
+            : id === "installed"
+              ? installedAssets.length
+              : 0;
+        return (
+          <button
+            key={id}
+            type="button"
+            className={agentFocus === id ? "primary" : "ghost"}
+            aria-pressed={agentFocus === id}
+            onClick={() => openAgentLibrary(id)}
+          >
+            {count ? `${label} (${count})` : label}
+          </button>
+        );
+      })}
+      <HelpQ topic="help-civitai" label="Civitai" onOpen={openHelp} />
+      {CIVITAI_SUBNAV.filter((s) => s.end).map(({ id, label }) => {
+        const activeDl = downloadJobs.some((j) =>
+          ["queued", "downloading"].includes(j.status),
+        );
+        return (
+          <button
+            key={id}
+            type="button"
+            className={`civitai-subnav-end${activeDl ? " dl-busy" : ""} ${
+              agentFocus === id ? "primary" : "ghost"
+            }`}
+            aria-pressed={agentFocus === id}
+            aria-busy={activeDl || undefined}
+            title={activeDl ? "Downloads in progress" : label}
+            onClick={() => openAgentLibrary(id)}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
 
   const ModeIcon = MODE_ICONS[automationMode] || IconSliders;
   const modeOptions = AUTOMATION_MODES.map((id) => {
@@ -4945,6 +7446,21 @@ export default function App() {
     ? ensureSelectedOption(routerModels, routerModel)
     : PLACEHOLDER_ROUTER_MODELS;
   const modelsMenuNote = modelsCatalogReady ? null : MODELS_API_HINT;
+  const favoriteTypeTabs = FAVORITE_TYPE_TABS.map((entry) => ({
+    ...entry,
+    items:
+      entry.id === "Images"
+        ? imageFavorites
+        : favorites.filter(
+            (item) =>
+              item?.kind !== "community-image" && favoriteTypeId(item) === entry.id,
+          ),
+  })).filter((entry) => entry.items.length > 0);
+  const activeFavoriteType = favoriteTypeTabs.some((entry) => entry.id === favoriteType)
+    ? favoriteType
+    : favoriteTypeTabs[0]?.id || "";
+  const activeFavoriteItems =
+    favoriteTypeTabs.find((entry) => entry.id === activeFavoriteType)?.items || [];
 
   const signedIn =
     mock || hasBrowserBearer() || !(authStatus?.authRequired || settings?.authRequired);
@@ -5090,6 +7606,7 @@ export default function App() {
         </div>
       )}
 
+      {chatStatus && <ChatPointer />}
       <header className="topbar">
         <div className="brand-lockup">
           <span className="brand-mark" aria-hidden="true">
@@ -5280,6 +7797,18 @@ export default function App() {
                         {l.name}
                         {l.baseModel ? ` · base ${l.baseModel}` : ""}
                         {l.triggerWord ? ` · ${l.triggerWord}` : ""}
+                        {" · weight "}
+                        <input
+                          type="number"
+                          className="pin-weight"
+                          min="0"
+                          max="2"
+                          step="0.05"
+                          value={l.scale ?? 1}
+                          onChange={(e) => setPinScale(l, e.target.value)}
+                          title="LoRA weight"
+                          aria-label={`Weight for ${l.name}`}
+                        />
                       </span>
                       <button type="button" className="ghost" onClick={() => unpinLora(l)}>
                         Unpin
@@ -5305,132 +7834,142 @@ export default function App() {
                       })}
                     </time>
                   )}
-                  {m.role !== "user" && m.route?.modality && (
-                    <span
-                      className="t-route"
-                      title={[
-                        m.resolvedModels?.agent && `agent: ${m.resolvedModels.agent}`,
-                        m.resolvedModels?.router && `router: ${m.resolvedModels.router}`,
-                        (m.routeContext?.backend || m.genBackend) === "local" &&
-                          m.routeContext?.base &&
-                          `base: ${m.routeContext.base}`,
-                        (m.routeContext?.backend || m.genBackend) === "local" &&
-                          m.routeContext?.lora &&
-                          `lora: ${m.routeContext.lora}`,
-                        (m.routeContext?.backend || m.genBackend) !== "local" &&
-                          m.resolvedModels?.image &&
-                          `image: ${m.resolvedModels.image}`,
-                        (m.routeContext?.backend || m.genBackend) !== "local" &&
-                          m.resolvedModels?.video &&
-                          `video: ${m.resolvedModels.video}`,
-                        (m.routeContext?.backend || m.genBackend) &&
-                          `backend: ${m.routeContext?.backend || m.genBackend}`,
-                        m.routeContext?.mode && `mode: ${m.routeContext.mode}`,
-                        m.route?.reason,
-                      ]
-                        .filter(Boolean)
-                        .join(" · ")}
-                    >
-                      {m.route.modality}
-                      {(m.routeContext?.backend || m.genBackend)
-                        ? ` · ${m.routeContext?.backend || m.genBackend}`
-                        : ""}
-                      {(m.routeContext?.backend || m.genBackend) === "local" && m.routeContext?.base
-                        ? ` · ${m.routeContext.base}`
-                        : ""}
-                      {(m.routeContext?.backend || m.genBackend) !== "local" &&
-                      m.resolvedModels?.image &&
-                      m.route.modality === "picture"
-                        ? ` · ${String(m.resolvedModels.image).split("/").pop()}`
-                        : ""}
-                      {(m.routeContext?.backend || m.genBackend) !== "local" &&
-                      m.resolvedModels?.video &&
-                      (m.route.modality === "gif" || m.route.modality === "video")
-                        ? ` · ${String(m.resolvedModels.video).split("/").pop()}`
-                        : ""}
-                    </span>
-                  )}
                 </div>
-                <p className="t-bubble">{m.content}</p>
-                {m.role !== "user" &&
-                  (() => {
-                    const offer = generateOfferForTurn(conversation, i);
-                    if (!offer) return null;
-                    return (
-                      <div className="t-generate-row">
-                        <button
-                          type="button"
-                          className="primary t-generate"
-                          disabled={busy}
-                          onClick={() => runGenerateOffer(offer)}
-                        >
-                          Generate
-                        </button>
-                      </div>
-                    );
-                  })()}
-                {Array.isArray(m.actions) && m.actions.length > 0 && (
-                  <ul className="t-tools">
-                    {m.actions.map((a, ai) => (
-                      <li key={`${a.type}-${ai}`} className={`t-tool t-tool-${a.status || "done"}`}>
-                        <span className="t-tool-type">{a.type}</span>
-                        <span className="t-tool-status">{a.status || "done"}</span>
-                        {a.status === "error" && a.error ? ` — ${a.error}` : ""}
-                      </li>
+                {(() => {
+                  const actions = Array.isArray(m.actions) ? m.actions : [];
+                  const debug =
+                    m.role === "user" ? null : partitionAssistantReply(m.content, actions);
+                  const body = debug ? debug.body : m.content;
+                  const routeLine =
+                    (debug && debug.routeLine) ||
+                    (m.role !== "user" ? routeLineForMessage(m) : "");
+                  const extraErrors = (debug?.errorLines || []).filter(
+                    (line) =>
+                      !actions.some(
+                        (a) =>
+                          a?.status === "error" &&
+                          String(line).startsWith(`${a.type} failed:`),
+                      ),
+                  );
+                  const showDebug =
+                    m.role !== "user" &&
+                    (actions.length > 0 || Boolean(routeLine) || extraErrors.length > 0);
+                  return (
+                    <>
+                      {body ? <p className="t-bubble">{body}</p> : null}
+                      {m.role !== "user" &&
+                        (() => {
+                          const offer = generateOfferForTurn(conversation, i);
+                          if (!offer) return null;
+                          return (
+                            <div className="t-generate-row">
+                              <button
+                                type="button"
+                                className="primary t-generate"
+                                disabled={busy}
+                                onClick={() => runGenerateOffer(offer)}
+                              >
+                                Generate
+                              </button>
+                            </div>
+                          );
+                        })()}
+                      {showDebug && (
+                        <details className="t-tools-disclosure">
+                          <summary>
+                            {actions.length > 0
+                              ? `${actions.length} tool${actions.length === 1 ? "" : "s"}`
+                              : "debug"}
+                          </summary>
+                          {routeLine ? <p className="t-debug-route">{routeLine}</p> : null}
+                          {(actions.length > 0 || extraErrors.length > 0) && (
+                            <ul className="t-tools">
+                              {actions.map((a, ai) => (
+                                <li
+                                  key={`${a.type}-${ai}`}
+                                  className={`t-tool t-tool-${a.status || "done"}`}
+                                >
+                                  <span className="t-tool-type">{a.type}</span>
+                                  <span className="t-tool-status">{a.status || "done"}</span>
+                                  {a.status === "error" && a.error ? ` — ${a.error}` : ""}
+                                </li>
+                              ))}
+                              {extraErrors.map((line, ei) => (
+                                <li key={`err-${ei}`} className="t-tool t-tool-error t-tool-line">
+                                  {line}
+                                </li>
+                              ))}
+                            </ul>
+                          )}
+                        </details>
+                      )}
+                    </>
+                  );
+                })()}
+                {(m.artifactIds?.length > 0 || referencedAssets(m).length > 0) && (
+                  <div className="t-ref-row">
+                    {referencedAssets(m).map((item) => (
+                      <button
+                        key={`asset-${item.name}`}
+                        type="button"
+                        className="linkish t-ref-link"
+                        onClick={() => {
+                          setAgentFocus("suggestions");
+                          setTab("agent");
+                          openCivitaiDetail(item);
+                        }}
+                      >
+                        {item.name}
+                      </button>
                     ))}
-                  </ul>
-                )}
-                {m.artifactIds?.length > 0 && (
-                  <div className="t-thumbs">
-                    {m.artifactIds.map((id) => {
+                    {(m.artifactIds || []).map((id, index) => {
                       const art =
                         batchResults.find((r) => r.artifactId === id) ||
                         (result?.artifactId === id ? result : null) ||
                         gallery.find((g) => g.id === id);
-                      const src = art?.url || (art ? gallerySrc(art) : `/v1/gallery/${id}/image`);
-                      const file = art || { id, artifactId: id };
+                      const src = art?.url || `/v1/gallery/${id}/image`;
+                      const label = imageLinkLabel(art, index);
+                      const open = () => {
+                        if (art) selectGalleryPreview(art);
+                        else setTab("gallery");
+                      };
                       return (
-                        <div className="t-thumb-wrap" key={id}>
-                          <button
-                            type="button"
+                        <span className="t-ref-art" key={id}>
+                          <span
                             className="t-thumb"
-                            onClick={() => {
-                              if (art) selectGalleryPreview(art);
+                            role="button"
+                            tabIndex={0}
+                            title={label}
+                            onClick={open}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" || e.key === " ") {
+                                e.preventDefault();
+                                open();
+                              }
                             }}
                           >
-                            {isVideoArtifact(art) ? (
-                              <video src={src} muted playsInline preload="metadata" />
-                            ) : (
-                              <img src={src} alt="" />
-                            )}
+                            <MediaFigure item={art} src={src} alt={label} />
+                          </span>
+                          <button
+                            type="button"
+                            className="linkish t-ref-link"
+                            onClick={open}
+                          >
+                            {label}
                           </button>
-                          <MediaDownload
-                            src={src}
-                            item={file}
-                            className="ghost icon-btn t-thumb-dl"
-                            onError={setError}
-                          />
-                        </div>
+                        </span>
                       );
                     })}
                   </div>
                 )}
-                {Array.isArray(m.ideas) && m.ideas.length > 0 && (
-                  <div className="idea-chips">
-                    {m.ideas.map((idea) => (
-                      <button
-                        key={idea}
-                        type="button"
-                        className="idea-chip"
-                        onClick={() => setPrompt(idea)}
-                      >
-                        {idea}
-                      </button>
-                    ))}
-                  </div>
-                )}
               </article>
             ))}
+
+            {chatStatus && (
+              <p className="t-live-status" role="status">
+                {chatStatus}
+              </p>
+            )}
 
             {pendingPlan && (pendingPlan.status === "plan" || pendingPlan.actions?.length) && (
               <aside className="pending-plan" aria-label="Proposed tools">
@@ -5526,60 +8065,6 @@ export default function App() {
               </aside>
             )}
 
-            {sessionLog.length > 0 && (
-              <aside className="session-log" aria-label="Session activity">
-                <span className="session-label">What Freya did</span>
-                <ul>
-                  {sessionLog.map((line, i) => (
-                    <li key={`${i}-${line.slice(0, 24)}`}>{line}</li>
-                  ))}
-                </ul>
-              </aside>
-            )}
-
-            {showAssistPanel && (
-              <aside className="suggestions">
-                <div className="suggestions-head">
-                  <h3>Ideas from Freya</h3>
-                  <button type="button" className="ghost" onClick={clearSuggestions}>
-                    Dismiss
-                  </button>
-                </div>
-                {civitaiQuery && (
-                  <p className="civitai-search-line" role="status">
-                    Searching Civitai for: <strong>{civitaiQuery}</strong>
-                  </p>
-                )}
-                {suggestNote && <p className="hint">{suggestNote}</p>}
-                {ideas.length > 0 && (
-                  <div className="idea-chips">
-                    {ideas.map((idea) => (
-                      <button
-                        key={idea}
-                        type="button"
-                        className="idea-chip"
-                        onClick={() => {
-                          setPrompt(idea);
-                          setSession((prev) => ({
-                            ...prev,
-                            goal: prev.goal || idea,
-                          }));
-                        }}
-                      >
-                        {idea}
-                      </button>
-                    ))}
-                  </div>
-                )}
-                {suggestedLoras.length > 0 && (
-                  <p className="hint">
-                    {suggestedLoras.length} Civitai{" "}
-                    {suggestedLoras.length === 1 ? "asset" : "assets"} in the gallery pane → pin or
-                    install there.
-                  </p>
-                )}
-              </aside>
-            )}
           </div>
 
           <div className="compose">
@@ -5655,6 +8140,16 @@ export default function App() {
             )}
             <div className="composer-bar" aria-label="Chat controls">
               <div className="compose-actions">
+                <button
+                  type="button"
+                  className="ghost icon-btn"
+                  title="Clear prompt, meta, and pinned LoRAs"
+                  aria-label="Clear inputs"
+                  onClick={() => void clearReproductionInputs()}
+                >
+                  <IconClear />
+                  <span className="sr-only">Clear inputs</span>
+                </button>
                 <button
                   type="button"
                   className={`ghost icon-btn sidebar-toggle${sidebarOpen ? " open" : ""}`}
@@ -5919,33 +8414,6 @@ export default function App() {
         />
 
         <section className="pane pane-right" aria-label="Gallery and results">
-          {suggestedLoras.length > 0 && (
-            <aside className="lora-strip" aria-label="Civitai asset suggestions">
-              <div className="lora-strip-head">
-                <div>
-                  <span className="t-kind">Civitai assets</span>
-                  {civitaiQuery ? (
-                    <p className="lora-strip-q">
-                      Civitai · <strong>{civitaiQuery}</strong>
-                    </p>
-                  ) : (
-                    <p className="lora-strip-q">Suggested for this prompt</p>
-                  )}
-                </div>
-                <button type="button" className="ghost" onClick={clearSuggestions}>
-                  Dismiss
-                </button>
-              </div>
-              <p className="hint">
-                LoRAs ranked first; checkpoints and other weights included. Pin anytime (no worker
-                needed). Install needs a worker — otherwise Freya generates via OpenRouter.
-              </p>
-              <div className="lora-row lora-row-strip">
-                {suggestedLoras.map((l) => renderLoraCard(l, { compact: true }))}
-              </div>
-            </aside>
-          )}
-
       {tab === "gallery" && !previewResult && gallery.length === 0 && batchResults.length === 0 && (
         <div className="gallery-empty">
           <div className="gallery-empty-art">
@@ -5963,62 +8431,36 @@ export default function App() {
         <section className="salon">
           <div className="salon-head">
             <span className="t-kind">Session set</span>
-            <p className="salon-sub">Select a work to inspect it above / remix its prompt.</p>
+            <p className="salon-sub">Select a work to inspect it. Remix loads its settings for another pass.</p>
           </div>
-          <div className="salon-wall">
-            {batchResults.map((r, i) => (
-              <article
+          <ul className="agent-gallery-list salon-wall-gallery">
+            {batchResults.map((r) => (
+              <li
                 key={r.artifactId || r.url}
-                className={`salon-work${previewResult?.artifactId === r.artifactId ? " selected" : ""} salon-work-${(i % 3) + 1}`}
-                onClick={() => {
-                  setResult(r);
-                  setModelBrief(r.enhancedPrompt || "");
-                  if (r.prompt) setPrompt(r.prompt);
-                }}
+                className={`agent-gallery-tile salon-gallery-tile${
+                  previewResult?.artifactId === r.artifactId ? " selected" : ""
+                }`}
               >
-                {r.url ? (
-                  <MediaDownload
-                    src={r.url}
-                    item={r}
-                    className="ghost icon-btn salon-work-dl"
-                    onError={setError}
-                  />
-                ) : null}
-                {r.artifactId ? (
-                  <button
-                    type="button"
-                    className="ghost salon-work-del"
-                    title="Delete from gallery"
-                    aria-label="Delete variation"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      deleteGalleryItem(r.artifactId);
-                    }}
-                  >
-                    <IconTrash />
-                  </button>
-                ) : null}
-                <figure>
-                  <MediaFigure item={r} src={r.url} alt={r.prompt || "variation"} />
-                  <figcaption>
-                    <span className="salon-caption">
-                      {(r.prompt || "").slice(0, 100)}
-                      {(r.prompt || "").length > 100 ? "…" : ""}
-                    </span>
-                    <span className="salon-meta">
-                      {r.backend}
-                      {r.model ? ` · ${r.model}` : ""}
-                      {mock ? " · mock" : ""}
-                    </span>
-                  </figcaption>
-                </figure>
-              </article>
+                <button
+                  type="button"
+                  className="agent-gallery-shot"
+                  onClick={() => {
+                    setResult(r);
+                    setModelBrief(r.enhancedPrompt || "");
+                    setGalleryDetail(r);
+                    setTab("gallery");
+                  }}
+                >
+                  <MediaFigure item={r} src={r.url} alt="" />
+                </button>
+                <div className="agent-gallery-tile-actions">{renderFreyaGalleryActions(r)}</div>
+              </li>
             ))}
-          </div>
+          </ul>
         </section>
       )}
 
-      {tab === "gallery" && previewResult && (
+      {tab === "gallery" && previewResult && batchResults.length <= 1 && (
         <section className="salon salon-single">
           <div className="salon-head">
             <span className="t-kind">
@@ -6047,59 +8489,12 @@ export default function App() {
               src={previewResult.url}
               alt={previewResult.enhancedPrompt || previewResult.prompt || prompt}
             />
-            <figcaption>
-              {previewResult.prompt ? (
-                <span className="salon-caption">{previewResult.prompt}</span>
-              ) : null}
-              <span className="salon-meta">
-                {previewResult.backend}
-                {previewResult.model ? ` · ${previewResult.model}` : ""}
-                {previewResult.modality ? ` · ${previewResult.modality}` : ""}
-                {previewResult.mime || previewResult.meta?.mime
-                  ? ` · ${previewResult.mime || previewResult.meta?.mime}`
-                  : ""}
-                {mock ? " · mock" : ""}
-              </span>
-              {previewResult.artifactId && (
-                <div className="salon-actions">
-                  <MediaDownload
-                    src={previewResult.url}
-                    item={previewResult}
-                    className="ghost icon-btn salon-dl"
-                    onError={setError}
-                  />
-                  <button
-                    type="button"
-                    className="ghost remix-btn"
-                    onClick={async () => {
-                      const remix = await api(
-                        `/v1/gallery/${previewResult.artifactId}/remix`,
-                        { method: "POST" },
-                      );
-                      setPrompt(remix.prompt || "");
-                    }}
-                  >
-                    Remix this prompt
-                  </button>
-                  <button
-                    type="button"
-                    className="ghost remix-btn salon-del-btn"
-                    title="Delete from gallery"
-                    onClick={() => deleteGalleryItem(previewResult.artifactId)}
-                  >
-                    <IconTrash />
-                    Delete
-                  </button>
-                </div>
-              )}
-            </figcaption>
+            {previewResult.artifactId ? (
+              <figcaption className="agent-gallery-tile-actions salon-feature-actions">
+                {renderFreyaGalleryActions(previewResult)}
+              </figcaption>
+            ) : null}
           </figure>
-          {modelBrief && (
-            <details className="model-brief">
-              <summary>What Freya sent to the model</summary>
-              <p>{modelBrief}</p>
-            </details>
-          )}
         </section>
       )}
 
@@ -6115,74 +8510,334 @@ export default function App() {
         ))}
       </nav>
 
-      {tab === "styles" && (
-        <section className="panel style-rail">
-          {styles.map((s) => (
-            <article
-              key={s.id}
-              className="style-item"
-              onClick={() => {
-                setPrompt(s.examplePrompt);
-                setSession((prev) => ({
-                  ...prev,
-                  goal: prev.goal || s.examplePrompt,
-                }));
-                setTab("gallery");
-              }}
-            >
-              <h3>{s.displayName}</h3>
-              <p>{(s.examplePrompt || "").slice(0, 120)}…</p>
-              <span className="salon-meta">{s.backend}</span>
-            </article>
-          ))}
+      {tab === "agent" && agentFocus === "gallery" && (
+        <section className="panel agent-gallery" aria-label="Community images">
+          {renderAgentSubnav()}
+          <p className="hint">
+            {galleryContext
+              ? `Community images for ${galleryContext.name}${
+                  galleryContext.modelVersionId
+                    ? ` · version ${galleryContext.modelVersionId}`
+                    : ""
+                }. Click an image for details. Copy clears the composer first, then fills prompt and meta from that image. Clear resets without copying.`
+              : "Open a model, or use a suggested or installed row, to list community images for that version."}
+          </p>
+          {communityBusy && <p className="hint">Loading community images…</p>}
+          {communityErr && <p className="err">{communityErr}</p>}
+          {communityNote && <p className="hint">{communityNote}</p>}
+          {!communityBusy && galleryContext && communityImages.length === 0 && !communityErr && (
+            <p className="hint">No community images for this version.</p>
+          )}
+          <ul className="agent-gallery-list">
+            {communityImages.map((item) => renderCommunityTile(item))}
+          </ul>
+          <div ref={communitySentinelRef} className="agent-gallery-sentinel" />
+          {communityMore && <p className="hint">Loading more images…</p>}
+        </section>
+      )}
+      {tab === "agent" &&
+        communityDetail &&
+        (agentFocus === "gallery" || agentFocus === "favorites") && (
+        <div
+          className="civitai-modal-backdrop"
+          role="presentation"
+          onClick={() => setCommunityDetail(null)}
+        >
+          <div
+            className="civitai-modal community-image-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Community image"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="civitai-modal-head">
+              <h3>Community image</h3>
+              <div className="row lora-card-actions agent-gallery-actions">
+                {renderCommunityActions(communityDetail)}
+                <button type="button" className="ghost" onClick={() => setCommunityDetail(null)}>
+                  Close
+                </button>
+              </div>
+            </div>
+            <div className="civitai-modal-gallery">
+              <CommunityMedia item={communityDetail} variant="modal" alt="" />
+            </div>
+            <div className="civitai-modal-body">
+              <p>{communityDetail.prompt || "No prompt"}</p>
+              {communityDetail.negativePrompt || communityDetail.negative ? (
+                <p className="hint">
+                  Negative: {communityDetail.negativePrompt || communityDetail.negative}
+                </p>
+              ) : null}
+              <p className="hint">
+                {[
+                  communityDetail.sampler ?? communityDetail.meta?.sampler,
+                  (communityDetail.steps ?? communityDetail.meta?.steps) != null
+                    ? `${communityDetail.steps ?? communityDetail.meta?.steps} steps`
+                    : "",
+                  (communityDetail.cfg ?? communityDetail.meta?.cfg) != null
+                    ? `CFG ${communityDetail.cfg ?? communityDetail.meta?.cfg}`
+                    : "",
+                  (communityDetail.seed ?? communityDetail.meta?.seed) != null
+                    ? `seed ${communityDetail.seed ?? communityDetail.meta?.seed}`
+                    : "",
+                  (communityDetail.clipSkip ?? communityDetail.meta?.clipSkip) != null
+                    ? `clip skip ${communityDetail.clipSkip ?? communityDetail.meta?.clipSkip}`
+                    : "",
+                  communityDetail.size || communityDetail.meta?.size || "",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              </p>
+              {communityCheckpointLine(communityDetail) ? (
+                <p className="agent-gallery-checkpoint">{communityCheckpointLine(communityDetail)}</p>
+              ) : null}
+              {(communityDetail.resources || []).some(
+                (r) => !isCheckpointAsset({ modelType: r?.type, type: r?.type }),
+              ) ? (
+                <p className="hint">
+                  Also used:{" "}
+                  {(communityDetail.resources || [])
+                    .filter((r) => !isCheckpointAsset({ modelType: r?.type, type: r?.type }))
+                    .map((r) => {
+                      const weight = r.weight != null ? ` ${r.weight}` : "";
+                      return `${r.name}${r.type ? ` (${r.type}${weight})` : ""}`;
+                    })
+                    .join(", ")}
+                </p>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tab === "agent" && agentFocus === "meta" && (
+        <section className="panel gen-meta" aria-label="Generation meta">
+          {renderAgentSubnav()}
+          <p className="hint gen-meta-source">
+            {genMeta.sourceLabel ||
+              (genMeta.source === "user"
+                ? "Hand edit"
+                : genMeta.source === "agent"
+                  ? "Set from chat"
+                  : "Sampler, CFG, steps, and clip skip for the next local generate.")}
+            {genMeta.locked ? " · kept until you use the example again" : ""}
+            {genMeta.enhance === "off" ? " · enhance off (prompt as-is)" : ""}
+          </p>
+          <div className="gen-meta-grid">
+            <label>
+              Enhance
+              <select
+                value={genMeta.enhance === "off" ? "off" : "auto"}
+                onChange={(e) => patchGenMeta({ enhance: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              >
+                <option value="auto">Auto</option>
+                <option value="off">Off (reproduce)</option>
+              </select>
+            </label>
+            <label>
+              Sampler
+              <input
+                value={genMeta.sampler}
+                onChange={(e) => patchGenMeta({ sampler: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label>
+              CFG
+              <input
+                type="number"
+                min="0"
+                max="30"
+                step="0.5"
+                value={genMeta.cfg}
+                onChange={(e) => patchGenMeta({ cfg: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label>
+              Steps
+              <input
+                type="number"
+                min="1"
+                max="80"
+                step="1"
+                value={genMeta.steps}
+                onChange={(e) => patchGenMeta({ steps: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label>
+              Clip skip
+              <input
+                type="number"
+                min="1"
+                max="12"
+                step="1"
+                value={genMeta.clipSkip}
+                onChange={(e) => patchGenMeta({ clipSkip: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label>
+              Seed
+              <input
+                type="number"
+                placeholder="random"
+                value={genMeta.seed}
+                onChange={(e) => patchGenMeta({ seed: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label>
+              Quantity
+              <input
+                type="number"
+                min="1"
+                max="4"
+                step="1"
+                value={genMeta.quantity}
+                onChange={(e) => patchGenMeta({ quantity: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label>
+              Size
+              <input
+                placeholder="1024x1024"
+                value={genMeta.size}
+                onChange={(e) => patchGenMeta({ size: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+            <label className="gen-meta-wide">
+              Negative prompt
+              <textarea
+                rows={3}
+                value={genMeta.negativePrompt}
+                onChange={(e) => patchGenMeta({ negativePrompt: e.target.value })}
+                onBlur={() => void flushGenMeta()}
+              />
+            </label>
+          </div>
+          {(session.pinnedLoras || []).length > 0 && (
+            <ul className="pin-list gen-meta-pins" aria-label="Pinned LoRA weights">
+              {(session.pinnedLoras || []).map((l) => (
+                <li key={`meta-${loraKey(l)}`}>
+                  <span>{l.name}</span>
+                  <input
+                    type="number"
+                    className="pin-weight"
+                    min="0"
+                    max="2"
+                    step="0.05"
+                    value={l.scale ?? 1}
+                    onChange={(e) => setPinScale(l, e.target.value)}
+                    aria-label={`Weight ${l.name}`}
+                  />
+                </li>
+              ))}
+            </ul>
+          )}
+          {genMeta.lastSeed != null && genMeta.lastSeed !== "" && (
+            <p className="hint">Last seed {genMeta.lastSeed}</p>
+          )}
+          {genMeta.samplerNote ? <p className="hint">{genMeta.samplerNote}</p> : null}
+          {genMeta.clipSkipApplied === false && genMeta.clipSkip ? (
+            <p className="hint">Clip skip {genMeta.clipSkip} is stored. The last generate could not apply it.</p>
+          ) : null}
+          <div className="row">
+            <button type="button" className="ghost" onClick={() => void clearReproductionInputs()}>
+              Clear
+            </button>
+            <button type="button" className="ghost" onClick={() => void useExampleMeta()}>
+              Use example
+            </button>
+          </div>
         </section>
       )}
 
-      {tab === "civitai" && (
+      {tab === "agent" && agentFocus === "suggestions" && (
+        <section className="panel style-rail">
+          {renderAgentSubnav()}
+          {(ideas.length > 0 || suggestNote) && (
+            <div className="suggestions agent-suggestions">
+              {suggestNote && <p className="hint">{suggestNote}</p>}
+              {ideas.length > 0 && (
+                <div className="idea-chips">
+                  {ideas.map((idea) => (
+                    <button
+                      key={idea}
+                      type="button"
+                      className="idea-chip"
+                      onClick={() => {
+                        setPrompt(idea);
+                        setSession((prev) => ({
+                          ...prev,
+                          goal: prev.goal || idea,
+                        }));
+                      }}
+                    >
+                      {idea}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+          {chatLookupCount > 0 && (
+            <div className="style-matches">
+              <div className="style-matches-head">
+                <div>
+                  <span className="t-kind">Civitai matches</span>
+                  {civitaiQuery ? (
+                    <p className="style-matches-q">
+                      Civitai · <strong>{civitaiQuery}</strong>
+                    </p>
+                  ) : (
+                    <p className="style-matches-q">Suggested for this prompt</p>
+                  )}
+                </div>
+                <button type="button" className="ghost" onClick={clearSuggestions}>
+                  Dismiss
+                </button>
+              </div>
+              <p className="hint">
+                Installed rows match this lookup by name, filename, or version id. Other Civitai
+                hits stay in the list below. Pin a row to use it: that installs the LoRA if it is
+                not on the worker, then pins it, and installs or selects the matching base. A
+                plain download does not pin.
+              </p>
+              {renderAssetLookup(chatLookup)}
+            </div>
+          )}
+          {styles.length > 0 &&
+            styles.map((s) => (
+              <article
+                key={s.id}
+                className="style-item"
+                onClick={() => {
+                  setPrompt(s.examplePrompt);
+                  setSession((prev) => ({
+                    ...prev,
+                    goal: prev.goal || s.examplePrompt,
+                  }));
+                  setTab("gallery");
+                }}
+              >
+                <h3>{s.displayName}</h3>
+                <p>{(s.examplePrompt || "").slice(0, 120)}…</p>
+                <span className="salon-meta">{s.backend}</span>
+              </article>
+            ))}
+        </section>
+      )}
+
+      {tab === "agent" && CIVITAI_AGENT_FOCUS.has(agentFocus) && (
         <section className="panel">
-          <div className="row civitai-subnav" style={{ marginBottom: "0.75rem" }}>
-            {CIVITAI_SUBNAV.filter((s) => !s.end).map(({ id, label }) => {
-              const count =
-                id === "favorites"
-                  ? favorites.length
-                  : id === "installed"
-                    ? installedAssets.length
-                    : 0;
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  className={civitaiSubview === id ? "primary" : "ghost"}
-                  aria-pressed={civitaiSubview === id}
-                  onClick={() => setCivitaiSubview(id)}
-                >
-                  {count ? `${label} (${count})` : label}
-                </button>
-              );
-            })}
-            <HelpQ topic="help-civitai" label="Civitai" onOpen={openHelp} />
-            {CIVITAI_SUBNAV.filter((s) => s.end).map(({ id, label }) => {
-              const activeDl = downloadJobs.some((j) =>
-                ["queued", "downloading"].includes(j.status),
-              );
-              return (
-                <button
-                  key={id}
-                  type="button"
-                  className={`civitai-subnav-end${activeDl ? " dl-busy" : ""} ${
-                    civitaiSubview === id ? "primary" : "ghost"
-                  }`}
-                  aria-pressed={civitaiSubview === id}
-                  aria-busy={activeDl || undefined}
-                  title={activeDl ? "Downloads in progress" : label}
-                  onClick={() => setCivitaiSubview(id)}
-                >
-                  {label}
-                </button>
-              );
-            })}
-          </div>
-          {civitaiSubview === "search" && (
+          {renderAgentSubnav()}
+          {agentFocus === "search" && (
             <>
               {!settings?.civitaiConfigured && (
                 <p className="hint">
@@ -6228,9 +8883,9 @@ export default function App() {
               </div>
             </>
           )}
-          {civitaiSubview === "favorites" && (
+          {agentFocus === "favorites" && (
             <>
-              {favorites.length === 0 ? (
+              {favoriteTypeTabs.length === 0 ? (
                 <div className="gallery-empty">
                   <div className="gallery-empty-art">
                     <img
@@ -6242,18 +8897,57 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                <div className="lora-row">
-                  {favorites.map((item) =>
-                    renderLoraCard(item, {
-                      pinLabel: "Pin to session",
-                      onAfterPin: () => setTab("gallery"),
-                    }),
+                <>
+                  <div className="row favorite-type-nav" role="tablist" aria-label="Favorite types">
+                    {favoriteTypeTabs.map((entry) => (
+                      <button
+                        key={entry.id}
+                        type="button"
+                        role="tab"
+                        aria-selected={entry.id === activeFavoriteType}
+                        className={entry.id === activeFavoriteType ? "primary" : "ghost"}
+                        onClick={() => setFavoriteType(entry.id)}
+                      >
+                        {entry.label}
+                      </button>
+                    ))}
+                  </div>
+                  {activeFavoriteType === "Images" && communityErr ? (
+                    <p className="err">{communityErr}</p>
+                  ) : null}
+                  {activeFavoriteType === "Images" && communityNote ? (
+                    <p className="hint">{communityNote}</p>
+                  ) : null}
+                  {activeFavoriteItems.length === 0 ? (
+                    <div className="gallery-empty">
+                      <div className="gallery-empty-art">
+                        <img
+                          src="/empty-favorites.png"
+                          alt="No favorites yet."
+                          className="gallery-empty-img"
+                          draggable={false}
+                        />
+                      </div>
+                    </div>
+                  ) : activeFavoriteType === "Images" ? (
+                    <ul className="agent-gallery-list">
+                      {activeFavoriteItems.map((item) => renderCommunityTile(item))}
+                    </ul>
+                  ) : (
+                    <div className="lora-row">
+                      {activeFavoriteItems.map((item) =>
+                        renderLoraCard(item, {
+                          pinLabel: "Pin to session",
+                          onAfterPin: () => setTab("gallery"),
+                        }),
+                      )}
+                    </div>
                   )}
-                </div>
+                </>
               )}
             </>
           )}
-          {civitaiSubview === "downloads" && (
+          {agentFocus === "downloads" && (
             <>
               <div className="row" style={{ justifyContent: "space-between", marginBottom: "0.5rem" }}>
                 <span className="label-with-help" style={{ flex: 1 }}>
@@ -6346,7 +9040,7 @@ export default function App() {
               )}
             </>
           )}
-          {civitaiSubview === "installed" && (
+          {agentFocus === "installed" && (
             <>
               {!hasWorker() ? (
                 <p className="hint">Connect a worker to manage installed assets.</p>
@@ -6397,47 +9091,62 @@ export default function App() {
         </section>
       )}
 
-      {tab === "gallery" && (
+      {tab === "gallery" && galleryWallItems.length > 0 && (
         <section className="panel salon">
-          <div className="salon-wall salon-wall-gallery">
-            {gallery.map((g) => (
-              <article
+          <ul className="agent-gallery-list salon-wall-gallery">
+            {galleryWallItems.map((g) => (
+              <li
                 key={g.id}
-                className={`salon-work${previewResult?.artifactId === g.id ? " selected" : ""}`}
-                onClick={() => selectGalleryPreview(g)}
+                className={`agent-gallery-tile salon-gallery-tile${
+                  previewResult?.artifactId === g.id ? " selected" : ""
+                }`}
               >
-                <MediaDownload
-                  src={gallerySrc(g)}
-                  item={g}
-                  className="ghost icon-btn salon-work-dl"
-                  onError={setError}
-                />
                 <button
                   type="button"
-                  className="ghost salon-work-del"
-                  title="Delete from gallery"
-                  aria-label={`Delete ${(g.prompt || "generation").slice(0, 40)}`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    deleteGalleryItem(g.id);
+                  className="agent-gallery-shot"
+                  onClick={() => {
+                    selectGalleryPreview(g);
+                    setGalleryDetail(galleryToResult(g));
                   }}
                 >
-                  <IconTrash />
+                  <MediaFigure item={g} src={gallerySrc(g)} alt="" />
                 </button>
-                <figure>
-                  <MediaFigure item={g} src={gallerySrc(g)} alt={g.prompt} />
-                  <figcaption>
-                    <span className="salon-caption">{(g.prompt || "").slice(0, 90)}…</span>
-                    <span className="salon-meta">
-                      {g.backend}
-                      {isVideoArtifact(g) ? " · video" : isGifArtifact(g) ? " · gif" : ""}
-                    </span>
-                  </figcaption>
-                </figure>
-              </article>
+                <div className="agent-gallery-tile-actions">
+                  {renderFreyaGalleryActions(galleryToResult(g) || g)}
+                </div>
+              </li>
             ))}
-          </div>
+          </ul>
         </section>
+      )}
+
+      {tab === "gallery" && galleryDetail && (
+        <div
+          className="civitai-modal-backdrop"
+          role="presentation"
+          onClick={() => setGalleryDetail(null)}
+        >
+          <div
+            className="civitai-modal community-image-modal freya-gallery-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Gallery image"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="civitai-modal-head">
+              <h3>Your generation</h3>
+              <div className="row lora-card-actions agent-gallery-actions">
+                {renderFreyaGalleryActions(galleryDetail)}
+                <button type="button" className="ghost" onClick={() => setGalleryDetail(null)}>
+                  Close
+                </button>
+              </div>
+            </div>
+            <div className="civitai-modal-gallery">
+              <MediaFigure item={galleryDetail} src={galleryDetail.url} alt="" />
+            </div>
+          </div>
+        </div>
       )}
 
       {tab === "worker" && (
@@ -6513,6 +9222,36 @@ export default function App() {
                     Copy Windows
                   </button>
                   {setupCmdCopyMsg ? <span className="hint">{setupCmdCopyMsg}</span> : null}
+                </div>
+              </div>
+
+              <div className="worker-setup" aria-label="Worker image update">
+                <strong className="worker-connect-title">Update worker image</strong>
+                <p className="hint">
+                  External GPU hosts: patch <code>FreyaDiffusionWorker</code>{" "}
+                  <code>spec.image</code>, then run on that host (pulls tag from the CR). Studio
+                  cannot restart a remote URL.
+                </p>
+                <label>
+                  Linux / macOS
+                  <textarea
+                    className="worker-setup-cmd"
+                    readOnly
+                    rows={2}
+                    value={linuxWorkerUpdateCmd()}
+                    spellCheck={false}
+                  />
+                </label>
+                <div className="row settings-token-actions">
+                  <button
+                    type="button"
+                    className="ghost"
+                    disabled={busy || mock}
+                    onClick={() => copyWorkerUpdateCmd()}
+                    title="Copy worker update one-liner"
+                  >
+                    Copy update
+                  </button>
                 </div>
               </div>
 
@@ -7504,8 +10243,10 @@ export default function App() {
 
           <HelpSection id="help-overview" title="Overview" active={helpFocus === "help-overview"}>
             <p>
-              Chat on the left; Gallery / Styles / Civitai / Worker on the tabs. Cloud Generate needs
-              an OpenRouter key. Local LoRAs and Local generate need a diffusion worker.
+              Chat on the left. Tabs are Agent, Gallery, Metrics, Help, Guidelines, Models, Worker,
+              and Settings. Cloud Generate needs an OpenRouter key. Local LoRAs and Local generate
+              need a diffusion worker. There is no separate worker enable switch — use Cloud | Local
+              and Worker start/stop.
             </p>
             <p>
               Keys and Privacy live under Settings. Model pickers, Auto fallbacks, and chat vendors
@@ -7515,16 +10256,25 @@ export default function App() {
 
           <HelpSection id="help-civitai" title="Civitai" active={helpFocus === "help-civitai"}>
             <p>
-              <strong>Search</strong> finds LoRAs / checkpoints (needs a Civitai API key).{" "}
-              <strong>★ Favorite</strong> is a persistent library in this browser.{" "}
-              <strong>Pin</strong> is session-only for LoRAs / adapters / embeddings — not
-              checkpoints (use Worker → Set as base). <strong>Install</strong> queues a download
-              and does not auto-pin.
+              <strong>Search</strong> finds LoRAs, checkpoints, and the other types (LoCon, DoRA,
+              LyCORIS, embeddings, VAE) — one type per search, needs a Civitai API key.{" "}
+              <strong>★ Favorite</strong> is a persistent library in this browser, with a tab per
+              type: LORA, LoCon, DoRA, LyCORIS, Checkpoint, TextualInversion, VAE, and Images for
+              community gallery favorites.{" "}
+              <strong>Pin</strong> on a suggestion installs the LoRA if it is not on the worker,
+              then pins it, and installs or selects the matching base. A plain download does not
+              pin. Checkpoints are a base, not a session pin.
             </p>
             <p>
               <strong>Installed</strong> shows assets already on the worker disk as clickable cards
               (same style as Favorites) — open a card for details, pin (adapters only), delete, or
               set base.
+            </p>
+            <p>
+              Lookups open on <strong>Agent</strong> as a scrollable table: installed matches
+              first, then other Civitai hits, one asset per row, Installed-sized thumbs. Chat
+              keeps the prompt and the reply. The route line and tool calls, including errors,
+              stay behind a collapsed line.
             </p>
           </HelpSection>
 
@@ -7544,6 +10294,8 @@ export default function App() {
               process is <code>freya-local-worker</code> (default port {DEFAULT_WORKER_PORT}); Studio
               is usually in-cluster and reaches it by URL (
               <code>FreyaDiffusionWorker</code> <code>externalEndpoint</code>).
+              New engine images: patch <code>spec.image</code>, then{" "}
+              <code>update-local-worker.sh --from-cr</code> on the GPU host.
             </p>
           </HelpSection>
 
@@ -7717,7 +10469,7 @@ export default function App() {
           onClick={closeCivitaiDetail}
         >
           <div
-            className="civitai-modal"
+            className="civitai-modal community-image-modal civitai-asset-modal"
             role="dialog"
             aria-modal="true"
             aria-label={detailModel.name || "Civitai asset"}
@@ -7733,9 +10485,12 @@ export default function App() {
                     .join(" · ")}
                 </p>
               </div>
-              <button type="button" className="ghost" onClick={closeCivitaiDetail}>
-                Close
-              </button>
+              <div className="row lora-card-actions agent-gallery-actions">
+                {renderCivitaiDetailActions()}
+                <button type="button" className="ghost" onClick={closeCivitaiDetail}>
+                  Close
+                </button>
+              </div>
             </div>
             <div className="civitai-modal-gallery">
               {detailImages.length > 0 ? (
@@ -7865,94 +10620,26 @@ export default function App() {
                     .join(" · ")}
                 </p>
               )}
-              <div className="row lora-card-actions">
-                <button
-                  type="button"
-                  className={`${isFavorite(detailModel) ? "primary" : "ghost"} icon-btn`}
-                  title={
-                    isFavorite(detailModel)
-                      ? "Remove from favorites"
-                      : "Save to favorites library"
-                  }
-                  aria-label={isFavorite(detailModel) ? "Unfavorite" : "Favorite"}
-                  onClick={() => toggleFavorite(detailModel)}
-                >
-                  <IconStar filled={isFavorite(detailModel)} />
-                </button>
-                {isPinnableAsset(detailModel) ? (
-                  <button
-                    type="button"
-                    className={`${isPinned(detailModel) ? "primary" : "ghost"} icon-btn`}
-                    title={
-                      isPinned(detailModel) ? "Unpin from this session" : "Pin to session"
-                    }
-                    aria-label={
-                      isPinned(detailModel) ? "Unpin from session" : "Pin to session"
-                    }
-                    onClick={() =>
-                      isPinned(detailModel)
-                        ? unpinLora(detailModel)
-                        : pinLora(
-                            detailModel,
-                            detailModel.path ? { path: detailModel.path } : undefined,
-                          )
-                    }
-                  >
-                    <IconPin />
-                  </button>
-                ) : null}
-                {renderInstallAction(detailModel)}
-                {(() => {
-                  const installed =
-                    findInstalledForItem(detailModel) ||
-                    (detailModel.path
-                      ? installedAssets.find((a) => a.path === detailModel.path)
-                      : null);
-                  const isCkpt =
-                    installed &&
-                    (installed.kind === "checkpoint" ||
-                      (installed.path || "").startsWith("checkpoints/"));
-                  const isActive = installed && activeBasePath && activeBasePath === installed.path;
-                  if (!isCkpt) return null;
-                  return (
-                    <button
-                      type="button"
-                      className={isActive ? "primary" : "ghost"}
-                      disabled={isActive}
-                      onClick={() => setInstalledAsBase(installed)}
-                    >
-                      {isActive ? "Active base" : "Set as base"}
-                    </button>
-                  );
-                })()}
-                {detailModel.civitaiUrl && (
-                  <a
-                    className="ghost"
-                    href={detailModel.civitaiUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    Open on Civitai
-                  </a>
-                )}
-              </div>
               {(detailModel.needsBase || detailModel.baseModel) && (
                 <p className="hint">
                   {detailModel.needsBase ||
                     `LoRA base family: ${detailModel.baseModel}. Install a matching checkpoint to checkpoints/ on the local worker, then set it as active base on the Worker tab.`}
                 </p>
               )}
-              {detailRelated.length > 0 && (
+              {detailSuggestions.length > 0 && (
                 <div className="civitai-related">
-                  <h4>Needs checkpoint / related</h4>
+                  <h4>
+                    {detailSuggestionsAreRecommended
+                      ? "Recommended base checkpoint"
+                      : "Needs checkpoint / related"}
+                  </h4>
                   <p className="hint">
-                    Civitai does not expose a hard dependency graph — Freya suggests popular
-                    checkpoints for this base family so you can install and set one as active base.
-                    Install puts weights under FREYA_MODELS_DIR (game drive / PVC); set active base
-                    after.
+                    {detailSuggestionsAreRecommended
+                      ? "Civitai lists these checkpoints for this version. Install one, then set it as the active base."
+                      : "Civitai does not expose a hard dependency graph — Freya suggests popular checkpoints for this base family so you can install and set one as active base. Install puts weights under FREYA_MODELS_DIR (game drive / PVC); set active base after."}
                   </p>
                   <div className="lora-row">
-                    {detailRelated.map((rel) => {
+                    {detailSuggestions.map((rel) => {
                       const card = rel?.model || rel;
                       return renderLoraCard(
                         {

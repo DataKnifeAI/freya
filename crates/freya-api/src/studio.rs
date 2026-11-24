@@ -39,6 +39,9 @@ pub struct StudioPrefs {
     pub favorites: Vec<Value>,
     #[serde(default)]
     pub pinned_loras: Vec<Value>,
+    /// Sampler, CFG, steps, clip skip, seed, and the rest of the next local generate.
+    #[serde(default)]
+    pub generation: crate::genmeta::GenerationSettings,
 }
 
 impl Default for StudioPrefs {
@@ -49,6 +52,7 @@ impl Default for StudioPrefs {
             automation_mode: String::new(),
             favorites: Vec::new(),
             pinned_loras: Vec::new(),
+            generation: crate::genmeta::GenerationSettings::default(),
         }
     }
 }
@@ -66,6 +70,8 @@ pub struct StudioPatch {
     pub favorites: Option<Vec<Value>>,
     #[serde(default)]
     pub pinned_loras: Option<Vec<Value>>,
+    #[serde(default)]
+    pub generation: Option<crate::genmeta::GenerationSettings>,
 }
 
 pub fn normalize_backend(raw: &str) -> Result<String, String> {
@@ -116,6 +122,9 @@ pub fn apply_patch(prefs: &mut StudioPrefs, patch: StudioPatch) -> Result<(), St
     if let Some(pins) = patch.pinned_loras {
         prefs.pinned_loras = sanitize_list(&pins, true)?;
     }
+    if let Some(generation) = patch.generation {
+        prefs.generation = generation;
+    }
     Ok(())
 }
 
@@ -144,6 +153,23 @@ pub fn pin_add(prefs: &mut StudioPrefs, card: &Value) -> Result<Value, String> {
     prefs.pinned_loras.push(card.clone());
     prefs.pinned_loras.truncate(24);
     Ok(card)
+}
+
+/// Pin or update scale on an existing pin without dropping other pin fields.
+pub fn pin_upsert(prefs: &mut StudioPrefs, card: &Value) -> Result<Value, String> {
+    let clean = sanitize_card(card, true)?;
+    let key = card_key(&clean);
+    if let Some(existing) = prefs
+        .pinned_loras
+        .iter_mut()
+        .find(|c| card_key(c) == key)
+    {
+        if let (Some(obj), Some(scale)) = (existing.as_object_mut(), clean.get("scale")) {
+            obj.insert("scale".into(), scale.clone());
+        }
+        return Ok(existing.clone());
+    }
+    pin_add(prefs, &clean)
 }
 
 pub fn pin_remove(prefs: &mut StudioPrefs, card: &Value) -> bool {
@@ -232,7 +258,7 @@ pub fn sanitize_card(card: &Value, pin: bool) -> Result<Value, String> {
         }
     }
     if !out.contains_key("scale") && pin {
-        out.insert("scale".into(), json!(0.8));
+        out.insert("scale".into(), json!(1.0));
     }
     let has_id = out.contains_key("id") || out.contains_key("path") || out.contains_key("name");
     if !has_id {

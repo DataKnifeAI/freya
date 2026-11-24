@@ -10,5 +10,6 @@ sentencepiece==0.2.0
 protobuf==5.29.4
 huggingface-hub==0.29.3
 peft==0.14.0
+compel==2.0.3
 # Optional: quieter single-file SDXL loads
 omegaconf==2.3.0

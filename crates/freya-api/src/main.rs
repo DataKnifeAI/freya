@@ -4,10 +4,12 @@ mod civitai;
 mod config;
 mod disk;
 mod gallery;
+mod genmeta;
 mod gpu;
 mod k8s_secret;
 mod openrouter;
 mod prefs;
+mod reproduce;
 mod router;
 mod routes;
 mod state;
@@ -71,9 +73,18 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/gallery/{id}/image", get(routes::gallery_image))
         .route("/v1/gallery/{id}/remix", post(routes::gallery_remix))
+        .route("/v1/gallery/{id}/apply", post(routes::gallery_apply))
+        .route(
+            "/v1/reproduction/community",
+            post(routes::reproduction_community_apply),
+        )
         .route("/v1/models", get(routes::models))
         .route("/v1/styles", get(routes::styles_list))
+        .route("/v1/route-defaults", get(routes::route_defaults))
         .route("/v1/civitai/search", get(routes::civitai_search))
+        .route("/v1/civitai/lookup", get(routes::civitai_lookup))
+        .route("/v1/civitai/images", get(routes::civitai_images))
+        .route("/v1/civitai/media", get(routes::civitai_media))
         .route("/v1/civitai/models/{id}", get(routes::civitai_model))
         .route(
             "/v1/civitai/model-versions/{id}",
@@ -94,6 +105,14 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/studio",
             get(routes::studio_get).put(routes::studio_put),
+        )
+        .route(
+            "/v1/generation-meta",
+            get(routes::generation_meta_get).put(routes::generation_meta_put),
+        )
+        .route(
+            "/v1/generation-meta/recommend",
+            post(routes::generation_meta_recommend),
         )
         .route("/v1/metrics/openrouter", get(routes::openrouter_metrics))
         .route("/v1/auth/token", post(routes::auth_token_create))
@@ -184,8 +203,10 @@ async fn require_api_token(
     if method == Method::OPTIONS {
         return Ok(next.run(req).await);
     }
-    // UUID gallery ids are unguessable; list/detail/search still require the bearer.
-    if matches!(method, Method::GET | Method::HEAD) && is_gallery_image_path(req.uri().path()) {
+    // UUID gallery ids are unguessable; Civitai media proxy is CDN-host allowlisted.
+    if matches!(method, Method::GET | Method::HEAD)
+        && (is_gallery_image_path(req.uri().path()) || is_civitai_media_path(req.uri().path()))
+    {
         return Ok(next.run(req).await);
     }
 
@@ -260,6 +281,10 @@ fn is_gallery_image_path(path: &str) -> bool {
     )
 }
 
+fn is_civitai_media_path(path: &str) -> bool {
+    path.trim_end_matches('/') == "/v1/civitai/media"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +296,7 @@ mod tests {
         assert!(!is_gallery_image_path("/v1/gallery"));
         assert!(!is_gallery_image_path("/v1/gallery/abc-123"));
         assert!(!is_gallery_image_path("/v1/civitai/search"));
+        assert!(is_civitai_media_path("/v1/civitai/media"));
+        assert!(is_civitai_media_path("/v1/civitai/media/"));
     }
 }

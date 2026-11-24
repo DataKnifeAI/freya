@@ -207,3 +207,4 @@ fi
 echo "Token file: $ENV_FILE"
 echo "Logs: docker logs -f $NAME"
 echo "Stop: docker rm -f $NAME"
+echo "Update image later: ./scripts/update-local-worker.sh --from-cr freya-gpu  # after patching CR spec.image"

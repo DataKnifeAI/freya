@@ -188,6 +188,8 @@ Worker health/stats:
 
 **GPU engine (this host):** `./scripts/run-local-worker.sh` (or `make run-local-worker`) builds `Dockerfile.worker` and runs Docker `freya-local-worker` with `--gpus all`. Inside the container, freya-worker proxies generate to a **Diffusers** sidecar (`FREYA_ENGINE_URL=http://127.0.0.1:8092`). Checkpoints + Civitai LoRAs under `FREYA_MODELS_DIR` load **on demand** into VRAM and unload after each generate unless `FREYA_ENGINE_KEEP_LOADED=1`. Stats `modelLoaded.loadedInVram` reflects the engine; `nvidia-smi` VRAM appears when the container has GPU access. Compose: `make compose-up-gpu`. Without `FREYA_ENGINE_URL`, generate still returns a stub PNG for wiring tests. CRD `engine: vllm-omni` remains the label for swapping to vLLM-Omni on the same HTTP surface.
 
+**Worker image updates (GPU host):** Studio cannot restart an external URL — patch `FreyaDiffusionWorker.spec.image` (`repository` / `tag` / `pullPolicy`), then on the GPU machine run `./scripts/update-local-worker.sh --from-cr freya-gpu` (`make update-local-worker` with args). In-cluster `placement: incluster` rolls the operator-managed Deployment when `spec.image` changes.
+
 ### Civitai in the UI
 
 - Search/Suggest returns installable types (LoRA, LoCon, DoRA, Checkpoint, TextualInversion, VAE) with thumbnails and type badges — not LoRA-only.

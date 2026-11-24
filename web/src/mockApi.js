@@ -46,26 +46,8 @@ export const BEGINNER_EXAMPLE = FREYA_BRAND_EXAMPLE;
 /** Civitai search that matches freya.png vibe (wings + fantasy armor). */
 export const BEGINNER_CIVITAI_QUERY = "fantasy winged warrior lora";
 
-/** Mock /v1/styles — first entry is the default Use example / empty Suggest seed. */
+/** Mock /v1/styles. Sample brand, moon, and local-LoRA packs are not shipped. */
 const STYLE_PACKS = [
-  {
-    id: "freya-winged-warrior",
-    displayName: "Freya (brand art)",
-    tags: ["character", "fantasy", "wings"],
-    examplePrompt: FREYA_BRAND_EXAMPLE,
-    backend: "openrouter",
-    openRouterModel: "black-forest-labs/flux.2-klein-4b",
-    recommendedSize: "1024x1024",
-  },
-  {
-    id: "ethereal-moon",
-    displayName: "Ethereal Moon Landscape",
-    tags: ["landscape", "fantasy", "moon"],
-    examplePrompt: ETHEREAL_MOON_EXAMPLE,
-    backend: "openrouter",
-    openRouterModel: "black-forest-labs/flux.2-klein-4b",
-    recommendedSize: "1024x1024",
-  },
   {
     id: "harbor-moon",
     displayName: "Harbor Moon (atelier)",
@@ -82,17 +64,6 @@ const STYLE_PACKS = [
     examplePrompt: ANIME_PORTRAIT_EXAMPLE,
     backend: "openrouter",
     recommendedSize: "768x1024",
-  },
-  {
-    id: "local-character-lora",
-    displayName: "Local Character LoRA (worker)",
-    tags: ["lora", "local", "character"],
-    examplePrompt: LOCAL_CHARACTER_EXAMPLE,
-    backend: "local",
-    localCheckpoint: "stabilityai/stable-diffusion-xl-base-1.0",
-    loras: [{ name: "my_character", scale: 0.8 }],
-    triggerWords: "my_character",
-    recommendedSize: "1024x1024",
   },
 ];
 
@@ -128,6 +99,10 @@ function svgDataUrl(title, subtitle, hue = 28) {
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 }
 
+/** Two-frame GIF so mock gif previews animate in <img>. */
+const ANIMATED_GIF_DATA_URL =
+  "data:image/gif;base64,R0lGODlhCAAIAJEAABQQDuh4KlqMoPDm0iH/C05FVFNDQVBFMi4wAwEAAAAh+QQEFAAAACwAAAAACAAIAAACB4wPU5fbWwEAIfkEBBQAAAAsAAAAAAgACAAAAgeUD1OX21sBADs=";
+
 function escapeXml(s) {
   return s
     .replace(/&/g, "&amp;")
@@ -153,10 +128,77 @@ const FREYA_ASSET_TYPES = new Set([
   "lora",
   "locon",
   "dora",
+  "lycoris",
   "checkpoint",
   "textualinversion",
   "vae",
 ]);
+
+/** Agent search enum. Model is not a Civitai type. Embedding is TextualInversion. */
+const AGENT_SEARCH_TYPES = [
+  "LORA",
+  "LoCon",
+  "DoRA",
+  "LyCORIS",
+  "Checkpoint",
+  "TextualInversion",
+  "VAE",
+];
+
+function canonicalSearchType(raw) {
+  const text = String(raw || "");
+  if (text.includes(",")) {
+    return {
+      error: `search one type per call. type is one of ${AGENT_SEARCH_TYPES.join(", ")}. Embedding is TextualInversion. Model is not a Civitai type.`,
+    };
+  }
+  const key = text.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const map = {
+    lora: "LORA",
+    loras: "LORA",
+    locon: "LoCon",
+    dora: "DoRA",
+    lycoris: "LyCORIS",
+    lyco: "LyCORIS",
+    checkpoint: "Checkpoint",
+    checkpoints: "Checkpoint",
+    textualinversion: "TextualInversion",
+    embedding: "TextualInversion",
+    embeddings: "TextualInversion",
+    vae: "VAE",
+    vaes: "VAE",
+  };
+  if (key === "model" || key === "models") {
+    return {
+      error:
+        "Model is not a Civitai model type. Search Checkpoint for a base, or one of LORA, LoCon, DoRA, LyCORIS, TextualInversion, VAE.",
+    };
+  }
+  if (!map[key]) {
+    return {
+      error: `type is required, one of ${AGENT_SEARCH_TYPES.join(", ")}. Embedding is TextualInversion. Call once per type. Does not pin or download.`,
+    };
+  }
+  return { type: map[key] };
+}
+
+function mockInstalledMatchesType(asset, canon) {
+  const mt = String(asset?.modelType || "").trim();
+  if (mt) return canonicalSearchType(mt).type === canon;
+  const kind = String(asset?.kind || "").trim();
+  if (kind) {
+    const got = canonicalSearchType(kind).type;
+    const adapters = ["LORA", "LoCon", "DoRA", "LyCORIS"];
+    if (got && adapters.includes(canon) && adapters.includes(got)) return true;
+    if (got) return got === canon;
+  }
+  const path = String(asset?.path || "");
+  if (["LORA", "LoCon", "DoRA", "LyCORIS"].includes(canon)) return path.startsWith("loras/");
+  if (canon === "Checkpoint") return path.startsWith("checkpoints/");
+  if (canon === "TextualInversion") return path.startsWith("embeddings/");
+  if (canon === "VAE") return path.startsWith("vae/");
+  return false;
+}
 
 function isFreyaAssetType(modelType) {
   return FREYA_ASSET_TYPES.has(String(modelType || "").toLowerCase());
@@ -164,7 +206,7 @@ function isFreyaAssetType(modelType) {
 
 function assetTypeRank(modelType) {
   const t = String(modelType || "").toLowerCase();
-  if (t === "lora" || t === "locon" || t === "dora" || t.includes("lora")) return 0;
+  if (t === "lora" || t === "locon" || t === "dora" || t === "lycoris" || t.includes("lora")) return 0;
   if (t === "checkpoint") return 1;
   if (t === "textualinversion") return 2;
   if (t === "vae") return 3;
@@ -243,7 +285,11 @@ function mockCard(partial) {
     fileName: defaultFile?.name,
     fileFormat: defaultFile?.format,
     creator: "freya-mock",
-    civitaiUrl: `https://civitai.com/models/${partial.id}`,
+    civitaiUrl: `${
+      partial.nsfw === true || Number(partial.nsfwLevel) > 1
+        ? "https://civitai.red"
+        : "https://civitai.com"
+    }/models/${partial.id}?modelVersionId=${modelVersions[0]?.id || versionId}`,
     description:
       partial.description ||
       `${partial.name} — mock Civitai asset for Freya. Compatible with ${baseModel} bases.`,
@@ -320,6 +366,15 @@ const CIVITAI_CATALOG = [
     thumbnailUrl: svgDataUrl("Studio Soft Light", "LORA · portrait", 200),
     triggerWord: "softstudiolight",
     tags: ["portrait", "studio", "light", "soft", "lighting", "photo", "character"],
+    recommendedResources: [
+      {
+        id: 101,
+        name: "Yamer's Anime Illustrator",
+        type: "Checkpoint",
+        modelVersionId: 1011,
+        baseModel: "SDXL 1.0",
+      },
+    ],
   }),
   mockCard({
     id: 303,
@@ -553,6 +608,23 @@ const state = {
     },
   ],
   civitai: CIVITAI_CATALOG,
+  generation: {
+    sampler: "Euler a",
+    cfg: 7,
+    steps: 28,
+    clipSkip: 2,
+    negativePrompt: "",
+    seed: null,
+    size: "",
+    quantity: 1,
+    source: "family",
+    sourceLabel: "Family default (Illustrious/Pony/SDXL) — no example image meta",
+    locked: false,
+    lastSeed: null,
+    samplerApplied: null,
+    samplerNote: null,
+    clipSkipApplied: null,
+  },
 };
 
 function parseBody(opts) {
@@ -650,6 +722,77 @@ function sessionBatch(base, session) {
     ].slice(0, pinned.length ? 4 : 3),
     pinNote,
   };
+}
+
+function mockLabelKey(raw) {
+  const file = String(raw || "").split(/[/\\]/).pop() || "";
+  const stem = file.replace(/\.(safetensors|ckpt|pt|gguf|bin)$/i, "");
+  return stem.toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function mockQueryHits(query, label) {
+  const q = mockLabelKey(query);
+  const n = mockLabelKey(label);
+  if (q.length < 3 || !n) return false;
+  if (q === n) return true;
+  return (q.length >= 4 && n.includes(q)) || (n.length >= 4 && q.includes(n));
+}
+
+function mockSameAsset(local, search) {
+  const lv = Number(local?.versionId);
+  const sv = Number(search?.versionId);
+  if (lv > 0 && sv > 0) return lv === sv;
+  const localKeys = [mockLabelKey(local?.name), mockLabelKey(local?.path)].filter(Boolean);
+  const searchKeys = [mockLabelKey(search?.name), mockLabelKey(search?.fileName)].filter(Boolean);
+  return localKeys.some((k) => searchKeys.includes(k));
+}
+
+/** Installed name/version first, then Civitai hits that are not that file. */
+function orderMockLookup(query, searchCards, assetType) {
+  const installed = (state.localAssets || []).filter((a) =>
+    assetType ? mockInstalledMatchesType(a, assetType) : true,
+  );
+  const search = Array.isArray(searchCards) ? searchCards : [];
+  const used = new Set();
+  const consumed = new Set();
+  const existing = [];
+  const pushExisting = (local, hit) => {
+    const path = local?.path || "";
+    if (!path || used.has(path)) return;
+    used.add(path);
+    const modelId = local.modelId || (!hit?.path && /^\d+$/.test(String(hit?.id || "")) ? Number(hit.id) : null);
+    existing.push({
+      ...(hit || {}),
+      ...local,
+      modelId: modelId || local.modelId || null,
+      versionId: local.versionId ?? hit?.versionId ?? null,
+      thumbnailUrl: local.thumbnailUrl || hit?.thumbnailUrl || null,
+      imageUrls: local.imageUrls?.length ? local.imageUrls : hit?.imageUrls,
+      path,
+      installed: true,
+    });
+  };
+  if (mockLabelKey(query).length >= 3) {
+    installed.forEach((local) => {
+      if (mockQueryHits(query, local.name) || mockQueryHits(query, local.path)) {
+        const idx = search.findIndex((s) => mockSameAsset(local, s));
+        pushExisting(local, idx >= 0 ? search[idx] : null);
+        if (idx >= 0) consumed.add(idx);
+      }
+    });
+  }
+  search.forEach((hit, i) => {
+    if (consumed.has(i)) return;
+    const local = installed.find((a) => mockSameAsset(a, hit));
+    if (local) {
+      pushExisting(local, hit);
+      consumed.add(i);
+    }
+  });
+  const fresh = search
+    .filter((_, i) => !consumed.has(i))
+    .map((hit) => ({ ...hit, installed: false }));
+  return [...existing, ...fresh];
 }
 
 function lorasForAssist(civitaiQuery) {
@@ -977,10 +1120,109 @@ function offerFromAsk(prompt, ask) {
   return null;
 }
 
+const TOOL_ERROR_RE = /\b([a-z][a-z0-9]*_[a-z0-9_]*) failed:\s*/g;
+
+/** Pull route-footer and tool-error text out of an assistant reply. */
+export function partitionAssistantReply(content, actions = []) {
+  const routeLines = [];
+  let text = String(content || "").replace(/(?:^|\n)\s*(Route:\s*\S[^\n]*)/gi, (_, line) => {
+    routeLines.push(String(line).replace(/\s+/g, " ").trim());
+    return "\n";
+  });
+  text = text.replace(/\s+(Route:\s*\S[^\n]*)$/i, (_, line) => {
+    routeLines.push(String(line).replace(/\s+/g, " ").trim());
+    return "";
+  });
+
+  for (const action of Array.isArray(actions) ? actions : []) {
+    if (action?.status !== "error" || !action.type) continue;
+    const phrase = `${action.type} failed: ${action.error || "error"}`;
+    if (text.includes(phrase)) text = text.split(phrase).join(" ");
+  }
+
+  const errorLines = [];
+  const kept = [];
+  for (const rawLine of text.split("\n")) {
+    const peeled = peelToolErrors(rawLine);
+    errorLines.push(...peeled.errors);
+    if (peeled.text) kept.push(peeled.text);
+  }
+
+  const body = kept
+    .join("\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/ *\n */g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return {
+    body,
+    routeLine: routeLines.join("\n"),
+    errorLines,
+  };
+}
+
+function peelToolErrors(line) {
+  const hits = [];
+  const re = new RegExp(TOOL_ERROR_RE.source, "g");
+  let match;
+  while ((match = re.exec(line))) {
+    hits.push({ index: match.index, type: match[1], end: re.lastIndex });
+  }
+  if (!hits.length) return { text: line.trim(), errors: [] };
+  const errors = [];
+  let visible = "";
+  let cursor = 0;
+  for (let i = 0; i < hits.length; i++) {
+    visible += line.slice(cursor, hits[i].index);
+    const stop = i + 1 < hits.length ? hits[i + 1].index : line.length;
+    let err = line.slice(hits[i].end, stop);
+    const boundary = err.search(/\s+(?=[A-Z][A-Za-z]{2,}\b)/);
+    if (boundary >= 0) {
+      visible += err.slice(boundary);
+      err = err.slice(0, boundary);
+    }
+    errors.push(`${hits[i].type} failed: ${err.replace(/\s+/g, " ").trim()}`.trim());
+    cursor = stop;
+  }
+  return { text: visible.replace(/\s{2,}/g, " ").trim(), errors: errors.filter(Boolean) };
+}
+
+function shortModelId(id) {
+  const value = String(id || "").trim();
+  if (!value || value === "auto") return "auto";
+  return value.split("/").pop() || "auto";
+}
+
+/** API route footer, rebuilt when a stored turn has route fields but the line was already removed. */
+export function routeLineForMessage(message) {
+  const modality = message?.route?.modality;
+  if (!modality) return "";
+  const agent = shortModelId(message.resolvedModels?.agent);
+  const router = shortModelId(message.resolvedModels?.router);
+  const backendRaw = String(message.routeContext?.backend || message.genBackend || "").toLowerCase();
+  const backend = backendRaw === "openrouter" ? "cloud" : backendRaw;
+  const mode = message.routeContext?.mode;
+  if (backend === "local") {
+    const base = message.routeContext?.base || "none";
+    const lora = message.routeContext?.lora || "none";
+    const modeBit = mode ? ` · mode=${mode}` : "";
+    return `Route: ${modality} · agent=${agent} · router=${router} · base=${base} · lora=${lora}${modeBit} · backend=local`;
+  }
+  if (backend === "cloud") {
+    const image = shortModelId(message.resolvedModels?.image);
+    const video = shortModelId(message.resolvedModels?.video);
+    return `Route: ${modality} · agent=${agent} · router=${router} · image=${image} · video=${video} · backend=cloud`;
+  }
+  const parts = [`Route: ${modality}`, `agent=${agent}`, `router=${router}`];
+  if (mode) parts.push(`mode=${mode}`);
+  if (backend) parts.push(`backend=${backend}`);
+  return parts.join(" · ");
+}
+
 /** Quoted prompt in an assistant reply, when the reply itself is not the thing to draw. */
 export function imagePromptFromReply(text) {
-  const raw = String(text || "");
-  const body = raw.split(/\n\s*Route:/i)[0].trim();
+  const body = partitionAssistantReply(text).body;
   if (!body) return null;
   const re = /["“]([^"”\n]{24,})["”]/g;
   let match;
@@ -1011,6 +1253,12 @@ export function generateOfferForTurn(messages, index) {
       a.status === "executed",
   );
   if (done) return null;
+  const failed = actions.some(
+    (a) =>
+      (a.type === "generate_image" || a.type === "generate_video" || a.type === "run_session") &&
+      a.status === "error",
+  );
+  if (failed) return null;
   const proposed = actions.find(
     (a) =>
       (a.type === "generate_image" || a.type === "generate_video" || a.type === "run_session") &&
@@ -1079,13 +1327,27 @@ function mockGenerateArtifact(prompt, body = {}) {
     createdAt: new Date().toISOString(),
     mime,
     modality,
-    url: svgDataUrl(
-      prompt.slice(0, 40) || "Freya",
-      isMotion ? modality : backend,
-      backend === "local" ? 140 : 28 + (id.length % 40),
-    ),
+    url:
+      modality === "gif"
+        ? ANIMATED_GIF_DATA_URL
+        : svgDataUrl(
+            prompt.slice(0, 40) || "Freya",
+            isMotion ? modality : backend,
+            backend === "local" ? 140 : 28 + (id.length % 40),
+          ),
     loras,
+    negativePrompt: body.negativePrompt || state.generation.negativePrompt || "",
+    sampler: body.sampler || state.generation.sampler,
+    cfg: body.cfg ?? state.generation.cfg,
+    steps: body.steps ?? state.generation.steps,
+    clipSkip: body.clipSkip ?? state.generation.clipSkip,
+    seed: body.seed ?? state.generation.seed ?? Math.floor(Math.random() * 1_000_000_000),
+    size: body.size || state.generation.size || "1024x1024",
+    quantity: body.quantity || state.generation.quantity || 1,
+    baseModel: body.baseModel || null,
+    genSource: state.generation.source,
   };
+  state.generation.lastSeed = item.seed;
   state.gallery.unshift(item);
   return {
     artifactId: id,
@@ -1098,6 +1360,176 @@ function mockGenerateArtifact(prompt, body = {}) {
     meta: item,
     loras,
   };
+}
+
+const QUERY_INSTRUCTION = new Set([
+  "a", "an", "the", "please", "me", "my", "of", "to", "and", "or", "with", "for", "on", "in",
+  "at", "it", "this", "that", "image", "images", "picture", "pictures", "photo", "photos", "pic",
+  "are", "you", "your", "able", "can", "could", "would", "should", "make", "makes", "making",
+  "create", "creating", "generate", "generating", "draw", "drawing", "paint", "render", "want",
+  "need", "help", "do", "does", "did", "is", "am", "be", "was", "were", "i", "im", "we", "our",
+  "us", "just", "like", "some", "any", "what", "how", "which", "who", "when", "where", "why",
+  "will", "let", "show", "give", "get", "got", "using", "use", "used", "via", "from", "into",
+  "about", "character", "characters", "style", "reference", "lora", "loras", "checkpoint",
+  "checkpoints", "model", "models", "asset", "assets", "base", "look", "looking", "see",
+  "standing", "sitting", "walking", "holding", "wearing", "wear", "wears", "worn", "dressed",
+  "by", "as", "if", "but", "so", "not", "no", "yes", "now", "then", "here", "there", "also",
+  "really", "very", "prompt", "art", "artwork", "illustration",
+]);
+const QUERY_SCENE = new Set([
+  "dress", "dresses", "shirt", "skirt", "pants", "jeans", "jacket", "coat", "hat", "shoes",
+  "boots", "outfit", "outfits", "clothing", "clothes", "hoodie", "gown", "armor", "armour",
+  "cape", "cloak", "lingerie", "bikini", "stockings", "gloves", "uniform", "costume", "heels",
+  "socks", "shorts", "sweater", "blouse", "suit", "scarf", "helmet", "crown", "necklace",
+  "lighting", "light", "lights", "neon", "cinematic", "shadow", "shadows", "moonlight",
+  "sunlight", "lamp", "lamps", "glow", "glowing", "dark", "night", "bright", "dim", "bokeh",
+  "sunset", "sunrise", "dawn", "dusk", "spotlight", "emerald", "crimson", "scarlet", "pink",
+  "red", "blue", "black", "white", "gold", "golden", "silver", "purple", "violet", "green",
+  "yellow", "orange", "teal", "cyan", "ivory", "nude", "background", "foreground",
+]);
+
+function subjectQuery(message) {
+  const raw = String(message || "").trim();
+  if (!raw) return "";
+  const tokens = raw.split(/\s+/).map((word) => {
+    const key = word.replace(/[^a-z0-9]/gi, "").toLowerCase();
+    const display = word.replace(/^[^a-z0-9'-]+|[^a-z0-9'-]+$/gi, "");
+    const alpha = word.match(/[a-z]/i);
+    const cap = Boolean(alpha && alpha[0] === alpha[0].toUpperCase() && alpha[0] !== alpha[0].toLowerCase());
+    return { key, display, cap };
+  }).filter((t) => t.key && t.display);
+  const spans = [];
+  let cur = [];
+  let sceneOnly = true;
+  const flush = () => {
+    if (cur.length) spans.push({ words: cur, sceneOnly });
+    cur = [];
+    sceneOnly = true;
+  };
+  for (const tok of tokens) {
+    const instruction = QUERY_INSTRUCTION.has(tok.key);
+    const scene = QUERY_SCENE.has(tok.key);
+    if (tok.cap && !instruction && cur.length < 6) {
+      if (!scene) sceneOnly = false;
+      cur.push(tok.display);
+    } else if (cur.length && !tok.cap && !instruction && !scene && cur.length < 6) {
+      sceneOnly = false;
+      cur.push(tok.display);
+    } else flush();
+  }
+  flush();
+  const named = spans.filter((s) => !s.sceneOnly);
+  const pool = named.length ? named : spans;
+  let best = null;
+  for (const span of pool) {
+    if (!best || span.words.length >= best.words.length) best = span;
+  }
+  if (best?.words?.length) return best.words.join(" ").slice(0, 80);
+  const strict = tokens
+    .filter((t) => !QUERY_INSTRUCTION.has(t.key) && !QUERY_SCENE.has(t.key))
+    .slice(0, 6)
+    .map((t) => t.display);
+  if (strict.length) return strict.join(" ").slice(0, 80);
+  return tokens
+    .filter((t) => !QUERY_INSTRUCTION.has(t.key))
+    .slice(0, 4)
+    .map((t) => t.display)
+    .join(" ")
+    .slice(0, 80);
+}
+
+const MOCK_AGENT_SEARCH_TYPES = [
+  "LORA",
+  "LoCon",
+  "DoRA",
+  "LyCORIS",
+  "Checkpoint",
+  "TextualInversion",
+  "VAE",
+];
+
+function initialLookupActions(message) {
+  const query = subjectQuery(message);
+  if (query.length < 2) return [];
+  return MOCK_AGENT_SEARCH_TYPES.map((type) => ({
+    type: "search_civitai",
+    args: {
+      query,
+      type,
+      limit: type === "LORA" || type === "Checkpoint" ? 4 : 2,
+    },
+  }));
+}
+
+function assetPathStem(value) {
+  const s = String(value || "").trim();
+  const base = s.includes("/") ? s.split("/").pop() : s;
+  return base.replace(/\.safetensors$/i, "").toLowerCase();
+}
+
+function pinnedLoraMatchesCard(card, pinned) {
+  const name = String(card?.name || "").trim().toLowerCase();
+  if (!name) return false;
+  return (pinned || []).some((p) => {
+    const pn = String(p?.name || "").trim().toLowerCase();
+    if (pn && (name.includes(pn) || pn.includes(name))) return true;
+    const stem = assetPathStem(p?.path);
+    return stem && (name.includes(stem) || stem.includes(name));
+  });
+}
+
+function activeBaseMatchesCard(card, activeBase) {
+  const baseKey = assetPathStem(activeBase);
+  if (!baseKey || baseKey === "none") return false;
+  for (const key of ["path", "model", "name"]) {
+    const stem = assetPathStem(card?.[key]);
+    if (stem && (stem.includes(baseKey) || baseKey.includes(stem))) return true;
+  }
+  return false;
+}
+
+function lookupHintRedundant(cards, pinned, activeBase) {
+  if (!Array.isArray(pinned) || !pinned.length) return false;
+  if (!(cards || []).some((c) => pinnedLoraMatchesCard(c, pinned))) return false;
+  const ckptCards = (cards || []).filter(
+    (c) => String(c?.type || "").toLowerCase() === "checkpoint",
+  );
+  if (!ckptCards.length) {
+    return Boolean(activeBase) && activeBase !== "none";
+  }
+  return ckptCards.some((c) => activeBaseMatchesCard(c, activeBase));
+}
+
+function noteSubjectLookup(reply, modality, loras, pinned = [], activeBase = "") {
+  const names = [];
+  for (const card of loras || []) {
+    const name = String(card?.name || "").trim();
+    if (!name || names.some((n) => n.toLowerCase() === name.toLowerCase())) continue;
+    names.push(name);
+    if (names.length >= 2) break;
+  }
+  const text = String(reply || "");
+  if (modality === "chat") {
+    const lower = text.toLowerCase();
+    if (lower.includes("pin") && lower.includes("base") && lower.includes("lora")) return text;
+    const lead =
+      names.length >= 2
+        ? `A couple of matches: ${names[0]} and ${names[1]}.`
+        : names.length === 1
+          ? `A match: ${names[0]}.`
+          : "I looked for a matching LoRA and base.";
+    const pin =
+      " Pin one on the Agent tab to use it. That installs the LoRA if it is not on the worker, then pins it, and installs or selects the matching base checkpoint.";
+    return `${text}\n\n${lead}${pin}`.trim();
+  }
+  if (
+    !names.length ||
+    text.toLowerCase().includes("agent tab") ||
+    lookupHintRedundant(loras, pinned, activeBase)
+  ) {
+    return text;
+  }
+  return `${text}\n\nMatching assets are on the Agent tab (${names.join(", ")}) if you want to pin a LoRA or switch the base.`;
 }
 
 function planChatActions(message, body) {
@@ -1113,9 +1545,18 @@ function planChatActions(message, body) {
     m.includes("find loras") ||
     m.includes("search civitai")
   ) {
-    const q =
-      (message.split(/\bfor\b/i)[1] || message).trim().slice(0, 80) || BEGINNER_CIVITAI_QUERY;
-    actions.push({ type: "search_civitai", args: { query: q } });
+    const q = subjectQuery(message) || BEGINNER_CIVITAI_QUERY;
+    const words = m.split(/[^a-z0-9]+/).filter(Boolean);
+    const has = (w) => words.includes(w);
+    let searchType = "LORA";
+    if (has("embedding") || has("embeddings") || m.includes("textual inversion")) {
+      searchType = "TextualInversion";
+    } else if (has("lycoris") || has("lyco")) searchType = "LyCORIS";
+    else if (has("locon")) searchType = "LoCon";
+    else if (has("dora")) searchType = "DoRA";
+    else if (has("vae") || has("vaes")) searchType = "VAE";
+    else if (has("checkpoint") || has("checkpoints")) searchType = "Checkpoint";
+    actions.push({ type: "search_civitai", args: { query: q, type: searchType } });
   }
   const asksSetBase =
     m.includes("set base") ||
@@ -1205,13 +1646,42 @@ async function executeMockChatAction(action, body) {
     };
   }
   if (ty === "search_civitai") {
-    const q = (args.query || "").trim() || BEGINNER_CIVITAI_QUERY;
+    const raw = (args.query || "").trim();
+    const short = subjectQuery(raw);
+    const q = short.length >= 2 ? short : raw || BEGINNER_CIVITAI_QUERY;
+    const parsed = canonicalSearchType(args.type || args.modelType || args.types || "");
+    if (parsed.error) {
+      return { type: ty, status: "error", args, error: parsed.error };
+    }
     const { loras } = lorasForAssist(q);
+    const typed = loras.filter((c) => canonicalSearchType(c.modelType).type === parsed.type);
     return {
       type: ty,
       status: "executed",
-      args: { ...args, query: q },
-      result: { query: q, loras },
+      args: { ...args, query: q, type: parsed.type },
+      result: { query: q, type: parsed.type, loras: orderMockLookup(q, typed, parsed.type) },
+    };
+  }
+  if (ty === "list_loras" || ty === "list_installed") {
+    const locals = (state.localAssets || []).map((a) => ({ ...a, installed: true, backend: "local" }));
+    if (ty === "list_loras") {
+      return {
+        type: ty,
+        status: "executed",
+        args,
+        result: { loras: locals.filter((a) => a.kind === "lora" || !a.kind) },
+      };
+    }
+    return {
+      type: ty,
+      status: "executed",
+      args,
+      result: {
+        loras: locals.filter((a) => a.kind === "lora"),
+        checkpoints: locals.filter((a) => a.kind === "checkpoint"),
+        embeddings: locals.filter((a) => a.kind === "embedding"),
+        vaes: locals.filter((a) => a.kind === "vae"),
+      },
     };
   }
   if (ty === "generate_image") {
@@ -1328,13 +1798,12 @@ function enrichMockReplyWithWorker(reply, actionResults) {
   const lines = [];
   for (const ar of actionResults || []) {
     if (ar.status === "error") {
-      lines.push(`${ar.type} failed: ${ar.error || "error"}`);
+      if (ar.type === "generate_image" || ar.type === "generate_video" || ar.type === "run_session") {
+        lines.push("I couldn't finish that generation.");
+      }
       continue;
     }
-    if (ar.status === "proposed") {
-      lines.push(`Proposed: ${ar.type}`);
-      continue;
-    }
+    if (ar.status === "proposed") continue;
     const res = ar.result || {};
     if (ar.type === "worker_status") {
       const parts = [];
@@ -1870,6 +2339,181 @@ export async function mockApi(path, opts = {}) {
     return { ok: true, runtime: state.workerRuntime };
   }
 
+  if (p === "/v1/generation-meta" && method === "GET") {
+    return { settings: state.generation, persisted: true };
+  }
+  if (p === "/v1/generation-meta" && method === "PUT") {
+    const body = parseBody(opts);
+    const g = state.generation;
+    const set = (key, alt) => {
+      if (body[key] !== undefined) g[key] = body[key];
+      else if (alt && body[alt] !== undefined) g[key] = body[alt];
+    };
+    set("sampler");
+    set("cfg");
+    set("steps");
+    set("clipSkip");
+    set("negativePrompt");
+    if (body.clearSeed) g.seed = null;
+    else if (body.seed !== undefined) g.seed = body.seed;
+    set("size");
+    set("quantity");
+    g.source = body.source === "gallery" ? "gallery" : "user";
+    g.sourceLabel =
+      body.source === "gallery"
+        ? String(body.sourceLabel || "Community image").slice(0, 160)
+        : "Hand edit";
+    g.locked = true;
+    return { settings: g, persisted: true };
+  }
+  if (p === "/v1/civitai/images" && method === "GET") {
+    const allowNsfw = Boolean(state.settings?.alignment?.allowNsfwLocal);
+    const modelId = Number(url.searchParams.get("modelId") || 0) || null;
+    const modelVersionId = Number(url.searchParams.get("modelVersionId") || 0) || null;
+    const versionQuery = modelVersionId ? `?modelVersionId=${modelVersionId}` : "";
+    const items = [
+      {
+        id: 11,
+        postId: 22,
+        prompt: "1girl, red hair, smile, hairclip, ponytail",
+        negativePrompt: "lowres, blurry",
+        sampler: "Euler a",
+        steps: 28,
+        cfg: 7,
+        seed: 1234,
+        clipSkip: 2,
+        size: "832x1216",
+        url: "",
+        nsfw: false,
+        nsfwLevel: "None",
+        civitaiUrl: `https://civitai.com/images/11${versionQuery}`,
+        resources: [
+          { name: "waiNSFWIllustrious_v100", type: "Checkpoint", hash: "7e87327f89" },
+          { name: "example-lora", type: "lora", weight: 1, modelVersionId: 1490040 },
+        ],
+        modelVersionIds: modelVersionId ? [modelVersionId] : [],
+        checkpoint: "waiNSFWIllustrious_v100",
+        checkpointInstalled: false,
+        checkpointDifferent: true,
+        missingResources: [
+          {
+            name: "waiNSFWIllustrious_v100",
+            type: "Checkpoint",
+            hash: "7e87327f89",
+            modelVersionId: 1367422,
+            modelId: 827184,
+            installable: true,
+            destPath: "checkpoints/waiNSFWIllustrious_v100.safetensors",
+          },
+          {
+            name: "example-lora",
+            type: "LORA",
+            modelVersionId: 1490040,
+            modelId: 1319790,
+            installable: true,
+            destPath: "loras/example-lora.safetensors",
+          },
+        ],
+      },
+    ];
+    if (allowNsfw) {
+      items.push({
+        id: 12,
+        postId: 23,
+        prompt: "mature community example",
+        negativePrompt: "lowres",
+        sampler: "Euler a",
+        steps: 24,
+        cfg: 6,
+        seed: 99,
+        clipSkip: 2,
+        size: "832x1216",
+        url: "",
+        nsfw: true,
+        nsfwLevel: "X",
+        civitaiUrl: `https://civitai.red/images/12${versionQuery}`,
+        resources: [{ name: "waiNSFWIllustrious_v100", type: "Checkpoint" }],
+        modelVersionIds: modelVersionId ? [modelVersionId] : [],
+        checkpoint: "waiNSFWIllustrious_v100",
+        checkpointInstalled: true,
+        checkpointDifferent: false,
+        missingResources: [],
+      });
+    }
+    const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit") || 20)));
+    const pageIndex = Math.max(
+      1,
+      Number(url.searchParams.get("cursor") || url.searchParams.get("page") || 1) || 1,
+    );
+    for (const item of items) {
+      if (!item.url) item.url = "/empty-gallery.png";
+    }
+    let pageItems = items;
+    if (pageIndex === 1) {
+      while (pageItems.length < limit) {
+        const n = 100 + pageItems.length + 1;
+        pageItems.push({
+          id: n,
+          prompt: `community example ${n}`,
+          negativePrompt: "lowres",
+          url: "/empty-gallery.png",
+          nsfw: false,
+          civitaiUrl: `https://civitai.com/images/${n}${versionQuery}`,
+          resources: [],
+          modelVersionIds: modelVersionId ? [modelVersionId] : [],
+          checkpointDifferent: false,
+          missingResources: [],
+        });
+      }
+    } else if (pageIndex <= 3) {
+      pageItems = Array.from({ length: limit }, (_, i) => {
+        const id = pageIndex * 1000 + i + 1;
+        return {
+          id,
+          prompt: `page ${pageIndex} image ${i + 1}`,
+          negativePrompt: "",
+          url: "/empty-gallery.png",
+          nsfw: false,
+          civitaiUrl: `https://civitai.com/images/${id}${versionQuery}`,
+          resources: [],
+          modelVersionIds: modelVersionId ? [modelVersionId] : [],
+          checkpointDifferent: false,
+          missingResources: [],
+        };
+      });
+    } else {
+      pageItems = [];
+    }
+    const nextCursor = pageIndex >= 3 || pageItems.length === 0 ? null : String(pageIndex + 1);
+    return {
+      modelId,
+      modelVersionId,
+      nsfw: allowNsfw,
+      count: pageItems.length,
+      items: pageItems,
+      nextCursor,
+      nextPage: null,
+      upstream: "https://civitai.com/api/v1/images",
+      note: "Community image posts. Pass nextCursor for another page. Does not download or generate.",
+    };
+  }
+  if (p === "/v1/generation-meta/recommend" && method === "POST") {
+    state.generation = {
+      ...state.generation,
+      sampler: "Euler a",
+      cfg: 7,
+      steps: 28,
+      clipSkip: 2,
+      source: "family",
+      sourceLabel: "Family default (Illustrious/Pony/SDXL) — no example image meta",
+      locked: false,
+      samplerApplied: null,
+      samplerNote: null,
+      clipSkipApplied: null,
+    };
+    return { settings: state.generation, persisted: true };
+  }
+
   if (p === "/v1/gallery" && method === "GET") {
     return { items: state.gallery };
   }
@@ -1912,33 +2556,51 @@ export async function mockApi(path, opts = {}) {
     const message = (body.message || "").trim() || BEGINNER_EXAMPLE;
     const mode = String(body.automationMode || "auto").toLowerCase();
     const route = inferModality(message);
+    const initial = !body.confirm && !(Array.isArray(body.messages) && body.messages.length);
+    const lookups = initial ? initialLookupActions(message) : [];
     if ((route.modality === "gif" || route.modality === "video") && !body.confirm) {
+      const actionResults = [];
+      for (const lookup of lookups) {
+        actionResults.push(await executeMockChatAction(lookup, body));
+      }
       const art = mockGenerateArtifact(message, {
         modality: route.modality,
         model: body.imageModel || body.model,
       });
+      actionResults.push({
+        type: "generate_video",
+        status: "executed",
+        args: { prompt: message, modality: route.modality },
+        result: art,
+      });
+      const loras = actionResults
+        .filter((a) => a.type === "search_civitai" && Array.isArray(a.result?.loras))
+        .flatMap((a) => a.result.loras);
+      const query = loras.length ? subjectQuery(message) : "";
       return {
-        reply: `Generating ${route.modality} (mock).`,
-        actions: [
-          {
-            type: "generate_video",
-            status: "executed",
-            args: { prompt: message, modality: route.modality },
-            result: art,
-          },
-        ],
+        reply: noteSubjectLookup(
+          `Generating ${route.modality} (mock).`,
+          route.modality,
+          loras,
+        ),
+        actions: actionResults,
         pendingConfirmation: false,
         question: null,
         ideas: [],
-        loras: [],
-        civitaiQuery: null,
+        loras,
+        civitaiQuery: query || null,
         artifacts: [art],
         automationMode: mode,
         route,
         resolvedModels: { video: art.model },
       };
     }
-    const { reply: plannedReply, actions: planned } = planChatActions(message, body);
+    const plannedChat = planChatActions(message, body);
+    let plannedReply = plannedChat.reply;
+    let planned = plannedChat.actions;
+    if (initial) {
+      planned = [...lookups, ...planned.filter((a) => a.type !== "search_civitai")];
+    }
     let reply = plannedReply;
     const actionResults = [];
     let pendingConfirmation = false;
@@ -1984,19 +2646,37 @@ export async function mockApi(path, opts = {}) {
     }
 
     const ideas = [];
-    const loras = [];
     const artifacts = [];
     let civitaiQuery = "";
+    let sawSearch = false;
+    const searchLoras = [];
+    const listed = [];
     for (const ar of actionResults) {
       const res = ar.result || {};
       if (Array.isArray(res.ideas)) ideas.push(...res.ideas);
-      if (Array.isArray(res.loras)) loras.push(...res.loras);
       if (res.query) civitaiQuery = res.query;
+      if (ar.type === "search_civitai" && Array.isArray(res.loras)) {
+        sawSearch = true;
+        searchLoras.push(...res.loras);
+      } else if (ar.type === "list_loras" && Array.isArray(res.loras)) {
+        listed.push(...res.loras);
+      } else if (ar.type === "list_installed") {
+        for (const key of ["loras", "checkpoints", "embeddings", "vaes"]) {
+          if (Array.isArray(res[key])) listed.push(...res[key]);
+        }
+      }
       if (ar.type === "generate_image" && res.artifactId) artifacts.push(res);
       if (Array.isArray(res.results)) artifacts.push(...res.results);
     }
+    const loras = sawSearch ? searchLoras : listed;
 
     reply = enrichMockReplyWithWorker(reply, actionResults);
+    const activeBase =
+      state.activeBaseModel && state.activeBaseModel !== "auto"
+        ? String(state.activeBaseModel).split("/").pop()
+        : "";
+    const pins = Array.isArray(body.loras) ? body.loras : [];
+    if (initial) reply = noteSubjectLookup(reply, route.modality, loras, pins, activeBase);
 
     return {
       reply,

@@ -13,6 +13,8 @@ import gc
 import io
 import logging
 import os
+import re
+import secrets
 import threading
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,9 @@ from pydantic import BaseModel, Field
 LOG = logging.getLogger("freya-engine")
 
 MODELS_DIR = Path(os.environ.get("FREYA_MODELS_DIR", "/models")).resolve()
+_A1111_INLINE_TAG = re.compile(r"<(?:lora|lyco):[^>]+>", re.IGNORECASE)
+# Civitai / A1111 emphasis and attention weights — plain Diffusers ignores these.
+_A1111_ATTENTION = re.compile(r"\([^)]*:\s*\d+(?:\.\d+)?\)|\([^):]+\)")
 KEEP_LOADED = os.environ.get("FREYA_ENGINE_KEEP_LOADED", "0").strip() in (
     "1",
     "true",
@@ -50,6 +55,11 @@ class GenerateReq(BaseModel):
     seed: int | None = None
     steps: int | None = None
     guidance_scale: float | None = None
+    cfg: float | None = None
+    sampler: str | None = None
+    clip_skip: int | None = Field(default=None, alias="clipSkip")
+    quantity: int | None = None
+    n: int | None = None
     lora_request: list[dict[str, Any]] | None = Field(default=None)
     base_model: str | None = Field(default=None, alias="baseModel")
     frames: int | None = None
@@ -200,10 +210,46 @@ def _load_pipeline(model: str, base_model: str | None) -> Any:
     return pipe
 
 
+def _seed_generator(seed: int) -> torch.Generator:
+    """Manual seed on CPU — matches Automatic1111 / webui reproducibility conventions."""
+    gen = torch.Generator(device="cpu")
+    return gen.manual_seed(int(seed) & 0xFFFFFFFF)
+
+
+def _lora_cache_key(lora_request: list[dict[str, Any]] | None) -> list[str]:
+    """Model + ordered adapter identity including scale (VRAM cache key)."""
+    if not lora_request:
+        return []
+    keys: list[str] = []
+    for item in lora_request:
+        name = (
+            item.get("lora_name")
+            or item.get("loraName")
+            or item.get("name")
+            or item.get("path")
+        )
+        if not name:
+            continue
+        scale = float(
+            item.get("lora_scale")
+            or item.get("loraScale")
+            or item.get("strength")
+            or item.get("scale")
+            or item.get("weight")
+            or 1.0
+        )
+        keys.append(f"{name}@{scale:.4f}")
+    return keys
+
+
 def _apply_loras(pipe: Any, lora_request: list[dict[str, Any]] | None) -> list[str]:
     names: list[str] = []
     if not lora_request:
         return names
+    try:
+        pipe.unload_lora_weights()
+    except Exception:
+        pass
     adapters: list[str] = []
     weights: list[float] = []
     for i, item in enumerate(lora_request):
@@ -217,7 +263,14 @@ def _apply_loras(pipe: Any, lora_request: list[dict[str, Any]] | None) -> list[s
         if not name:
             continue
         path = _resolve_lora_path(str(name))
-        scale = float(item.get("strength") or item.get("scale") or item.get("weight") or 1.0)
+        scale = float(
+            item.get("lora_scale")
+            or item.get("loraScale")
+            or item.get("strength")
+            or item.get("scale")
+            or item.get("weight")
+            or 1.0
+        )
         adapter = f"lora_{i}"
         LOG.info("load_lora %s -> %s scale=%s", name, path, scale)
         pipe.load_lora_weights(str(path.parent), weight_name=path.name, adapter_name=adapter)
@@ -225,6 +278,7 @@ def _apply_loras(pipe: Any, lora_request: list[dict[str, Any]] | None) -> list[s
         weights.append(scale)
         names.append(path.stem)
     if adapters:
+        # Scaled PEFT adapters only — never fuse into weights (cached pipelines would stack).
         pipe.set_adapters(adapters, adapter_weights=weights)
     return names
 
@@ -235,12 +289,7 @@ def _ensure_pipe(
     lora_request: list[dict[str, Any]] | None,
 ) -> tuple[Any, list[str]]:
     global _pipe, _loaded_model, _loaded_loras
-    want_loras = []
-    if lora_request:
-        for item in lora_request:
-            n = item.get("lora_name") or item.get("loraName") or item.get("name") or item.get("path")
-            if n:
-                want_loras.append(str(n))
+    want_loras = _lora_cache_key(lora_request)
     same = (
         _pipe is not None
         and _loaded_model == model
@@ -255,6 +304,238 @@ def _ensure_pipe(
     _loaded_model = model
     _loaded_loras = want_loras
     return pipe, applied
+
+
+def _norm_sampler(name: str) -> str:
+    s = " ".join(name.strip().lower().replace("_", " ").split())
+    return s.replace("dpmpp", "dpm++")
+
+
+def _resolve_sampler(name: str | None) -> tuple[str, str, str | None]:
+    """Return (applied label, kind, note).
+
+    kind is euler_a, euler, or dpm2m_karras. Exact for Euler a, Euler, and
+    DPM++ 2M Karras. Other names use the closest of those and say so.
+    """
+    requested = (name or "").strip()
+    key = _norm_sampler(requested)
+    exact = {
+        "euler a": "euler_a",
+        "eulera": "euler_a",
+        "euler ancestral": "euler_a",
+        "euler ancestral discrete": "euler_a",
+        "euler": "euler",
+        "euler discrete": "euler",
+        "dpm++ 2m karras": "dpm2m_karras",
+        "dpm++2m karras": "dpm2m_karras",
+    }
+    kind = exact.get(key)
+    matched = kind is not None
+    if kind is None:
+        if "euler" in key and ("ancestral" in key or key.endswith(" a")):
+            kind = "euler_a"
+        elif "euler" in key:
+            kind = "euler"
+        elif "dpm" in key or "karras" in key:
+            kind = "dpm2m_karras"
+        else:
+            kind = "euler_a"
+    applied = {
+        "euler_a": "Euler a",
+        "euler": "Euler",
+        "dpm2m_karras": "DPM++ 2M Karras",
+    }[kind]
+    note = None
+    if requested and not matched:
+        sched = {
+            "euler_a": "EulerAncestralDiscreteScheduler",
+            "euler": "EulerDiscreteScheduler",
+            "dpm2m_karras": "DPMSolverMultistepScheduler",
+        }[kind]
+        note = f"requested {requested}; applied {applied} ({sched})"
+    return applied, kind, note
+
+
+def _apply_scheduler(pipe: Any, sampler: str | None) -> tuple[str | None, str | None, str | None]:
+    """Set a Diffusers scheduler. On failure, keep the pipeline default and record it."""
+    if not sampler or not str(sampler).strip():
+        return None, None, None
+    applied, kind, note = _resolve_sampler(sampler)
+    try:
+        from diffusers import (
+            DPMSolverMultistepScheduler,
+            EulerAncestralDiscreteScheduler,
+            EulerDiscreteScheduler,
+        )
+
+        config = dict(pipe.scheduler.config)
+        if kind == "euler_a":
+            config["timestep_spacing"] = "leading"
+            pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(config)
+            sched = "EulerAncestralDiscreteScheduler"
+        elif kind == "euler":
+            pipe.scheduler = EulerDiscreteScheduler.from_config(config)
+            sched = "EulerDiscreteScheduler"
+        else:
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                config,
+                algorithm_type="dpmsolver++",
+                use_karras_sigmas=True,
+                solver_order=2,
+            )
+            sched = "DPMSolverMultistepScheduler"
+        return applied, sched, note
+    except Exception as e:
+        LOG.warning("scheduler map failed for %s: %s", sampler, e)
+        fallback = f"requested {sampler}; scheduler unchanged ({e})"
+        return str(sampler).strip(), None, note or fallback
+
+
+def _random_seed() -> int:
+    return secrets.randbelow(2_147_483_646) or 1
+
+
+def _strip_a1111_resource_tags(prompt: str) -> str:
+    return _A1111_INLINE_TAG.sub("", prompt).rstrip()
+
+
+def _sdxl_pipeline(pipe: Any) -> bool:
+    return pipe.__class__.__name__ == "StableDiffusionXLPipeline"
+
+
+def _needs_a1111_prompt_parse(prompt: str, negative: str | None) -> bool:
+    blob = f"{prompt}\n{negative or ''}"
+    return bool(_A1111_ATTENTION.search(blob))
+
+
+def _compel_embeddings_type(clip_skip: int | None, sdxl: bool):
+    from compel import ReturnedEmbeddingsType
+
+    skip = max(1, int(clip_skip) if clip_skip is not None else 1)
+    if skip > 1:
+        if sdxl:
+            return ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED
+        return ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NORMALIZED
+    return ReturnedEmbeddingsType.LAST_HIDDEN_STATES_NORMALIZED
+
+
+def _encode_a1111_prompts(
+    pipe: Any, prompt: str, negative: str | None, clip_skip: int | None
+) -> dict[str, Any]:
+    """Encode with Compel so (word) and (word:1.2) match A1111-style conditioning."""
+    from compel import Compel
+
+    device = getattr(pipe, "device", _device())
+    if _sdxl_pipeline(pipe):
+        compel = Compel(
+            tokenizer=[pipe.tokenizer, pipe.tokenizer_2],
+            text_encoder=[pipe.text_encoder, pipe.text_encoder_2],
+            returned_embeddings_type=_compel_embeddings_type(clip_skip, sdxl=True),
+            requires_pooled=[False, True],
+            truncate_long_prompts=False,
+            device=device,
+        )
+        neg_text = negative or ""
+        # Batch both prompts so Compel pads to the same sequence length (long prompt + short negative).
+        cond, pooled = compel([prompt, neg_text])
+        return {
+            "prompt_embeds": cond[0:1],
+            "pooled_prompt_embeds": pooled[0:1],
+            "negative_prompt_embeds": cond[1:2],
+            "negative_pooled_prompt_embeds": pooled[1:2],
+        }
+    compel = Compel(
+        tokenizer=pipe.tokenizer,
+        text_encoder=pipe.text_encoder,
+        returned_embeddings_type=_compel_embeddings_type(clip_skip, sdxl=False),
+        truncate_long_prompts=False,
+        device=device,
+    )
+    out: dict[str, Any] = {"prompt_embeds": compel(prompt)}
+    if negative:
+        out["negative_prompt_embeds"] = compel(negative)
+    return out
+
+
+def _prompt_token_diag(pipe: Any, prompt: str, negative: str | None) -> dict[str, Any]:
+    """Rough token counts for SDXL dual encoders (SDXL reports the longer path)."""
+    out: dict[str, Any] = {"promptChars": len(prompt), "negativeChars": len(negative or "")}
+    try:
+        if _sdxl_pipeline(pipe):
+            t1 = pipe.tokenizer(prompt, truncation=False, return_tensors="pt")
+            t2 = pipe.tokenizer_2(prompt, truncation=False, return_tensors="pt")
+            n1 = int(t1["input_ids"].shape[-1])
+            n2 = int(t2["input_ids"].shape[-1])
+            out["promptTokens"] = max(n1, n2)
+            out["promptTokensClipL"] = n1
+            out["promptTokensClipG"] = n2
+            if negative:
+                u1 = pipe.tokenizer(negative, truncation=False, return_tensors="pt")
+                u2 = pipe.tokenizer_2(negative, truncation=False, return_tensors="pt")
+                out["negativeTokens"] = max(int(u1["input_ids"].shape[-1]), int(u2["input_ids"].shape[-1]))
+            # Compel path uses both encoders; flag when either encoder context is long.
+            out["promptMayTruncate"] = n1 > 77 or n2 > 77
+        else:
+            t = pipe.tokenizer(prompt, truncation=False, return_tensors="pt")
+            n = int(t["input_ids"].shape[-1])
+            out["promptTokens"] = n
+            out["promptMayTruncate"] = n > 77
+            if negative:
+                u = pipe.tokenizer(negative, truncation=False, return_tensors="pt")
+                out["negativeTokens"] = int(u["input_ids"].shape[-1])
+    except Exception as e:
+        out["promptTokenError"] = str(e)
+    return out
+
+
+def _generation_prompt_kwargs(
+    pipe: Any, prompt: str, negative: str | None, clip_skip: int | None
+) -> dict[str, Any]:
+    skip = int(clip_skip) if clip_skip is not None else 1
+    use_compel = _sdxl_pipeline(pipe) or _needs_a1111_prompt_parse(prompt, negative) or skip > 1
+    if use_compel:
+        try:
+            return _encode_a1111_prompts(pipe, prompt, negative, clip_skip)
+        except Exception as e:
+            LOG.warning("compel encode failed (%s); using raw prompt strings", e)
+    kwargs: dict[str, Any] = {"prompt": prompt}
+    if negative:
+        kwargs["negative_prompt"] = negative
+    return kwargs
+
+
+def _call_pipe(pipe: Any, kwargs: dict[str, Any], clip_skip: int | None) -> tuple[Any, bool]:
+    """Pass clip_skip when the pipeline accepts it. Never fail the generate over it."""
+    if kwargs.get("prompt_embeds") is not None:
+        skip = int(clip_skip) if clip_skip is not None else 0
+        return pipe(**kwargs), skip > 1
+    skip = int(clip_skip) if clip_skip is not None else 0
+    if skip <= 1:
+        return pipe(**kwargs), False
+    trial = dict(kwargs)
+    trial["clip_skip"] = skip
+    try:
+        out = pipe(**trial)
+        if _sdxl_pipeline(pipe) and skip > 1:
+            return out, True
+        return out, True
+    except TypeError as e:
+        LOG.warning("clip_skip unsupported, stored only: %s", e)
+    except Exception as e:
+        msg = str(e).lower()
+        if "clip_skip" in msg or "unexpected keyword" in msg:
+            LOG.warning("clip_skip rejected, stored only: %s", e)
+        else:
+            raise
+    return pipe(**kwargs), False
+
+
+def _guidance(req: GenerateReq) -> float:
+    if req.guidance_scale is not None:
+        return float(req.guidance_scale)
+    if req.cfg is not None:
+        return float(req.cfg)
+    return DEFAULT_GUIDANCE
 
 
 @app.get("/health")
@@ -305,27 +586,31 @@ def generate_gif(req: GenerateReq) -> JSONResponse:
     width = min(width, 768)
     height = min(height, 768)
     steps = min(req.steps or 15, 20)
-    guidance = req.guidance_scale if req.guidance_scale is not None else DEFAULT_GUIDANCE
-    base_seed = int(req.seed if req.seed is not None else 42) & 0xFFFFFFFF
+    guidance = _guidance(req)
+    base_seed = int(req.seed if req.seed is not None else _random_seed()) & 0xFFFFFFFF
     device = _device()
+    clip_skip = req.clip_skip
 
     with _lock:
         try:
             pipe, lora_names = _ensure_pipe(model, req.base_model, req.lora_request)
+            applied, scheduler, sampler_note = _apply_scheduler(pipe, req.sampler)
             images = []
+            clip_applied = False
             for i in range(frames):
-                gen = torch.Generator(device=device).manual_seed((base_seed + i * 17) & 0xFFFFFFFF)
+                gen = _seed_generator((base_seed + i * 17) & 0xFFFFFFFF)
                 kwargs: dict[str, Any] = {
-                    "prompt": req.prompt,
                     "num_inference_steps": steps,
                     "guidance_scale": guidance,
                     "width": width,
                     "height": height,
                     "generator": gen,
                 }
-                if req.negative_prompt:
-                    kwargs["negative_prompt"] = req.negative_prompt
-                out = pipe(**kwargs)
+                kwargs.update(
+                    _generation_prompt_kwargs(pipe, req.prompt, req.negative_prompt, clip_skip)
+                )
+                out, used_clip = _call_pipe(pipe, kwargs, clip_skip)
+                clip_applied = clip_applied or used_clip
                 images.append(out.images[0])
             buf = io.BytesIO()
             images[0].save(
@@ -341,7 +626,7 @@ def generate_gif(req: GenerateReq) -> JSONResponse:
                 _unload_locked()
             return JSONResponse(
                 {
-                    "data": [{"b64_json": b64}],
+                    "data": [{"b64_json": b64, "seed": base_seed}],
                     "model": model,
                     "loras": lora_names,
                     "engine": "diffusers",
@@ -349,6 +634,18 @@ def generate_gif(req: GenerateReq) -> JSONResponse:
                     "frames": frames,
                     "stub": False,
                     "mime": "image/gif",
+                    "seed": base_seed,
+                    "steps": steps,
+                    "guidance_scale": guidance,
+                    "cfg": guidance,
+                    "sampler": req.sampler or applied,
+                    "scheduler": scheduler,
+                    "samplerNote": sampler_note,
+                    "clipSkip": clip_skip,
+                    "clipSkipApplied": clip_applied,
+                    "quantity": 1,
+                    "width": width,
+                    "height": height,
                 }
             )
         except HTTPException:
@@ -367,47 +664,70 @@ def generate(req: GenerateReq) -> JSONResponse:
     if not model:
         raise HTTPException(status_code=400, detail="model is required")
 
+    prompt = req.prompt.strip()
+    if req.lora_request:
+        cleaned = _strip_a1111_resource_tags(prompt)
+        if cleaned != prompt:
+            LOG.info(
+                "stripped inline lora tags from prompt (%d -> %d chars)",
+                len(prompt),
+                len(cleaned),
+            )
+            prompt = cleaned
+
     width, height = _parse_size(req.size)
-    steps = req.steps or DEFAULT_STEPS
-    guidance = req.guidance_scale if req.guidance_scale is not None else DEFAULT_GUIDANCE
-    seed = req.seed
+    steps = max(1, min(int(req.steps or DEFAULT_STEPS), 80))
+    guidance = _guidance(req)
+    quantity = max(1, min(int(req.quantity or req.n or 1), 4))
+    base_seed = int(req.seed if req.seed is not None else _random_seed()) & 0xFFFFFFFF
     device = _device()
-    generator = None
-    if seed is not None:
-        generator = torch.Generator(device=device).manual_seed(int(seed) & 0xFFFFFFFF)
+    clip_skip = req.clip_skip
 
     with _lock:
         try:
             pipe, lora_names = _ensure_pipe(model, req.base_model, req.lora_request)
-            kwargs: dict[str, Any] = {
-                "prompt": req.prompt,
-                "num_inference_steps": steps,
-                "guidance_scale": guidance,
-                "width": width,
-                "height": height,
-            }
-            if req.negative_prompt:
-                kwargs["negative_prompt"] = req.negative_prompt
-            if generator is not None:
-                kwargs["generator"] = generator
-            LOG.info(
-                "generate model=%s size=%sx%s steps=%s loras=%s",
-                model,
-                width,
-                height,
-                steps,
-                lora_names,
-            )
-            out = pipe(**kwargs)
-            image = out.images[0]
-            buf = io.BytesIO()
-            image.save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            applied, scheduler, sampler_note = _apply_scheduler(pipe, req.sampler)
+            data = []
+            clip_applied = False
+            for i in range(quantity):
+                seed_i = (base_seed + i) & 0xFFFFFFFF
+                generator = _seed_generator(seed_i)
+                kwargs: dict[str, Any] = {
+                    "num_inference_steps": steps,
+                    "guidance_scale": guidance,
+                    "width": width,
+                    "height": height,
+                    "generator": generator,
+                }
+                kwargs.update(
+                    _generation_prompt_kwargs(pipe, prompt, req.negative_prompt, clip_skip)
+                )
+                LOG.info(
+                    "generate model=%s size=%sx%s steps=%s guidance=%s sampler=%s clip_skip=%s seed=%s i=%s loras=%s",
+                    model,
+                    width,
+                    height,
+                    steps,
+                    guidance,
+                    applied or req.sampler,
+                    clip_skip,
+                    seed_i,
+                    i,
+                    lora_names,
+                )
+                out, used_clip = _call_pipe(pipe, kwargs, clip_skip)
+                clip_applied = clip_applied or used_clip
+                image = out.images[0]
+                buf = io.BytesIO()
+                image.save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+                data.append({"b64_json": b64, "seed": seed_i})
+            prompt_diag = _prompt_token_diag(pipe, prompt, req.negative_prompt)
             if not KEEP_LOADED:
                 _unload_locked()
             return JSONResponse(
                 {
-                    "data": [{"b64_json": b64}],
+                    "data": data,
                     "model": model,
                     "loras": lora_names,
                     "engine": "diffusers",
@@ -415,6 +735,19 @@ def generate(req: GenerateReq) -> JSONResponse:
                     "width": width,
                     "height": height,
                     "steps": steps,
+                    "guidance_scale": guidance,
+                    "cfg": guidance,
+                    "sampler": req.sampler or applied,
+                    "scheduler": scheduler,
+                    "samplerNote": sampler_note,
+                    "clipSkip": clip_skip,
+                    "clipSkipApplied": clip_applied,
+                    "seed": base_seed,
+                    "quantity": quantity,
+                    "negative_prompt": req.negative_prompt,
+                    "workerPrompt": prompt if prompt != req.prompt.strip() else None,
+                    "promptEncoding": "compel-sdxl" if _sdxl_pipeline(pipe) else "compel-sd15",
+                    **prompt_diag,
                 }
             )
         except HTTPException:

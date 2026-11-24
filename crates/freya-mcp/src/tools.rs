@@ -48,6 +48,60 @@ pub struct GenerateArgs {
     pub size: Option<String>,
     #[serde(default)]
     pub seed: Option<i64>,
+    #[serde(default)]
+    pub steps: Option<u32>,
+    #[serde(default)]
+    pub cfg: Option<f64>,
+    #[serde(default)]
+    pub sampler: Option<String>,
+    #[serde(default)]
+    pub clip_skip: Option<u32>,
+    #[serde(default)]
+    pub quantity: Option<u32>,
+    /// Use the last gallery sidecar (sampler, cfg, steps, clip skip, seed).
+    #[serde(default)]
+    pub reuse_meta: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationMetaArgs {
+    /// Sampler name, such as `Euler a`, `Euler`, or `DPM++ 2M Karras`.
+    #[serde(default)]
+    pub sampler: Option<String>,
+    #[serde(default)]
+    pub cfg: Option<f64>,
+    #[serde(default)]
+    pub steps: Option<u32>,
+    #[serde(default)]
+    pub clip_skip: Option<u32>,
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+    /// Omit to leave the stored seed. Null is not representable here; pass clearSeed.
+    #[serde(default)]
+    pub seed: Option<i64>,
+    /// Next generate picks a new seed.
+    #[serde(default)]
+    pub clear_seed: Option<bool>,
+    #[serde(default)]
+    pub size: Option<String>,
+    #[serde(default)]
+    pub quantity: Option<u32>,
+    /// `auto` | `off` | `on` | `prompt-prose` | `prompt-sd`. Use `off` when reproducing a Civitai or gallery image.
+    #[serde(default)]
+    pub enhance: Option<String>,
+    #[serde(default)]
+    pub lora_weights: Option<Vec<LoraWeightPatch>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LoraWeightPatch {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    pub scale: f64,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -59,14 +113,117 @@ pub struct GalleryGetArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct GalleryApplyArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CommunityApplyArgs {
+    /// Community image object from civitai_images (prompt, resources, sampler, …).
+    #[serde(flatten)]
+    pub image: Value,
+}
+
+/// One Civitai model type. Call `civitai_search` again to search a different type.
+/// `Model` is not a Civitai type (use `Checkpoint` for a base). Embedding is `TextualInversion`.
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
+pub enum CivitaiAssetType {
+    #[serde(rename = "LORA", alias = "lora", alias = "LoRA", alias = "Lora")]
+    #[schemars(rename = "LORA")]
+    Lora,
+    #[serde(rename = "LoCon", alias = "locon", alias = "LoCON")]
+    #[schemars(rename = "LoCon")]
+    LoCon,
+    #[serde(rename = "DoRA", alias = "dora", alias = "DORA")]
+    #[schemars(rename = "DoRA")]
+    DoRA,
+    #[serde(
+        rename = "LyCORIS",
+        alias = "lycoris",
+        alias = "Lycoris",
+        alias = "lyco"
+    )]
+    #[schemars(rename = "LyCORIS")]
+    LyCORIS,
+    #[serde(rename = "Checkpoint", alias = "checkpoint", alias = "checkpoints")]
+    #[schemars(rename = "Checkpoint")]
+    Checkpoint,
+    #[serde(
+        rename = "TextualInversion",
+        alias = "textualinversion",
+        alias = "embedding",
+        alias = "embeddings",
+        alias = "Embedding"
+    )]
+    #[schemars(rename = "TextualInversion")]
+    TextualInversion,
+    #[serde(rename = "VAE", alias = "vae", alias = "vaes")]
+    #[schemars(rename = "VAE")]
+    Vae,
+}
+
+impl CivitaiAssetType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lora => "LORA",
+            Self::LoCon => "LoCon",
+            Self::DoRA => "DoRA",
+            Self::LyCORIS => "LyCORIS",
+            Self::Checkpoint => "Checkpoint",
+            Self::TextualInversion => "TextualInversion",
+            Self::Vae => "VAE",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct CivitaiSearchArgs {
-    /// Search query.
+    /// Short subject: character or asset name, 2–6 words. Not the whole prompt, scene, clothing, or lighting.
     pub q: String,
+    /// Required. Exactly one of `LORA`, `LoCon`, `DoRA`, `LyCORIS`, `Checkpoint`, `TextualInversion`, `VAE`.
+    /// Embedding is `TextualInversion`. Model is not a Civitai type.
+    /// One call searches that type only; call again for a different type. Does not pin or download.
+    #[serde(rename = "type")]
+    pub asset_type: CivitaiAssetType,
     #[serde(default)]
     pub limit: Option<u32>,
-    /// Comma-separated types, e.g. `LORA,Checkpoint`.
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CivitaiImagesArgs {
+    /// Civitai model id.
+    pub model_id: i64,
+    /// Version in context. Omit to list images for any version of the model.
     #[serde(default)]
-    pub types: Option<String>,
+    pub model_version_id: Option<i64>,
+    /// Page size. Default 20. Capped at 100.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Opaque `nextCursor` from the previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Page number when the previous response has `nextPage` and no cursor.
+    #[serde(default)]
+    pub page: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StyleRefArgs {
+    /// Style pack id from list_styles.
+    #[serde(alias = "id")]
+    pub style_ref: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicArgs {
+    /// Optional focus for the ideas. Does not generate an image.
+    #[serde(default)]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -298,7 +455,7 @@ impl FreyaMcp {
     }
 
     #[tool(
-        description = "Generate an image via Freya (OpenRouter by default, or local worker when backend=local)"
+        description = "Generate an image via Freya (OpenRouter by default, or local worker when backend=local). To reproduce a Civitai or gallery image, call apply_community_generation or apply_gallery_artifact first, then generate with enhance=off and the exact prompt — do not paraphrase."
     )]
     async fn generate_image(
         &self,
@@ -313,6 +470,19 @@ impl FreyaMcp {
             "styleRef": args.style_ref,
             "size": args.size,
             "seed": args.seed,
+            "steps": args.steps,
+            "cfg": args.cfg,
+            "sampler": args.sampler,
+            "clipSkip": args.clip_skip,
+            "quantity": args.quantity,
+            "reuseMeta": args.reuse_meta,
+            "persistMeta": args.sampler.is_some()
+                || args.cfg.is_some()
+                || args.steps.is_some()
+                || args.clip_skip.is_some()
+                || args.quantity.is_some()
+                || args.negative_prompt.is_some()
+                || args.seed.is_some(),
         });
         let v = self
             .api
@@ -328,7 +498,9 @@ impl FreyaMcp {
         json_ok(v)
     }
 
-    #[tool(description = "Get one Freya gallery artifact metadata by id")]
+    #[tool(
+        description = "Get one Freya gallery artifact metadata by id (full sidecar: sampler, seed, LoRA pins with scale, checkpoint, enhance flag)."
+    )]
     async fn gallery_get(
         &self,
         Parameters(args): Parameters<GalleryGetArgs>,
@@ -338,21 +510,87 @@ impl FreyaMcp {
         json_ok(v)
     }
 
-    #[tool(description = "Search Civitai models/LoRAs via Freya API")]
+    #[tool(
+        description = "Load a gallery artifact into generation meta, session LoRA pins (installed only), and enhance:off. Returns prompt to pass verbatim to generate_image. Does not download missing files."
+    )]
+    async fn apply_gallery_artifact(
+        &self,
+        Parameters(args): Parameters<GalleryApplyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let path =
+            crate::api::bind_path_segment("/v1/gallery", &args.id, "/apply").map_err(map_err)?;
+        let v = self
+            .api
+            .post_json(&path, &json!({}))
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Load a Civitai community post into generation meta, pins (installed LoRAs at post weight, default 1), and enhance:off. Pass one item from civitai_images. Then generate_image with enhance=off and the returned prompt unchanged."
+    )]
+    async fn apply_community_generation(
+        &self,
+        Parameters(args): Parameters<CommunityApplyArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let v = self
+            .api
+            .post_json("/v1/reproduction/community", &args.image)
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Search one Civitai asset type. Required type is exactly one of LORA, LoCon, DoRA, LyCORIS, Checkpoint, TextualInversion (embedding), VAE. Call again to search a different type. Model is not a Civitai type (use Checkpoint for a base). Installed matches come first, then other Civitai hits. Does not pin or download."
+    )]
     async fn civitai_search(
         &self,
         Parameters(args): Parameters<CivitaiSearchArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let mut q = vec![("q".into(), args.q)];
+        let mut q = vec![
+            ("q".into(), args.q),
+            ("type".into(), args.asset_type.as_str().to_string()),
+        ];
         if let Some(limit) = args.limit {
             q.push(("limit".into(), limit.to_string()));
         }
-        if let Some(types) = args.types {
-            q.push(("types".into(), types));
+        let v = self
+            .api
+            .get_json_query("/v1/civitai/lookup", &q)
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Community images made with a Civitai model. modelId required, modelVersionId optional. One page (default 20). Pass cursor or page from nextCursor or nextPage for the next page. Each item has prompt, negative, sampler, steps, cfg, seed, resources, checkpoint, checkpointInstalled, checkpointDifferent, and missingResources. Does not download, pin, or change the base. install_asset is a separate call (versionId or modelId). Show NSFW follows Freya settings."
+    )]
+    async fn civitai_images(
+        &self,
+        Parameters(args): Parameters<CivitaiImagesArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut q = vec![("modelId".into(), args.model_id.to_string())];
+        if let Some(version) = args.model_version_id.filter(|n| *n > 0) {
+            q.push(("modelVersionId".into(), version.to_string()));
+        }
+        if let Some(limit) = args.limit {
+            q.push(("limit".into(), limit.to_string()));
+        }
+        if let Some(cursor) = args
+            .cursor
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            q.push(("cursor".into(), cursor.to_string()));
+        } else if let Some(page) = args.page.filter(|n| *n > 0) {
+            q.push(("page".into(), page.to_string()));
         }
         let v = self
             .api
-            .get_json_query("/v1/civitai/search", &q)
+            .get_json_query("/v1/civitai/images", &q)
             .await
             .map_err(map_err)?;
         json_ok(v)
@@ -700,6 +938,84 @@ impl FreyaMcp {
         json_ok(v)
     }
 
+    #[tool(
+        description = "Read generation meta (sampler, cfg, steps, clip skip, negative, seed, size, quantity, enhance). Combine with list_pins for LoRA weights. No secrets."
+    )]
+    async fn get_generation_meta(&self) -> Result<CallToolResult, McpError> {
+        let v = self
+            .api
+            .get_json("/v1/generation-meta")
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Set generation meta and optional LoRA weights (loraWeights). Use enhance=off when reproducing. No secrets."
+    )]
+    async fn set_generation_meta(
+        &self,
+        Parameters(args): Parameters<GenerationMetaArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut body = serde_json::Map::new();
+        if let Some(s) = args.sampler {
+            body.insert("sampler".into(), json!(s));
+        }
+        if let Some(n) = args.cfg {
+            body.insert("cfg".into(), json!(n));
+        }
+        if let Some(n) = args.steps {
+            body.insert("steps".into(), json!(n));
+        }
+        if let Some(n) = args.clip_skip {
+            body.insert("clipSkip".into(), json!(n));
+        }
+        if let Some(s) = args.negative_prompt {
+            body.insert("negativePrompt".into(), json!(s));
+        }
+        if args.clear_seed.unwrap_or(false) {
+            body.insert("clearSeed".into(), json!(true));
+        } else if let Some(seed) = args.seed {
+            body.insert("seed".into(), json!(seed));
+        }
+        if let Some(s) = args.size {
+            body.insert("size".into(), json!(s));
+        }
+        if let Some(n) = args.quantity {
+            body.insert("quantity".into(), json!(n));
+        }
+        if let Some(e) = args.enhance {
+            body.insert("enhance".into(), json!(e));
+        }
+        if let Some(weights) = args.lora_weights {
+            let arr: Vec<Value> = weights
+                .iter()
+                .map(|w| json!({ "name": w.name, "path": w.path, "scale": w.scale }))
+                .collect();
+            if !arr.is_empty() {
+                body.insert("loraWeights".into(), json!(arr));
+            }
+        }
+        let v = self
+            .api
+            .put_json("/v1/generation-meta", &Value::Object(body))
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Replace generation meta with the selected version's Civitai example image (sampler, cfg, steps, clip skip, negative) or the small family default when that meta is missing."
+    )]
+    async fn recommend_generation_meta(&self) -> Result<CallToolResult, McpError> {
+        let v = self
+            .api
+            .post_json("/v1/generation-meta/recommend", &json!({}))
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
     #[tool(description = "Set the composer backend to cloud or local")]
     async fn set_generate_backend(
         &self,
@@ -810,6 +1126,89 @@ impl FreyaMcp {
         json_ok(v)
     }
 
+    #[tool(description = "List favorited asset cards. No secrets.")]
+    async fn list_favorites(&self) -> Result<CallToolResult, McpError> {
+        let studio = self.api.get_json("/v1/studio").await.map_err(map_err)?;
+        let favorites = studio
+            .get("favorites")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        json_ok(json!({ "favorites": favorites }))
+    }
+
+    #[tool(description = "List session LoRA pins. Checkpoints are not pins. No secrets.")]
+    async fn list_pins(&self) -> Result<CallToolResult, McpError> {
+        let studio = self.api.get_json("/v1/studio").await.map_err(map_err)?;
+        let pins = studio
+            .get("pinnedLoras")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        json_ok(json!({ "pinnedLoras": pins }))
+    }
+
+    #[tool(description = "List local LoRAs on the diffusion worker")]
+    async fn list_loras(&self) -> Result<CallToolResult, McpError> {
+        let v = self
+            .api
+            .get_json("/v1/worker/loras")
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Look up one style pack by id. Pass that styleRef to generate_image to use it. Does not generate."
+    )]
+    async fn apply_style(
+        &self,
+        Parameters(args): Parameters<StyleRefArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let styles = self.api.get_json("/v1/styles").await.map_err(map_err)?;
+        let id = args.style_ref.trim();
+        let found = styles
+            .get("items")
+            .and_then(|v| v.as_array())
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find(|item| item.get("id").and_then(|i| i.as_str()) == Some(id))
+            })
+            .cloned();
+        match found {
+            Some(pack) => json_ok(pack),
+            None => Err(map_err(format!("unknown styleRef: {id}"))),
+        }
+    }
+
+    #[tool(description = "Propose alternative scene ideas. Does not generate an image.")]
+    async fn suggest_ideas(
+        &self,
+        Parameters(args): Parameters<TopicArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let topic = args.topic.unwrap_or_else(|| "a memorable scene".into());
+        let v = self
+            .api
+            .post_json(
+                "/v1/assist",
+                &json!({ "mode": "suggest", "message": topic }),
+            )
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
+    #[tool(
+        description = "Auto sentinels and resolved agent/router/image/video defaults. No API keys."
+    )]
+    async fn get_route_defaults(&self) -> Result<CallToolResult, McpError> {
+        let v = self
+            .api
+            .get_json("/v1/route-defaults")
+            .await
+            .map_err(map_err)?;
+        json_ok(v)
+    }
+
     #[tool(description = "OpenRouter key spend / credits snapshot (GET /v1/metrics/openrouter)")]
     async fn openrouter_metrics(&self) -> Result<CallToolResult, McpError> {
         let v = self
@@ -834,7 +1233,8 @@ impl ServerHandler for FreyaMcp {
         .with_instructions(
             "Freya image studio MCP. Tools proxy freya-api for generate, gallery, Civitai \
              install/jobs, installed assets, favorites, LoRA pins, cost/privacy/alignment, \
-             cloud vs local, and model id pins. Never read or set API keys, tokens, or passwords. \
+             cloud vs local, generation meta (sampler/cfg/steps/clip skip/seed), and model id pins. \
+             Never read or set API keys, tokens, or passwords. \
              gallery_download returns the URL the UI saves; it does not return image bytes. \
              Pin LoRAs only — checkpoints use worker_set_base_model. Do not change the worker host URL."
                 .to_string(),

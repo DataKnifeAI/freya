@@ -150,6 +150,7 @@ impl DiffusionWorkerClient {
                         .get("thumbnailUrl")
                         .and_then(|x| x.as_str())
                         .map(str::to_string),
+                    hash: local_asset_hash(a),
                 });
             }
         }
@@ -190,35 +191,8 @@ impl DiffusionWorkerClient {
         Ok(resp.json().await.unwrap_or(Value::Null))
     }
 
-    pub async fn generate(
-        &self,
-        prompt: &str,
-        model: Option<&str>,
-        loras: &[LoraWeight],
-        size: Option<&str>,
-        seed: Option<i64>,
-        negative: Option<&str>,
-    ) -> Result<Vec<u8>> {
-        let mut body = serde_json::json!({
-            "prompt": prompt,
-            "n": 1,
-            "response_format": "b64_json",
-        });
-        if let Some(m) = model {
-            body["model"] = Value::String(m.into());
-        }
-        if let Some(s) = size {
-            body["size"] = Value::String(s.into());
-        }
-        if let Some(seed) = seed {
-            body["seed"] = Value::from(seed);
-        }
-        if let Some(neg) = negative {
-            body["negative_prompt"] = Value::String(neg.into());
-        }
-        if !loras.is_empty() {
-            body["lora_request"] = serde_json::to_value(loras)?;
-        }
+    pub async fn generate(&self, call: &GenCall) -> Result<WorkerGenResult> {
+        let body = image_generation_body(call)?;
 
         let resp = self
             .apply_auth(
@@ -235,41 +209,39 @@ impl DiffusionWorkerClient {
             return Err(anyhow!("worker {status}: {text}"));
         }
         let v: Value = serde_json::from_str(&text)?;
-        let b64 = v
-            .pointer("/data/0/b64_json")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| anyhow!("worker missing b64_json"))?;
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .context("decode worker image")
+        parse_worker_gen(&v)
     }
 
     /// Local multi-frame GIF via Diffusers engine (`POST /v1/videos/generations` format=gif).
-    pub async fn generate_gif(
-        &self,
-        prompt: &str,
-        model: Option<&str>,
-        size: Option<&str>,
-        seed: Option<i64>,
-        negative: Option<&str>,
-    ) -> Result<Vec<u8>> {
+    pub async fn generate_gif(&self, call: &GenCall) -> Result<WorkerGenResult> {
         let mut body = serde_json::json!({
-            "prompt": prompt,
+            "prompt": call.prompt,
             "format": "gif",
             "frames": 6,
         });
-        if let Some(m) = model {
+        if let Some(m) = call.model.as_deref() {
             body["model"] = Value::String(m.into());
         }
-        if let Some(s) = size {
+        if let Some(s) = call.size.as_deref() {
             body["size"] = Value::String(s.into());
         }
-        if let Some(seed) = seed {
+        if let Some(seed) = call.seed {
             body["seed"] = Value::from(seed);
         }
-        if let Some(neg) = negative {
-            body["negative_prompt"] = Value::String(neg.into());
+        if let Some(neg) = call.negative.as_deref().filter(|s| !s.is_empty()) {
+            body["negativePrompt"] = Value::String(neg.into());
+        }
+        if let Some(steps) = call.steps {
+            body["steps"] = Value::from(steps);
+        }
+        if let Some(g) = call.guidance {
+            body["cfg"] = Value::from(g);
+        }
+        if let Some(sampler) = call.sampler.as_deref().filter(|s| !s.is_empty()) {
+            body["sampler"] = Value::String(sampler.into());
+        }
+        if let Some(clip) = call.clip_skip {
+            body["clipSkip"] = Value::from(clip);
         }
         let resp = self
             .apply_auth(
@@ -286,14 +258,7 @@ impl DiffusionWorkerClient {
             return Err(anyhow!("worker gif {status}: {text}"));
         }
         let v: Value = serde_json::from_str(&text)?;
-        let b64 = v
-            .pointer("/data/0/b64_json")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| anyhow!("worker gif missing b64_json"))?;
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .context("decode worker gif")
+        parse_worker_gen(&v)
     }
 
     fn install_body(
@@ -486,6 +451,155 @@ pub struct InstallMeta {
     pub thumbnail_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GenCall {
+    pub prompt: String,
+    pub model: Option<String>,
+    pub loras: Vec<LoraWeight>,
+    pub size: Option<String>,
+    pub seed: Option<i64>,
+    pub negative: Option<String>,
+    pub steps: Option<u32>,
+    pub guidance: Option<f64>,
+    pub sampler: Option<String>,
+    pub clip_skip: Option<u32>,
+    pub quantity: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerImage {
+    pub bytes: Vec<u8>,
+    pub seed: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct WorkerGenResult {
+    pub images: Vec<WorkerImage>,
+    pub steps: Option<u32>,
+    pub guidance: Option<f64>,
+    pub sampler: Option<String>,
+    pub scheduler: Option<String>,
+    pub sampler_note: Option<String>,
+    pub clip_skip: Option<u32>,
+    pub clip_skip_applied: Option<bool>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub quantity: Option<u32>,
+    pub negative_prompt: Option<String>,
+    pub stub: bool,
+}
+
+/// Body for `POST /v1/images/generations`.
+///
+/// Worker `GenReq` is camelCase. `quantity` and its alias `n` are one field,
+/// so both keys are a serde `duplicate field quantity`. Guidance is `cfg`
+/// (`guidanceScale` / `guidance`). Snake names such as `negative_prompt` and
+/// `lora_request` are ignored.
+pub(crate) fn image_generation_body(call: &GenCall) -> Result<Value> {
+    let mut body = serde_json::json!({
+        "prompt": call.prompt,
+        "quantity": call.quantity.unwrap_or(1),
+        "response_format": "b64_json",
+    });
+    if let Some(m) = call.model.as_deref() {
+        body["model"] = Value::String(m.into());
+    }
+    if let Some(s) = call.size.as_deref() {
+        body["size"] = Value::String(s.into());
+    }
+    if let Some(seed) = call.seed {
+        body["seed"] = Value::from(seed);
+    }
+    if let Some(neg) = call.negative.as_deref().filter(|s| !s.is_empty()) {
+        body["negativePrompt"] = Value::String(neg.into());
+    }
+    if let Some(steps) = call.steps {
+        body["steps"] = Value::from(steps);
+    }
+    if let Some(g) = call.guidance {
+        body["cfg"] = Value::from(g);
+    }
+    if let Some(sampler) = call.sampler.as_deref().filter(|s| !s.is_empty()) {
+        body["sampler"] = Value::String(sampler.into());
+    }
+    if let Some(clip) = call.clip_skip {
+        body["clipSkip"] = Value::from(clip);
+    }
+    if !call.loras.is_empty() {
+        body["loraRequest"] = serde_json::to_value(&call.loras)?;
+    }
+    Ok(body)
+}
+
+fn parse_worker_gen(v: &Value) -> Result<WorkerGenResult> {
+    use base64::Engine;
+    let items = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .ok_or_else(|| anyhow!("worker missing data"))?;
+    let mut images = Vec::new();
+    for item in items {
+        let b64 = item
+            .get("b64_json")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| anyhow!("worker missing b64_json"))?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .context("decode worker image")?;
+        let seed = item
+            .get("seed")
+            .and_then(|s| s.as_i64())
+            .or_else(|| v.get("seed").and_then(|s| s.as_i64()));
+        images.push(WorkerImage { bytes, seed });
+    }
+    if images.is_empty() {
+        return Err(anyhow!("worker returned no images"));
+    }
+    let num = |k: &str| {
+        v.get(k)
+            .and_then(|x| x.as_u64())
+            .map(|n| n as u32)
+            .or_else(|| {
+                v.get(k)
+                    .and_then(|x| x.as_i64())
+                    .filter(|n| *n >= 0)
+                    .map(|n| n as u32)
+            })
+    };
+    Ok(WorkerGenResult {
+        images,
+        steps: num("steps"),
+        guidance: v
+            .get("guidance_scale")
+            .or_else(|| v.get("cfg"))
+            .and_then(|x| x.as_f64()),
+        sampler: v
+            .get("sampler")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        scheduler: v
+            .get("scheduler")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        sampler_note: v
+            .get("samplerNote")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        clip_skip: num("clipSkip"),
+        clip_skip_applied: v.get("clipSkipApplied").and_then(|x| x.as_bool()),
+        width: num("width"),
+        height: num("height"),
+        quantity: num("quantity").or_else(|| num("n")),
+        negative_prompt: v
+            .get("negativePrompt")
+            .or_else(|| v.get("negative_prompt"))
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
+        stub: v.get("stub").and_then(|x| x.as_bool()).unwrap_or(false),
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoraWeight {
     pub lora_name: String,
@@ -555,6 +669,31 @@ pub struct LocalAsset {
     pub source: Option<String>,
     #[serde(default)]
     pub thumbnail_url: Option<String>,
+    /// File hash when the worker sidecar has one (SHA256 or AutoV2).
+    #[serde(default)]
+    pub hash: Option<String>,
+}
+
+fn local_asset_hash(asset: &Value) -> Option<String> {
+    let accept = |raw: &str| -> Option<String> {
+        let hex = raw.trim().rsplit([':', '/']).next().unwrap_or(raw).trim();
+        if hex.len() < 10 || hex.len() > 128 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        Some(hex.to_ascii_lowercase())
+    };
+    for key in ["hash", "sha256", "autoV2", "autoV3"] {
+        if let Some(token) = asset.get(key).and_then(|v| v.as_str()).and_then(&accept) {
+            return Some(token);
+        }
+    }
+    let hashes = asset.get("hashes")?.as_object()?;
+    for key in ["SHA256", "sha256", "AutoV2", "autoV2", "AutoV3", "autoV3"] {
+        if let Some(token) = hashes.get(key).and_then(|v| v.as_str()).and_then(&accept) {
+            return Some(token);
+        }
+    }
+    None
 }
 
 /// True when the JSON is worker inventory, not the liveness `{ok:true}` body.
@@ -614,7 +753,58 @@ fn host_is_local_or_private(host: &str) -> bool {
 
 #[cfg(test)]
 mod tls_tests {
-    use super::{inventory_stats, tls_skip_allowed, worker_job_url};
+    use super::{image_generation_body, inventory_stats, tls_skip_allowed, worker_job_url, GenCall};
+    use serde::Deserialize;
+
+    /// Same aliases as `freya-worker` `GenReq`. A field plus its alias is a duplicate.
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct WorkerGenReq {
+        #[serde(default, alias = "cfg", alias = "guidance")]
+        guidance_scale: Option<f64>,
+        #[serde(default)]
+        steps: Option<u32>,
+        #[serde(default)]
+        seed: Option<i64>,
+        #[serde(default)]
+        negative_prompt: Option<String>,
+        #[serde(default)]
+        sampler: Option<String>,
+        #[serde(default)]
+        clip_skip: Option<u32>,
+        #[serde(default, alias = "n")]
+        quantity: Option<u32>,
+    }
+
+    #[test]
+    fn image_generation_body_sends_quantity_once() {
+        let call = GenCall {
+            prompt: "a red door".into(),
+            model: Some("ckpt.safetensors".into()),
+            size: Some("832x1216".into()),
+            seed: Some(42),
+            negative: Some("blurry".into()),
+            steps: Some(28),
+            guidance: Some(7.0),
+            sampler: Some("Euler a".into()),
+            clip_skip: Some(2),
+            quantity: Some(3),
+            ..GenCall::default()
+        };
+        let body = image_generation_body(&call).unwrap();
+        let text = serde_json::to_string(&body).unwrap();
+        assert_eq!(text.matches("\"quantity\"").count(), 1);
+        let req: WorkerGenReq = serde_json::from_value(body.clone()).expect("worker accepts body");
+        assert_eq!(req.quantity, Some(3));
+        assert_eq!(req.steps, Some(28));
+        assert_eq!(req.guidance_scale, Some(7.0));
+        assert_eq!(req.seed, Some(42));
+        assert_eq!(req.negative_prompt.as_deref(), Some("blurry"));
+        assert_eq!(req.sampler.as_deref(), Some("Euler a"));
+        assert_eq!(req.clip_skip, Some(2));
+        assert!(body.get("n").is_none());
+        assert_eq!(body["cfg"], serde_json::json!(7.0));
+    }
 
     #[test]
     fn health_ok_is_not_inventory() {
