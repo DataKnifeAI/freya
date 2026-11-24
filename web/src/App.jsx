@@ -3588,6 +3588,13 @@ export default function App() {
   };
   const canCloudGenerate = () => Boolean(settings?.openRouterConfigured);
 
+  const pinnedCivitaiModelId = (l) => {
+    const fromField = positiveId(l.modelId ?? l.civitaiModelId);
+    if (fromField != null) return fromField;
+    if (l.id != null && /^\d+$/.test(String(l.id))) return Number(l.id);
+    return undefined;
+  };
+
   const pinnedPayload = () =>
     (session.pinnedLoras || [])
       .filter((l) => isPinnableAsset(l))
@@ -3598,8 +3605,8 @@ export default function App() {
         scale: l.scale ?? 0.8,
         path: l.path || undefined,
         baseModel: l.baseModel || undefined,
-        versionId: l.versionId || undefined,
-        modelId: l.modelId || l.id || undefined,
+        versionId: positiveId(l.versionId) ?? undefined,
+        modelId: pinnedCivitaiModelId(l),
       }));
 
   const isPinned = (item) =>

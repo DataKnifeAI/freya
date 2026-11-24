@@ -3424,11 +3424,11 @@ fn lora_from_pin_value(v: &Value) -> Option<LoraIn> {
             .get("baseModel")
             .and_then(|b| b.as_str())
             .map(str::to_string),
-        version_id: v.get("versionId").and_then(|x| x.as_i64()),
+        version_id: v.get("versionId").and_then(|x| json_i64(Some(x))),
         model_id: v
             .get("modelId")
-            .and_then(|x| x.as_i64())
-            .or_else(|| v.get("id").and_then(|x| x.as_i64())),
+            .and_then(|x| json_i64(Some(x)))
+            .or_else(|| v.get("id").and_then(|x| json_i64(Some(x)))),
     })
 }
 
@@ -4628,9 +4628,10 @@ pub struct LoraIn {
     /// Civitai base family (SDXL 1.0, Pony, …) — used to pick a checkpoint.
     #[serde(default)]
     pub base_model: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
     pub version_id: Option<i64>,
-    #[serde(default)]
+    /// Civitai model id when known; non-numeric strings in JSON are dropped (legacy clients sent filenames).
+    #[serde(default, deserialize_with = "deserialize_optional_i64")]
     pub model_id: Option<i64>,
 }
 
@@ -6060,6 +6061,14 @@ fn json_i64(v: Option<&serde_json::Value>) -> Option<i64> {
         })
 }
 
+fn deserialize_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(opt.and_then(|v| json_i64(Some(&v))))
+}
+
 fn installed_match(asset: crate::worker::LocalAsset) -> crate::civitai::InstalledAssetMatch {
     let kind = if asset.path.starts_with("checkpoints/") {
         "checkpoint"
@@ -7262,6 +7271,25 @@ mod route_footer_tests {
         assert!(cleaned.contains("Frankie Foster"));
         assert!(!cleaned.to_lowercase().contains("freya route"));
         assert!(!cleaned.contains("search_civitai"));
+    }
+
+    #[test]
+    fn lora_in_ignores_filename_model_id() {
+        let raw = json!({
+            "name": "Frankie",
+            "modelId": "Frankie_Foster_-_Foster_s_Home_for_Imaginary_Friends_-_Illustrious_XL_-_by_YeiyeiArt",
+            "path": "loras/Frankie_Foster_-_Foster_s_Home_for_Imaginary_Friends_-_Illustrious_XL_-_by_YeiyeiArt.safetensors"
+        });
+        let l: LoraIn = serde_json::from_value(raw).expect("deserialize lora");
+        assert!(l.model_id.is_none());
+        assert_eq!(l.name, "Frankie");
+    }
+
+    #[test]
+    fn lora_in_parses_numeric_model_id_string() {
+        let raw = json!({ "name": "x", "modelId": "1319790" });
+        let l: LoraIn = serde_json::from_value(raw).expect("deserialize lora");
+        assert_eq!(l.model_id, Some(1319790));
     }
 
     #[test]
