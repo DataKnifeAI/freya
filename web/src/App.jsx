@@ -1467,8 +1467,14 @@ const IconClear = () => (
   </Svg>
 );
 
-function CompactMenu({ label, valueLabel, options, value, onChange, open, onOpen, icon, title }) {
-  const ref = useRef(null);
+/** Civitai subnav: worded labels; Downloads stays right-aligned. */
+const CIVITAI_SUBNAV = [
+  { id: "search", label: "Search" },
+  { id: "favorites", label: "Favorites" },
+  { id: "installed", label: "Installed" },
+  { id: "downloads", label: "Downloads", end: true },
+];
+const CIVITAI_AGENT_FOCUS = new Set(CIVITAI_SUBNAV.map((s) => s.id));
 
 /** Favorites sub-tabs. Empty types stay hidden. Images are community gallery favorites. */
 const FAVORITE_TYPE_TABS = [
@@ -1887,6 +1893,26 @@ function kindsCompatible(resourceType, assetKind) {
   return resource === asset || asset === "other" || resource === "other";
 }
 
+/** Filename, stem, or display name against an installed row (same spirit as chat lookup). */
+function labelMatchesAsset(label, asset) {
+  const want = String(label || "").trim();
+  if (!want || !asset) return false;
+  for (const field of [asset.name, asset.path, asset.fileName, asset.id]) {
+    if (field && queryHitsLabel(want, field)) return true;
+  }
+  return false;
+}
+
+function sameCheckpointPath(a, b) {
+  const left = String(a || "").trim();
+  const right = String(b || "").trim();
+  if (!left || !right) return false;
+  if (left === right) return true;
+  const lk = assetLabelKey(left);
+  const rk = assetLabelKey(right);
+  return Boolean(lk && rk && lk === rk);
+}
+
 /** Same rules as the API resource match: version id wins, then model id, hash, then file stem. */
 function resourceMatchesAsset(resource, asset) {
   if (!resource || !asset) return false;
@@ -1902,11 +1928,9 @@ function resourceMatchesAsset(resource, asset) {
   if (resource.hash && asset.hash && hashesMatch(resource.hash, asset.hash)) return true;
   const resourceType = resource.type || resource.modelType || "Checkpoint";
   if (!kindsCompatible(resourceType, asset.modelType || asset.kind)) return false;
-  const want = assetLabelKey(resource.name || "");
-  if (!want) return false;
-  const name = assetLabelKey(asset.name);
-  const path = assetLabelKey(asset.path);
-  return Boolean((name && want === name) || (path && want === path));
+  const name = String(resource.name || "").trim();
+  if (!name) return false;
+  return labelMatchesAsset(name, asset);
 }
 
 function slimCommunityResource(resource) {
@@ -2040,20 +2064,48 @@ function installedBaseForCommunityImage(item, installed, origin) {
   const checkpoints = (installed || []).filter(isCheckpointAsset);
   const fromPost = findInstalledResource(checkpointResourceOf(item), checkpoints);
   if (fromPost) return fromPost;
+  const ckLabel = String(item?.checkpoint || "").trim();
+  if (ckLabel) {
+    const byLabel = checkpoints.find((asset) => labelMatchesAsset(ckLabel, asset));
+    if (byLabel) return byLabel;
+  }
   const fb = origin || item?.fallbackCheckpoint || null;
   if (!fb) return null;
-  for (const rec of fb.recommended || []) {
-    if (!isCheckpointAsset({ modelType: rec.modelType || rec.type, type: rec.type })) continue;
-    const hit = findInstalledResource(
+  if (isCheckpointAsset({ modelType: fb.modelType, kind: fb.modelType, path: fb.path })) {
+    const self = findInstalledResource(
       {
-        name: rec.name,
+        name: fb.name,
         type: "Checkpoint",
-        modelVersionId: rec.versionId || rec.modelVersionId,
-        modelId: rec.modelId || rec.id,
-        hash: rec.hash,
+        modelVersionId: fb.modelVersionId || fb.versionId,
+        modelId: fb.modelId,
+        hash: fb.hash,
       },
       checkpoints,
     );
+    if (self) return self;
+    if (fb.name) {
+      const byName = checkpoints.find((asset) => labelMatchesAsset(fb.name, asset));
+      if (byName) return byName;
+    }
+    if (fb.path) {
+      const byPath = checkpoints.find((asset) => sameCheckpointPath(asset.path, fb.path));
+      if (byPath) return byPath;
+    }
+  }
+  for (const rec of fb.recommended || []) {
+    if (!isCheckpointAsset({ modelType: rec.modelType || rec.type, type: rec.type })) continue;
+    const hit =
+      findInstalledResource(
+        {
+          name: rec.name,
+          type: "Checkpoint",
+          modelVersionId: rec.versionId || rec.modelVersionId,
+          modelId: rec.modelId || rec.id,
+          hash: rec.hash,
+        },
+        checkpoints,
+      ) ||
+      (rec.name ? checkpoints.find((asset) => labelMatchesAsset(rec.name, asset)) : null);
     if (hit) return hit;
   }
   return null;
@@ -4339,17 +4391,32 @@ export default function App() {
   const setInstalledAsBase = async (asset) => {
     if (!asset?.path) return false;
     try {
-      await api("/v1/worker/base-model", {
+      const res = await api("/v1/worker/base-model", {
         method: "PUT",
         body: JSON.stringify({
           model: asset.path,
           baseModel: asset.baseModel || undefined,
         }),
       });
-      setActiveBasePath(asset.path);
-      setLocalBaseModel(asset.path);
-      if (typeof asset.baseModel === "string") setLocalBaseFamily(asset.baseModel);
-      setSavedMsg(`Active base → ${asset.name || asset.path}`);
+      const nextPath = res?.model || asset.path;
+      const nextFamily =
+        typeof res?.baseModel === "string" ? res.baseModel : asset.baseModel || "";
+      setActiveBasePath(nextPath);
+      setLocalBaseModel(nextPath);
+      if (nextFamily) setLocalBaseFamily(nextFamily);
+      setWorkerStats((prev) =>
+        prev
+          ? {
+              ...prev,
+              modelLoaded: {
+                ...(prev.modelLoaded || {}),
+                model: nextPath,
+                baseModel: nextFamily || prev.modelLoaded?.baseModel || null,
+              },
+            }
+          : prev,
+      );
+      setSavedMsg(`Active base → ${asset.name || nextPath}`);
       return true;
     } catch (e) {
       setError(e.message);
@@ -5644,7 +5711,7 @@ export default function App() {
     const recommendedInstead = Boolean(base?.path && !imageCheckpoint && item?.checkpoint);
     let baseNote = "";
     if (base?.path) {
-      if (activeBasePath && activeBasePath === base.path) {
+      if (activeBasePath && sameCheckpointPath(activeBasePath, base.path)) {
         baseNote = recommendedInstead
           ? ` Checkpoint “${item.checkpoint}” is not installed. Base already ${baseName}.`
           : ` Base already ${baseName}.`;
@@ -7274,6 +7341,7 @@ export default function App() {
 
       {tab === "agent" && agentFocus === "meta" && (
         <section className="panel gen-meta" aria-label="Generation meta">
+          {renderAgentSubnav()}
           <p className="hint gen-meta-source">
             {genMeta.sourceLabel ||
               (genMeta.source === "user"
@@ -7460,10 +7528,10 @@ export default function App() {
         </section>
       )}
 
-      {tab === "agent" && agentFocus !== "suggestions" && agentFocus !== "gallery" && (
+      {tab === "agent" && CIVITAI_AGENT_FOCUS.has(agentFocus) && (
         <section className="panel">
           {renderAgentSubnav()}
-          {civitaiSubview === "search" && (
+          {agentFocus === "search" && (
             <>
               {!settings?.civitaiConfigured && (
                 <p className="hint">
@@ -7509,7 +7577,7 @@ export default function App() {
               </div>
             </>
           )}
-          {civitaiSubview === "favorites" && (
+          {agentFocus === "favorites" && (
             <>
               {favoriteTypeTabs.length === 0 ? (
                 <div className="gallery-empty">
@@ -7573,7 +7641,7 @@ export default function App() {
               )}
             </>
           )}
-          {civitaiSubview === "downloads" && (
+          {agentFocus === "downloads" && (
             <>
               <div className="row" style={{ justifyContent: "space-between", marginBottom: "0.5rem" }}>
                 <span className="label-with-help" style={{ flex: 1 }}>
@@ -7609,9 +7677,110 @@ export default function App() {
                     {hasWorker() ? "Install to worker" : "Install (needs worker)"}
                   </button>
                 </div>
-              </article>
-            ))}
-          </div>
+              ) : (
+                <div className="install-job-list">
+                  {downloadJobs.map((job) => {
+                    const pct =
+                      job.percent != null
+                        ? Math.min(100, Math.max(0, Number(job.percent)))
+                        : job.bytesTotal
+                          ? Math.min(
+                              100,
+                              (Number(job.bytesDone || 0) / Number(job.bytesTotal)) * 100,
+                            )
+                          : null;
+                    const canCancel = ["queued", "downloading"].includes(job.status);
+                    return (
+                      <article key={job.id} className="install-job-row">
+                        <div className="install-job-head">
+                          <strong>{job.name || job.destPath || job.id}</strong>
+                          <span className={`install-job-status status-${job.status}`}>
+                            {job.status}
+                          </span>
+                        </div>
+                        <p className="hint" style={{ margin: "0.25rem 0" }}>
+                          {job.destPath}
+                          {job.baseModel ? ` · ${job.baseModel}` : ""}
+                          {job.modelType ? ` · ${job.modelType}` : ""}
+                        </p>
+                        <div className="install-job-progress">
+                          <div
+                            className="install-job-bar"
+                            style={{ width: `${pct != null ? pct : job.status === "succeeded" ? 100 : 0}%` }}
+                          />
+                        </div>
+                        <div className="row install-job-meta">
+                          <span className="hint">
+                            {formatBytes(job.bytesDone)}
+                            {job.bytesTotal ? ` / ${formatBytes(job.bytesTotal)}` : ""}
+                            {pct != null ? ` (${pct.toFixed(0)}%)` : ""}
+                            {job.error ? ` — ${job.error}` : ""}
+                          </span>
+                          {canCancel ? (
+                            <button
+                              type="button"
+                              className="ghost"
+                              onClick={() => cancelDownloadJob(job.id)}
+                            >
+                              Cancel
+                            </button>
+                          ) : null}
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </>
+          )}
+          {agentFocus === "installed" && (
+            <>
+              {!hasWorker() ? (
+                <p className="hint">Connect a worker to manage installed assets.</p>
+              ) : installedBusy && installedAssets.length === 0 ? (
+                <p className="hint">Loading…</p>
+              ) : installedAssets.length === 0 ? (
+                <div className="gallery-empty">
+                  <div className="gallery-empty-art">
+                    <img
+                      src="/empty-installed.png"
+                      alt="Nothing installed yet."
+                      className="gallery-empty-img"
+                      draggable={false}
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div className="installed-sections">
+                  {groupInstalledAssets(installedAssets).map((section) => (
+                    <section key={section.id} className="installed-section" aria-label={section.title}>
+                      <h3 className="installed-section-title">
+                        {section.title}
+                        <span className="hint"> ({section.items.length})</span>
+                      </h3>
+                      <div className="lora-row">
+                        {section.items.map((asset) => {
+                          const card = {
+                            ...asset,
+                            modelType: asset.modelType || asset.kind || "Asset",
+                            modelId: asset.modelId ?? null,
+                            versionId: asset.versionId ?? null,
+                            name: asset.name || asset.id,
+                            thumbnailUrl: pickCivitaiThumb(asset, favorites),
+                          };
+                          return renderLoraCard(card, {
+                            onAfterPin: isPinnableAsset(card)
+                              ? () => setTab("gallery")
+                              : undefined,
+                          });
+                        })}
+                      </div>
+                    </section>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
         </section>
       )}
 
