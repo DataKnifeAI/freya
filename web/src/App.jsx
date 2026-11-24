@@ -2280,6 +2280,44 @@ function installedBaseForCommunityImage(item, installed, origin) {
   return null;
 }
 
+function resourceLooksLikeLora(resource) {
+  return kindBucket(resource?.type || resource?.modelType) === "lora";
+}
+
+/** Installed LoRAs named on a community post — does not download missing files. */
+function installedLorasFromPostResources(item, installed) {
+  const pinnable = (installed || []).filter(isPinnableAsset);
+  const resources = Array.isArray(item?.resources) ? item.resources : [];
+  const out = [];
+  const seen = new Set();
+  for (const resource of resources) {
+    if (!resourceLooksLikeLora(resource)) continue;
+    const hit = findInstalledResource(resource, pinnable);
+    if (!hit) continue;
+    const key = loraKey(hit);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(hit);
+  }
+  return out;
+}
+
+/** Gallery opened for a model — pin that LoRA when it is already on the worker. */
+function installedGalleryContextLora(ctx, installed) {
+  if (!ctx) return null;
+  const pinnable = (installed || []).filter(isPinnableAsset);
+  const hit = findInstalledResource(
+    {
+      name: ctx.name || "",
+      type: "LORA",
+      modelVersionId: ctx.modelVersionId ?? null,
+      modelId: ctx.modelId ?? null,
+    },
+    pinnable,
+  );
+  return hit && isPinnableAsset(hit) ? hit : null;
+}
+
 function communityCheckpointLine(item) {
   if (!item?.checkpoint) return "";
   if (item.kind === "community-image") return String(item.checkpoint);
@@ -6346,6 +6384,17 @@ export default function App() {
       baseNote = ` Checkpoint “${item.checkpoint}” is not installed.`;
     }
 
+    const contextLora = installedGalleryContextLora(galleryContext, installedAssets);
+    const lorasToPin = contextLora
+      ? [contextLora]
+      : installedLorasFromPostResources(item, installedAssets);
+    const pinNames = [];
+    for (const lora of lorasToPin) {
+      if (!isPinned(lora)) pinLora(lora);
+      pinNames.push(lora.name || lora.path || "LoRA");
+    }
+    const pinNote = pinNames.length ? ` Pinned ${pinNames.join(", ")}.` : "";
+
     let copied = false;
     try {
       copied = await copyCommunityInput({ prompt, negativePrompt: negative });
@@ -6354,7 +6403,9 @@ export default function App() {
     }
     setCommunityErr("");
     const clip = copied ? " Copied the prompt and negative prompt." : "";
-    setCommunityNote(`Filled the prompt, negative prompt, and generation meta.${baseNote}${clip}`);
+    setCommunityNote(
+      `Filled the prompt, negative prompt, and generation meta.${pinNote}${baseNote}${clip}`,
+    );
   };
 
   const renderCommunityActions = (item) => {
@@ -6369,39 +6420,6 @@ export default function App() {
     const linkHost = linkTone === "nsfw" ? "civitai.red" : "civitai.com";
     return (
       <>
-        <button
-          type="button"
-          className={`${saved ? "primary" : "ghost"} icon-btn`}
-          title={saved ? "Remove from image favorites" : "Favorite this image"}
-          aria-label={saved ? "Unfavorite image" : "Favorite image"}
-          onClick={(e) => {
-            e.stopPropagation();
-            toggleImageFavorite(item);
-          }}
-        >
-          <IconStar filled={saved} />
-        </button>
-        <button
-          type="button"
-          className="ghost icon-btn"
-          title="Fill the prompt, negative prompt, and generation meta"
-          aria-label="Copy input"
-          onClick={(e) => {
-            e.stopPropagation();
-            void copyImageInput(item);
-          }}
-        >
-          <IconCopy />
-        </button>
-        <MediaDownload
-          src={item.url || item.thumbnailUrl}
-          item={{ ...item, filename: communityImageFilename(item) }}
-          className="ghost icon-btn"
-          onError={(msg) => {
-            setCommunityNote("");
-            setCommunityErr(msg || "Download failed");
-          }}
-        />
         {installableMissing.length > 0 ? (
           <button
             type="button"
@@ -6436,6 +6454,39 @@ export default function App() {
             <IconExternal />
           </a>
         ) : null}
+        <button
+          type="button"
+          className={`${saved ? "primary" : "ghost"} icon-btn`}
+          title={saved ? "Remove from image favorites" : "Favorite this image"}
+          aria-label={saved ? "Unfavorite image" : "Favorite image"}
+          onClick={(e) => {
+            e.stopPropagation();
+            toggleImageFavorite(item);
+          }}
+        >
+          <IconStar filled={saved} />
+        </button>
+        <button
+          type="button"
+          className="ghost icon-btn"
+          title="Fill the prompt, negative prompt, and generation meta"
+          aria-label="Copy input"
+          onClick={(e) => {
+            e.stopPropagation();
+            void copyImageInput(item);
+          }}
+        >
+          <IconCopy />
+        </button>
+        <MediaDownload
+          src={item.url || item.thumbnailUrl}
+          item={{ ...item, filename: communityImageFilename(item) }}
+          className="ghost icon-btn"
+          onError={(msg) => {
+            setCommunityNote("");
+            setCommunityErr(msg || "Download failed");
+          }}
+        />
       </>
     );
   };
