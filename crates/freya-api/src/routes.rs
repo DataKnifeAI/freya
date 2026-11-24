@@ -4857,7 +4857,7 @@ fn image_generate_request(
     GenerateRequest {
         prompt,
         negative_prompt: pick_s(&from_args.negative_prompt, &from_text.negative_prompt),
-        enhance: Some("auto".into()),
+        enhance: pick_s(&from_args.enhance, &from_text.enhance),
         backend: Some(backend),
         model,
         style_ref,
@@ -5308,21 +5308,18 @@ async fn run_generate(state: &AppState, mut req: GenerateRequest) -> ApiResult<s
     req.quantity = Some(prepared.quantity);
 
     let backend = req.backend.clone().unwrap_or_else(|| "openrouter".into());
-    let enhance = {
-        let from_req = req
-            .enhance
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        if let Some(e) = from_req {
-            e
-        } else {
-            let gen = state.config.read().await.studio.generation.enhance.clone();
-            gen.filter(|e| !e.trim().is_empty())
-                .unwrap_or_else(|| "auto".into())
-        }
+    let (stored_locked, stored_enhance) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.studio.generation.locked,
+            cfg.studio.generation.enhance.clone(),
+        )
     };
+    let enhance = crate::prefs::resolve_generate_enhance(
+        req.enhance.as_deref(),
+        stored_enhance.as_deref(),
+        stored_locked,
+    );
     let enhance_on = crate::prefs::enhance_enabled(&enhance);
     let (alignment, privacy, auto_fallbacks, chat_pin) = {
         let cfg = state.config.read().await;

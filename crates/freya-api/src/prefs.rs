@@ -318,6 +318,28 @@ pub fn enhance_enabled(enhance: &str) -> bool {
     matches!(enhance, "on" | "auto" | "prompt-prose" | "prompt-sd")
 }
 
+/// Prefer studio `enhance: off` (and locked reproduction meta) over chat defaults like `auto`.
+pub fn resolve_generate_enhance(
+    from_request: Option<&str>,
+    stored: Option<&str>,
+    locked: bool,
+) -> String {
+    let req = from_request.map(str::trim).filter(|s| !s.is_empty());
+    let saved = stored.map(str::trim).filter(|s| !s.is_empty());
+    if saved == Some("off") {
+        if locked {
+            return "off".into();
+        }
+        if !matches!(req, Some("on" | "prompt-prose" | "prompt-sd")) {
+            return "off".into();
+        }
+    }
+    if let Some(e) = req {
+        return e.to_string();
+    }
+    saved.unwrap_or("auto").to_string()
+}
+
 /// Whether a chat model JSON object from OpenRouter `/models` matches alignment prefs.
 pub fn chat_model_matches_alignment(m: &Value, prefs: &AlignmentPrefs) -> bool {
     match prefs.model_alignment.as_str() {
@@ -545,5 +567,26 @@ mod tests {
         assert!(enhance_enabled("prompt-prose"));
         assert!(enhance_enabled("on"));
         assert!(!enhance_enabled("off"));
+    }
+
+    #[test]
+    fn resolve_generate_enhance_respects_stored_off() {
+        assert_eq!(
+            resolve_generate_enhance(Some("auto"), Some("off"), true),
+            "off"
+        );
+        assert_eq!(
+            resolve_generate_enhance(Some("auto"), Some("off"), false),
+            "off"
+        );
+        assert_eq!(
+            resolve_generate_enhance(Some("prompt-sd"), Some("off"), false),
+            "prompt-sd"
+        );
+        assert_eq!(
+            resolve_generate_enhance(None, Some("off"), false),
+            "off"
+        );
+        assert_eq!(resolve_generate_enhance(None, None, false), "auto");
     }
 }
